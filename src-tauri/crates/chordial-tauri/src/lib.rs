@@ -178,8 +178,13 @@ pub fn run() {
             commands::netease_search_playlists,
             commands::netease_get_playlist_full,
             commands::netease_save_playlist_to_library,
+            commands::netease_save_album_to_library,
             commands::netease_download_song,
             commands::netease_compare_with_local,
+            // Netease 用户账户与"我的资源"
+            commands::netease_get_user_account,
+            commands::netease_get_user_playlists,
+            commands::netease_get_user_albums,
             // Netease 扫码登录
             commands::netease_login_qr_key,
             commands::netease_login_qr_create,

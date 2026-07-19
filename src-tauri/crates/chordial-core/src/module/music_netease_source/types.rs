@@ -112,7 +112,7 @@ impl<T> NeteaseResponse<T> {
     }
 }
 
-/// 搜索结果（/search 接口）。
+/// 搜索结果（/search 接口 `result` 字段）。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NeteaseSearchResult {
     #[serde(default)]
@@ -123,6 +123,38 @@ pub struct NeteaseSearchResult {
     pub albums: Vec<NeteaseAlbumBrief>,
     #[serde(default)]
     pub artists: Vec<NeteaseArtistBrief>,
+}
+
+/// `/search` 接口响应包装。
+///
+/// 注意：网易云搜索接口把数据嵌套在 `result` 字段下（与其他接口直接平铺不同），
+/// 因此不能复用 `NeteaseResponse<T>` 的 `flatten` 模式，需要单独定义。
+///
+/// ```json
+/// { "code": 200, "result": { "songs": [...], "playlists": [...] } }
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct NeteaseSearchResponse {
+    pub code: i32,
+    #[serde(default)]
+    pub msg: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub result: NeteaseSearchResult,
+}
+
+impl NeteaseSearchResponse {
+    pub fn is_ok(&self) -> bool {
+        self.code == 200
+    }
+
+    pub fn error_message(&self) -> String {
+        self.message
+            .clone()
+            .or_else(|| self.msg.clone())
+            .unwrap_or_else(|| format!("NeteaseCloudMusicApi 错误 code={}", self.code))
+    }
 }
 
 /// 歌曲简略信息（搜索结果）。
@@ -186,6 +218,13 @@ pub struct NeteasePlaylistBrief {
     pub playCount: i64,
     #[serde(default)]
     pub description: Option<String>,
+    /// 是否被当前用户收藏（仅 /user/playlist 接口返回，搜索接口不带）。
+    /// `true` = 收藏的歌单；`false` = 自己创建的歌单。
+    #[serde(default)]
+    pub subscribed: Option<bool>,
+    /// 歌单标签（/user/playlist 接口返回）。
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// 歌单创建者信息。
@@ -425,4 +464,128 @@ impl QrCheckStatus {
             Self::Unknown => "unknown",
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 用户账户与"我的资源"响应（/user/account、/user/playlist、/album/sublist）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// `/user/account` 响应（需要登录 cookie）。
+///
+/// ```json
+/// { "code": 200, "account": {...}, "profile": { "userId": 123, "nickname": "...", "avatarUrl": "..." } }
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseUserAccountResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub profile: Option<NeteaseUserProfile>,
+    #[serde(default)]
+    pub account: Option<NeteaseUserAccount>,
+}
+
+/// 用户公开资料（`/user/account` 的 `profile` 字段）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NeteaseUserProfile {
+    #[serde(default)]
+    pub userId: i64,
+    #[serde(default)]
+    pub nickname: String,
+    #[serde(default)]
+    pub avatarUrl: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+/// 账户字段（`/user/account` 的 `account` 字段，含登录账号信息）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NeteaseUserAccount {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub userName: String,
+}
+
+/// `/user/playlist?uid=xxx` 响应。
+///
+/// 注意：网易云在这里把数组放在 `playlist`（单数）字段下。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseUserPlaylistsResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub playlist: Vec<NeteasePlaylistBrief>,
+    #[serde(default)]
+    pub more: Option<bool>,
+}
+
+/// `/album/sublist` 响应（收藏的专辑）。
+///
+/// ```json
+/// { "code": 200, "data": [...], "count": 100, "hasMore": true }
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseAlbumSublistResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub data: Vec<NeteaseSubAlbum>,
+    #[serde(default)]
+    pub count: i64,
+    #[serde(default)]
+    pub hasMore: Option<bool>,
+}
+
+/// 收藏的专辑条目（`/album/sublist` 的 `data[i]`）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NeteaseSubAlbum {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub picUrl: Option<String>,
+    #[serde(default)]
+    pub artist: Option<NeteaseArtistBrief>,
+    #[serde(default)]
+    pub artists: Vec<NeteaseArtistBrief>,
+    #[serde(default)]
+    pub trackCount: i32,
+    #[serde(default)]
+    pub playCount: i64,
+    #[serde(default)]
+    pub subTime: i64,
+}
+
+/// `/album?id=xxx` 响应（专辑详情，含曲目）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseAlbumDetailResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub album: Option<NeteaseAlbumDetail>,
+    #[serde(default)]
+    pub songs: Vec<NeteaseSongDetail>,
+}
+
+/// 专辑详情（`/album` 的 `album` 字段）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NeteaseAlbumDetail {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub picUrl: Option<String>,
+    #[serde(default)]
+    pub artist: Option<NeteaseArtistBrief>,
+    #[serde(default)]
+    pub artists: Vec<NeteaseArtistBrief>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub publishTime: i64,
+    #[serde(default)]
+    pub size: i32,
 }

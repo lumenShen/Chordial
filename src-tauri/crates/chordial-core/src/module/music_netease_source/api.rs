@@ -43,7 +43,7 @@ pub fn search_songs(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<NeteaseSongBrief>, String> {
-    let resp: NeteaseResponse<NeteaseSearchResult> = client.get_json(
+    let resp: NeteaseSearchResponse = client.get_json(
         "/search",
         &[
             ("keywords", query),
@@ -55,7 +55,7 @@ pub fn search_songs(
     if !resp.is_ok() {
         return Err(resp.error_message());
     }
-    Ok(resp.data.songs)
+    Ok(resp.result.songs)
 }
 
 /// 搜索歌单。
@@ -65,7 +65,7 @@ pub fn search_playlists(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<NeteasePlaylistBrief>, String> {
-    let resp: NeteaseResponse<NeteaseSearchResult> = client.get_json(
+    let resp: NeteaseSearchResponse = client.get_json(
         "/search",
         &[
             ("keywords", query),
@@ -77,7 +77,7 @@ pub fn search_playlists(
     if !resp.is_ok() {
         return Err(resp.error_message());
     }
-    Ok(resp.data.playlists)
+    Ok(resp.result.playlists)
 }
 
 /// 获取歌单详情（含元信息）。
@@ -244,6 +244,72 @@ pub fn login_qr_check(
     let resp: NeteaseQrCheckResponse = client.get_json("/login/qr/check", &[("key", key)])?;
     // 此处允许非 200 的 code（800/801/802/803），它们是业务状态而非错误
     Ok(resp)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 用户账户与"我的资源"
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 获取当前登录账号信息（依赖 cookie）。
+///
+/// 调用 `/user/account`，返回 `NeteaseUserAccountResponse`。
+/// 需要登录态 cookie（含 MUSIC_U），未登录时 `profile` 为 `None`。
+pub fn get_user_account(client: &WebHttpClient) -> Result<NeteaseUserAccountResponse, String> {
+    let resp: NeteaseUserAccountResponse = client.get_json("/user/account", &[])?;
+    Ok(resp)
+}
+
+/// 获取指定用户的全部歌单（创建 + 收藏，通过 `subscribed` 字段区分）。
+///
+/// 调用 `/user/playlist?uid=xxx`。一次返回所有歌单（不分页）。
+pub fn get_user_playlists(
+    client: &WebHttpClient,
+    uid: i64,
+) -> Result<Vec<NeteasePlaylistBrief>, String> {
+    let resp: NeteaseUserPlaylistsResponse =
+        client.get_json("/user/playlist", &[("uid", &uid.to_string())])?;
+    if resp.code != 200 {
+        return Err(format!("获取用户歌单失败 code={}", resp.code));
+    }
+    Ok(resp.playlist)
+}
+
+/// 获取当前用户收藏的专辑（依赖 cookie，分页）。
+///
+/// 调用 `/album/sublist?limit=25&offset=0`。
+pub fn get_user_albums(
+    client: &WebHttpClient,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<NeteaseSubAlbum>, i64), String> {
+    let resp: NeteaseAlbumSublistResponse = client.get_json(
+        "/album/sublist",
+        &[
+            ("limit", &limit.to_string()),
+            ("offset", &offset.to_string()),
+        ],
+    )?;
+    if resp.code != 200 {
+        return Err(format!("获取收藏专辑失败 code={}", resp.code));
+    }
+    let count = resp.count;
+    Ok((resp.data, count))
+}
+
+/// 获取专辑详情（含全部曲目）。
+///
+/// 调用 `/album?id=xxx`，返回 `(album_meta, songs)`。
+pub fn get_album_detail(
+    client: &WebHttpClient,
+    album_id: i64,
+) -> Result<(NeteaseAlbumDetail, Vec<NeteaseSongDetail>), String> {
+    let resp: NeteaseAlbumDetailResponse =
+        client.get_json("/album", &[("id", &album_id.to_string())])?;
+    if resp.code != 200 {
+        return Err(format!("获取专辑详情失败 code={}", resp.code));
+    }
+    let album = resp.album.ok_or_else(|| "API 未返回专辑数据".to_string())?;
+    Ok((album, resp.songs))
 }
 
 #[cfg(test)]

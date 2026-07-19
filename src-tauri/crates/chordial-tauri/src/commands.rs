@@ -1268,6 +1268,100 @@ pub fn netease_save_playlist_to_library(
     Ok(playlist)
 }
 
+/// 获取当前登录账号信息（依赖 cookie）。
+///
+/// # 返回
+/// `{ code, profile: { userId, nickname, avatarUrl, signature } | null,
+///    account: { id, userName } | null }`
+#[tauri::command]
+pub fn netease_get_user_account(
+    ctx: State<'_, Arc<AppContext>>,
+) -> Result<serde_json::Value, String> {
+    let resp = ctx.netease_source.get_user_account()?;
+    Ok(serde_json::json!({
+        "code": resp.code,
+        "profile": resp.profile,
+        "account": resp.account,
+    }))
+}
+
+/// 获取指定用户的全部歌单（创建 + 收藏，通过 `subscribed` 字段区分）。
+///
+/// # 返回
+/// `Vec<NeteasePlaylistBrief>` — 每个 item 含 `subscribed: bool`（true=收藏，false=创建）
+#[tauri::command]
+pub fn netease_get_user_playlists(
+    ctx: State<'_, Arc<AppContext>>,
+    uid: i64,
+) -> Result<Vec<NeteasePlaylistBrief>, String> {
+    ctx.netease_source.get_user_playlists(uid)
+}
+
+/// 获取当前用户收藏的专辑（依赖 cookie，分页）。
+///
+/// # 返回
+/// `{ albums: [...], total: number, hasMore: bool }`
+#[tauri::command]
+pub fn netease_get_user_albums(
+    ctx: State<'_, Arc<AppContext>>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let lim = limit.unwrap_or(50);
+    let off = offset.unwrap_or(0);
+    let (albums, total) = ctx.netease_source.get_user_albums(lim, off)?;
+    Ok(serde_json::json!({
+        "albums": albums,
+        "total": total,
+        "offset": off,
+        "limit": lim,
+        "hasMore": (off + albums.len() as u32) < total as u32,
+    }))
+}
+
+/// 将网易云专辑导入本地音乐库（不创建本地 Playlist，仅把所有曲目加入 library）。
+///
+/// # 工作流
+/// 1. 调用 `get_album_detail` 拉取专辑元信息 + 全部曲目
+/// 2. 每首曲目通过 `library.add_song` 加入库（带 netease SourceId，自动合并去重）
+/// 3. 触发 `library-changed` 事件
+///
+/// # 返回
+/// `{ album: {...}, imported_count: number }`
+#[tauri::command]
+pub fn netease_save_album_to_library(
+    ctx: State<'_, Arc<AppContext>>,
+    app: AppHandle,
+    album_id: i64,
+) -> Result<serde_json::Value, String> {
+    let (album, songs) = ctx.netease_source.get_album_detail(album_id)?;
+
+    let mut imported = 0usize;
+    for track in &songs {
+        let song = ctx.netease_source.build_song_from_detail(track);
+        if ctx.library.add_song(&song).is_ok() {
+            imported += 1;
+        }
+    }
+    ctx.store.save()?;
+
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
+    Ok(serde_json::json!({
+        "album": {
+            "id": album.id,
+            "name": album.name,
+            "picUrl": album.picUrl,
+            "artist": album.artist,
+            "artists": album.artists,
+            "description": album.description,
+            "publishTime": album.publishTime,
+            "size": album.size,
+        },
+        "imported_count": imported,
+        "total_count": songs.len(),
+    }))
+}
+
 /// 下载网易云歌曲到本地 download_dir。
 ///
 /// # 参数
