@@ -18,6 +18,26 @@ pub enum SourceType {
     Web(String),
 }
 
+impl SourceType {
+    /// 是否为本地来源。
+    pub fn is_local(&self) -> bool {
+        matches!(self, SourceType::Local)
+    }
+
+    /// 是否为网络来源。
+    pub fn is_web(&self) -> bool {
+        matches!(self, SourceType::Web(_))
+    }
+
+    /// 网络来源的名称（本地来源返回 None）。
+    pub fn web_name(&self) -> Option<&str> {
+        match self {
+            SourceType::Web(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
 /// 来源标识 — 描述某个实体在特定来源中的身份。
 ///
 /// 一个实体（如歌曲）可以同时拥有多个 [`SourceId`]，表示它来自多个来源。

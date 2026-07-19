@@ -25,8 +25,10 @@ use crate::module::config::store::ConfigStore;
 use crate::module::music_library::library::MusicLibrary;
 use crate::module::music_localSource;
 use crate::module::music_localSource::source::LocalMusicSource;
+use crate::module::music_netease_source::NeteaseCloudMusicApiSource;
 use crate::module::music_source::manager::SourceManager;
 use crate::module::music_source::registrar::{SourceCleanup, SourceRegistrar};
+use crate::module::music_source::traits::MusicSource;
 use crate::module::p2p::P2pManager;
 use crate::module::perf;
 use crate::module::storage::persistent::PersistentStore;
@@ -51,6 +53,8 @@ pub struct AppContext {
     pub registrar: Arc<SourceRegistrar>,
     /// 本地音乐来源实现。
     pub local_source: Arc<LocalMusicSource>,
+    /// 网易云音乐来源实现（运行时配置，启用/禁用由 config 控制）。
+    pub netease_source: Arc<NeteaseCloudMusicApiSource>,
     /// P2P 资源共享管理器。
     pub p2p: Arc<P2pManager>,
 }
@@ -97,6 +101,21 @@ impl AppContext {
             format!("初始化本地音乐来源失败: {}", e)
         })?;
 
+        // ── 网易云音乐来源（可选，由用户在设置中配置 base_url 后启用）──
+        let netease_source = Arc::new(
+            NeteaseCloudMusicApiSource::new(store.clone())
+                .map_err(|e| format!("初始化网易云来源失败: {}", e))?,
+        );
+        // 仅在配置中标记 enabled 且 base_url 非空时注册到 registrar
+        {
+            let cfg = netease_source.config();
+            if cfg.enabled && !cfg.base_url.is_empty() {
+                if let Err(e) = registrar.register(netease_source.clone() as Arc<dyn MusicSource>) {
+                    eprintln!("[chordial] 注册网易云来源失败: {}", e);
+                }
+            }
+        }
+
         // ── P2P 资源共享管理器 ──
         let p2p = P2pManager::new(library.clone(), registrar.clone(), config.clone());
 
@@ -108,6 +127,7 @@ impl AppContext {
             manager,
             registrar,
             local_source,
+            netease_source,
             p2p,
         })
     }

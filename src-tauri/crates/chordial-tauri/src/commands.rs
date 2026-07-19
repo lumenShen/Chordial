@@ -8,6 +8,7 @@
 
 use chordial_core::module::music_localSource;
 use chordial_core::module::music_source::resource;
+use chordial_core::module::music_source::traits::MusicSource;
 use chordial_core::module::music_source::types::{EntityType, SourceId};
 use chordial_core::module::platform::{self, PlatformPath};
 use chordial_core::module::storage::entry::Ttl;
@@ -1147,4 +1148,424 @@ pub fn debug_inspect_song_lyrics(
             serde_json::json!({ "key": k, "value": v })
         }).collect::<Vec<_>>(),
     }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Netease Cloud Music API 来源命令
+// ══════════════════════════════════════════════════════════════════════════════
+
+use chordial_core::module::music_netease_source::{
+    self, AudioQuality, NeteasePlaylistBrief,
+};
+use chordial_core::module::music_source::cache;
+use chordial_core::module::music_web_source::WebSourceConfig;
+use chordial_core::module::playlist::{self, Playlist};
+use chordial_core::module::music_library::models::Song;
+
+/// 获取网易云来源配置（base_url / cookie / 超时 / 启用 / 下载目录）。
+#[tauri::command]
+pub fn netease_get_config(ctx: State<'_, Arc<AppContext>>) -> Result<WebSourceConfig, String> {
+    Ok(ctx.netease_source.config())
+}
+
+/// 更新网易云来源配置并持久化。
+///
+/// 重建 HTTP 客户端以应用新的 base_url / cookie / timeout。
+#[tauri::command]
+pub fn netease_update_config(
+    ctx: State<'_, Arc<AppContext>>,
+    config: WebSourceConfig,
+) -> Result<(), String> {
+    ctx.netease_source.update_config(config)
+}
+
+/// 测试与网易云 API 服务器的连通性。
+///
+/// 通过发起一次 limit=1 的搜索请求验证 base_url + cookie 是否有效。
+#[tauri::command]
+pub fn netease_test_connection(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::Value, String> {
+    let cfg = ctx.netease_source.config();
+    if cfg.base_url.is_empty() {
+        return Err("API base_url 未配置".to_string());
+    }
+    let result = ctx.netease_source.search_songs("test");
+    Ok(serde_json::json!({
+        "ok": result.is_ok(),
+        "error": result.err(),
+        "base_url": cfg.base_url,
+    }))
+}
+
+/// 在线搜索歌曲（返回库内 Song 模型，附带 netease SourceId）。
+#[tauri::command]
+pub fn netease_search_songs(
+    ctx: State<'_, Arc<AppContext>>,
+    query: String,
+) -> Result<Vec<Song>, String> {
+    ctx.netease_source.search_songs(&query)
+}
+
+/// 在线搜索歌单（返回简略信息列表）。
+#[tauri::command]
+pub fn netease_search_playlists(
+    ctx: State<'_, Arc<AppContext>>,
+    query: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<NeteasePlaylistBrief>, String> {
+    ctx.netease_source
+        .search_playlists(&query, limit.unwrap_or(30), offset.unwrap_or(0))
+}
+
+/// 获取歌单详情（元信息 + 全部曲目）。
+#[tauri::command]
+pub fn netease_get_playlist_full(
+    ctx: State<'_, Arc<AppContext>>,
+    playlist_id: i64,
+) -> Result<serde_json::Value, String> {
+    let (detail, tracks) = ctx.netease_source.get_playlist_full(playlist_id)?;
+    Ok(serde_json::json!({
+        "detail": detail,
+        "tracks": tracks,
+    }))
+}
+
+/// 将在线歌单保存为本地 Playlist，并把所有曲目加入音乐库（自动去重）。
+///
+/// # 工作流
+/// 1. 调用 `get_playlist_full` 拉取歌单元信息 + 全部曲目
+/// 2. 每首曲目通过 `library.add_song` 加入库（带 netease SourceId，自动合并去重）
+/// 3. 创建本地 Playlist 记录，song_ids 引用库内 Song.id
+/// 4. 持久化 + 触发 `library-changed` 事件
+#[tauri::command]
+pub fn netease_save_playlist_to_library(
+    ctx: State<'_, Arc<AppContext>>,
+    app: AppHandle,
+    playlist_id: i64,
+) -> Result<Playlist, String> {
+    let (detail, tracks) = ctx.netease_source.get_playlist_full(playlist_id)?;
+
+    // 将每首曲目加入库（add_song 会自动合并相同标题/艺术家的歌曲）
+    let mut song_ids = Vec::with_capacity(tracks.len());
+    for track in &tracks {
+        let song = ctx.netease_source.build_song_from_detail(track);
+        let stored_id = ctx.library.add_song(&song)?;
+        song_ids.push(stored_id);
+    }
+
+    let mut playlist = Playlist::new("netease", &detail.name);
+    playlist.remote_id = Some(detail.id);
+    playlist.cover_url = detail.coverImgUrl;
+    playlist.creator = detail.creator.map(|c| c.nickname);
+    playlist.description = detail.description;
+    playlist.tags = detail.tags;
+    playlist.song_ids = song_ids;
+
+    playlist::add(&ctx.store, &playlist)?;
+    ctx.store.save()?;
+
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
+    Ok(playlist)
+}
+
+/// 下载网易云歌曲到本地 download_dir。
+///
+/// # 参数
+/// - `song_entity_id`: 网易云 entity_id（如 `"song:123456"`）
+/// - `title`: 歌曲标题（用于文件命名）
+/// - `artist`: 主艺术家名（用于文件命名）
+/// - `level`: 音质等级（"standard"/"higher"/"exhigh"/"lossless"/"hires"），默认 "exhigh"
+///
+/// # 返回
+/// 下载后的本地文件绝对路径。
+#[tauri::command]
+pub fn netease_download_song(
+    ctx: State<'_, Arc<AppContext>>,
+    song_entity_id: String,
+    title: String,
+    artist: String,
+    level: Option<String>,
+) -> Result<String, String> {
+    let remote_id = song_entity_id
+        .splitn(3, ':')
+        .nth(1)
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| format!("无效的 entity_id: {}", song_entity_id))?;
+
+    let level = level.unwrap_or_else(|| AudioQuality::Exhigh.to_level_str().to_string());
+    let (bytes, url_data) =
+        music_netease_source::api::download_song(ctx.netease_source.client(), remote_id, &level)?;
+
+    // 推断扩展名：优先 url_data.type，其次 level（lossless→flac），最后默认 mp3
+    let ext = url_data
+        .r#type
+        .as_deref()
+        .and_then(|t| match t.to_lowercase().as_str() {
+            "flac" => Some("flac"),
+            "mp3" => Some("mp3"),
+            "m4a" => Some("m4a"),
+            _ => None,
+        })
+        .unwrap_or_else(|| match level.as_str() {
+            "lossless" | "hires" => "flac",
+            _ => "mp3",
+        });
+
+    // 解析 download_dir：优先 netease 配置；为空则回退到 app_data_dir/downloads
+    let download_dir_str = ctx.netease_source.download_dir();
+    let download_dir = if download_dir_str.is_empty() {
+        let config_path = ctx.config.path();
+        let parent = config_path
+            .parent()
+            .ok_or_else(|| "无法定位应用数据目录".to_string())?;
+        parent.join("downloads")
+    } else {
+        std::path::PathBuf::from(download_dir_str)
+    };
+
+    let path = cache::write_downloaded_file(&download_dir, "netease", &artist, &title, ext, &bytes)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 比较 online 歌曲与本地库中相同歌曲的音质。
+///
+/// 通过 标题+艺术家 模糊匹配本地库，返回所有匹配项及其推断音质。
+#[tauri::command]
+pub fn netease_compare_with_local(
+    ctx: State<'_, Arc<AppContext>>,
+    title: String,
+    artist: String,
+    _album: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let title_lower = title.to_lowercase();
+    let artist_lower = artist.to_lowercase();
+
+    let candidates = ctx.library.search_songs(&title);
+    let matches: Vec<serde_json::Value> = candidates
+        .into_iter()
+        .filter(|s| s.title.to_lowercase().contains(&title_lower))
+        .filter(|s| {
+            if artist.is_empty() {
+                return true;
+            }
+            s.artist_names
+                .iter()
+                .any(|a| a.to_lowercase().contains(&artist_lower))
+        })
+        .map(|s| {
+            let local_path = s
+                .source_ids
+                .iter()
+                .find(|sid| sid.source_name == "local")
+                .map(|sid| sid.entity_id.clone());
+            let quality = local_path
+                .as_ref()
+                .and_then(|p| std::path::Path::new(p).extension())
+                .and_then(|e| e.to_str())
+                .map(AudioQuality::from_extension)
+                .unwrap_or(AudioQuality::Unknown);
+            serde_json::json!({
+                "song_id": s.id,
+                "title": s.title,
+                "artist_names": s.artist_names,
+                "album_title": s.album_title,
+                "file_path": local_path,
+                "quality": quality.to_level_str(),
+                "quality_rank": quality as u8,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "matches": matches,
+        "has_local_match": !matches.is_empty(),
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 歌词优先级命令 — 多来源歌词选择最佳
+// ══════════════════════════════════════════════════════════════════════════════
+
+use chordial_core::module::lyric_preference::{self, LyricCandidate, LyricPreference};
+
+/// 获取歌词优先级配置。
+#[tauri::command]
+pub fn lyric_preference_get(ctx: State<'_, Arc<AppContext>>) -> Result<LyricPreference, String> {
+    Ok(LyricPreference::load(&ctx.config))
+}
+
+/// 更新歌词优先级配置（自动防抖落盘到 config.json）。
+#[tauri::command]
+pub fn lyric_preference_set(
+    ctx: State<'_, Arc<AppContext>>,
+    preference: LyricPreference,
+) -> Result<(), String> {
+    preference.save(&ctx.config)
+}
+
+/// 获取指定歌曲的最佳歌词（综合本地 + 网易云两个来源，按用户偏好选择）。
+///
+/// # 工作流
+/// 1. 加载用户偏好 `LyricPreference`
+/// 2. 收集候选歌词：
+///    - 本地：库内通过 `song_id` 索引的 Lyric
+///    - 网易云：通过 song.source_ids 找到 netease entity_id，调用 `netease_source.get_lyric`
+/// 3. 用 `select_best` 选出得分最高的候选
+/// 4. 返回歌词文本 + 格式 + 来源
+#[tauri::command]
+pub fn lyric_get_preferred(
+    ctx: State<'_, Arc<AppContext>>,
+    song_id: String,
+) -> Result<serde_json::Value, String> {
+    let pref = LyricPreference::load(&ctx.config);
+
+    let mut candidates: Vec<LyricCandidate> = Vec::new();
+
+    // 候选 1：本地歌词（库内 Lyric 实体）
+    if let Some(local_lyric) = ctx.library.get_lyric_of_song(&song_id) {
+        candidates.push(LyricCandidate::new(
+            lyric_preference::LyricSourceKind::Local,
+            local_lyric.text,
+        ));
+    }
+
+    // 候选 2：网易云歌词
+    if let Some(song) = ctx.library.get_song(&song_id) {
+        let netease_entity_id = song
+            .source_ids
+            .iter()
+            .find(|sid| sid.source_name == "netease")
+            .map(|sid| sid.entity_id.clone());
+
+        if let Some(entity_id) = netease_entity_id {
+            if let Ok(Some(netease_lyric)) = ctx.netease_source.get_lyric(&entity_id) {
+                candidates.push(LyricCandidate::new(
+                    lyric_preference::LyricSourceKind::Netease,
+                    netease_lyric.text,
+                ));
+            }
+        }
+    }
+
+    // 选最佳
+    if let Some(best) = lyric_preference::select_best(&candidates, &pref) {
+        Ok(serde_json::json!({
+            "text": best.text,
+            "format": best.format,
+            "source": best.source,
+            "is_word_by_word": best.format.is_word_by_word(),
+            "candidates_count": candidates.len(),
+        }))
+    } else {
+        Ok(serde_json::json!({
+            "text": null,
+            "format": null,
+            "source": null,
+            "candidates_count": 0,
+        }))
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 歌单命令 — 本地歌单 CRUD + 曲目管理
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// 列出所有本地保存的歌单。
+#[tauri::command]
+pub fn playlist_list(ctx: State<'_, Arc<AppContext>>) -> Result<Vec<Playlist>, String> {
+    Ok(playlist::get_all(&ctx.store))
+}
+
+/// 获取指定歌单（含完整曲目详情）。
+#[tauri::command]
+pub fn playlist_get(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let pl = playlist::get(&ctx.store, &id);
+    if let Some(pl) = pl {
+        let songs = ctx.library.get_songs_by_ids(&pl.song_ids);
+        Ok(Some(serde_json::json!({
+            "playlist": pl,
+            "songs": songs,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 创建新的本地空歌单。
+#[tauri::command]
+pub fn playlist_create(
+    ctx: State<'_, Arc<AppContext>>,
+    name: String,
+    description: Option<String>,
+) -> Result<Playlist, String> {
+    let mut pl = Playlist::new("local", &name);
+    pl.description = description;
+    playlist::add(&ctx.store, &pl)?;
+    ctx.store.save()?;
+    Ok(pl)
+}
+
+/// 更新歌单元信息（name / description / tags 等）。
+#[tauri::command]
+pub fn playlist_update(
+    ctx: State<'_, Arc<AppContext>>,
+    playlist: Playlist,
+) -> Result<(), String> {
+    playlist::update(&ctx.store, &playlist)?;
+    ctx.store.save()
+}
+
+/// 删除歌单。
+#[tauri::command]
+pub fn playlist_delete(
+    ctx: State<'_, Arc<AppContext>>,
+    id: String,
+) -> Result<bool, String> {
+    let removed = playlist::remove(&ctx.store, &id);
+    ctx.store.save()?;
+    Ok(removed)
+}
+
+/// 向歌单追加歌曲（自动去重）。
+#[tauri::command]
+pub fn playlist_add_song(
+    ctx: State<'_, Arc<AppContext>>,
+    playlist_id: String,
+    song_id: String,
+) -> Result<(), String> {
+    playlist::add_song(&ctx.store, &playlist_id, &song_id)?;
+    ctx.store.save()
+}
+
+/// 从歌单移除歌曲。
+#[tauri::command]
+pub fn playlist_remove_song(
+    ctx: State<'_, Arc<AppContext>>,
+    playlist_id: String,
+    song_id: String,
+) -> Result<(), String> {
+    playlist::remove_song(&ctx.store, &playlist_id, &song_id)?;
+    ctx.store.save()
+}
+
+/// 调整歌单内歌曲顺序。
+///
+/// `new_order` 为新的 song_id 顺序，长度必须与原 song_ids 一致。
+#[tauri::command]
+pub fn playlist_reorder_songs(
+    ctx: State<'_, Arc<AppContext>>,
+    playlist_id: String,
+    new_order: Vec<String>,
+) -> Result<(), String> {
+    playlist::reorder_songs(&ctx.store, &playlist_id, new_order)?;
+    ctx.store.save()
+}
+
+/// 获取歌单总数（用于侧边栏 badge 显示）。
+#[tauri::command]
+pub fn playlist_count(ctx: State<'_, Arc<AppContext>>) -> Result<usize, String> {
+    Ok(playlist::count(&ctx.store))
 }

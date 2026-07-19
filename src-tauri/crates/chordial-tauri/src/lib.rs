@@ -170,6 +170,30 @@ pub fn run() {
             commands::maintenance_repair_references,
             // 诊断命令 — 歌词问题排查
             commands::debug_inspect_song_lyrics,
+            // Netease Cloud Music API 来源
+            commands::netease_get_config,
+            commands::netease_update_config,
+            commands::netease_test_connection,
+            commands::netease_search_songs,
+            commands::netease_search_playlists,
+            commands::netease_get_playlist_full,
+            commands::netease_save_playlist_to_library,
+            commands::netease_download_song,
+            commands::netease_compare_with_local,
+            // 歌词优先级 — 多来源选择
+            commands::lyric_preference_get,
+            commands::lyric_preference_set,
+            commands::lyric_get_preferred,
+            // 歌单 — 本地 CRUD + 曲目管理
+            commands::playlist_list,
+            commands::playlist_get,
+            commands::playlist_create,
+            commands::playlist_update,
+            commands::playlist_delete,
+            commands::playlist_add_song,
+            commands::playlist_remove_song,
+            commands::playlist_reorder_songs,
+            commands::playlist_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

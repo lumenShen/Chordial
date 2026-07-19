@@ -30,6 +30,7 @@
 //! let audio = resource::get_song_file(&registrar, &source_id)?;
 //! ```
 
+pub mod cache;
 pub mod manager;
 pub mod registrar;
 pub mod resource;

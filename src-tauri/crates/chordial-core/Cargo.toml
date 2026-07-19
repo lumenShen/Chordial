@@ -33,6 +33,13 @@ notify = "8"
 http = "1"
 parking_lot = "0.12.5"
 
+# HTTP 客户端 — WebServiceSource 调用远程 API（网易云等）
+# 使用 blocking + json 特性，因为 MusicSource trait 是同步接口
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+
+# URL 解析
+url = "2"
+
 # Android JNI 桥接（仅 Android 目标）
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
