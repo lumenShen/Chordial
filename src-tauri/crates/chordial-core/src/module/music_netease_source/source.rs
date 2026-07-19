@@ -483,4 +483,48 @@ impl NeteaseCloudMusicApiSource {
         let tracks = api::get_playlist_tracks(&self.client, playlist_id, 1000, 0)?;
         Ok((detail, tracks))
     }
+
+    // ── 扫码登录 ───────────────────────────────────────────────────────────
+
+    /// 第 1 步：获取扫码登录的 unikey。
+    pub fn login_qr_key(&self) -> Result<String, String> {
+        api::login_qr_key(&self.client)
+    }
+
+    /// 第 2 步：用 unikey 生成二维码。
+    pub fn login_qr_create(
+        &self,
+        key: &str,
+        qrimg: bool,
+    ) -> Result<super::types::NeteaseQrCreateData, String> {
+        api::login_qr_create(&self.client, key, qrimg)
+    }
+
+    /// 第 3 步：轮询扫码状态。
+    ///
+    /// **副作用**：当返回 `code == 803`（授权成功）时，自动将响应中的 cookie
+    /// 写回当前配置（持久化）并更新 `WebHttpClient` 的 cookie，调用方无需再手动保存。
+    pub fn login_qr_check(
+        &self,
+        key: &str,
+    ) -> Result<super::types::NeteaseQrCheckResponse, String> {
+        let resp = api::login_qr_check(&self.client, key)?;
+        if resp.status() == super::types::QrCheckStatus::Authorized {
+            if let Some(cookie) = resp.cookie.clone() {
+                if !cookie.is_empty() {
+                    // 写入运行时 client（立即生效）
+                    self.client.set_cookie(cookie.clone());
+                    // 持久化到 config
+                    let mut cfg = self.config.write().clone();
+                    cfg.cookie = cookie;
+                    // update_config 会落盘并刷新 client
+                    if let Err(e) = self.update_config(cfg) {
+                        // 持久化失败不影响返回 cookie，仅 stderr 记录
+                        eprintln!("[netease] 扫码登录 cookie 持久化失败: {}", e);
+                    }
+                }
+            }
+        }
+        Ok(resp)
+    }
 }

@@ -321,3 +321,108 @@ pub struct NeteasePlaylistTracksResponse {
     #[serde(default)]
     pub songs: Vec<NeteaseSongDetail>,
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// 扫码登录响应（/login/qr/* 接口）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// `/login/qr/key` 响应包装。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseQrKeyResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub data: Option<NeteaseQrKeyData>,
+}
+
+/// `/login/qr/key` 返回的 unikey 载荷。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseQrKeyData {
+    #[serde(default)]
+    pub unikey: String,
+}
+
+/// `/login/qr/create` 响应包装。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseQrCreateResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub data: Option<NeteaseQrCreateData>,
+}
+
+/// `/login/qr/create` 返回的二维码载荷。
+///
+/// - `qrurl`: 可直接转化为二维码的 URL（用前端 qrcode 库渲染即可）
+/// - `qrimg`: 当请求带 `qrimg=true` 时返回 `data:image/png;base64,...`，可直接作为 `<img src>`
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseQrCreateData {
+    #[serde(default)]
+    pub qrurl: String,
+    #[serde(default)]
+    pub qrimg: Option<String>,
+}
+
+/// `/login/qr/check` 响应。
+///
+/// `code` 取值：
+/// - `800`: 二维码过期
+/// - `801`: 等待扫码
+/// - `802`: 已扫码，等待用户确认
+/// - `803`: 授权成功，`cookie` 字段返回登录 cookie 字符串
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NeteaseQrCheckResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// 仅 code == 802 时可能返回（用户头像 URL）
+    #[serde(default)]
+    pub avatarUrl: Option<String>,
+    /// 仅 code == 803 时返回（登录 cookie 字符串）
+    #[serde(default)]
+    pub cookie: Option<String>,
+    /// 部分版本返回 nickname（仅 803）
+    #[serde(default)]
+    pub nickname: Option<String>,
+}
+
+impl NeteaseQrCheckResponse {
+    /// 状态枚举，便于 match。
+    pub fn status(&self) -> QrCheckStatus {
+        match self.code {
+            800 => QrCheckStatus::Expired,
+            801 => QrCheckStatus::Waiting,
+            802 => QrCheckStatus::Scanned,
+            803 => QrCheckStatus::Authorized,
+            _ => QrCheckStatus::Unknown,
+        }
+    }
+}
+
+/// 扫码状态枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrCheckStatus {
+    /// 二维码已过期
+    Expired,
+    /// 等待扫码
+    Waiting,
+    /// 已扫码，等待确认
+    Scanned,
+    /// 已授权（成功）
+    Authorized,
+    /// 未知状态码
+    Unknown,
+}
+
+impl QrCheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Waiting => "waiting",
+            Self::Scanned => "scanned",
+            Self::Authorized => "authorized",
+            Self::Unknown => "unknown",
+        }
+    }
+}

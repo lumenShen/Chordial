@@ -180,6 +180,10 @@ pub fn run() {
             commands::netease_save_playlist_to_library,
             commands::netease_download_song,
             commands::netease_compare_with_local,
+            // Netease 扫码登录
+            commands::netease_login_qr_key,
+            commands::netease_login_qr_create,
+            commands::netease_login_qr_check,
             // 歌词优先级 — 多来源选择
             commands::lyric_preference_get,
             commands::lyric_preference_set,

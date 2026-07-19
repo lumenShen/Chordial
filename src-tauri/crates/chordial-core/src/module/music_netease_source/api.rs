@@ -193,6 +193,59 @@ pub fn download_song(
     Ok((bytes, url_data))
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// 扫码登录
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 第 1 步：获取扫码登录的 unikey。
+///
+/// 调用 `/login/qr/key`，返回一个 32 位字符串 key，用于后续生成二维码与轮询。
+pub fn login_qr_key(client: &WebHttpClient) -> Result<String, String> {
+    let resp: NeteaseQrKeyResponse = client.get_json("/login/qr/key", &[])?;
+    if resp.code != 200 {
+        return Err(format!("获取扫码 key 失败 code={}", resp.code));
+    }
+    resp.data
+        .map(|d| d.unikey)
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "API 未返回 unikey".to_string())
+}
+
+/// 第 2 步：用 unikey 生成二维码。
+///
+/// `qrimg = true` 时返回 base64 data URL（可直接作为 `<img src>`），否则只返回 qrurl。
+pub fn login_qr_create(
+    client: &WebHttpClient,
+    key: &str,
+    qrimg: bool,
+) -> Result<NeteaseQrCreateData, String> {
+    let qrimg_str = if qrimg { "true" } else { "false" };
+    let resp: NeteaseQrCreateResponse = client.get_json(
+        "/login/qr/create",
+        &[("key", key), ("qrimg", qrimg_str)],
+    )?;
+    if resp.code != 200 {
+        return Err(format!("生成二维码失败 code={}", resp.code));
+    }
+    resp.data.ok_or_else(|| "API 未返回二维码数据".to_string())
+}
+
+/// 第 3 步：轮询扫码状态。
+///
+/// 返回 [`NeteaseQrCheckResponse`]，调用方根据 `code` 字段判断状态：
+/// - `800`: 二维码过期
+/// - `801`: 等待扫码
+/// - `802`: 已扫码，待确认
+/// - `803`: 授权成功，`cookie` 字段为登录 cookie 字符串
+pub fn login_qr_check(
+    client: &WebHttpClient,
+    key: &str,
+) -> Result<NeteaseQrCheckResponse, String> {
+    let resp: NeteaseQrCheckResponse = client.get_json("/login/qr/check", &[("key", key)])?;
+    // 此处允许非 200 的 code（800/801/802/803），它们是业务状态而非错误
+    Ok(resp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
