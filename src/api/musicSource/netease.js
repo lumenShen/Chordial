@@ -6,7 +6,7 @@
  */
 
 import { transport } from '@/api/transport';
-import { Song } from '@/class';
+import { Song, Artist, Album } from '@/class';
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 配置管理
@@ -55,6 +55,30 @@ export async function testConnection() {
 export async function searchSongs(query) {
   const data = await transport.command('netease_search_songs', { query });
   return (data || []).map((d) => new Song(d));
+}
+
+/**
+ * 在线搜索歌手（返回库内 Artist 模型，附带 netease SourceId）。
+ * @param {string} query - 搜索关键词
+ * @param {number} [limit=30]
+ * @param {number} [offset=0]
+ * @returns {Promise<Artist[]>}
+ */
+export async function searchArtists(query, limit = 30, offset = 0) {
+  const data = await transport.command('netease_search_artists', { query, limit, offset });
+  return Artist.fromDataArray(data || []);
+}
+
+/**
+ * 在线搜索专辑（返回库内 Album 模型，附带 netease SourceId）。
+ * @param {string} query - 搜索关键词
+ * @param {number} [limit=30]
+ * @param {number} [offset=0]
+ * @returns {Promise<Album[]>}
+ */
+export async function searchAlbums(query, limit = 30, offset = 0) {
+  const data = await transport.command('netease_search_albums', { query, limit, offset });
+  return Album.fromDataArray(data || []);
 }
 
 /**

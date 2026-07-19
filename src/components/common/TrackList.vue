@@ -9,6 +9,7 @@ import PlayerStore from '@/stores/player.js';
 import { usePerf } from '@/utils/performanceMonitor.js';
 import * as playlistApi from '@/api/musicSource/playlists.js';
 import * as neteaseApi from '@/api/musicSource/netease.js';
+import * as sourceApi from '@/api/musicSource/sources.js';
 import * as prefApi from '@/api/musicSource/lyricPreference.js';
 
 const { start, end, log } = usePerf('TrackList');
@@ -113,11 +114,26 @@ const ctxMenu = ref({
   showPlaylistSub: false,
 });
 
+// 主菜单靠近右侧时，二级菜单向左翻转，避免溢出视窗
+// 仅在桌面端生效（移动端二级菜单向下展开，由 CSS media query 覆盖）
+const submenuFlip = computed(() => {
+  if (typeof window === 'undefined') return false;
+  const MENU_WIDTH = 220;
+  const SUBMENU_WIDTH = 180;
+  const MARGIN = 16;
+  const menuRightEdge = ctxMenu.value.x + MENU_WIDTH;
+  const availableRight = window.innerWidth - menuRightEdge - MARGIN;
+  return availableRight < SUBMENU_WIDTH;
+});
+
 // 懒加载的歌单列表（首次打开"添加到歌单"时拉取）
 const playlists = ref([]);
 let playlistsLoaded = false;
 
-// "从网易云下载"对话框
+// "从云端下载"对话框
+// - selectedSource: 当前选中的云端来源名称（registrar 中注册的 web source）
+// - webSources: 可用云端来源列表（listWebSources 返回）
+// - selectedLevel: 选中的音质等级（standard/higher/exhigh/lossless/hires）
 const downloadDialog = ref({
   visible: false,
   track: null,
@@ -125,8 +141,22 @@ const downloadDialog = ref({
   matches: [],
   downloading: false,
   result: null,
+  resultQualityLabel: '',
   error: '',
+  selectedSource: 'netease',
+  webSources: [],
+  selectedLevel: 'exhigh',
+  levels: [
+    { value: 'standard', label: '标准 128kbps MP3' },
+    { value: 'higher', label: '较高 192kbps MP3' },
+    { value: 'exhigh', label: '极高 320kbps MP3' },
+    { value: 'lossless', label: '无损 FLAC 16/44kHz' },
+    { value: 'hires', label: 'Hi-Res FLAC 24/96kHz' },
+  ],
 });
+
+// 懒加载的云端来源列表（首次打开"从云端下载"时拉取）
+let webSourcesLoaded = false;
 
 // "查看歌词来源"对话框
 const lyricDialog = ref({
@@ -150,10 +180,30 @@ function onContextMenu(track, event) {
   if (!props.contextMenu) return;
   event.preventDefault();
   event.stopPropagation();
+
+  // 估算菜单尺寸，避免超出视窗（替代原先 overflow-y:auto 的作用）
+  const MENU_WIDTH = 220;
+  const MENU_HEIGHT = 240;
+  const MARGIN = 8;
+
+  let x = event.clientX;
+  let y = event.clientY;
+
+  // 右边界
+  if (x + MENU_WIDTH > window.innerWidth - MARGIN) {
+    x = window.innerWidth - MENU_WIDTH - MARGIN;
+  }
+  // 下边界
+  if (y + MENU_HEIGHT > window.innerHeight - MARGIN) {
+    y = window.innerHeight - MENU_HEIGHT - MARGIN;
+  }
+  if (x < MARGIN) x = MARGIN;
+  if (y < MARGIN) y = MARGIN;
+
   ctxMenu.value = {
     visible: true,
-    x: event.clientX,
-    y: event.clientY,
+    x,
+    y,
     track,
     showPlaylistSub: false,
   };
@@ -260,24 +310,40 @@ async function ctxCreatePlaylistAndAdd() {
   }
 }
 
-async function ctxDownloadFromNetease() {
+async function ctxDownloadFromCloud() {
   const t = ctxMenu.value.track;
   if (!t) return;
   closeCtxMenu();
   downloadDialog.value = {
+    ...downloadDialog.value,
     visible: true,
     track: t,
     loading: true,
     matches: [],
     downloading: false,
     result: null,
+    resultQualityLabel: '',
     error: '',
   };
+  // 并行：加载云端来源列表（仅首次） + 与本地对比
   try {
+    if (!webSourcesLoaded) {
+      try {
+        const list = await sourceApi.listWebSources();
+        downloadDialog.value.webSources = Array.isArray(list) ? list : [];
+        if (downloadDialog.value.webSources.length > 0 && !downloadDialog.value.webSources.find((s) => s.name === downloadDialog.value.selectedSource)) {
+          downloadDialog.value.selectedSource = downloadDialog.value.webSources[0].name;
+        }
+      } catch (e) {
+        // 拉取来源列表失败不致命，降级为默认 netease
+        downloadDialog.value.webSources = [{ name: 'netease', label: '网易云音乐' }];
+      }
+      webSourcesLoaded = true;
+    }
     const title = t.title || '';
     const artist = t.getDisplayArtist ? t.getDisplayArtist() : (t.artist || '');
     const album = t.albumTitle || null;
-    const data = await neteaseApi.compareWithLocal(title, artist, album);
+    const data = await sourceApi.compareWithLocalFromSource(downloadDialog.value.selectedSource, title, artist, album);
     downloadDialog.value.matches = data.matches || [];
     downloadDialog.value.loading = false;
   } catch (e) {
@@ -289,34 +355,47 @@ async function ctxDownloadFromNetease() {
 async function ctxDoDownload() {
   const t = downloadDialog.value.track;
   if (!t) return;
-  // 需要先在线搜索网易云版本以获取 entity_id
   downloadDialog.value.downloading = true;
   downloadDialog.value.error = '';
   try {
     const title = t.title || '';
     const artist = t.getDisplayArtist ? t.getDisplayArtist() : (t.artist || '');
-    // 搜索网易云
-    const onlineSongs = await neteaseApi.searchSongs(`${title} ${artist}`);
-    if (!onlineSongs || onlineSongs.length === 0) {
-      downloadDialog.value.error = '网易云未找到匹配的歌曲';
+    const sourceName = downloadDialog.value.selectedSource;
+    const level = downloadDialog.value.selectedLevel;
+
+    // 先按选中来源搜索以获取 entity_id
+    // 当前阶段仅 netease 提供 searchSongs，其他来源需各自实现 search 接口
+    let entityId = null;
+    if (sourceName === 'netease') {
+      const onlineSongs = await neteaseApi.searchSongs(`${title} ${artist}`);
+      if (onlineSongs && onlineSongs.length > 0) {
+        const sid = onlineSongs[0].sourceIds.find((s) => s.sourceName === 'netease' || !s.isLocal());
+        entityId = sid?.entityId;
+      }
+    } else {
+      // 通用来源：通过 compare 接口的 matches 字段获取 entity_id（如果有）
+      // 这里假设其他来源未来会提供 searchSongs API；当前先报错让用户感知
+      const compareData = await sourceApi.compareWithLocalFromSource(sourceName, title, artist, t.albumTitle || null);
+      // 某些来源会在 matches 里附带 source_entity_id
+      const match = (compareData.matches || []).find((m) => m.source_entity_id);
+      entityId = match?.source_entity_id;
+    }
+
+    if (!entityId) {
+      downloadDialog.value.error = `${sourceName} 未找到匹配的歌曲`;
       downloadDialog.value.downloading = false;
       return;
     }
-    // 取第一个结果的 source_id（netease 来源）
-    const online = onlineSongs[0];
-    const neteaseSid = online.sourceIds.find((s) => s.sourceName === 'netease' || !s.isLocal());
-    if (!neteaseSid) {
-      downloadDialog.value.error = '未找到网易云来源标识';
-      downloadDialog.value.downloading = false;
-      return;
-    }
-    const path = await neteaseApi.downloadSong(
-      neteaseSid.entityId,
+
+    const result = await sourceApi.downloadFromSource(
+      sourceName,
+      entityId,
       title,
       artist,
-      'exhigh'
+      level,
     );
-    downloadDialog.value.result = path;
+    downloadDialog.value.result = result.path || result;
+    downloadDialog.value.resultQualityLabel = result.quality_label || '';
     showToast('下载完成', 'success');
   } catch (e) {
     downloadDialog.value.error = e.message || String(e);
@@ -328,6 +407,26 @@ async function ctxDoDownload() {
 
 function closeDownloadDialog() {
   downloadDialog.value.visible = false;
+}
+
+// 当用户切换云端来源时重新对比本地
+async function onDownloadSourceChange() {
+  const t = downloadDialog.value.track;
+  if (!t) return;
+  downloadDialog.value.loading = true;
+  downloadDialog.value.matches = [];
+  downloadDialog.value.error = '';
+  try {
+    const title = t.title || '';
+    const artist = t.getDisplayArtist ? t.getDisplayArtist() : (t.artist || '');
+    const album = t.albumTitle || null;
+    const data = await sourceApi.compareWithLocalFromSource(downloadDialog.value.selectedSource, title, artist, album);
+    downloadDialog.value.matches = data.matches || [];
+  } catch (e) {
+    downloadDialog.value.error = e.message || String(e);
+  } finally {
+    downloadDialog.value.loading = false;
+  }
 }
 
 async function ctxViewLyricSource() {
@@ -378,6 +477,46 @@ function qualityRankLabel(rank) {
     50: '低',
   };
   return map[rank] || `rank=${rank}`;
+}
+
+/**
+ * 显示匹配项的音质标签。
+ *
+ * - 若后端返回了 quality_label（统一格式：包含码率+编码格式），优先使用之
+ * - 否则若返回了 quality_descriptor（{codec, bitrate_kbps, sample_rate_hz, bit_depth}），按规则拼装
+ * - 最后退化为 rank 数字标签
+ */
+function matchQualityLabel(m) {
+  if (m.quality_label) return m.quality_label;
+  if (m.quality_descriptor) {
+    const d = m.quality_descriptor;
+    const codec = codecName(d.codec);
+    const parts = [];
+    if (d.bitrate_kbps) {
+      parts.push(`${d.bitrate_kbps} kbps`);
+    }
+    parts.push(codec);
+    if (d.sample_rate_hz && d.bit_depth) {
+      parts.push(`${d.bit_depth}/${Math.round(d.sample_rate_hz / 1000)}kHz`);
+    }
+    return parts.join(' ');
+  }
+  return qualityRankLabel(m.quality_rank);
+}
+
+function codecName(c) {
+  if (!c) return '';
+  const map = {
+    mp3: 'MP3',
+    aac: 'AAC',
+    flac: 'FLAC',
+    alac: 'ALAC',
+    wav: 'WAV',
+    ape: 'APE',
+    vorbis: 'Ogg',
+    opus: 'Opus',
+  };
+  return map[String(c).toLowerCase()] || String(c).toUpperCase();
 }
 
 // --- 动画（anime.js v4）---
@@ -581,7 +720,12 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
           <i class="bi bi-music-note-list"></i> 添加到歌单
           <i class="bi bi-chevron-right ctx-arrow"></i>
           <!-- 子菜单 -->
-          <div v-if="ctxMenu.showPlaylistSub" class="ctx-submenu" @click.stop>
+          <div
+            v-if="ctxMenu.showPlaylistSub"
+            class="ctx-submenu"
+            :class="{ 'ctx-submenu-left': submenuFlip }"
+            @click.stop
+          >
             <div v-if="playlists.length === 0" class="ctx-sub-item muted">
               暂无歌单
             </div>
@@ -601,8 +745,8 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
             </div>
           </div>
         </div>
-        <div class="ctx-item" @click="ctxDownloadFromNetease">
-          <i class="bi bi-cloud-download"></i> 从网易云下载…
+        <div class="ctx-item" @click="ctxDownloadFromCloud">
+          <i class="bi bi-cloud-download"></i> 从云端下载…
         </div>
         <div class="ctx-item" @click="ctxViewLyricSource">
           <i class="bi bi-card-text"></i> 查看歌词来源…
@@ -615,7 +759,7 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
           <div class="ctx-dialog-header">
             <h3 class="ctx-dialog-title">
               <i class="bi bi-cloud-download"></i>
-              从网易云下载
+              从云端下载
             </h3>
             <button class="ctx-close-btn" @click="closeDownloadDialog">
               <i class="bi bi-x-lg"></i>
@@ -625,6 +769,25 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
             <div class="ctx-track-info" v-if="downloadDialog.track">
               <strong>{{ downloadDialog.track.title }}</strong>
               <span> {{ downloadDialog.track.getDisplayArtist ? downloadDialog.track.getDisplayArtist() : (downloadDialog.track.artist || '') }}</span>
+            </div>
+
+            <!-- 云端来源选择 -->
+            <div class="ctx-section">
+              <label class="ctx-field-label">云端来源</label>
+              <select
+                v-model="downloadDialog.selectedSource"
+                class="ctx-select"
+                :disabled="downloadDialog.loading || downloadDialog.downloading"
+                @change="onDownloadSourceChange"
+              >
+                <option
+                  v-for="s in downloadDialog.webSources"
+                  :key="s.name"
+                  :value="s.name"
+                >
+                  {{ s.label || s.name }}
+                </option>
+              </select>
             </div>
 
             <div v-if="downloadDialog.loading" class="ctx-loading">
@@ -640,6 +803,9 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
               <div>
                 <div>下载完成</div>
                 <code class="ctx-path">{{ downloadDialog.result }}</code>
+                <div v-if="downloadDialog.resultQualityLabel" class="ctx-result-quality">
+                  音质：{{ downloadDialog.resultQualityLabel }}
+                </div>
               </div>
             </div>
 
@@ -658,8 +824,8 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
                       {{ (m.artist_names || []).join(', ') }}
                       <span v-if="m.album_title"> · {{ m.album_title }}</span>
                     </div>
-                    <div class="ctx-match-quality" :class="{ high: m.quality_rank >= 90 }">
-                      {{ qualityRankLabel(m.quality_rank) }}
+                    <div class="ctx-match-quality" :class="{ high: (m.quality_rank || 0) >= 90 }">
+                      {{ matchQualityLabel(m) }}
                     </div>
                   </div>
                 </div>
@@ -669,12 +835,25 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
                 </p>
               </div>
               <div v-else class="ctx-section">
-                <p class="ctx-hint">本地未找到匹配，可直接下载网易云版本</p>
+                <p class="ctx-hint">本地未找到匹配，可直接下载云端版本</p>
               </div>
 
               <div class="ctx-section">
-                <h4 class="ctx-section-title">下载音质</h4>
-                <p class="ctx-hint">默认使用 exhigh（320kbps），如需更高音质请在网易云 API 服务器配置</p>
+                <label class="ctx-field-label">下载音质</label>
+                <select
+                  v-model="downloadDialog.selectedLevel"
+                  class="ctx-select"
+                  :disabled="downloadDialog.downloading"
+                >
+                  <option
+                    v-for="lv in downloadDialog.levels"
+                    :key="lv.value"
+                    :value="lv.value"
+                  >
+                    {{ lv.label }}
+                  </option>
+                </select>
+                <p class="ctx-hint">实际音质由云端来源决定，更高等级可能需要 VIP 或受限</p>
               </div>
             </template>
           </div>
@@ -1018,10 +1197,9 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   font-size: 13px;
   color: var(--text-primary, #333);
   user-select: none;
-  /* 防止超出视窗 */
+  /* 防止超出视窗：仅限制宽度，高度由 JS 边界检测处理 */
   max-width: calc(100vw - 16px);
-  max-height: calc(100vh - 16px);
-  overflow-y: auto;
+  /* 注意：不要设置 overflow-y:auto，否则会裁剪掉绝对定位的二级菜单 */
 }
 
 .ctx-item {
@@ -1054,12 +1232,23 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   left: 100%;
   top: -4px;
   min-width: 180px;
+  /* 歌单可能很多，给予最大高度并允许滚动 */
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
   background: var(--bg-secondary, #fff);
   border: 1px solid var(--border-light, #e8e8e8);
   border-radius: 10px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.16);
   padding: 4px;
   margin-left: 4px;
+}
+
+/* 主菜单靠近视窗右侧时，二级菜单向左展开，避免溢出 */
+.ctx-submenu-left {
+  left: auto;
+  right: 100%;
+  margin-left: 0;
+  margin-right: 4px;
 }
 
 .ctx-sub-item {
@@ -1290,6 +1479,47 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   margin-right: 4px;
 }
 
+.ctx-field-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary, #666);
+  margin-bottom: 6px;
+}
+
+.ctx-select {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--text-primary, #333);
+  background: var(--bg-input, #fff);
+  border: 1px solid var(--border-color, rgba(0, 0, 0, 0.1));
+  border-radius: 8px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.ctx-select:hover:not(:disabled) {
+  border-color: var(--accent-color, #007aff);
+}
+
+.ctx-select:focus {
+  border-color: var(--accent-color, #007aff);
+}
+
+.ctx-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ctx-result-quality {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #28a745;
+  font-weight: 600;
+}
+
 .ctx-path {
   display: block;
   margin-top: 4px;
@@ -1437,10 +1667,13 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
     min-width: 180px;
   }
 
-  .ctx-submenu {
+  .ctx-submenu,
+  .ctx-submenu-left {
     left: 0;
+    right: auto;
     top: 100%;
     margin-left: 0;
+    margin-right: 0;
     margin-top: 4px;
   }
 

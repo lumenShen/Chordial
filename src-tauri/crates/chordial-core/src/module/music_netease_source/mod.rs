@@ -34,6 +34,7 @@ pub mod types;
 
 pub use source::{NeteaseCloudMusicApiSource, NETEASE_SOURCE_NAME};
 pub use types::{
-    AudioQuality, NeteaseAlbumDetail, NeteasePlaylistBrief, NeteasePlaylistDetail,
-    NeteaseSongDetail, NeteaseSubAlbum, NeteaseUserAccountResponse, NeteaseUserProfile,
+    AudioCodec, AudioQuality, AudioQualityDescriptor, NeteaseAlbumDetail,
+    NeteasePlaylistBrief, NeteasePlaylistDetail, NeteaseSongDetail, NeteaseSubAlbum,
+    NeteaseUserAccountResponse, NeteaseUserProfile,
 };

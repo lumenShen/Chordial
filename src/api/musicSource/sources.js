@@ -99,6 +99,93 @@ export async function addWebDev(_apiBaseUrl, _name, _apiKey, _authToken) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// 通用云端来源 — 从网络来源实例选择一个云端音乐源进行下载/比较
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @typedef {Object} WebSourceInfo
+ * @property {string} name - 来源名（如 `"netease"`）
+ * @property {string} display_name - 显示名（如 `"网易云音乐"`）
+ * @property {string} source_type - 来源内部类型标识
+ * @property {boolean} enabled - 是否已启用
+ */
+
+/**
+ * @typedef {Object} AudioQualityDescriptor
+ * @property {number} rank - 归一化等级（0-5）
+ * @property {number} bitrate_kbps - 码率（kbps）
+ * @property {string} codec - 编码格式（"mp3"/"flac"/"aac"/...）
+ * @property {number|null} sample_rate_hz - 采样率（Hz）
+ * @property {number|null} bit_depth - 位深
+ */
+
+/**
+ * 列出已注册的云端（Web）音乐来源。
+ *
+ * 用于下载对话框的"来源选择"下拉框。
+ * 仅返回已通过 registrar.register 注册的 Web 类型来源。
+ * @returns {Promise<WebSourceInfo[]>}
+ */
+export async function listWebSources() {
+  return transport.command('source_list_web_sources');
+}
+
+/**
+ * 从指定云端来源下载歌曲到本地 download_dir。
+ *
+ * @param {string} sourceName - 来源名（如 `"netease"`）
+ * @param {string} songEntityId - 来源内部的歌曲 entity_id（如 `"song:123456"`）
+ * @param {string} title - 歌曲标题（用于文件命名）
+ * @param {string} artist - 主艺术家名（用于文件命名）
+ * @param {string} [level] - 音质等级（默认 `"exhigh"`）
+ * @returns {Promise<{
+ *   path: string,
+ *   quality_descriptor: AudioQualityDescriptor,
+ *   quality_label: string,
+ * }>}
+ */
+export async function downloadFromSource(sourceName, songEntityId, title, artist, level = 'exhigh') {
+  return transport.command('source_download_song', {
+    sourceName,
+    songEntityId,
+    title,
+    artist,
+    level,
+  });
+}
+
+/**
+ * 比较 online 歌曲与本地库中相同歌曲的音质（通用版本）。
+ *
+ * @param {string} sourceName - 来源名
+ * @param {string} title - 歌曲标题
+ * @param {string} artist - 艺术家名
+ * @param {string|null} [album] - 专辑名（可选）
+ * @returns {Promise<{
+ *   matches: Array<{
+ *     song_id: string,
+ *     title: string,
+ *     artist_names: string[],
+ *     album_title: string|null,
+ *     file_path: string|null,
+ *     quality: string,
+ *     quality_rank: number,
+ *     quality_descriptor: AudioQualityDescriptor,
+ *     quality_label: string,
+ *   }>,
+ *   has_local_match: boolean,
+ * }>}
+ */
+export async function compareWithLocalFromSource(sourceName, title, artist, album = null) {
+  return transport.command('source_compare_with_local', {
+    sourceName,
+    title,
+    artist,
+    album,
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // 数据维护 — 设置页"清理数据"工具
 // ══════════════════════════════════════════════════════════════════════════════
 

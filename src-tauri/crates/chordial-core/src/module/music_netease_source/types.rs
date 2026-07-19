@@ -8,75 +8,9 @@
 #![allow(non_snake_case)]
 
 use serde::{Deserialize, Serialize};
-
-/// 音质等级 — 用于本地/在线音质比较。
-///
-/// 顺序由低到高，便于通过 `as u8` 直接比较。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum AudioQuality {
-    /// 未知 / 无可用音源
-    Unknown = 0,
-    /// 标准音质（128 kbps MP3）
-    Standard = 1,
-    /// 较高音质（192 kbps MP3）
-    Higher = 2,
-    /// 极高音质（320 kbps MP3）
-    Exhigh = 3,
-    /// 无损音质（FLAC）
-    Lossless = 4,
-    /// Hi-Res（FLAC 24bit/96kHz+）
-    Hires = 5,
-}
-
-impl AudioQuality {
-    /// 从 NeteaseCloudMusicApi 的 `level` 字符串解析。
-    pub fn from_level_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "standard" => Self::Standard,
-            "higher" => Self::Higher,
-            "exhigh" | "exhighs" => Self::Exhigh,
-            "lossless" => Self::Lossless,
-            "hires" => Self::Hires,
-            _ => Self::Unknown,
-        }
-    }
-
-    /// 转换为 NeteaseCloudMusicApi 的 `level` 字符串。
-    pub fn to_level_str(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Higher => "higher",
-            Self::Exhigh => "exhigh",
-            Self::Lossless => "lossless",
-            Self::Hires => "hires",
-            Self::Unknown => "standard",
-        }
-    }
-
-    /// 从文件扩展名推断音质（粗略）。
-    /// `.flac` → Lossless，`.mp3` → Exhigh（假设 320kbps）。
-    /// 真实音质需要读取文件元数据。
-    pub fn from_extension(ext: &str) -> Self {
-        match ext.to_lowercase().as_str() {
-            "flac" => Self::Lossless,
-            "wav" | "ape" => Self::Hires,
-            "mp3" | "m4a" | "aac" => Self::Exhigh,
-            _ => Self::Unknown,
-        }
-    }
-
-    /// 是否为无损及以上音质。
-    pub fn is_lossless_or_above(self) -> bool {
-        self >= Self::Lossless
-    }
-}
-
-impl Default for AudioQuality {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
+// 重导出统一的音质类型 —— 网易云的 `AudioQuality` 与 `music_source::AudioQuality` 是同一个类型，
+// 历史代码通过 `music_netease_source::AudioQuality` 引用，保留以维持向后兼容。
+pub use crate::module::music_source::types::{AudioCodec, AudioQuality, AudioQualityDescriptor};
 
 // ───────────────────────────────────────────────────────────────────────────
 // API 响应数据模型
@@ -296,6 +230,49 @@ pub struct NeteaseSongUrlData {
     /// level 字段（"standard" / "higher" / "exhigh" / "lossless" / "hires"）
     #[serde(default)]
     pub level: Option<String>,
+}
+
+impl NeteaseSongUrlData {
+    /// 从网易云返回的 URL 数据构造音质描述符。
+    ///
+    /// - `level` 字段决定等级 rank
+    /// - `r#type` 字段（"flac" / "mp3" / "m4a"）决定编码格式
+    /// - `br` 字段为真实码率（bps → kbps）
+    pub fn to_quality_descriptor(&self) -> AudioQualityDescriptor {
+        let quality = self
+            .level
+            .as_deref()
+            .map(AudioQuality::from_level_str)
+            .unwrap_or(AudioQuality::Unknown);
+
+        let codec = self
+            .r#type
+            .as_deref()
+            .map(AudioCodec::from_extension)
+            .unwrap_or(quality.typical_codec());
+
+        // 网易云 br 单位为 bps，转换为 kbps
+        let bitrate_kbps = if self.br > 0 {
+            (self.br / 1000) as u32
+        } else {
+            quality.typical_bitrate_kbps()
+        };
+
+        // 无损格式从 level 推断采样率/位深
+        let (sample_rate_hz, bit_depth) = match quality {
+            AudioQuality::Lossless => (Some(44_100u32), Some(16u8)),
+            AudioQuality::Hires => (Some(96_000u32), Some(24u8)),
+            _ => (None, None),
+        };
+
+        AudioQualityDescriptor {
+            rank: quality as u8,
+            bitrate_kbps,
+            codec,
+            sample_rate_hz,
+            bit_depth,
+        }
+    }
 }
 
 /// 歌曲 URL 响应包装。

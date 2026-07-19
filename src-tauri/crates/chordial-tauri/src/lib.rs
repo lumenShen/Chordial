@@ -175,12 +175,18 @@ pub fn run() {
             commands::netease_update_config,
             commands::netease_test_connection,
             commands::netease_search_songs,
+            commands::netease_search_artists,
+            commands::netease_search_albums,
             commands::netease_search_playlists,
             commands::netease_get_playlist_full,
             commands::netease_save_playlist_to_library,
             commands::netease_save_album_to_library,
             commands::netease_download_song,
             commands::netease_compare_with_local,
+            // 通用云端来源 — 从网络来源实例选择下载
+            commands::source_list_web_sources,
+            commands::source_download_song,
+            commands::source_compare_with_local,
             // Netease 用户账户与"我的资源"
             commands::netease_get_user_account,
             commands::netease_get_user_playlists,

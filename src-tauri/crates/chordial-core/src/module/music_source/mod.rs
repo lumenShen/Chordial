@@ -36,3 +36,5 @@ pub mod registrar;
 pub mod resource;
 pub mod traits;
 pub mod types;
+
+pub use types::{AudioCodec, AudioQuality, AudioQualityDescriptor};
