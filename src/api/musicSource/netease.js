@@ -225,3 +225,63 @@ export async function loginQrCreate(key, qrimg = true) {
 export async function loginQrCheck(key) {
   return transport.command('netease_login_qr_check', { key });
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 用户账户与"我的资源"（依赖登录 cookie）
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 获取当前登录账号信息。
+ * @returns {Promise<{
+ *   code: number,
+ *   profile: { userId: number, nickname: string, avatarUrl: string|null, signature: string|null } | null,
+ *   account: { id: number, userName: string } | null,
+ * }>}
+ */
+export async function getUserAccount() {
+  return transport.command('netease_get_user_account');
+}
+
+/**
+ * 获取指定用户的全部歌单（创建 + 收藏）。
+ * @param {number} uid - 用户 ID（从 getUserAccount 获取）
+ * @returns {Promise<Array<{
+ *   id: number, name: string, coverImgUrl: string|null,
+ *   creator: { nickname: string, userId: number }|null,
+ *   trackCount: number, playCount: number, description: string|null,
+ *   subscribed: boolean|null, tags: string[],
+ * }>>}
+ */
+export async function getUserPlaylists(uid) {
+  return transport.command('netease_get_user_playlists', { uid });
+}
+
+/**
+ * 获取当前用户收藏的专辑（分页）。
+ * @param {number} [limit=50]
+ * @param {number} [offset=0]
+ * @returns {Promise<{
+ *   albums: Array<{
+ *     id: number, name: string, picUrl: string|null,
+ *     artist: object|null, artists: array,
+ *     trackCount: number, playCount: number, subTime: number,
+ *   }>,
+ *   total: number, offset: number, limit: number, hasMore: boolean,
+ * }>}
+ */
+export async function getUserAlbums(limit = 50, offset = 0) {
+  return transport.command('netease_get_user_albums', { limit, offset });
+}
+
+/**
+ * 将网易云专辑导入本地音乐库（把专辑所有曲目加入 library，不创建本地 Playlist）。
+ * @param {number} albumId
+ * @returns {Promise<{
+ *   album: { id, name, picUrl, artist, artists, description, publishTime, size },
+ *   imported_count: number,
+ *   total_count: number,
+ * }>}
+ */
+export async function saveAlbumToLibrary(albumId) {
+  return transport.command('netease_save_album_to_library', { albumId });
+}
