@@ -43,6 +43,7 @@ pub fn search_songs(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<NeteaseSongBrief>, String> {
+    let ts = now_ts();
     let resp: NeteaseSearchResponse = client.get_json(
         "/search",
         &[
@@ -50,6 +51,7 @@ pub fn search_songs(
             ("type", SearchType::Song.as_str()),
             ("limit", &limit.to_string()),
             ("offset", &offset.to_string()),
+            ("timestamp", ts.as_str()),
         ],
     )?;
     if !resp.is_ok() {
@@ -65,6 +67,7 @@ pub fn search_playlists(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<NeteasePlaylistBrief>, String> {
+    let ts = now_ts();
     let resp: NeteaseSearchResponse = client.get_json(
         "/search",
         &[
@@ -72,6 +75,7 @@ pub fn search_playlists(
             ("type", SearchType::Playlist.as_str()),
             ("limit", &limit.to_string()),
             ("offset", &offset.to_string()),
+            ("timestamp", ts.as_str()),
         ],
     )?;
     if !resp.is_ok() {
@@ -80,13 +84,64 @@ pub fn search_playlists(
     Ok(resp.result.playlists)
 }
 
+/// 搜索歌手（type=100）。
+pub fn search_artists(
+    client: &WebHttpClient,
+    query: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<NeteaseArtistBrief>, String> {
+    let ts = now_ts();
+    let resp: NeteaseSearchResponse = client.get_json(
+        "/search",
+        &[
+            ("keywords", query),
+            ("type", SearchType::Artist.as_str()),
+            ("limit", &limit.to_string()),
+            ("offset", &offset.to_string()),
+            ("timestamp", ts.as_str()),
+        ],
+    )?;
+    if !resp.is_ok() {
+        return Err(resp.error_message());
+    }
+    Ok(resp.result.artists)
+}
+
+/// 搜索专辑（type=10）。
+pub fn search_albums(
+    client: &WebHttpClient,
+    query: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<NeteaseAlbumBrief>, String> {
+    let ts = now_ts();
+    let resp: NeteaseSearchResponse = client.get_json(
+        "/search",
+        &[
+            ("keywords", query),
+            ("type", SearchType::Album.as_str()),
+            ("limit", &limit.to_string()),
+            ("offset", &offset.to_string()),
+            ("timestamp", ts.as_str()),
+        ],
+    )?;
+    if !resp.is_ok() {
+        return Err(resp.error_message());
+    }
+    Ok(resp.result.albums)
+}
+
 /// 获取歌单详情（含元信息）。
 pub fn get_playlist_detail(
     client: &WebHttpClient,
     playlist_id: i64,
 ) -> Result<NeteasePlaylistDetail, String> {
-    let resp: NeteasePlaylistDetailResponse =
-        client.get_json("/playlist/detail", &[("id", &playlist_id.to_string())])?;
+    let ts = now_ts();
+    let resp: NeteasePlaylistDetailResponse = client.get_json(
+        "/playlist/detail",
+        &[("id", &playlist_id.to_string()), ("timestamp", ts.as_str())],
+    )?;
     if resp.code != 200 {
         return Err(format!("获取歌单详情失败 code={}", resp.code));
     }
@@ -102,12 +157,14 @@ pub fn get_playlist_tracks(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<NeteaseSongDetail>, String> {
+    let ts = now_ts();
     let resp: NeteasePlaylistTracksResponse = client.get_json(
         "/playlist/track/all",
         &[
             ("id", &playlist_id.to_string()),
             ("limit", &limit.to_string()),
             ("offset", &offset.to_string()),
+            ("timestamp", ts.as_str()),
         ],
     )?;
     if resp.code != 200 {
@@ -131,7 +188,11 @@ pub fn get_song_details(
         #[serde(default)]
         songs: Vec<NeteaseSongDetail>,
     }
-    let resp: SongDetailResp = client.get_json("/song/detail", &[("ids", ids_json)])?;
+    let ts = now_ts();
+    let resp: SongDetailResp = client.get_json(
+        "/song/detail",
+        &[("ids", ids_json), ("timestamp", ts.as_str())],
+    )?;
     if resp.code != 200 {
         return Err(format!("获取歌曲详情失败 code={}", resp.code));
     }
@@ -147,11 +208,13 @@ pub fn get_song_url(
     song_id: i64,
     level: &str,
 ) -> Result<NeteaseSongUrlData, String> {
+    let ts = now_ts();
     let resp: NeteaseSongUrlResponse = client.get_json(
         "/song/url/v1",
         &[
             ("id", &song_id.to_string()),
             ("level", level),
+            ("timestamp", ts.as_str()),
         ],
     )?;
     if resp.code != 200 {
@@ -168,8 +231,11 @@ pub fn get_lyric(
     client: &WebHttpClient,
     song_id: i64,
 ) -> Result<NeteaseLyricResponse, String> {
-    let resp: NeteaseLyricResponse =
-        client.get_json("/lyric", &[("id", &song_id.to_string())])?;
+    let ts = now_ts();
+    let resp: NeteaseLyricResponse = client.get_json(
+        "/lyric",
+        &[("id", &song_id.to_string()), ("timestamp", ts.as_str())],
+    )?;
     if resp.code != 200 {
         return Err(format!("获取歌词失败 code={}", resp.code));
     }
@@ -201,7 +267,10 @@ pub fn download_song(
 ///
 /// 调用 `/login/qr/key`，返回一个 32 位字符串 key，用于后续生成二维码与轮询。
 pub fn login_qr_key(client: &WebHttpClient) -> Result<String, String> {
-    let resp: NeteaseQrKeyResponse = client.get_json("/login/qr/key", &[])?;
+    // 加 timestamp 防止任何中间层（代理/浏览器/reqwest 连接池/ncmapi 内部）缓存
+    let ts = now_ts();
+    let resp: NeteaseQrKeyResponse =
+        client.get_json("/login/qr/key", &[("timestamp", ts.as_str())])?;
     if resp.code != 200 {
         return Err(format!("获取扫码 key 失败 code={}", resp.code));
     }
@@ -220,9 +289,14 @@ pub fn login_qr_create(
     qrimg: bool,
 ) -> Result<NeteaseQrCreateData, String> {
     let qrimg_str = if qrimg { "true" } else { "false" };
+    let ts = now_ts();
     let resp: NeteaseQrCreateResponse = client.get_json(
         "/login/qr/create",
-        &[("key", key), ("qrimg", qrimg_str)],
+        &[
+            ("key", key),
+            ("qrimg", qrimg_str),
+            ("timestamp", ts.as_str()),
+        ],
     )?;
     if resp.code != 200 {
         return Err(format!("生成二维码失败 code={}", resp.code));
@@ -241,9 +315,25 @@ pub fn login_qr_check(
     client: &WebHttpClient,
     key: &str,
 ) -> Result<NeteaseQrCheckResponse, String> {
-    let resp: NeteaseQrCheckResponse = client.get_json("/login/qr/check", &[("key", key)])?;
+    // 关键：加 timestamp 破坏任何缓存层。
+    // ncmapi enhanced 在内部对 GET 请求做了缓存（基于 URL），
+    // 不带 timestamp 时同一 URL 的 check 请求会被服务端缓存返回第一次的结果，
+    // 即使前端持续轮询，ncmapi 日志可能只显示一次实际请求。
+    let ts = now_ts();
+    let resp: NeteaseQrCheckResponse = client.get_json(
+        "/login/qr/check",
+        &[("key", key), ("timestamp", ts.as_str())],
+    )?;
     // 此处允许非 200 的 code（800/801/802/803），它们是业务状态而非错误
     Ok(resp)
+}
+
+/// 当前 Unix 时间戳（毫秒）— 用于破坏 ncmapi 内部的 GET 请求缓存。
+fn now_ts() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -255,7 +345,9 @@ pub fn login_qr_check(
 /// 调用 `/user/account`，返回 `NeteaseUserAccountResponse`。
 /// 需要登录态 cookie（含 MUSIC_U），未登录时 `profile` 为 `None`。
 pub fn get_user_account(client: &WebHttpClient) -> Result<NeteaseUserAccountResponse, String> {
-    let resp: NeteaseUserAccountResponse = client.get_json("/user/account", &[])?;
+    let ts = now_ts();
+    let resp: NeteaseUserAccountResponse =
+        client.get_json("/user/account", &[("timestamp", ts.as_str())])?;
     Ok(resp)
 }
 
@@ -266,8 +358,11 @@ pub fn get_user_playlists(
     client: &WebHttpClient,
     uid: i64,
 ) -> Result<Vec<NeteasePlaylistBrief>, String> {
-    let resp: NeteaseUserPlaylistsResponse =
-        client.get_json("/user/playlist", &[("uid", &uid.to_string())])?;
+    let ts = now_ts();
+    let resp: NeteaseUserPlaylistsResponse = client.get_json(
+        "/user/playlist",
+        &[("uid", &uid.to_string()), ("timestamp", ts.as_str())],
+    )?;
     if resp.code != 200 {
         return Err(format!("获取用户歌单失败 code={}", resp.code));
     }
@@ -282,11 +377,13 @@ pub fn get_user_albums(
     limit: u32,
     offset: u32,
 ) -> Result<(Vec<NeteaseSubAlbum>, i64), String> {
+    let ts = now_ts();
     let resp: NeteaseAlbumSublistResponse = client.get_json(
         "/album/sublist",
         &[
             ("limit", &limit.to_string()),
             ("offset", &offset.to_string()),
+            ("timestamp", ts.as_str()),
         ],
     )?;
     if resp.code != 200 {
@@ -303,8 +400,11 @@ pub fn get_album_detail(
     client: &WebHttpClient,
     album_id: i64,
 ) -> Result<(NeteaseAlbumDetail, Vec<NeteaseSongDetail>), String> {
-    let resp: NeteaseAlbumDetailResponse =
-        client.get_json("/album", &[("id", &album_id.to_string())])?;
+    let ts = now_ts();
+    let resp: NeteaseAlbumDetailResponse = client.get_json(
+        "/album",
+        &[("id", &album_id.to_string()), ("timestamp", ts.as_str())],
+    )?;
     if resp.code != 200 {
         return Err(format!("获取专辑详情失败 code={}", resp.code));
     }

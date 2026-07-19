@@ -129,6 +129,11 @@ impl WebHttpClient {
                 rb = rb.header(reqwest::header::COOKIE, value);
             }
         }
+        // 禁用任何中间层缓存（代理/CDN/reqwest 连接池的响应复用）
+        // 对于登录态轮询等场景至关重要
+        rb = rb
+            .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+            .header(reqwest::header::PRAGMA, "no-cache");
         rb
     }
 
