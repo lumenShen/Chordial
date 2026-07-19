@@ -396,6 +396,15 @@
                     <i class="bi bi-x-circle-fill"></i> {{ qrLogin.error }}
                   </div>
                 </div>
+
+                <!-- "我已扫码"按钮：仅在 waiting 状态显示，乐观切到 scanned 并立即 check -->
+                <button
+                  v-if="qrLogin.status === 'waiting'"
+                  class="action-btn primary qr-scanned-btn"
+                  @click="manualScanned"
+                >
+                  <i class="bi bi-phone"></i> 我已扫码
+                </button>
               </div>
 
               <!-- 成功 -->
@@ -738,7 +747,6 @@ const qrLogin = ref({
   error: '',
 });
 
-let pollTimer = null;
 let pollAbort = false;  // 用户关闭 modal 时置 true，停止轮询
 
 async function openQrLogin() {
@@ -783,54 +791,113 @@ function refreshQr() {
   fetchQr();
 }
 
+// ── 轮询循环（while + pollingActive 标志，替代 setTimeout 链） ──────────────
+//
+// 之前用 setTimeout 链式调用存在竞争条件（pollTimer 被多个异步函数共享），
+// 导致第一次 check 后无法继续轮询。改用 while 循环 + 布尔标志，逻辑更清晰：
+// - startPolling() 启动一个异步循环
+// - stopPolling() 设置 pollingActive=false，循环在下个 await 点退出
+// - 不依赖 pollTimer 变量，避免覆盖/丢失
+let pollingActive = false;
+
 function startPolling() {
-  stopPolling();
-  // 每 1 秒轮询一次，二维码有效期约 5 分钟（300 次 × 1s = 300s）
-  // 网易云 /login/qr/check 接口设计为可高频轮询，1s 体验最佳
-  pollTimer = setTimeout(pollOnce, 1000);
+  if (pollingActive) return;
+  pollingActive = true;
+  // 启动异步循环（不 await，让调用方立即返回）
+  pollingLoop();
 }
 
-async function pollOnce() {
-  if (pollAbort || !qrLogin.value.visible) return;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollingLoop() {
+  // 先等 1 秒再发起第一次 check（避免和 create 抢请求）
+  await sleep(1000);
+
+  while (pollingActive && qrLogin.value.visible && !pollAbort) {
+    const key = qrLogin.value.key;
+    if (!key) {
+      // key 还没准备好，等一下再试
+      await sleep(500);
+      continue;
+    }
+
+    try {
+      const resp = await neteaseApi.loginQrCheck(key);
+      // 请求返回后再次检查轮询是否已停止（用户可能已关闭 modal）
+      if (!pollingActive || !qrLogin.value.visible || pollAbort) break;
+
+      qrLogin.value.status = resp.status;
+      if (resp.avatarUrl) qrLogin.value.avatarUrl = resp.avatarUrl;
+      if (resp.nickname) qrLogin.value.nickname = resp.nickname;
+
+      if (resp.status === 'authorized') {
+        // 后端已自动持久化 cookie，重新拉取配置以更新前端状态
+        try {
+          await loadConfig();
+          updateLoginStatus();
+        } catch (e) {
+          console.warn('登录成功后刷新配置失败:', e);
+        }
+        qrLogin.value.phase = 'success';
+        showToast('登录成功', 'success');
+        break;
+      }
+      if (resp.status === 'expired') {
+        // 二维码过期，停止轮询，等用户点"重新获取"
+        break;
+      }
+      // waiting / scanned / unknown → 继续循环，等 1 秒后再 check
+      await sleep(1000);
+    } catch (e) {
+      // 网络错误也继续重试，避免短暂抖动中断流程
+      qrLogin.value.error = e.message || String(e);
+      console.warn('[qr poll] check 失败，2s 后重试:', e);
+      await sleep(2000);
+    }
+  }
+
+  pollingActive = false;
+}
+
+// 用户手动点击"我已扫码"按钮：
+// 1. 立即触发一次 check（避免等待下次 1s 轮询）
+// 2. 乐观更新 UI 到 "scanned" 状态，给用户即时反馈
+// 注意：网易云真实状态由服务端推送，此按钮不能伪造授权态，
+//      仅加速 check 并提供视觉反馈。
+async function manualScanned() {
+  if (qrLogin.value.status !== 'waiting') return;
+  // 乐观更新：UI 立即切换到"已扫码待确认"
+  qrLogin.value.status = 'scanned';
+  // 立即发起一次 check（复用轮询循环里的一段逻辑，但不进入循环）
   const key = qrLogin.value.key;
   if (!key) return;
   try {
     const resp = await neteaseApi.loginQrCheck(key);
+    if (!qrLogin.value.visible) return;
     qrLogin.value.status = resp.status;
     if (resp.avatarUrl) qrLogin.value.avatarUrl = resp.avatarUrl;
     if (resp.nickname) qrLogin.value.nickname = resp.nickname;
-
     if (resp.status === 'authorized') {
-      // 后端已自动持久化 cookie，重新拉取配置以更新前端状态
-      await loadConfig();
-      updateLoginStatus();
+      try {
+        await loadConfig();
+        updateLoginStatus();
+      } catch (e) {
+        console.warn('登录成功后刷新配置失败:', e);
+      }
       qrLogin.value.phase = 'success';
+      stopPolling();
       showToast('登录成功', 'success');
-      stopPolling();
-      return;
     }
-    if (resp.status === 'expired') {
-      stopPolling();
-      return;
-    }
-    // waiting / scanned → 继续轮询
-    if (qrLogin.value.visible) {
-      pollTimer = setTimeout(pollOnce, 1000);
-    }
+    // 其他状态交给正在运行的轮询循环继续处理
   } catch (e) {
     qrLogin.value.error = e.message || String(e);
-    // 网络错误也继续重试，避免短暂抖动中断流程（2s 间隔）
-    if (qrLogin.value.visible) {
-      pollTimer = setTimeout(pollOnce, 2000);
-    }
   }
 }
 
 function stopPolling() {
-  if (pollTimer) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-  }
+  pollingActive = false;
 }
 
 function closeQrLogin() {
@@ -852,6 +919,8 @@ async function logout() {
 }
 
 onUnmounted(() => {
+  // 组件销毁时停止轮询（设置 pollAbort 让正在 await 的循环也能退出）
+  pollAbort = true;
   stopPolling();
 });
 
@@ -1585,6 +1654,33 @@ onMounted(async () => {
   justify-content: center;
   font-size: 13px;
   text-align: center;
+}
+
+/* "我已扫码"按钮：仅在 waiting 状态显示，乐观切到 scanned */
+.qr-scanned-btn {
+  margin-top: 4px;
+  padding: 8px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--primary-color, #0078d7);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s;
+}
+
+.qr-scanned-btn:hover {
+  background: var(--primary-hover, #0064b8);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 120, 215, 0.3);
+}
+
+.qr-scanned-btn:active {
+  transform: translateY(0);
 }
 
 .status-text {
