@@ -110,7 +110,10 @@ export function parseSyncedLyrics(content) {
   // 2. LRC 格式 [mm:ss.xx]歌词 或 [mm:ss.xxx]歌词
   const lyrics = [];
   const lines = content.split(/\r?\n/);
-  const timeRegex = /\[(\d{1,2}):(\d{2})\.(\d{2,3})\]/;
+  // 注意：matchAll 要求正则带 g 标志，否则抛 TypeError。
+  // 之前缺 g 标志导致整个 parseSyncedLyrics 抛错被外层 catch 静默吃掉，
+  // 表现为"歌词数据存在但 AMLL 收到空数组"。
+  const timeRegex = /\[(\d{1,2}):(\d{2})\.(\d{2,3})\]/g;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -147,7 +150,9 @@ export function formatToLRC(syncedLyrics) {
     .map((line) => {
       const mins = Math.floor(line.time / 60);
       const secs = Math.floor(line.time % 60);
-      const ms = Math.floor((line.time % 1) * 100);
+      // 毫秒计算：time 的小数部分是秒，乘以 1000 得毫秒。
+      // 之前误用 *100 导致 0.45s → 45ms（实际应为 450ms）。
+      const ms = Math.floor((line.time % 1) * 1000);
       return `[${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(ms).padStart(3, '0')}]${line.text}`;
     })
     .join('\n');

@@ -147,14 +147,20 @@ export class Song {
       }
 
       // 检测是否为同步歌词 (LRC 格式)
+      // 直接把原始 LRC 文本赋给 syncedLyrics，由 useAmllBridge 的 parseToAmllLyricLines
+      // 用 parseLyrics (lyricConverter.js) 统一解析 LRC/YRC/QRC/TTML。
+      // 不再做 parseSyncedLyrics → formatToLRC 往返转换：
+      //   1. 往返是有损的（formatToLRC 丢精度、丢元数据行）
+      //   2. parseSyncedLyrics 的 matchAll 缺 g 标志会抛 TypeError 被静默吃掉
+      //   3. useAmllBridge 本来就要重新解析，parse→format→parse 是浪费
       if (/^\[(\d{1,2}):(\d{2})\.(\d{2,3})\]/.test(lyricText)) {
-        const { parseSyncedLyrics, formatToLRC } = await import('@/api/musicSource/musicResource.js');
-        const syncedLines = parseSyncedLyrics(lyricText);
-        result.syncedLyrics = formatToLRC(syncedLines);
+        result.syncedLyrics = lyricText;
         result.hasSyncedLyrics = true;
+        console.log('[Song.getLyricsInfo] 同步歌词(LRC), len=%d', lyricText.length);
       } else {
         result.plainLyrics = lyricText;
         result.hasPlainLyrics = true;
+        console.log('[Song.getLyricsInfo] 纯文本歌词, len=%d', lyricText.length);
       }
 
       return result;
