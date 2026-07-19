@@ -17,6 +17,15 @@ export {
   getFolders,
   getLocalStats,
   rescanAll,
+  // 数据维护 — 设置页"清理数据"工具
+  maintenanceStats,
+  maintenanceClearLibrary,
+  maintenanceClearCache,
+  maintenanceClearStorage,
+  maintenanceResetAll,
+  maintenanceRepairReferences,
+  // 诊断命令 — 歌词问题排查
+  debugInspectSongLyrics,
 } from './musicSource/sources.js';
 
 // ── Music Library: CRUD + 搜索 + 关系查询 ──────────

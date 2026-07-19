@@ -152,6 +152,14 @@ impl FolderManager {
     pub fn store(&self) -> &PersistentStore {
         &self.store
     }
+
+    /// 清空所有监听文件夹（仅清空列表，不级联清理音乐库）。
+    ///
+    /// 调用方需自行清理音乐库数据。落盘到磁盘。
+    pub fn clear_folders(&self) -> Result<(), String> {
+        self.folders.write().clear();
+        self.save()
+    }
 }
 
 /// 递归收集文件夹下所有受支持的音频文件。

@@ -18,7 +18,6 @@ use chordial_core::module::platform::{self, PlatformPath};
 use chordial_core::module::storage::entry::Ttl;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -220,15 +219,7 @@ fn dispatch(state: &AppState, name: &str, args: &Value) -> Result<Value, String>
             let folder_path = PlatformPath::from(path);
             source.folder_manager.add_folder(&folder_path)?;
             let files = music_localSource::folder::collect_audio_files(&folder_path);
-            let mut indexed = 0u64;
-            let mut errors = Vec::new();
-            for file in &files {
-                match source.index_file(file) {
-                    Ok(true) => indexed += 1,
-                    Ok(false) => {}
-                    Err(e) => errors.push(format!("{}: {}", platform::path_to_string(file), e)),
-                }
-            }
+            let (indexed, errors) = source.batch_index_files(&files)?;
             source.library.save()?;
             Ok(json!({ "added": true, "path": path, "files_found": files.len(), "indexed": indexed, "errors": errors }))
         }
@@ -237,35 +228,25 @@ fn dispatch(state: &AppState, name: &str, args: &Value) -> Result<Value, String>
             let source = &state.ctx.local_source;
             let folder_path = PlatformPath::from(path);
             let files = music_localSource::folder::collect_audio_files(&folder_path);
-            let entity_ids: HashSet<String> = files.iter()
-                .map(|f| platform::path_to_string(&platform::canonicalize(f).unwrap_or_else(|_| f.clone())))
-                .collect();
-            if !entity_ids.is_empty() {
-                source.library.remove_specific_song_source_ids(
-                    music_localSource::source::LOCAL_SOURCE_NAME, &entity_ids,
-                )?;
-            }
-            for file in &files { let _ = source.unindex_file(file); }
+            let cleaned = source.batch_unindex_files(&files)?;
             let removed = source.folder_manager.remove_folder(&folder_path);
             source.library.save()?;
-            Ok(json!({ "removed": removed, "path": path, "cleaned_files": entity_ids.len() }))
+            Ok(json!({ "removed": removed, "path": path, "cleaned_files": cleaned }))
         }
         "local_get_folders" => Ok(json!(state.ctx.local_source.folder_manager.get_folders()
             .iter().map(|p| platform::path_to_string(p)).collect::<Vec<_>>())),
         "local_rescan" => {
             let source = &state.ctx.local_source;
             let folders = source.folder_manager.get_folders();
-            let mut total = 0u64;
+            let mut all_files: Vec<PlatformPath> = Vec::new();
             for folder in &folders {
-                for file in &music_localSource::folder::collect_audio_files(folder) {
-                    match source.index_file(file) {
-                        Ok(true) => total += 1,
-                        _ => {}
-                    }
-                }
+                all_files.extend(music_localSource::folder::collect_audio_files(folder));
             }
+            let files_found = all_files.len();
+            let (indexed, errors) = source.batch_index_files(&all_files)?;
+            for e in &errors { eprintln!("[local_rescan] {}", e); }
             source.library.save()?;
-            Ok(json!({ "indexed": total, "folders_scanned": folders.len() }))
+            Ok(json!({ "indexed": indexed, "files_found": files_found, "folders_scanned": folders.len(), "errors": errors }))
         }
 
         // Library persistence

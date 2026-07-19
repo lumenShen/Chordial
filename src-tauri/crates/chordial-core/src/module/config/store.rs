@@ -149,6 +149,11 @@ impl ConfigStore {
         let _ = self.inner.debounce_tx.send(());
     }
 
+    /// 返回持久化文件的路径。
+    pub fn path(&self) -> &std::path::PathBuf {
+        self.backend.path()
+    }
+
     // ── 持久化控制 ───────────────────────────────────
 
     /// 立即同步落盘，跳过防抖定时器。

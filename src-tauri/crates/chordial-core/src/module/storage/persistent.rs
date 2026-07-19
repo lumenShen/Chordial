@@ -201,9 +201,13 @@ impl PersistentStore {
         let _scope = perf::scope("persistent.set_subkey");
         let json = serde_json::to_value(value).map_err(|e| format!("序列化失败: {}", e))?;
         let mut guard = self.cache.write();
+        // 键不存在时自动创建为空 JSON Object，与 `set()` 语义一致。
+        // 旧实现要求调用方先 `set(key, &HashMap::new())` 初始化，
+        // 这对首次写入 lyrics / blobs 等冷键的场景是个陷阱
+        // （典型表现：`键 'lyrics' 不存在` 错误，歌词写入静默失败）。
         let entry = guard
-            .get_mut(key)
-            .ok_or_else(|| format!("键 '{}' 不存在", key))?;
+            .entry(key.to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
         if let Some(obj) = entry.as_object_mut() {
             obj.insert(id.to_string(), json);
             drop(guard);

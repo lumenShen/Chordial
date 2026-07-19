@@ -115,19 +115,36 @@ export class Song {
     try {
       let lyricText = '';
 
-      if (this.lyricId) {
-        const { getLyricOfSong } = await import('@/api/musicSource/library.js');
-        const lyric = await getLyricOfSong(this.id);
+      // 始终按 song_id 查询；lyricId 字段仅为元数据，不可作为查询门控。
+      // 旧实现 `if (this.lyricId)` 会跳过 lyric_id 为 null 的歌曲，
+      // 但 Lyric 实体可能已存在于库中（按 song_id 索引），
+      // 导致已扫描歌曲的歌词无法显示。
+      // 后端 getLyricOfSong 用 JSON 层字段匹配，~0.1ms，无性能担忧。
+      const { getLyricOfSong } = await import('@/api/musicSource/library.js');
+      const lyric = await getLyricOfSong(this.id);
 
-        if (lyric && lyric.text) {
-          lyricText = lyric.text;
-        } else if (lyric && lyric.sourceId) {
-          const { getLyricText } = await import('@/api/musicSource/musicResource.js');
-          lyricText = await getLyricText(lyric.sourceId) || '';
-        }
+      // ── 诊断日志：追踪歌词数据流向 ──
+      // 帮助定位"部分歌曲歌词为空"问题：是库里没有 Lyric 实体，还是实体存在但 text 为空
+      console.log('[Song.getLyricsInfo] songId=%s title=%s', this.id, this.title, {
+        lyricFound: !!lyric,
+        lyricId: lyric?.id ?? null,
+        lyricTextLen: lyric?.text?.length ?? 0,
+        lyricTextPreview: lyric?.text ? lyric.text.slice(0, 80) : null,
+        hasSourceId: !!lyric?.sourceId,
+      });
+
+      if (lyric && lyric.text) {
+        lyricText = lyric.text;
+      } else if (lyric && lyric.sourceId) {
+        const { getLyricText } = await import('@/api/musicSource/musicResource.js');
+        lyricText = await getLyricText(lyric.sourceId) || '';
+        console.log('[Song.getLyricsInfo] 通过 sourceId 回查歌词: len=%d', lyricText.length);
       }
 
-      if (!lyricText) return result;
+      if (!lyricText) {
+        console.warn('[Song.getLyricsInfo] 最终无歌词文本，返回空 result. songId=%s', this.id);
+        return result;
+      }
 
       // 检测是否为同步歌词 (LRC 格式)
       if (/^\[(\d{1,2}):(\d{2})\.(\d{2,3})\]/.test(lyricText)) {

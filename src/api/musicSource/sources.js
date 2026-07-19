@@ -97,3 +97,90 @@ export async function addWebDisk(_url, _username, _password) {
 export async function addWebDev(_apiBaseUrl, _name, _apiKey, _authToken) {
   throw new Error('WebDAV 来源后端尚未实现');
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 数据维护 — 设置页"清理数据"工具
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 获取数据维护统计信息（计数 + 路径 + 磁盘占用）。
+ * @returns {Promise<{
+ *   counts: { songs: number, artists: number, albums: number, lyrics: number, folders: number, indexed_files: number },
+ *   paths: { library: string, storage: string, config: string, folder_store: string },
+ *   disk_usage_bytes: number,
+ * }>}
+ */
+export async function maintenanceStats() {
+  return transport.command('maintenance_stats');
+}
+
+/**
+ * 清空音乐库（Song / Artist / Album / Lyric）+ 本地索引 + 文件夹列表。
+ * 保留：配置、通用存储、缓存。
+ * @returns {Promise<{ cleared: boolean, message: string }>}
+ */
+export async function maintenanceClearLibrary() {
+  return transport.command('maintenance_clear_library');
+}
+
+/**
+ * 清空内存缓存 + Blob 磁盘缓存。不影响音乐库 / 配置 / 存储。
+ * @returns {Promise<{ cleared: boolean, memory_items: number, blob_items: number }>}
+ */
+export async function maintenanceClearCache() {
+  return transport.command('maintenance_clear_cache');
+}
+
+/**
+ * 清空通用存储（storage.json）的所有键值。不影响音乐库 / 配置 / 缓存。
+ * @returns {Promise<{ cleared: boolean, items: number }>}
+ */
+export async function maintenanceClearStorage() {
+  return transport.command('maintenance_clear_storage');
+}
+
+/**
+ * 重置全部数据 — 音乐库 + 本地索引 + 文件夹 + 配置 + 存储 + 缓存。
+ * 等效于"恢复出厂设置"。调用后建议重启应用。
+ * @returns {Promise<{ reset: boolean, message: string }>}
+ */
+export async function maintenanceResetAll() {
+  return transport.command('maintenance_reset_all');
+}
+
+/**
+ * 修复库中 song.artist_ids / song.album_id 引用的无效 UUID。
+ * 适用场景：点击歌手详情页时报"歌手不存在 / 找不到该歌手的信息"。
+ * 修复后无需重新扫描即可正常访问歌手/专辑页面。
+ * @returns {Promise<{ repaired: boolean, repaired_songs: number, repaired_artists: number, repaired_albums: number, message: string }>}
+ */
+export async function maintenanceRepairReferences() {
+  return transport.command('maintenance_repair_references');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 诊断命令 — 歌词问题排查
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 诊断指定歌曲的歌词状态。
+ *
+ * 用于排查"部分歌曲歌词无法显示"问题。一次性返回：
+ * - 库中 Song 实体（含 source_ids、lyric_id）
+ * - 库中 Lyric 实体（按 song_id 查，可能为 null）
+ * - 实际音频文件路径 + 是否存在
+ * - 同目录 .lrc/.txt 文件内容预览
+ * - symphonia 探测到的所有原始标签（key + value 类型）
+ * - scanner.probe_file 提取出的嵌入歌词预览
+ *
+ * 用法（在浏览器控制台）：
+ * ```js
+ * import('@/api/musicSource/sources.js').then(m => m.debugInspectSongLyrics('<songId>')).then(console.log)
+ * ```
+ *
+ * @param {string} songId - 库内 Song ID
+ * @returns {Promise<object>}
+ */
+export async function debugInspectSongLyrics(songId) {
+  return transport.command('debug_inspect_song_lyrics', { songId });
+}

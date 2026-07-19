@@ -35,6 +35,10 @@ pub struct AudioMeta {
     pub format_name: Option<String>,
     /// 发行年份（来自 ID3 TYER/TDRC、Vorbis DATE/YEAR、MP4 ©day 等标签）
     pub year: Option<u32>,
+    /// 嵌入式歌词文本（来自 ID3 USLT/SYLT、Vorbis LYRICS、MP4 ©lyr 等标签）
+    ///
+    /// 仅在扫描时未找到同目录 `.lrc`/`.txt` 外部歌词文件时作为回退源。
+    pub lyrics: Option<String>,
 }
 
 /// 探测音频文件，提取元数据。
@@ -127,6 +131,56 @@ pub fn probe_file(path: &PlatformPath) -> Result<AudioMeta, String> {
                 if is_year_key {
                     if let Some(y) = parse_year_from_value(&tag.raw.value) {
                         meta.year = Some(y);
+                    }
+                }
+            }
+
+            // 嵌入式歌词兜底提取：symphonia 未提供 StandardTag::Lyrics，
+            // 通过 raw tag key 匹配 ID3 USLT/SYLT、Vorbis LYRICS、MP4 ©lyr 等。
+            // 优先级：外部 .lrc/.txt > 嵌入歌词；外部文件在 source.rs 中先于本字段使用。
+            if meta.lyrics.is_none() {
+                let key_lower = tag.raw.key.to_lowercase();
+                // 去掉 ID3v2 语言后缀，例如 "USLT:eng" -> "uslt"
+                let key_main = key_lower.split(':').next().unwrap_or(&key_lower);
+                // 完整匹配列表：
+                // - "lyrics" / "lyric" — 通用
+                // - "uslt" / "sylt" — ID3v2.3/2.4 未同步/同步歌词
+                // - "ult" / "slt" — ID3v2.2 短名（旧 MP3 文件）
+                // - "unsyncedlyrics" / "syncedlyrics" — Vorbis comments 常见写法
+                // - "unsynchronized lyrics" / "synchronized lyrics" — Vorbis comments 全称
+                // - "unsynced lyrics" / "synced lyrics" — Vorbis comments 简写
+                // - "©lyr" — MP4 atom
+                let is_lyrics_key = matches!(
+                    key_main,
+                    "lyrics" | "lyric"
+                        | "uslt" | "sylt"
+                        | "ult" | "slt"
+                        | "unsyncedlyrics" | "syncedlyrics"
+                        | "unsynchronized lyrics" | "synchronized lyrics"
+                        | "unsynced lyrics" | "synced lyrics"
+                        | "©lyr"
+                );
+                if is_lyrics_key {
+                    // symphonia 对 ID3v2 USLT 通常解析为 RawValue::String，
+                    // 但某些非标准或损坏的帧可能被存为 Binary。两种值都尝试。
+                    match &tag.raw.value {
+                        symphonia::core::meta::RawValue::String(s) => {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                meta.lyrics = Some(trimmed.to_string());
+                            }
+                        }
+                        symphonia::core::meta::RawValue::Binary(b) => {
+                            // 尝试解码 ID3v2 USLT 帧的二进制结构：
+                            // [encoding:1B][language:3B][descriptor:变长\0][lyrics text]
+                            if let Some(text) = decode_uslt_binary(b) {
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() {
+                                    meta.lyrics = Some(trimmed.to_string());
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -268,6 +322,70 @@ pub fn is_supported_audio(path: &PlatformPath) -> bool {
     }
 }
 
+/// 调试用：列出音频文件中所有原始标签键值对（字符串值）。
+///
+/// 用于诊断"歌词无法被检测"问题：可以看到 symphonia 实际暴露了哪些 tag key，
+/// 以及它们的值类型（String/Int/Binary）。仅在诊断命令中调用，不在扫描热路径使用。
+///
+/// # 返回
+/// `Vec<(String, String)>` — (key, value_display)，value_display 形如：
+/// - `"actual text"` （String 值）
+/// - `<binary 1234 bytes>` （Binary 值）
+/// - `<uint 2024>` （UnsignedInt 值）
+pub fn list_raw_tags(path: &PlatformPath) -> Result<Vec<(String, String)>, String> {
+    let src = platform::open_file(path)?;
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = platform::path_extension(path) {
+        hint.with_extension(&ext);
+    }
+
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("无法识别音频格式: {}", e))?;
+
+    // 消费所有旧修订
+    loop {
+        if format.metadata().is_latest() {
+            break;
+        }
+        format.metadata().pop();
+    }
+
+    let mut tags: Vec<(String, String)> = Vec::new();
+    if let Some(revision) = format.metadata().current() {
+        for tag in &revision.media.tags {
+            let key = tag.raw.key.clone();
+            let value_display = match &tag.raw.value {
+                symphonia::core::meta::RawValue::String(s) => {
+                    let preview = if s.len() > 200 {
+                        format!("{}...(len={})", &s[..200], s.len())
+                    } else {
+                        s.as_str().to_string()
+                    };
+                    format!("String: {:?}", preview)
+                }
+                symphonia::core::meta::RawValue::Binary(b) => {
+                    format!("<binary {} bytes>", b.len())
+                }
+                symphonia::core::meta::RawValue::UnsignedInt(n) => format!("<uint {}>", n),
+                symphonia::core::meta::RawValue::SignedInt(n) => format!("<sint {}>", n),
+                symphonia::core::meta::RawValue::Boolean(b) => format!("<bool {}>", b),
+                symphonia::core::meta::RawValue::Float(f) => format!("<float {}>", f),
+                _ => "<unknown>".to_string(),
+            };
+            tags.push((key, value_display));
+        }
+    }
+    Ok(tags)
+}
+
 /// 从 symphonia `RawValue` 提取合法的年份（1900..=2100）。
 ///
 /// 支持三种形式：
@@ -288,6 +406,88 @@ fn parse_year_from_value(value: &symphonia::core::meta::RawValue) -> Option<u32>
         _ => None,
     };
     raw_year.filter(|y| (1900..=2100).contains(y))
+}
+
+/// 解码 ID3v2 USLT 帧的二进制结构为歌词文本。
+///
+/// USLT 帧结构（ID3v2.3/2.4 规范）：
+/// ```text
+/// [encoding:1B][language:3B][content descriptor:变长\0][lyrics text]
+/// ```
+/// - encoding: 0=ISO-8859-1, 1=UTF-16 with BOM, 2=UTF-16BE, 3=UTF-8
+/// - descriptor 可能为空字符串（仅一个 \0）
+///
+/// 此函数用于 symphonia 将 USLT 帧作为 RawValue::Binary 存储的兜底情况。
+/// 正常情况下 symphonia 已解析为 String，此函数不会被调用。
+fn decode_uslt_binary(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 5 {
+        return None;
+    }
+    let encoding = bytes[0];
+    // 跳过 encoding(1) + language(3)
+    let rest = &bytes[4..];
+
+    // 找到 descriptor 的结束符（依编码不同），返回歌词文本字节切片
+    let text_bytes: &[u8] = match encoding {
+        0 | 3 => {
+            // ISO-8859-1 或 UTF-8：descriptor 以单字节 \0 结束
+            let desc_end = rest.iter().position(|&b| b == 0)?;
+            let text_start = desc_end + 1;
+            if text_start >= rest.len() {
+                return None;
+            }
+            &rest[text_start..]
+        }
+        1 | 2 => {
+            // UTF-16：descriptor 以双字节 \0\0 结束
+            let mut desc_end = None;
+            let mut i = 0;
+            while i + 1 < rest.len() {
+                if rest[i] == 0 && rest[i + 1] == 0 {
+                    desc_end = Some(i);
+                    break;
+                }
+                i += 2;
+            }
+            let desc_end = desc_end?;
+            let text_start = desc_end + 2;
+            if text_start >= rest.len() {
+                return None;
+            }
+            &rest[text_start..]
+        }
+        _ => return None,
+    };
+
+    // 按 encoding 解码歌词文本
+    match encoding {
+        0 => {
+            // ISO-8859-1 → 转 String（每字节映射到对应 Unicode 码点）
+            Some(text_bytes.iter().map(|&b| b as char).collect())
+        }
+        1 => {
+            // UTF-16 with BOM
+            String::from_utf16_lossy(
+                &text_bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect::<Vec<_>>(),
+            )
+            .into()
+        }
+        2 => {
+            // UTF-16BE
+            String::from_utf16_lossy(
+                &text_bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect::<Vec<_>>(),
+            )
+            .into()
+        }
+        3 => String::from_utf8(text_bytes.to_vec()).ok(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

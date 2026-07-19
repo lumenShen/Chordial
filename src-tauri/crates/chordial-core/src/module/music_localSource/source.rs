@@ -108,8 +108,12 @@ impl LocalMusicSource {
         // 探测元数据
         let meta = scanner::probe_file(&canonical)?;
 
-        // 读取同目录歌词文件（.lrc 优先，.txt 兜底）
-        let lyric_text = scanner::read_lyric_file(&canonical);
+        // 读取同目录歌词文件（.lrc 优先，.txt 兜底）；
+        // 找不到时回退到音频文件嵌入的歌词（ID3 USLT/SYLT、Vorbis LYRICS、MP4 ©lyr）
+        let mut lyric_text = scanner::read_lyric_file(&canonical);
+        if lyric_text.is_none() {
+            lyric_text = meta.lyrics.clone();
+        }
 
         // 构建 Song（lyric_id 占位 UUID 仅在确实有歌词时保留）
         let mut song = self.build_song(&canonical, &meta);
@@ -258,8 +262,12 @@ impl LocalMusicSource {
                         // probe + read_lyric 在同一线程内串行，
                         // 避免再次起线程的开销；线程间仍是并行的
                         let result = scanner::probe_file(path).and_then(|meta| {
-                            // read_lyric_file 失败不影响 song 入库，返回 None 即可
-                            let lyric = scanner::read_lyric_file(path);
+                            // 外部 .lrc/.txt 优先；找不到时回退到嵌入歌词
+                            // （ID3 USLT/SYLT、Vorbis LYRICS、MP4 ©lyr）
+                            let mut lyric = scanner::read_lyric_file(path);
+                            if lyric.is_none() {
+                                lyric = meta.lyrics.clone();
+                            }
                             Ok((meta, lyric))
                         });
                         chunk_results.push((path.clone(), result));
@@ -396,6 +404,21 @@ impl LocalMusicSource {
         Ok(removed)
     }
 
+    /// 清空本地来源的所有索引（file_index / id_to_path / mtime / 封面缓存）。
+    ///
+    /// 不影响音乐库本身（Song/Artist/Album/Lyric）— 调用方需自行 `library.clear_all()`。
+    /// 持久化的 mtime_store 也一并清空并落盘。
+    pub fn clear_all_index(&self) -> Result<(), String> {
+        let _scope = perf::scope("source.clear_all_index");
+        self.file_index.write().clear();
+        self.id_to_path.write().clear();
+        self.file_mtimes.write().clear();
+        self.cover_cache.lock().clear();
+        // mtime_store 持久化清空
+        self.mtime_store.clear();
+        self.mtime_store.save()
+    }
+
     /// 从 AudioMeta 构建 Song 模型。
     ///
     /// 关键逻辑：
@@ -505,35 +528,41 @@ impl LocalMusicSource {
         let mut removed_paths: HashSet<String> = HashSet::new();
         let canonicalize_count = to_canonicalize.len();
 
-        // 并行 canonicalize
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(canonicalize_count.max(1));
-        let chunk_size = (canonicalize_count + num_threads - 1) / num_threads;
-
         let mut results: Vec<(String, String, bool)> = Vec::with_capacity(canonicalize_count);
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(num_threads);
-            for chunk in to_canonicalize.chunks(chunk_size) {
-                let chunk: Vec<(String, String)> = chunk.to_vec();
-                handles.push(s.spawn(move || {
-                    let mut chunk_results = Vec::with_capacity(chunk.len());
-                    for (song_id, path_str) in &chunk {
-                        let path = PlatformPath::from(path_str.as_str());
-                        let ok = platform::canonicalize(&path).is_ok();
-                        chunk_results.push((song_id.clone(), path_str.clone(), ok));
-                    }
-                    chunk_results
-                }));
-            }
-            for handle in handles {
-                if let Ok(chunk_results) = handle.join() {
-                    results.extend(chunk_results);
+        // 并行 canonicalize（空库时跳过，避免 chunks(0) panic）
+        let num_threads = if canonicalize_count > 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(canonicalize_count)
+        } else {
+            0
+        };
+        if num_threads > 0 {
+            let chunk_size = (canonicalize_count + num_threads - 1) / num_threads;
+
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(num_threads);
+                for chunk in to_canonicalize.chunks(chunk_size) {
+                    let chunk: Vec<(String, String)> = chunk.to_vec();
+                    handles.push(s.spawn(move || {
+                        let mut chunk_results = Vec::with_capacity(chunk.len());
+                        for (song_id, path_str) in &chunk {
+                            let path = PlatformPath::from(path_str.as_str());
+                            let ok = platform::canonicalize(&path).is_ok();
+                            chunk_results.push((song_id.clone(), path_str.clone(), ok));
+                        }
+                        chunk_results
+                    }));
                 }
-            }
-        });
+                for handle in handles {
+                    if let Ok(chunk_results) = handle.join() {
+                        results.extend(chunk_results);
+                    }
+                }
+            });
+        }
 
         // 串行写入索引
         for (song_id, path_str, ok) in &results {

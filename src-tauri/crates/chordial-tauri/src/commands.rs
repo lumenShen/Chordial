@@ -854,3 +854,297 @@ pub fn p2p_remove_trusted(
 pub fn p2p_get_match_payload(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::Value, String> {
     Ok(ctx.p2p.get_match_payload())
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 数据维护命令 — 设置页"清理数据"工具
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// 获取数据存储的统计信息（用于维护页展示）。
+///
+/// 返回各类数据的条目数 + 持久化文件路径 + 磁盘占用估算。
+#[tauri::command]
+pub fn maintenance_stats(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::Value, String> {
+    let library = &ctx.library;
+    let local = &ctx.local_source;
+
+    // 各类实体计数
+    let song_count = library.song_count();
+    let artist_count = library.artist_count();
+    let album_count = library.album_count();
+    let lyric_count = library.lyric_count();
+    let folder_count = local.folder_manager.count();
+    let indexed_files = local.file_index.read().len();
+
+    // 持久化文件路径
+    let library_path = library.store_path().to_string_lossy().to_string();
+    let storage_path = ctx.store.path().to_string_lossy().to_string();
+    let config_path = ctx.config.path().to_string_lossy().to_string();
+    let folder_store_path = local.folder_manager.store().path().to_string_lossy().to_string();
+
+    // 磁盘占用估算（仅统计主要数据文件）
+    let mut total_bytes: u64 = 0;
+    for path in [
+        library.store_path(),
+        ctx.store.path(),
+        ctx.config.path(),
+        local.folder_manager.store().path(),
+    ] {
+        if let Ok(meta) = std::fs::metadata(path) {
+            total_bytes += meta.len();
+        }
+    }
+    // Blob 缓存目录
+    if let Some(blob_dir) = ctx.cache.blob_dir() {
+        if let Ok(entries) = std::fs::read_dir(&blob_dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    total_bytes += meta.len();
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "counts": {
+            "songs": song_count,
+            "artists": artist_count,
+            "albums": album_count,
+            "lyrics": lyric_count,
+            "folders": folder_count,
+            "indexed_files": indexed_files,
+        },
+        "paths": {
+            "library": library_path,
+            "storage": storage_path,
+            "config": config_path,
+            "folder_store": folder_store_path,
+        },
+        "disk_usage_bytes": total_bytes,
+    }))
+}
+
+/// 清空音乐库（Song / Artist / Album / Lyric）+ 本地索引 + 文件夹列表。
+///
+/// 保留：配置（config.json）、通用存储（storage.json）、缓存。
+/// 清空后需重新添加文件夹并扫描。
+#[tauri::command]
+pub fn maintenance_clear_library(
+    ctx: State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    // 1. 清空音乐库（内存 + 标记脏）
+    ctx.library.clear_all();
+    // 2. 清空本地索引（file_index / id_to_path / mtime / 封面缓存 / mtime_store 持久化）
+    ctx.local_source.clear_all_index()?;
+    // 3. 清空文件夹列表（持久化）
+    ctx.local_source.folder_manager.clear_folders()?;
+    // 4. 落盘音乐库
+    ctx.library.save()?;
+
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
+
+    Ok(serde_json::json!({
+        "cleared": true,
+        "message": "音乐库已清空，请重新添加文件夹并扫描",
+    }))
+}
+
+/// 修复库中 song.artist_ids / song.album_id 引用的无效 UUID。
+///
+/// 适用场景：历史扫描产生的 song.artist_ids 引用了不存在的 artist UUID，
+/// 导致点击歌手详情页时报"艺术家 'xxx' 不存在"。
+///
+/// 修复后无需重新扫描即可正常访问歌手/专辑页面。
+#[tauri::command]
+pub fn maintenance_repair_references(
+    ctx: State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    let (repaired_songs, repaired_artists, repaired_albums) =
+        ctx.library.repair_references()?;
+
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
+
+    Ok(serde_json::json!({
+        "repaired": true,
+        "repaired_songs": repaired_songs,
+        "repaired_artists": repaired_artists,
+        "repaired_albums": repaired_albums,
+        "message": format!(
+            "已修复 {} 首歌曲 / {} 个艺人 / {} 张专辑的引用",
+            repaired_songs, repaired_artists, repaired_albums
+        ),
+    }))
+}
+
+/// 清空内存缓存 + Blob 磁盘缓存（不影响音乐库 / 配置 / 存储）。
+#[tauri::command]
+pub fn maintenance_clear_cache(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::Value, String> {
+    let mem_keys = ctx.cache.keys().len();
+    let blob_keys = ctx.cache.blob_keys().len();
+    ctx.cache.clear();
+    ctx.cache.clear_blobs();
+    Ok(serde_json::json!({
+        "cleared": true,
+        "memory_items": mem_keys,
+        "blob_items": blob_keys,
+    }))
+}
+
+/// 清空通用存储 storage.json（不影响音乐库 / 配置 / 缓存）。
+#[tauri::command]
+pub fn maintenance_clear_storage(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::Value, String> {
+    let keys = ctx.store.keys();
+    let count = keys.len();
+    ctx.store.clear();
+    ctx.store.save()?;
+    Ok(serde_json::json!({
+        "cleared": true,
+        "items": count,
+    }))
+}
+
+/// 重置全部数据 — 音乐库 + 本地索引 + 文件夹 + 配置 + 存储 + 缓存。
+///
+/// 等效于"恢复出厂设置"。保留可执行文件本身和 Blob 目录结构。
+/// 调用后建议重启应用。
+#[tauri::command]
+pub fn maintenance_reset_all(
+    ctx: State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    // 1. 音乐库 + 本地索引 + 文件夹
+    ctx.library.clear_all();
+    ctx.local_source.clear_all_index()?;
+    ctx.local_source.folder_manager.clear_folders()?;
+    // 2. 通用存储 + 配置
+    ctx.store.clear();
+    ctx.store.save()?;
+    ctx.config.clear();
+    ctx.config.flush()?;
+    // 3. 缓存（内存 + Blob）
+    ctx.cache.clear();
+    ctx.cache.clear_blobs();
+    // 4. 落盘音乐库
+    ctx.library.save()?;
+
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
+
+    Ok(serde_json::json!({
+        "reset": true,
+        "message": "所有数据已清空，建议重启应用",
+    }))
+}
+
+/// 诊断命令：检查指定歌曲的歌词状态。
+///
+/// 用于排查"部分歌曲歌词无法显示"问题。返回：
+/// - `song`: 库中的 Song 实体（含 source_ids、lyric_id 等）
+/// - `lyric`: 库中通过 song_id 查到的 Lyric 实体（可能为 null）
+/// - `file_path`: 实际音频文件路径
+/// - `file_exists`: 文件是否存在
+/// - `external_lyric_file`: 同目录 .lrc/.txt 文件内容预览（若存在）
+/// - `raw_tags`: symphonia 探测到的所有原始标签键值对
+/// - `embedded_lyrics_in_meta`: scanner.probe_file 提取出的嵌入歌词预览
+///
+/// 前端可通过此命令一次性看到：
+///   1. 库里是否真的有 Lyric 实体（lyric 字段）
+///   2. 若没有，是因为外部歌词文件缺失 + 嵌入歌词也没被提取（看 raw_tags 里是否有歌词键）
+///   3. 嵌入歌词的 raw tag key 实际叫什么（可能不在我们的匹配列表里）
+#[tauri::command]
+pub fn debug_inspect_song_lyrics(
+    ctx: State<'_, Arc<AppContext>>,
+    song_id: String,
+) -> Result<serde_json::Value, String> {
+    use chordial_core::module::music_localSource::scanner;
+
+    // 1. 查 Song 实体
+    let song = ctx.library.get_song(&song_id);
+    let song_json = serde_json::to_value(&song)
+        .map_err(|e| format!("序列化 song 失败: {}", e))?;
+
+    // 2. 查 Lyric 实体（按 song_id 索引）
+    let lyric = ctx.library.get_lyric_of_song(&song_id);
+    let lyric_json = serde_json::to_value(&lyric)
+        .map_err(|e| format!("序列化 lyric 失败: {}", e))?;
+
+    // 3. 找到实际音频文件路径
+    let path_str = ctx
+        .local_source
+        .id_to_path
+        .read()
+        .get(&song_id)
+        .map(|p| platform::path_to_string(p))
+        .or_else(|| {
+            // fallback：从 song.source_ids 找 local 来源的 entity_id
+            song.as_ref().and_then(|s| {
+                s.source_ids
+                    .iter()
+                    .find(|sid| sid.source_name == "local")
+                    .map(|sid| sid.entity_id.clone())
+            })
+        });
+
+    let Some(path_str) = path_str else {
+        return Ok(serde_json::json!({
+            "song": song_json,
+            "lyric": lyric_json,
+            "file_path": null,
+            "error": "无法定位音频文件路径（song_id 既不在 id_to_path，也无 local source_id）",
+        }));
+    };
+
+    let path = PlatformPath::from(path_str.as_str());
+    let file_exists = platform::exists(&path);
+
+    // 4. 外部 .lrc/.txt 文件
+    let external_lyric = if file_exists {
+        scanner::read_lyric_file(&path)
+    } else {
+        None
+    };
+    let external_lyric_preview = external_lyric
+        .as_ref()
+        .map(|t| {
+            if t.len() > 300 {
+                format!("{}...(len={})", &t[..300], t.len())
+            } else {
+                t.clone()
+            }
+        });
+
+    // 5. 列出所有原始标签
+    let raw_tags: Vec<(String, String)> = if file_exists {
+        scanner::list_raw_tags(&path).unwrap_or_else(|e| vec![("<error>".to_string(), e)])
+    } else {
+        vec![]
+    };
+
+    // 6. 提取嵌入歌词（与扫描时逻辑一致）
+    let embedded_lyrics_in_meta = if file_exists {
+        scanner::probe_file(&path)
+            .ok()
+            .and_then(|m| m.lyrics)
+            .map(|t| {
+                if t.len() > 300 {
+                    format!("{}...(len={})", &t[..300], t.len())
+                } else {
+                    t
+                }
+            })
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "song": song_json,
+        "lyric": lyric_json,
+        "file_path": path_str,
+        "file_exists": file_exists,
+        "external_lyric_file": external_lyric_preview,
+        "embedded_lyrics_in_meta": embedded_lyrics_in_meta,
+        "raw_tags": raw_tags.into_iter().map(|(k, v)| {
+            serde_json::json!({ "key": k, "value": v })
+        }).collect::<Vec<_>>(),
+    }))
+}

@@ -13,6 +13,7 @@ const SettingsView = () => import('../views/SettingsView.vue')
 const GeneralSettingsView = () => import('../views/settings/GeneralSettingsView.vue')
 const P2pSettingsView = () => import('../views/settings/P2pSettingsView.vue')
 const LyricsSettingsView = () => import('../views/settings/LyricsSettingsView.vue')
+const MaintenanceSettingsView = () => import('../views/settings/MaintenanceSettingsView.vue')
 const TestPage = () => import('../views/TestPage.vue')
 const Search = () => import('../views/Search.vue')
 
@@ -104,6 +105,12 @@ const routes = [
         name: 'SettingsLyrics',
         component: LyricsSettingsView,
         meta: { title: '歌词与播放器' }
+      },
+      {
+        path: 'maintenance',
+        name: 'SettingsMaintenance',
+        component: MaintenanceSettingsView,
+        meta: { title: '数据维护' }
       }
     ]
   },

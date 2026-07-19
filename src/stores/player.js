@@ -24,6 +24,10 @@ export const PlayMode = {
 const createAudioElement = () => {
   const audio = new Audio();
   audio.preload = 'metadata';
+  // crossOrigin 必须在 src 设置之前指定，否则资源会以 no-cors 模式加载，
+  // MediaElementAudioSource 会因 CORS 限制输出全零（频谱分析失效）。
+  // chordial:// 协议层已注入 Access-Control-Allow-Origin: *，可放心开启。
+  audio.crossOrigin = 'anonymous';
   return audio;
 };
 

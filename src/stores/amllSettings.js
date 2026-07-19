@@ -48,8 +48,9 @@ export const AMLL_DEFAULTS = {
 	cssBackgroundProperty: '#111111',
 
 	// 流体背景鼓点频段（Hz）— 驱动 lowFreqVolume 计算
-	// AMLL 文档推荐 80-120Hz（低音鼓点）。用户可自定义以适配不同曲风。
-	lowFreqVolumeRange: [80, 120],
+	// 默认 4kHz–10kHz，覆盖中高频段以适配流行曲风的人声/军鼓能量。
+	// 用户可通过输入框自定义任意 0–20000Hz 范围。
+	lowFreqVolumeRange: [4000, 10000],
 
 	// 显示项
 	showMusicName: true,

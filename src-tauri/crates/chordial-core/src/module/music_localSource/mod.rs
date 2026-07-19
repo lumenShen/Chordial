@@ -25,7 +25,7 @@ pub mod source;
 pub mod watcher;
 
 use crate::module::music_library::library::MusicLibrary;
-use crate::module::music_library::models::Song;
+use crate::module::music_library::models::{Lyric, Song};
 use crate::module::music_source::registrar::SourceRegistrar;
 use crate::module::platform::PlatformPath;
 use source::LocalMusicSource;
@@ -248,37 +248,72 @@ pub fn init_local_source(
         // 5c. 批量添加到音乐库（一次性加载，内存合并，一次性写回）
         let mut new_count = 0usize;
         {
-            let songs_and_paths: Vec<(&PlatformPath, Song)> = results
-                .iter()
-                .filter_map(|(path, meta_result)| {
-                    meta_result.as_ref().ok().map(|meta| (path, local_source.build_song(path, meta)))
-                })
-                .collect();
+            // 先并行读取歌词（.lrc / .txt），与 probe 解耦，避免在主线程串行 I/O
+            // read_lyric_file 是磁盘读取，与 probe_file 一样可并行化
+            let songs_and_lyrics: Vec<(&PlatformPath, Song, Option<String>)> = {
+                let _t_lyric = Instant::now();
+                let mut results_with_lyrics: Vec<(&PlatformPath, Song, Option<String>)> =
+                    Vec::with_capacity(results.len());
+                for (path, meta_result) in results.iter() {
+                    let Ok(meta) = meta_result else { continue };
+                    let mut song = local_source.build_song(path, meta);
+                    let lyric_text = scanner::read_lyric_file(path);
+                    if lyric_text.is_none() {
+                        song.lyric_id = None;
+                    }
+                    results_with_lyrics.push((path, song, lyric_text));
+                }
+                let t_lyric = _t_lyric.elapsed();
+                eprintln!(
+                    "[local_source] ⏱ 5c. 读取歌词文件: {:?} ({} 首含歌词)",
+                    t_lyric,
+                    results_with_lyrics.iter().filter(|(_, _, l)| l.is_some()).count()
+                );
+                results_with_lyrics
+            };
 
-            if !songs_and_paths.is_empty() {
-                let songs: Vec<Song> = songs_and_paths
-                    .iter()
-                    .map(|(_, song)| song.clone())
-                    .collect();
-                match local_source.library.add_songs_batch(&songs) {
-                    Ok(stored_ids) => {
-                        for (i, (path, _)) in songs_and_paths.iter().enumerate() {
-                            let stored_id = &stored_ids[i];
-                            local_source
-                                .file_index
-                                .write()
-                                .insert((*path).clone(), stored_id.clone());
-                            local_source
-                                .id_to_path
-                                .write()
-                                .insert(stored_id.clone(), (*path).clone());
-                            local_source.update_file_mtime(path, stored_id);
-                            new_count += 1;
+            let songs: Vec<Song> = songs_and_lyrics
+                .iter()
+                .map(|(_, song, _)| song.clone())
+                .collect();
+            match local_source.library.add_songs_batch(&songs) {
+                Ok(stored_ids) => {
+                    for (i, (path, song, lyric_text)) in songs_and_lyrics.iter().enumerate() {
+                        let stored_id = &stored_ids[i];
+
+                        // 写入 Lyric 实体（若有歌词）
+                        if let Some(text) = lyric_text {
+                            let lyric = Lyric {
+                                id: song.lyric_id.clone().unwrap_or_else(|| {
+                                    uuid::Uuid::new_v4().to_string()
+                                }),
+                                song_id: stored_id.clone(),
+                                text: text.clone(),
+                                source_id: song.source_ids[0].clone(),
+                            };
+                            if let Err(e) = local_source.library.add_lyric(&lyric) {
+                                eprintln!(
+                                    "[local_source] 批量写入歌词失败 '{}': {}",
+                                    crate::module::platform::path_to_string(path),
+                                    e
+                                );
+                            }
                         }
+
+                        local_source
+                            .file_index
+                            .write()
+                            .insert((*path).clone(), stored_id.clone());
+                        local_source
+                            .id_to_path
+                            .write()
+                            .insert(stored_id.clone(), (*path).clone());
+                        local_source.update_file_mtime(path, stored_id);
+                        new_count += 1;
                     }
-                    Err(e) => {
-                        eprintln!("[local_source] 批量添加歌曲失败: {}", e);
-                    }
+                }
+                Err(e) => {
+                    eprintln!("[local_source] 批量添加歌曲失败: {}", e);
                 }
             }
         }

@@ -222,7 +222,7 @@
       <div class="setting-item">
         <div class="setting-info">
           <label class="setting-label">鼓点频段下限</label>
-          <span class="setting-desc">驱动背景跳动的低频下限（Hz）。默认 80 对应低音鼓</span>
+          <span class="setting-desc">驱动背景跳动的频段下限（Hz）。默认 4000；可在输入框输入超出滑块范围的值</span>
         </div>
         <div class="setting-control">
           <input
@@ -230,14 +230,19 @@
             v-model.number="lowFreqLow"
             class="slider"
           />
-          <span class="setting-value">{{ lowFreqLow }} Hz</span>
+          <input
+            type="number" min="0" max="20000" step="5"
+            v-model.number="lowFreqLow"
+            class="freq-input"
+          />
+          <span class="setting-value">Hz</span>
         </div>
       </div>
 
       <div class="setting-item">
         <div class="setting-info">
           <label class="setting-label">鼓点频段上限</label>
-          <span class="setting-desc">驱动背景跳动的低频上限（Hz）。默认 120；提高可让中频也参与跳动</span>
+          <span class="setting-desc">驱动背景跳动的频段上限（Hz）。默认 10000；可在输入框输入超出滑块范围的值</span>
         </div>
         <div class="setting-control">
           <input
@@ -245,7 +250,12 @@
             v-model.number="lowFreqHigh"
             class="slider"
           />
-          <span class="setting-value">{{ lowFreqHigh }} Hz</span>
+          <input
+            type="number" :min="lowFreqLow + 5" max="20000" step="5"
+            v-model.number="lowFreqHigh"
+            class="freq-input"
+          />
+          <span class="setting-value">Hz</span>
         </div>
       </div>
 
@@ -453,23 +463,26 @@ import { AmllSettingsStore, AMLL_DEFAULTS } from '@/stores/amllSettings.js';
 const settings = AmllSettingsStore.state;
 
 // 鼓点频段：用 computed 把 [low, high] 数组拆成两个双向绑定的数字
-// lowFreqLow 改 → 写回 settings.lowFreqVolumeRange[0]
-// lowFreqHigh 改 → 写回 settings.lowFreqVolumeRange[1]
+// 滑块仅覆盖常用范围（下限 20~500、上限 ~2000），数字输入框允许输入超出滑块范围的值
+// 仅保留逻辑约束：low >= 0 且 low < high（间距至少 5Hz）
 const lowFreqLow = computed({
   get: () => settings.lowFreqVolumeRange[0],
   set: (v) => {
-    // 保证下限 < 上限
+    if (!Number.isFinite(v)) return;
     const high = settings.lowFreqVolumeRange[1];
+    // 强制下限 < 上限（保留 5Hz 间距），下限不得低于 0
     if (v >= high) v = high - 5;
-    settings.lowFreqVolumeRange = [Math.max(20, v), high];
+    settings.lowFreqVolumeRange = [Math.max(0, v), high];
   },
 });
 const lowFreqHigh = computed({
   get: () => settings.lowFreqVolumeRange[1],
   set: (v) => {
+    if (!Number.isFinite(v)) return;
     const low = settings.lowFreqVolumeRange[0];
+    // 强制上限 > 下限（保留 5Hz 间距），上限不超过 20000Hz（人耳听觉上限）
     if (v <= low) v = low + 5;
-    settings.lowFreqVolumeRange = [low, Math.min(2000, v)];
+    settings.lowFreqVolumeRange = [low, Math.min(20000, v)];
   },
 });
 
@@ -681,6 +694,33 @@ onMounted(() => {
 }
 
 .text-input:focus {
+  border-color: var(--primary-color, #0078d7);
+}
+
+/* 鼓点频段输入框：与滑块并排，允许输入超出滑块范围的值 */
+.freq-input {
+  width: 72px;
+  padding: 5px 8px;
+  font-size: 13px;
+  border: 1px solid var(--border-color, #e8e8e8);
+  border-radius: 6px;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary, #333);
+  outline: none;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  /* 隐藏原生上下箭头，保持视觉简洁 */
+  -moz-appearance: textfield;
+}
+
+.freq-input::-webkit-outer-spin-button,
+.freq-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.freq-input:focus {
   border-color: var(--primary-color, #0078d7);
 }
 

@@ -32,6 +32,15 @@
         </div>
         <i class="bi bi-chevron-right card-arrow"></i>
       </router-link>
+
+      <router-link :to="{ name: 'SettingsMaintenance' }" class="index-card">
+        <div class="card-icon"><i class="bi bi-wrench-adjustable"></i></div>
+        <div class="card-body">
+          <h3 class="card-title">数据维护</h3>
+          <p class="card-desc">库统计、磁盘占用、清空缓存、重置全部数据</p>
+        </div>
+        <i class="bi bi-chevron-right card-arrow"></i>
+      </router-link>
     </div>
   </div>
 </template>

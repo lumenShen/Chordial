@@ -20,7 +20,6 @@ use chordial_core::module::music_source::resource;
 use chordial_core::module::music_source::types::SourceId;
 use chordial_core::module::platform::{self, PlatformPath};
 use serde::Deserialize;
-use std::collections::HashSet;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -71,17 +70,9 @@ async fn local_add_folder(
     let folder_path = PlatformPath::from(body.path.as_str());
     source.folder_manager.add_folder(&folder_path)?;
 
+    // 批量索引（单次加载库 + 并行探测 + 单次写回）
     let files = music_localSource::folder::collect_audio_files(&folder_path);
-    let mut indexed = 0u64;
-    let mut errors = Vec::new();
-
-    for file in &files {
-        match source.index_file(file) {
-            Ok(true) => indexed += 1,
-            Ok(false) => {}
-            Err(e) => errors.push(format!("{}: {}", platform::path_to_string(file), e)),
-        }
-    }
+    let (indexed, errors) = source.batch_index_files(&files)?;
 
     source.library.save()?;
 
@@ -101,24 +92,9 @@ async fn local_remove_folder(
     let source = &state.ctx.local_source;
     let folder_path = PlatformPath::from(body.path.as_str());
 
+    // 批量清理（单次库调用替代 N 次 unindex_file）
     let files = music_localSource::folder::collect_audio_files(&folder_path);
-    let entity_ids: HashSet<String> = files
-        .iter()
-        .map(|f| {
-            platform::path_to_string(&platform::canonicalize(f).unwrap_or_else(|_| f.clone()))
-        })
-        .collect();
-
-    if !entity_ids.is_empty() {
-        source.library.remove_specific_song_source_ids(
-            music_localSource::source::LOCAL_SOURCE_NAME,
-            &entity_ids,
-        )?;
-    }
-
-    for file in &files {
-        let _ = source.unindex_file(file);
-    }
+    let cleaned = source.batch_unindex_files(&files)?;
 
     let removed = source.folder_manager.remove_folder(&folder_path);
     source.library.save()?;
@@ -126,33 +102,32 @@ async fn local_remove_folder(
     Ok(Json(serde_json::json!({
         "removed": removed,
         "path": body.path,
-        "cleaned_files": entity_ids.len(),
+        "cleaned_files": cleaned,
     })))
 }
 
 async fn local_rescan(State(state): State<AppState>) -> Result<Json<serde_json::Value>, String> {
     let source = &state.ctx.local_source;
     let folders = source.folder_manager.get_folders();
-    let mut total = 0u64;
 
+    // 收集所有文件夹下的音频文件，一次性批量索引
+    let mut all_files: Vec<PlatformPath> = Vec::new();
     for folder in &folders {
-        let files = music_localSource::folder::collect_audio_files(folder);
-        for file in &files {
-            match source.index_file(file) {
-                Ok(true) => total += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    eprintln!("[local_rescan] {}: {}", platform::path_to_string(file), e);
-                }
-            }
-        }
+        all_files.extend(music_localSource::folder::collect_audio_files(folder));
+    }
+    let files_found = all_files.len();
+    let (indexed, errors) = source.batch_index_files(&all_files)?;
+    for e in &errors {
+        eprintln!("[local_rescan] {}", e);
     }
 
     source.library.save()?;
 
     Ok(Json(serde_json::json!({
-        "indexed": total,
+        "indexed": indexed,
+        "files_found": files_found,
         "folders_scanned": folders.len(),
+        "errors": errors,
     })))
 }
 

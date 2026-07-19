@@ -161,6 +161,15 @@ pub fn run() {
             commands::p2p_add_trusted,
             commands::p2p_remove_trusted,
             commands::p2p_get_match_payload,
+            // 数据维护 — 设置页"清理数据"工具
+            commands::maintenance_stats,
+            commands::maintenance_clear_library,
+            commands::maintenance_clear_cache,
+            commands::maintenance_clear_storage,
+            commands::maintenance_reset_all,
+            commands::maintenance_repair_references,
+            // 诊断命令 — 歌词问题排查
+            commands::debug_inspect_song_lyrics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
