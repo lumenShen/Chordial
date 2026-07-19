@@ -179,3 +179,49 @@ export async function downloadSong(songEntityId, title, artist, level = 'exhigh'
 export async function compareWithLocal(title, artist, album = null) {
   return transport.command('netease_compare_with_local', { title, artist, album });
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 扫码登录
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 第 1 步：获取扫码登录的 unikey。
+ * @returns {Promise<string>} 32 位 unikey
+ */
+export async function loginQrKey() {
+  return transport.command('netease_login_qr_key');
+}
+
+/**
+ * 第 2 步：用 unikey 生成二维码。
+ * @param {string} key - 从 loginQrKey 获取的 unikey
+ * @param {boolean} [qrimg=true] - 是否返回 base64 data URL
+ * @returns {Promise<{ qrurl: string, qrimg: string|null }>}
+ */
+export async function loginQrCreate(key, qrimg = true) {
+  return transport.command('netease_login_qr_create', { key, qrimg });
+}
+
+/**
+ * 第 3 步：轮询扫码状态。
+ *
+ * status 取值：
+ * - `expired`: 二维码已过期（code 800）
+ * - `waiting`: 等待扫码（code 801）
+ * - `scanned`: 已扫码待确认（code 802）
+ * - `authorized`: 授权成功（code 803，后端已自动持久化 cookie）
+ * - `unknown`: 未知状态
+ *
+ * @param {string} key
+ * @returns {Promise<{
+ *   code: number,
+ *   status: 'expired'|'waiting'|'scanned'|'authorized'|'unknown',
+ *   message: string|null,
+ *   avatarUrl: string|null,
+ *   nickname: string|null,
+ *   cookie: string|null,
+ * }>}
+ */
+export async function loginQrCheck(key) {
+  return transport.command('netease_login_qr_check', { key });
+}

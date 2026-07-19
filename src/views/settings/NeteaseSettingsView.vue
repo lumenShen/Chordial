@@ -43,10 +43,31 @@
 
       <div class="setting-item column">
         <div class="setting-info">
-          <label class="setting-label">Cookie</label>
-          <span class="setting-desc">登录后的 cookie 字符串（用于访问 VIP 歌曲、私人歌单等）</span>
+          <label class="setting-label">登录状态</label>
+          <span class="setting-desc">
+            扫码登录后可访问 VIP 歌曲、私人歌单等资源。
+            <span v-if="loginStatus.loggedIn" class="login-badge ok">
+              <i class="bi bi-check-circle-fill"></i> 已登录<span v-if="loginStatus.nickname">（{{ loginStatus.nickname }}）</span>
+            </span>
+            <span v-else class="login-badge warn">
+              <i class="bi bi-exclamation-circle-fill"></i> 未登录
+            </span>
+          </span>
+        </div>
+        <div class="login-actions">
+          <button class="action-btn primary" @click="openQrLogin">
+            <i class="bi bi-qr-code"></i> 扫码登录
+          </button>
+          <button v-if="loginStatus.loggedIn" class="action-btn" @click="logout">
+            <i class="bi bi-box-arrow-right"></i> 退出登录
+          </button>
+          <button class="action-btn ghost" @click="showManualCookie = !showManualCookie">
+            <i class="bi bi" :class="showManualCookie ? 'bi-chevron-up' : 'bi-chevron-down'"></i>
+            手动填入 Cookie
+          </button>
         </div>
         <textarea
+          v-if="showManualCookie"
           v-model="config.cookie"
           placeholder="MUSIC_U=xxxxx; __csrf=yyyyy; ..."
           class="textarea-input"
@@ -181,6 +202,82 @@
       </div>
     </div>
 
+    <!-- 扫码登录 Modal -->
+    <teleport to="body">
+      <transition name="fade">
+        <div v-if="qrLogin.visible" class="qr-modal-mask" @click.self="closeQrLogin">
+          <div class="qr-modal" role="dialog" aria-modal="true">
+            <div class="qr-modal-header">
+              <h3 class="qr-modal-title">
+                <i class="bi bi-qr-code"></i> 网易云扫码登录
+              </h3>
+              <button class="qr-modal-close" @click="closeQrLogin" aria-label="关闭">
+                <i class="bi bi-x-lg"></i>
+              </button>
+            </div>
+
+            <div class="qr-modal-body">
+              <!-- loading: 正在获取二维码 -->
+              <div v-if="qrLogin.phase === 'loading'" class="qr-loading">
+                <div class="qr-spinner"></div>
+                <p>正在获取二维码…</p>
+              </div>
+
+              <!-- 二维码展示 -->
+              <div v-else-if="qrLogin.phase === 'showing' || qrLogin.phase === 'polling'" class="qr-showing">
+                <div class="qr-image-wrap" :class="{ expired: qrLogin.status === 'expired' }">
+                  <img v-if="qrLogin.qrimg" :src="qrLogin.qrimg" alt="网易云登录二维码" class="qr-image" />
+                  <div v-else class="qr-fallback">
+                    <p>无法显示二维码图片</p>
+                    <p class="qr-url">{{ qrLogin.qrurl }}</p>
+                  </div>
+                  <!-- 过期遮罩 -->
+                  <div v-if="qrLogin.status === 'expired'" class="qr-expired-overlay">
+                    <i class="bi bi-clock-history"></i>
+                    <p>二维码已过期</p>
+                    <button class="action-btn primary" @click="refreshQr">
+                      <i class="bi bi-arrow-clockwise"></i> 重新获取
+                    </button>
+                  </div>
+                </div>
+
+                <div class="qr-status">
+                  <div v-if="qrLogin.status === 'waiting'" class="status-text waiting">
+                    <i class="bi bi-hourglass-split"></i> 请使用网易云音乐 App 扫码
+                  </div>
+                  <div v-else-if="qrLogin.status === 'scanned'" class="status-text scanned">
+                    <i class="bi bi-phone"></i> 已扫码，请在手机上确认登录
+                    <img v-if="qrLogin.avatarUrl" :src="qrLogin.avatarUrl" class="avatar" alt="用户头像" />
+                  </div>
+                  <div v-else-if="qrLogin.status === 'authorized'" class="status-text authorized">
+                    <i class="bi bi-check-circle-fill"></i> 授权成功
+                  </div>
+                  <div v-else-if="qrLogin.status === 'expired'" class="status-text expired">
+                    <i class="bi bi-clock-history"></i> 二维码已过期，请重新获取
+                  </div>
+                  <div v-else-if="qrLogin.error" class="status-text error">
+                    <i class="bi bi-x-circle-fill"></i> {{ qrLogin.error }}
+                  </div>
+                </div>
+              </div>
+
+              <!-- 成功 -->
+              <div v-else-if="qrLogin.phase === 'success'" class="qr-success">
+                <i class="bi bi-check-circle-fill success-icon"></i>
+                <h4>登录成功</h4>
+                <p v-if="qrLogin.nickname">欢迎，{{ qrLogin.nickname }}</p>
+                <button class="action-btn primary" @click="closeQrLogin">完成</button>
+              </div>
+            </div>
+
+            <div class="qr-modal-footer">
+              <span class="qr-tip">使用网易云音乐 App 扫描左侧二维码即可登录</span>
+            </div>
+          </div>
+        </div>
+      </transition>
+    </teleport>
+
     <!-- Toast -->
     <transition name="fade">
       <div v-if="toast" class="toast" :class="toast.type">
@@ -192,7 +289,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, useTemplateRef } from 'vue';
+import { ref, computed, onMounted, onUnmounted, useTemplateRef } from 'vue';
 import { useAnime } from '@/composables/useAnime.js';
 import * as neteaseApi from '@/api/musicSource/netease.js';
 import * as prefApi from '@/api/musicSource/lyricPreference.js';
@@ -360,9 +457,158 @@ async function pickDownloadDir() {
   }
 }
 
+// ── 扫码登录 ────────────────────────────────────────────────
+const showManualCookie = ref(false);
+
+// 登录状态（仅前端展示用，从 cookie 字符串推断）
+const loginStatus = ref({ loggedIn: false, nickname: '' });
+
+function updateLoginStatus() {
+  const cookie = (config.value.cookie || '').trim();
+  // MUSIC_U 是网易云登录态的核心 cookie
+  const hasMusicU = /(^|;\s*)MUSIC_U\s*=/.test(cookie);
+  loginStatus.value = {
+    loggedIn: hasMusicU,
+    nickname: '',
+  };
+}
+
+// 扫码登录 Modal 状态
+const qrLogin = ref({
+  visible: false,
+  // phase: loading（正在获取二维码）| showing（已显示二维码，轮询中）| polling（同 showing，语义保留）| success
+  phase: 'loading',
+  // status: waiting | scanned | authorized | expired | unknown
+  status: 'waiting',
+  key: '',
+  qrurl: '',
+  qrimg: '',
+  avatarUrl: '',
+  nickname: '',
+  error: '',
+});
+
+let pollTimer = null;
+let pollAbort = false;  // 用户关闭 modal 时置 true，停止轮询
+
+async function openQrLogin() {
+  qrLogin.value = {
+    visible: true,
+    phase: 'loading',
+    status: 'waiting',
+    key: '',
+    qrurl: '',
+    qrimg: '',
+    avatarUrl: '',
+    nickname: '',
+    error: '',
+  };
+  pollAbort = false;
+  await fetchQr();
+}
+
+async function fetchQr() {
+  try {
+    const key = await neteaseApi.loginQrKey();
+    qrLogin.value.key = key;
+    const data = await neteaseApi.loginQrCreate(key, true);
+    qrLogin.value.qrurl = data.qrurl || '';
+    qrLogin.value.qrimg = data.qrimg || '';
+    qrLogin.value.phase = 'showing';
+    qrLogin.value.status = 'waiting';
+    startPolling();
+  } catch (e) {
+    qrLogin.value.error = e.message || String(e);
+    showToast(`获取二维码失败：${e.message || e}`, 'error');
+  }
+}
+
+function refreshQr() {
+  stopPolling();
+  qrLogin.value.error = '';
+  qrLogin.value.status = 'waiting';
+  qrLogin.value.phase = 'loading';
+  qrLogin.value.qrimg = '';
+  qrLogin.value.qrurl = '';
+  fetchQr();
+}
+
+function startPolling() {
+  stopPolling();
+  // 每 1 秒轮询一次，二维码有效期约 5 分钟（300 次 × 1s = 300s）
+  // 网易云 /login/qr/check 接口设计为可高频轮询，1s 体验最佳
+  pollTimer = setTimeout(pollOnce, 1000);
+}
+
+async function pollOnce() {
+  if (pollAbort || !qrLogin.value.visible) return;
+  const key = qrLogin.value.key;
+  if (!key) return;
+  try {
+    const resp = await neteaseApi.loginQrCheck(key);
+    qrLogin.value.status = resp.status;
+    if (resp.avatarUrl) qrLogin.value.avatarUrl = resp.avatarUrl;
+    if (resp.nickname) qrLogin.value.nickname = resp.nickname;
+
+    if (resp.status === 'authorized') {
+      // 后端已自动持久化 cookie，重新拉取配置以更新前端状态
+      await loadConfig();
+      updateLoginStatus();
+      qrLogin.value.phase = 'success';
+      showToast('登录成功', 'success');
+      stopPolling();
+      return;
+    }
+    if (resp.status === 'expired') {
+      stopPolling();
+      return;
+    }
+    // waiting / scanned → 继续轮询
+    if (qrLogin.value.visible) {
+      pollTimer = setTimeout(pollOnce, 1000);
+    }
+  } catch (e) {
+    qrLogin.value.error = e.message || String(e);
+    // 网络错误也继续重试，避免短暂抖动中断流程（2s 间隔）
+    if (qrLogin.value.visible) {
+      pollTimer = setTimeout(pollOnce, 2000);
+    }
+  }
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function closeQrLogin() {
+  pollAbort = true;
+  stopPolling();
+  qrLogin.value.visible = false;
+}
+
+async function logout() {
+  if (!confirm('确定退出网易云登录？清除 Cookie 后将无法访问 VIP 歌曲/私人歌单。')) return;
+  config.value.cookie = '';
+  try {
+    await neteaseApi.updateConfig(config.value);
+    updateLoginStatus();
+    showToast('已退出登录', 'info');
+  } catch (e) {
+    showToast(`退出失败：${e.message || e}`, 'error');
+  }
+}
+
+onUnmounted(() => {
+  stopPolling();
+});
+
 // ── 初始化 ──────────────────────────────────────────────────
 onMounted(async () => {
   await Promise.all([loadConfig(), loadPreference()]);
+  updateLoginStatus();
   run(({ animate, stagger, presets }) => {
     animate('.section-header', { ...presets.fadeIn });
     animate('.settings-section', { ...presets.fadeInUp, delay: stagger(80) });
@@ -749,6 +995,304 @@ onMounted(async () => {
   .action-btn {
     width: 100%;
     justify-content: center;
+  }
+}
+
+/* ── 登录状态徽标 + 按钮 ──────────────────────────────────────────── */
+.login-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.login-badge.ok {
+  background: rgba(40, 167, 69, 0.12);
+  color: #28a745;
+}
+.login-badge.warn {
+  background: rgba(255, 193, 7, 0.15);
+  color: #b8860b;
+}
+
+.login-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.action-btn.ghost {
+  background: transparent;
+  border-color: var(--border-color, #e8e8e8);
+  color: var(--text-secondary, #666);
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
+/* ── 扫码登录 Modal（teleport 到 body，使用非 scoped 样式） ─────────── */
+</style>
+
+<style>
+/* 非 scoped：teleport 到 body 的元素需要全局样式 */
+.qr-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  padding: 16px;
+}
+
+.qr-modal {
+  width: 100%;
+  max-width: 400px;
+  background: var(--bg-primary, #fff);
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.qr-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-light, #e8e8e8);
+}
+
+.qr-modal-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary, #333);
+}
+
+.qr-modal-title i {
+  color: var(--primary-color, #0078d7);
+}
+
+.qr-modal-close {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary, #666);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+  font-size: 14px;
+  transition: background 0.2s;
+}
+
+.qr-modal-close:hover {
+  background: var(--bg-hover, rgba(0, 0, 0, 0.05));
+  color: var(--text-primary, #333);
+}
+
+.qr-modal-body {
+  padding: 28px 20px;
+  min-height: 320px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+}
+
+.qr-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  color: var(--text-secondary, #666);
+  font-size: 14px;
+}
+
+.qr-spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid var(--border-light, #e8e8e8);
+  border-top-color: var(--primary-color, #0078d7);
+  border-radius: 50%;
+  animation: qr-spin 0.9s linear infinite;
+}
+
+@keyframes qr-spin {
+  to { transform: rotate(360deg); }
+}
+
+.qr-showing {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+}
+
+.qr-image-wrap {
+  position: relative;
+  padding: 12px;
+  background: #fff;
+  border-radius: 12px;
+  border: 1px solid var(--border-light, #e8e8e8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.qr-image-wrap.expired {
+  opacity: 0.5;
+}
+
+.qr-image {
+  width: 220px;
+  height: 220px;
+  object-fit: contain;
+  display: block;
+}
+
+.qr-fallback {
+  width: 220px;
+  height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-secondary, #666);
+}
+
+.qr-url {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  word-break: break-all;
+}
+
+.qr-expired-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  font-size: 14px;
+  color: var(--text-secondary, #666);
+}
+
+.qr-expired-overlay i {
+  font-size: 32px;
+  color: var(--text-tertiary, #999);
+}
+
+.qr-status {
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  text-align: center;
+}
+
+.status-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-weight: 500;
+}
+
+.status-text.waiting {
+  color: var(--text-secondary, #666);
+  background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+}
+
+.status-text.scanned {
+  color: #0078d7;
+  background: rgba(0, 120, 215, 0.1);
+}
+
+.status-text.scanned .avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+  margin-left: 4px;
+}
+
+.status-text.authorized {
+  color: #28a745;
+  background: rgba(40, 167, 69, 0.12);
+}
+
+.status-text.expired {
+  color: #b8860b;
+  background: rgba(255, 193, 7, 0.15);
+}
+
+.status-text.error {
+  color: #dc3545;
+  background: rgba(220, 53, 69, 0.12);
+}
+
+.qr-success {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.qr-success .success-icon {
+  font-size: 48px;
+  color: #28a745;
+}
+
+.qr-success h4 {
+  margin: 0;
+  font-size: 18px;
+  color: var(--text-primary, #333);
+}
+
+.qr-success p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-secondary, #666);
+}
+
+.qr-modal-footer {
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-light, #e8e8e8);
+  text-align: center;
+}
+
+.qr-tip {
+  font-size: 12px;
+  color: var(--text-tertiary, #999);
+}
+
+@media (max-width: 480px) {
+  .qr-modal {
+    max-width: 100%;
+  }
+  .qr-image,
+  .qr-fallback {
+    width: 180px;
+    height: 180px;
   }
 }
 </style>

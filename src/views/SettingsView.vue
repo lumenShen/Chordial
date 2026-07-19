@@ -14,10 +14,6 @@
         <i class="bi bi-music-note-list"></i>
         <span>歌词与播放器</span>
       </router-link>
-      <router-link :to="{ name: 'SettingsNetease' }" class="nav-item" active-class="active">
-        <i class="bi bi-cloud-arrow-down"></i>
-        <span>网易云来源</span>
-      </router-link>
       <router-link :to="{ name: 'SettingsMaintenance' }" class="nav-item" active-class="active">
         <i class="bi bi-wrench-adjustable"></i>
         <span>数据维护</span>

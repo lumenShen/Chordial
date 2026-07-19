@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted, watch, nextTick, useTemplateRef } from 'vue';
+import { useRouter } from 'vue-router';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
   addLocalFolder,
@@ -8,6 +9,7 @@ import {
   getLocalStats,
   rescanAll,
 } from '../api/musicSource';
+import * as neteaseApi from '@/api/musicSource/netease.js';
 import { usePerf } from '@/utils/performanceMonitor.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { useLibraryEvents } from '@/composables/useLibraryEvents.js';
@@ -16,6 +18,7 @@ const { start, end, log } = usePerf('MusicSourceManager');
 
 const rootRef = useTemplateRef('root');
 const { run } = useAnime(() => rootRef.value);
+const router = useRouter();
 
 // ── State ──────────────────────────────────────────────────────────────────
 const folders = ref([]);
@@ -24,6 +27,14 @@ const isLoading = ref(true);
 const isScanning = ref(false);
 const isAdding = ref(false);
 const isRemoving = ref(false);
+
+// 网易云来源状态
+const neteaseState = ref({
+  enabled: false,
+  baseUrl: '',
+  loggedIn: false,
+  loaded: false,
+});
 
 // 订阅全局库变更事件 — 在其他视图触发变更时同步刷新本页统计
 const { libraryVersion } = useLibraryEvents();
@@ -69,13 +80,26 @@ watch([isScanning, isAdding], ([scanning, adding]) => {
 const loadData = async () => {
   start('loadData');
   try {
-    const [paths, s] = await Promise.all([getFolders(), getLocalStats()]);
+    const [paths, s, neteaseCfg] = await Promise.all([
+      getFolders(),
+      getLocalStats(),
+      neteaseApi.getConfig().catch(() => null),
+    ]);
     folders.value = (paths || []).map((p) => ({
       path: p,
       // 从路径提取显示名（最后一个目录名）
       name: p.split(/[/\\]/).filter(Boolean).pop() || p,
     }));
     stats.value = s || { folder_count: 0, indexed_files: 0 };
+    if (neteaseCfg) {
+      const cookie = (neteaseCfg.cookie || '').trim();
+      neteaseState.value = {
+        enabled: !!neteaseCfg.enabled,
+        baseUrl: neteaseCfg.base_url || '',
+        loggedIn: /(^|;\s*)MUSIC_U\s*=/.test(cookie),
+        loaded: true,
+      };
+    }
     end('loadData', { folderCount: folders.value.length, indexedFiles: stats.value.indexed_files });
   } catch (error) {
     console.error('Failed to load sources:', error);
@@ -153,6 +177,11 @@ const formatFileCount = (n) => {
   if (n == null) return '—';
   return n.toLocaleString();
 };
+
+// 跳转到网易云来源设置页
+const goToNeteaseSettings = () => {
+  router.push('/music-sources/netease');
+};
 </script>
 
 <template>
@@ -162,8 +191,8 @@ const formatFileCount = (n) => {
       <div>
         <h1 class="page-title">音乐源管理</h1>
         <p class="page-subtitle">
-          管理本地音乐文件夹 —
-          <template v-if="!isLoading">{{ stats.folder_count }} 个文件夹，共 {{ formatFileCount(stats.indexed_files) }} 个音频文件</template>
+          管理本地音乐文件夹与在线音乐来源 —
+          <template v-if="!isLoading">{{ stats.folder_count }} 个本地文件夹，共 {{ formatFileCount(stats.indexed_files) }} 个音频文件</template>
           <template v-else>加载中…</template>
         </p>
       </div>
@@ -234,13 +263,55 @@ const formatFileCount = (n) => {
         <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
           <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
         </svg>
-        <h3 class="empty-state-title">暂无音乐源</h3>
+        <h3 class="empty-state-title">暂无本地音乐源</h3>
         <p class="empty-state-desc">添加本地音乐文件夹开始管理你的音乐</p>
         <button class="btn btn-primary" style="margin-top: 16px;" @click="handleAddSource">
           添加文件夹
         </button>
       </div>
     </template>
+
+    <!-- 在线来源：网易云音乐 -->
+    <div class="online-sources-section">
+      <h2 class="section-subheading">
+        <i class="bi bi-cloud-arrow-down"></i> 在线音乐来源
+      </h2>
+
+      <div class="source-card card online-source-card" @click="goToNeteaseSettings" role="button" tabindex="0"
+        @keydown.enter.prevent="goToNeteaseSettings" @keydown.space.prevent="goToNeteaseSettings">
+        <div class="source-info">
+          <div class="source-icon netease-icon">
+            <i class="bi bi-cloud-arrow-down"></i>
+          </div>
+          <div class="source-details">
+            <h3 class="source-name">
+              网易云音乐
+              <span class="source-type-badge" :class="neteaseState.enabled ? 'enabled' : 'disabled'">
+                {{ neteaseState.enabled ? '已启用' : '未启用' }}
+              </span>
+            </h3>
+            <p class="source-path">
+              <template v-if="neteaseState.loaded">
+                {{ neteaseState.baseUrl || '（未配置 API 服务器）' }}
+              </template>
+              <template v-else>加载中…</template>
+            </p>
+            <div class="source-meta">
+              <span class="meta-tag" :class="neteaseState.loggedIn ? 'ok' : 'warn'">
+                <i class="bi" :class="neteaseState.loggedIn ? 'bi-check-circle-fill' : 'bi-exclamation-circle-fill'"></i>
+                {{ neteaseState.loggedIn ? '已登录' : '未登录' }}
+              </span>
+              <span class="meta-tag">扫码登录 · 搜索歌单 · 在线下载</span>
+            </div>
+          </div>
+        </div>
+        <div class="source-actions">
+          <button class="btn-icon" title="设置" aria-label="设置">
+            <i class="bi bi-chevron-right"></i>
+          </button>
+        </div>
+      </div>
+    </div>
 
     <!-- Unsupported source notice -->
     <div class="unsupported-note card" style="margin-top: 24px;">
@@ -255,7 +326,7 @@ const formatFileCount = (n) => {
         </p>
         <p class="note-text">
           网盘（WebDisk）和 WebDAV 来源目前后端尚未实现。
-          当前仅支持本地文件夹作为音乐源。
+          当前支持本地文件夹与网易云音乐 API 两个来源。
         </p>
       </div>
     </div>
@@ -405,6 +476,92 @@ const formatFileCount = (n) => {
 .btn-icon:disabled:hover {
   background: transparent;
   color: var(--text-secondary, #666);
+}
+
+/* ── 在线音乐来源区块 ─────────────────────────────────────────────── */
+.online-sources-section {
+  margin-top: 32px;
+}
+
+.section-subheading {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-secondary, #666);
+  margin: 0 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.online-source-card {
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: 1px solid var(--border-color, #e8e8ed);
+}
+
+.online-source-card:hover {
+  border-color: var(--primary-color, #0078d7);
+  box-shadow: 0 4px 16px rgba(0, 120, 215, 0.1);
+  transform: translateY(-1px);
+}
+
+.online-source-card:focus-visible {
+  outline: 2px solid var(--primary-color, #0078d7);
+  outline-offset: 2px;
+}
+
+.netease-icon {
+  background: linear-gradient(135deg, #c20c0c 0%, #e84747 100%);
+  color: #fff;
+}
+
+.netease-icon i {
+  font-size: 22px;
+}
+
+.source-type-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+.source-type-badge.enabled {
+  background: rgba(40, 167, 69, 0.12);
+  color: #28a745;
+}
+
+.source-type-badge.disabled {
+  background: rgba(255, 193, 7, 0.15);
+  color: #b8860b;
+}
+
+.meta-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 8px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--bg-tertiary, rgba(15, 15, 15, 0.05));
+  color: var(--text-tertiary, #999);
+}
+
+.meta-tag.ok {
+  background: rgba(40, 167, 69, 0.1);
+  color: #28a745;
+}
+
+.meta-tag.warn {
+  background: rgba(255, 193, 7, 0.12);
+  color: #b8860b;
 }
 
 /* ── Unsupported note ──────────────────────────────────────────────── */

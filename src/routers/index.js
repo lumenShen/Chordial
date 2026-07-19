@@ -93,6 +93,12 @@ const routes = [
     meta: { title: '音乐源管理' }
   },
   {
+    path: '/music-sources/netease',
+    name: 'MusicSourceNetease',
+    component: NeteaseSettingsView,
+    meta: { title: '网易云音乐来源' }
+  },
+  {
     path: '/track/:trackId',
     name: 'TrackDetail',
     component: TrackDetail,
@@ -134,12 +140,6 @@ const routes = [
         name: 'SettingsMaintenance',
         component: MaintenanceSettingsView,
         meta: { title: '数据维护' }
-      },
-      {
-        path: 'netease',
-        name: 'SettingsNetease',
-        component: NeteaseSettingsView,
-        meta: { title: '网易云音乐来源' }
       }
     ]
   },
