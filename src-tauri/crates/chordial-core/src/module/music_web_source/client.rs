@@ -125,9 +125,21 @@ impl WebHttpClient {
         let cookie = self.cookie.read().clone();
         if !cookie.is_empty() {
             // 用 HeaderName 自动校验，避免无效字符触发 panic
-            if let Ok(value) = HeaderValue::from_str(&cookie) {
-                rb = rb.header(reqwest::header::COOKIE, value);
+            match HeaderValue::from_str(&cookie) {
+                Ok(value) => {
+                    rb = rb.header(reqwest::header::COOKIE, value);
+                }
+                Err(e) => {
+                    // cookie 字符串含非法字符，跳过附加并打日志
+                    eprintln!(
+                        "[web_http] cookie 含非法字符无法附加到 header：{}（cookie 长度={}）",
+                        e,
+                        cookie.len()
+                    );
+                }
             }
+        } else {
+            eprintln!("[web_http] cookie 为空，请求未携带登录态");
         }
         // 禁用任何中间层缓存（代理/CDN/reqwest 连接池的响应复用）
         // 对于登录态轮询等场景至关重要

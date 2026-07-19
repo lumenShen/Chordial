@@ -468,6 +468,65 @@ impl NeteaseCloudMusicApiSource {
         api::search_playlists(&self.client, query, limit, offset)
     }
 
+    /// 搜索网易云歌手，返回库内 Artist 模型（附带 netease SourceId）。
+    pub fn search_artists(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Artist>, String> {
+        if !self.is_enabled() {
+            return Err("网易云来源未启用".to_string());
+        }
+        let briefs = api::search_artists(&self.client, query, limit, offset)?;
+        let artists = briefs
+            .into_iter()
+            .map(|b| Artist {
+                id: Uuid::new_v4().to_string(),
+                name: b.name,
+                bio: None,
+                source_ids: vec![SourceId {
+                    source_name: self.name.clone(),
+                    source_type: SourceType::Web(NETEASE_SOURCE_NAME.to_string()),
+                    entity_type: EntityType::Artist,
+                    entity_id: build_entity_id(EntityKind::artist, b.id),
+                }],
+            })
+            .collect();
+        Ok(artists)
+    }
+
+    /// 搜索网易云专辑，返回库内 Album 模型（附带 netease SourceId）。
+    pub fn search_albums(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Album>, String> {
+        if !self.is_enabled() {
+            return Err("网易云来源未启用".to_string());
+        }
+        let briefs = api::search_albums(&self.client, query, limit, offset)?;
+        let albums = briefs
+            .into_iter()
+            .map(|b| Album {
+                id: Uuid::new_v4().to_string(),
+                title: b.name,
+                artist_id: String::new(),
+                cover_url: b.picUrl,
+                song_ids: Vec::new(),
+                source_ids: vec![SourceId {
+                    source_name: self.name.clone(),
+                    source_type: SourceType::Web(NETEASE_SOURCE_NAME.to_string()),
+                    entity_type: EntityType::Album,
+                    entity_id: build_entity_id(EntityKind::album, b.id),
+                }],
+                year: None,
+            })
+            .collect();
+        Ok(albums)
+    }
+
     /// 获取歌单详情（元信息 + 全部曲目）。
     ///
     /// 返回 `(playlist_meta, songs)`。
@@ -510,8 +569,20 @@ impl NeteaseCloudMusicApiSource {
     ) -> Result<super::types::NeteaseQrCheckResponse, String> {
         let resp = api::login_qr_check(&self.client, key)?;
         if resp.status() == super::types::QrCheckStatus::Authorized {
-            if let Some(cookie) = resp.cookie.clone() {
-                if !cookie.is_empty() {
+            if let Some(raw_cookie) = resp.cookie.clone() {
+                if !raw_cookie.is_empty() {
+                    // ncmapi 返回的 cookie 字段是多个 Set-Cookie 用 ", " 连接的字符串
+                    // 每条格式：NAME=VALUE; Path=/; HttpOnly; Expires=Day, DD Mon YYYY HH:MM:SS GMT
+                    // 直接当作 Cookie 请求头发送会让 ncmapi 把 Path/Expires 等属性当成 cookie 名
+                    // 解析失败 → profile=null + 匿名 account
+                    // 此处解析出 NAME=VALUE 对，用 "; " 连接成标准 Cookie 头格式
+                    let cookie = parse_set_cookie_to_header(&raw_cookie);
+                    eprintln!(
+                        "[netease] 扫码登录成功，原始 cookie 长度={}，解析后长度={}，含 MUSIC_U={}",
+                        raw_cookie.len(),
+                        cookie.len(),
+                        cookie.contains("MUSIC_U=")
+                    );
                     // 写入运行时 client（立即生效）
                     self.client.set_cookie(cookie.clone());
                     // 持久化到 config
@@ -562,5 +633,132 @@ impl NeteaseCloudMusicApiSource {
         album_id: i64,
     ) -> Result<(super::types::NeteaseAlbumDetail, Vec<NeteaseSongDetail>), String> {
         api::get_album_detail(&self.client, album_id)
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 私有辅助函数
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 将 ncmapi `/login/qr/check` 返回的 Set-Cookie 串解析为标准 Cookie 请求头格式。
+///
+/// # 背景
+///
+/// ncmapi 在 `code==803` 时返回的 `cookie` 字段是多个 Set-Cookie 用 `", "` 连接的字符串，
+/// 每条形如：`NAME=VALUE; Path=/; HttpOnly; Expires=Day, DD Mon YYYY HH:MM:SS GMT`。
+///
+/// 直接当作 Cookie 请求头发送时，ncmapi 会把 `Path`/`Expires`/`Max-Age` 等属性名
+/// 当成 cookie 名解析，真正的 `MUSIC_U` 被属性淹没，导致登录态丢失（profile=null）。
+///
+/// # 解析策略
+///
+/// 1. 将 `", "` 替换为 `"; "`，把多 cookie 分隔符与属性分隔符统一
+///    （注意 `Expires=Fri, 06 Aug` 内的 `", "` 也会被替换，但后续步骤会跳过非 token 段）
+/// 2. 按 `;` 切分，对每段 trim 后判断是否为有效 `NAME=VALUE` 对：
+///    - 必须含 `=`
+///    - `NAME` 必须为合法 token（仅字母数字 `_` `-` `.`）
+///    - `NAME` 不在保留属性名集合内（`Path`/`Domain`/`Expires`/`Max-Age`/...）
+/// 3. 对重名 cookie 只保留第一次出现的（去重）
+/// 4. 用 `"; "` 连接所有有效对
+fn parse_set_cookie_to_header(set_cookie: &str) -> String {
+    // 已知的 Set-Cookie 属性名（不区分大小写）
+    const RESERVED: &[&str] = &[
+        "Path",
+        "Domain",
+        "Expires",
+        "Max-Age",
+        "HttpOnly",
+        "Secure",
+        "SameSite",
+        "Comment",
+        "Version",
+        "Priority",
+    ];
+
+    // 统一分隔符
+    let normalized = set_cookie.replace(", ", "; ");
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pairs: Vec<String> = Vec::new();
+
+    for segment in normalized.split(';') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        // 必须含 =（HttpOnly / Secure 等 flag 没有 =）
+        let eq_pos = match segment.find('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        let name = segment[..eq_pos].trim();
+        // name 必须非空且为合法 token
+        if name.is_empty() || name.contains(' ') || name.contains(',') {
+            continue;
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            continue;
+        }
+        // 跳过保留属性
+        if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        // 去重（同名 cookie 只保留首次）
+        if !seen.insert(name.to_string()) {
+            continue;
+        }
+        pairs.push(segment.to_string());
+    }
+
+    pairs.join("; ")
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_cookie() {
+        let raw = "MUSIC_U=abc123; Path=/; HttpOnly";
+        let parsed = parse_set_cookie_to_header(raw);
+        assert_eq!(parsed, "MUSIC_U=abc123");
+    }
+
+    #[test]
+    fn test_parse_multiple_cookies() {
+        let raw = "MUSIC_U=abc123; Path=/; HttpOnly, __csrf=xyz; Path=/; HttpOnly";
+        let parsed = parse_set_cookie_to_header(raw);
+        assert_eq!(parsed, "MUSIC_U=abc123; __csrf=xyz");
+    }
+
+    #[test]
+    fn test_parse_cookie_with_expires_date() {
+        // Expires 内含 ", "，不应破坏解析
+        let raw = "MUSIC_U=abc123; Path=/; HttpOnly; Expires=Fri, 06 Aug 2094 17:42:50 GMT, __csrf=xyz; Path=/; HttpOnly";
+        let parsed = parse_set_cookie_to_header(raw);
+        assert_eq!(parsed, "MUSIC_U=abc123; __csrf=xyz");
+    }
+
+    #[test]
+    fn test_parse_cookie_dedup() {
+        let raw = "MUSIC_U=abc; Path=/, MUSIC_U=def; Path=/";
+        let parsed = parse_set_cookie_to_header(raw);
+        assert_eq!(parsed, "MUSIC_U=abc");
+    }
+
+    #[test]
+    fn test_parse_cookie_preserves_order() {
+        let raw = "MUSIC_A_T=1513381581471; Max-Age=2147483647; Expires=Fri, 06 Aug 2094 17:42:50 GMT, MUSIC_U=real_token; Path=/; HttpOnly, __csrf=csrf_val; Path=/";
+        let parsed = parse_set_cookie_to_header(raw);
+        assert_eq!(parsed, "MUSIC_A_T=1513381581471; MUSIC_U=real_token; __csrf=csrf_val");
+    }
+
+    #[test]
+    fn test_parse_empty() {
+        assert_eq!(parse_set_cookie_to_header(""), "");
+        assert_eq!(parse_set_cookie_to_header("   "), "");
     }
 }

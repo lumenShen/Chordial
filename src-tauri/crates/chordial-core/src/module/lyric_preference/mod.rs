@@ -281,7 +281,8 @@ mod tests {
         );
         // Local 优先级更高（source_rank=2*100），即使 Netease 是逐字
         // 但 YRC 格式权重 45 > LRC 20，所以差距缩小但仍 Local 领先
-        let best = select_best(&[local_lrc.clone(), netease_yrc], &pref);
+        let binding = [local_lrc.clone(), netease_yrc];
+        let best = select_best(&binding, &pref);
         assert_eq!(best.unwrap().source, LyricSourceKind::Local);
     }
 
@@ -291,7 +292,8 @@ mod tests {
         // 同一来源的两个候选，逐字应优先
         let lrc = LyricCandidate::new(LyricSourceKind::Local, "[00:01.00]hi".to_string());
         let yrc = LyricCandidate::new(LyricSourceKind::Local, "[1000,2000](0,1,0)hi".to_string());
-        let best = select_best(&[lrc, yrc], &pref);
+        let binding = [lrc, yrc];
+        let best = select_best(&binding, &pref);
         assert_eq!(best.unwrap().format, LyricFormat::Yrc);
     }
 

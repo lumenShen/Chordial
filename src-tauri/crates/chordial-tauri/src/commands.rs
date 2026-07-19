@@ -1160,7 +1160,7 @@ use chordial_core::module::music_netease_source::{
 use chordial_core::module::music_source::cache;
 use chordial_core::module::music_web_source::WebSourceConfig;
 use chordial_core::module::playlist::{self, Playlist};
-use chordial_core::module::music_library::models::Song;
+use chordial_core::module::music_library::models::{Album, Artist, Song};
 
 /// 获取网易云来源配置（base_url / cookie / 超时 / 启用 / 下载目录）。
 #[tauri::command]
@@ -1203,6 +1203,30 @@ pub fn netease_search_songs(
     query: String,
 ) -> Result<Vec<Song>, String> {
     ctx.netease_source.search_songs(&query)
+}
+
+/// 在线搜索歌手（返回库内 Artist 模型，附带 netease SourceId）。
+#[tauri::command]
+pub fn netease_search_artists(
+    ctx: State<'_, Arc<AppContext>>,
+    query: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<Artist>, String> {
+    ctx.netease_source
+        .search_artists(&query, limit.unwrap_or(30), offset.unwrap_or(0))
+}
+
+/// 在线搜索专辑（返回库内 Album 模型，附带 netease SourceId）。
+#[tauri::command]
+pub fn netease_search_albums(
+    ctx: State<'_, Arc<AppContext>>,
+    query: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<Album>, String> {
+    ctx.netease_source
+        .search_albums(&query, limit.unwrap_or(30), offset.unwrap_or(0))
 }
 
 /// 在线搜索歌单（返回简略信息列表）。
@@ -1277,12 +1301,33 @@ pub fn netease_save_playlist_to_library(
 pub fn netease_get_user_account(
     ctx: State<'_, Arc<AppContext>>,
 ) -> Result<serde_json::Value, String> {
+    // 调试日志：确认 cookie 是否被正确传递到 HTTP 客户端
+    let cookie = ctx.netease_source.client().cookie();
+    let cookie_preview: String = cookie.chars().take(80).collect();
+    eprintln!(
+        "[netease] get_user_account 调用，cookie 长度={}，预览=\"{}...\"",
+        cookie.len(),
+        cookie_preview
+    );
+
     let resp = ctx.netease_source.get_user_account()?;
-    Ok(serde_json::json!({
+    eprintln!(
+        "[netease] get_user_account 响应：code={}，profile={}，account={}",
+        resp.code,
+        resp.profile.is_some(),
+        resp.account.is_some()
+    );
+
+    let json = serde_json::json!({
         "code": resp.code,
         "profile": resp.profile,
         "account": resp.account,
-    }))
+    });
+    eprintln!(
+        "[netease] get_user_account 返回 JSON：{}",
+        serde_json::to_string(&json).unwrap_or_default()
+    );
+    Ok(json)
 }
 
 /// 获取指定用户的全部歌单（创建 + 收藏，通过 `subscribed` 字段区分）。
@@ -1452,12 +1497,13 @@ pub fn netease_compare_with_local(
                 .iter()
                 .find(|sid| sid.source_name == "local")
                 .map(|sid| sid.entity_id.clone());
-            let quality = local_path
+            let descriptor = local_path
                 .as_ref()
                 .and_then(|p| std::path::Path::new(p).extension())
                 .and_then(|e| e.to_str())
-                .map(AudioQuality::from_extension)
-                .unwrap_or(AudioQuality::Unknown);
+                .map(AudioQualityDescriptor::from_extension)
+                .unwrap_or_else(AudioQualityDescriptor::unknown);
+            let quality = AudioQuality::from(descriptor.rank);
             serde_json::json!({
                 "song_id": s.id,
                 "title": s.title,
@@ -1466,6 +1512,212 @@ pub fn netease_compare_with_local(
                 "file_path": local_path,
                 "quality": quality.to_level_str(),
                 "quality_rank": quality as u8,
+                "quality_descriptor": descriptor,
+                "quality_label": descriptor.label(),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "matches": matches,
+        "has_local_match": !matches.is_empty(),
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 通用云端来源命令 — 从网络来源实例选择一个云端音乐源进行下载/比较
+// ══════════════════════════════════════════════════════════════════════════════
+
+use chordial_core::module::music_source::types::AudioQualityDescriptor;
+
+/// 列出已注册的云端（Web）音乐来源。
+///
+/// 用于下载对话框的"来源选择"下拉框。仅返回已通过 `registrar.register` 注册的 Web 类型来源。
+/// 本地来源不会出现在此列表中。
+///
+/// # 返回
+/// `[{ name, display_name, source_type, enabled }]`
+#[tauri::command]
+pub fn source_list_web_sources(ctx: State<'_, Arc<AppContext>>) -> Result<Vec<serde_json::Value>, String> {
+    let entries = ctx.registrar.get_entries();
+    let result: Vec<serde_json::Value> = entries
+        .into_iter()
+        .filter(|e| e.source_type.is_web())
+        .map(|e| {
+            // 显示名映射：未来可通过 trait 方法提供；当前硬编码 netease → 网易云
+            let display_name = match e.name.as_str() {
+                "netease" => "网易云音乐",
+                _ => &e.name,
+            };
+            serde_json::json!({
+                "name": e.name,
+                "display_name": display_name,
+                "source_type": match &e.source_type {
+                    chordial_core::module::music_source::types::SourceType::Web(name) => name.clone(),
+                    _ => String::new(),
+                },
+                "enabled": true, // 已注册即视为启用
+            })
+        })
+        .collect();
+    Ok(result)
+}
+
+/// 从指定云端来源下载歌曲到本地 download_dir。
+///
+/// # 参数
+/// - `source_name`: 来源名（如 `"netease"`），必须为已注册的 Web 来源
+/// - `song_entity_id`: 来源内部的歌曲 entity_id（如 `"song:123456"`）
+/// - `title`: 歌曲标题（用于文件命名）
+/// - `artist`: 主艺术家名（用于文件命名）
+/// - `level`: 音质等级（可选，默认 `"exhigh"`）
+///
+/// # 返回
+/// `{ path: string, quality_descriptor: AudioQualityDescriptor }`
+#[tauri::command]
+pub fn source_download_song(
+    ctx: State<'_, Arc<AppContext>>,
+    source_name: String,
+    song_entity_id: String,
+    title: String,
+    artist: String,
+    level: Option<String>,
+) -> Result<serde_json::Value, String> {
+    // 校验来源已注册（当前仅 netease 实现，其他来源返回错误）
+    let _ = ctx
+        .registrar
+        .get(&source_name)
+        .ok_or_else(|| format!("来源 '{}' 未注册或未启用", source_name))?;
+
+    // 当前仅 netease 实现了下载到文件的能力；其他 Web 来源需各自实现
+    // （未来可通过 trait 扩展方法 `download_to_file` 统一接口）
+    if source_name != chordial_core::module::music_netease_source::NETEASE_SOURCE_NAME {
+        return Err(format!(
+            "来源 '{}' 暂不支持下载（仅 netease 实现）",
+            source_name
+        ));
+    }
+
+    // 解析网易云 entity_id 中的远程 ID
+    let remote_id = song_entity_id
+        .splitn(3, ':')
+        .nth(1)
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| format!("无效的 entity_id: {}", song_entity_id))?;
+
+    let level_str = level.unwrap_or_else(|| AudioQuality::Exhigh.to_level_str().to_string());
+    let (bytes, url_data) = music_netease_source::api::download_song(
+        ctx.netease_source.client(),
+        remote_id,
+        &level_str,
+    )?;
+
+    // 从网易云返回数据构造真实音质描述符（包含真实码率 + 编码格式）
+    let quality_descriptor = url_data.to_quality_descriptor();
+
+    // 推断扩展名：优先 url_data.type，其次 level
+    let ext = url_data
+        .r#type
+        .as_deref()
+        .and_then(|t| match t.to_lowercase().as_str() {
+            "flac" => Some("flac"),
+            "mp3" => Some("mp3"),
+            "m4a" => Some("m4a"),
+            _ => None,
+        })
+        .unwrap_or_else(|| match level_str.as_str() {
+            "lossless" | "hires" => "flac",
+            _ => "mp3",
+        });
+
+    // 解析 download_dir：优先 netease 配置；为空则回退到 app_data_dir/downloads
+    let download_dir_str = ctx.netease_source.download_dir();
+    let download_dir = if download_dir_str.is_empty() {
+        let config_path = ctx.config.path();
+        let parent = config_path
+            .parent()
+            .ok_or_else(|| "无法定位应用数据目录".to_string())?;
+        parent.join("downloads")
+    } else {
+        std::path::PathBuf::from(download_dir_str)
+    };
+
+    let path = cache::write_downloaded_file(&download_dir, &source_name, &artist, &title, ext, &bytes)?;
+
+    Ok(serde_json::json!({
+        "path": path.to_string_lossy(),
+        "quality_descriptor": quality_descriptor,
+        "quality_label": quality_descriptor.label(),
+    }))
+}
+
+/// 比较 online 歌曲与本地库中相同歌曲的音质（通用版本）。
+///
+/// 与 [`netease_compare_with_local`] 行为一致，但接受 `source_name` 参数以便未来支持多来源。
+/// 当前仅 netease 来源可用，其他来源返回空匹配。
+///
+/// # 返回
+/// `{ matches: [...], has_local_match: bool }`
+/// 每个 match 包含完整的 `quality_descriptor`（rank + bitrate_kbps + codec + 采样率 + 位深）
+#[tauri::command]
+pub fn source_compare_with_local(
+    ctx: State<'_, Arc<AppContext>>,
+    source_name: String,
+    title: String,
+    artist: String,
+    album: Option<String>,
+) -> Result<serde_json::Value, String> {
+    // 校验来源已注册
+    if ctx.registrar.get(&source_name).is_none() {
+        return Err(format!("来源 '{}' 未注册或未启用", source_name));
+    }
+
+    let title_lower = title.to_lowercase();
+    let artist_lower = artist.to_lowercase();
+    let album_lower = album
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+
+    let candidates = ctx.library.search_songs(&title);
+    let matches: Vec<serde_json::Value> = candidates
+        .into_iter()
+        .filter(|s| s.title.to_lowercase().contains(&title_lower))
+        .filter(|s| {
+            if artist.is_empty() {
+                return true;
+            }
+            s.artist_names
+                .iter()
+                .any(|a| a.to_lowercase().contains(&artist_lower))
+        })
+        .filter(|s| match (&album_lower, &s.album_title) {
+            (None, _) | (_, None) => true,
+            (Some(al), Some(at)) => at.to_lowercase().contains(al),
+        })
+        .map(|s| {
+            let local_path = s
+                .source_ids
+                .iter()
+                .find(|sid| sid.source_name == "local")
+                .map(|sid| sid.entity_id.clone());
+            let descriptor = local_path
+                .as_ref()
+                .and_then(|p| std::path::Path::new(p).extension())
+                .and_then(|e| e.to_str())
+                .map(AudioQualityDescriptor::from_extension)
+                .unwrap_or_else(AudioQualityDescriptor::unknown);
+            let quality = AudioQuality::from(descriptor.rank);
+            serde_json::json!({
+                "song_id": s.id,
+                "title": s.title,
+                "artist_names": s.artist_names,
+                "album_title": s.album_title,
+                "file_path": local_path,
+                "quality": quality.to_level_str(),
+                "quality_rank": quality as u8,
+                "quality_descriptor": descriptor,
+                "quality_label": descriptor.label(),
             })
         })
         .collect();
