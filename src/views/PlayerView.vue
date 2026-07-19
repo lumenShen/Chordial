@@ -3,10 +3,10 @@
     <div ref="root" class="player-view" tabindex="0" @keydown="onKeydown">
       <!-- AMLL React 播放器挂载点 -->
       <div ref="amllContainer" class="amll-container" />
-      <!-- 关闭按钮（浮动在 AMLL 之上） -->
-      <button class="close-btn" @click="handleClose" title="关闭">
-        <i class="bi bi-chevron-down"></i>
-      </button>
+      <!-- 顶部窗口拖动区域（仅桌面端）
+           pointer-events:none 让点击穿透到 AMLL 的 ControlThumb；
+           -webkit-app-region:drag 由 Tauri native 层识别用于拖动窗口 -->
+      <div v-if="isDesktop" class="drag-region" />
     </div>
   </Teleport>
 </template>
@@ -18,6 +18,9 @@ import { createElement } from 'react'
 import { AmllPlayer } from '@/amll/AmllPlayer.jsx'
 import { useAmllBridge } from '@/amll/useAmllBridge.js'
 import { PlayerStore } from '@/stores/player.js'
+import { usePlatform } from '@/composables/usePlatform.js'
+
+const { isDesktop } = usePlatform()
 
 const root = ref(null)
 const amllContainer = ref(null)
@@ -80,33 +83,20 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
-.close-btn {
+/* 顶部窗口拖动区域：仅桌面端
+   - 高度 32px，覆盖整个宽度
+   - -webkit-app-region:drag 让 Tauri 识别为窗口拖动区
+   - pointer-events:none 让点击穿透到下方的 AMLL ControlThumb
+   - Tauri 的 drag 识别独立于浏览器 pointer-events，两者可共存 */
+.drag-region {
   position: fixed;
-  top: max(12px, env(safe-area-inset-top, 0px));
-  left: 50%;
-  transform: translateX(-50%);
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  -webkit-app-region: drag;
+  pointer-events: none;
   z-index: 310;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  border: none;
-  background: rgba(255, 255, 255, 0.1);
-  backdrop-filter: blur(12px);
-  color: rgba(255, 255, 255, 0.8);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: background 0.15s, transform 0.15s;
-  font-size: 1.1rem;
-}
-
-.close-btn:hover {
-  background: rgba(255, 255, 255, 0.2);
-}
-
-.close-btn:active {
-  transform: translateX(-50%) scale(0.92);
 }
 
 @keyframes player-enter {
@@ -117,22 +107,6 @@ onBeforeUnmount(() => {
   to {
     opacity: 1;
     transform: translateY(0);
-  }
-}
-
-@media (min-width: 768px) {
-  .close-btn {
-    left: 24px;
-    transform: none;
-    top: 24px;
-  }
-
-  .close-btn:hover {
-    transform: scale(1.05);
-  }
-
-  .close-btn:active {
-    transform: scale(0.92);
   }
 }
 </style>

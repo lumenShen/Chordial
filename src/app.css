@@ -201,3 +201,11 @@ img {
   -webkit-user-drag: none;
   user-select: none;
 }
+
+/* AMLL 播放器内的交互元素需显式标记 no-drag，
+   保证 PlayerView 顶部 drag-region 不会拦截 ControlThumb 点击。
+   AMLL core/react-full 使用 CSS Module hash 类名（如 OWkF6W_controlThumb），
+   用 [class*="controlThumb"] 通配匹配并限定在 .amll-container 内避免误伤。 */
+.amll-container [class*="controlThumb"] {
+  -webkit-app-region: no-drag;
+}

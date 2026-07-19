@@ -55,6 +55,11 @@ const navItems = [
     icon: 'bi-disc'
   },
   {
+    path: '/playlists',
+    name: '歌单',
+    icon: 'bi-music-note-list'
+  },
+  {
     path: '/music-sources',
     name: '音乐源',
     icon: 'bi-folder'

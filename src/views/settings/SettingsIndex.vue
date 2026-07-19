@@ -33,6 +33,15 @@
         <i class="bi bi-chevron-right card-arrow"></i>
       </router-link>
 
+      <router-link :to="{ name: 'SettingsNetease' }" class="index-card">
+        <div class="card-icon"><i class="bi bi-cloud-arrow-down"></i></div>
+        <div class="card-body">
+          <h3 class="card-title">网易云音乐来源</h3>
+          <p class="card-desc">API 服务器配置、Cookie、下载目录、歌词优先级</p>
+        </div>
+        <i class="bi bi-chevron-right card-arrow"></i>
+      </router-link>
+
       <router-link :to="{ name: 'SettingsMaintenance' }" class="index-card">
         <div class="card-icon"><i class="bi bi-wrench-adjustable"></i></div>
         <div class="card-body">

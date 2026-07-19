@@ -14,6 +14,10 @@ const GeneralSettingsView = () => import('../views/settings/GeneralSettingsView.
 const P2pSettingsView = () => import('../views/settings/P2pSettingsView.vue')
 const LyricsSettingsView = () => import('../views/settings/LyricsSettingsView.vue')
 const MaintenanceSettingsView = () => import('../views/settings/MaintenanceSettingsView.vue')
+const NeteaseSettingsView = () => import('../views/settings/NeteaseSettingsView.vue')
+const PlaylistsView = () => import('../views/PlaylistsView.vue')
+const PlaylistDetailView = () => import('../views/PlaylistDetailView.vue')
+const PlaylistSearchView = () => import('../views/PlaylistSearchView.vue')
 const TestPage = () => import('../views/TestPage.vue')
 const Search = () => import('../views/Search.vue')
 
@@ -64,6 +68,25 @@ const routes = [
     meta: { title: '专辑详情' }
   },
   {
+    path: '/playlists',
+    name: 'Playlists',
+    component: PlaylistsView,
+    meta: { title: '歌单' }
+  },
+  {
+    path: '/playlists/search',
+    name: 'PlaylistSearch',
+    component: PlaylistSearchView,
+    meta: { title: '搜索网易云歌单' }
+  },
+  {
+    path: '/playlists/:id',
+    name: 'PlaylistDetail',
+    component: PlaylistDetailView,
+    props: true,
+    meta: { title: '歌单详情' }
+  },
+  {
     path: '/music-sources',
     name: 'MusicSourceManager',
     component: MusicSourceManager,
@@ -111,6 +134,12 @@ const routes = [
         name: 'SettingsMaintenance',
         component: MaintenanceSettingsView,
         meta: { title: '数据维护' }
+      },
+      {
+        path: 'netease',
+        name: 'SettingsNetease',
+        component: NeteaseSettingsView,
+        meta: { title: '网易云音乐来源' }
       }
     ]
   },
