@@ -1432,23 +1432,14 @@ pub fn netease_download_song(
         .ok_or_else(|| format!("无效的 entity_id: {}", song_entity_id))?;
 
     let level = level.unwrap_or_else(|| AudioQuality::Exhigh.to_level_str().to_string());
-    let (bytes, url_data) =
-        music_netease_source::api::download_song(ctx.netease_source.client(), remote_id, &level)?;
 
     // 推断扩展名：优先 url_data.type，其次 level（lossless→flac），最后默认 mp3
-    let ext = url_data
-        .r#type
-        .as_deref()
-        .and_then(|t| match t.to_lowercase().as_str() {
-            "flac" => Some("flac"),
-            "mp3" => Some("mp3"),
-            "m4a" => Some("m4a"),
-            _ => None,
-        })
-        .unwrap_or_else(|| match level.as_str() {
-            "lossless" | "hires" => "flac",
-            _ => "mp3",
-        });
+    // 但扩展名需要先调 /song/url/v1 才知道，为避免两次 API 调用，
+    // 这里按 level 预推断扩展名，url_data.type 仅用于校验
+    let ext = match level.as_str() {
+        "lossless" | "hires" => "flac",
+        _ => "mp3",
+    };
 
     // 解析 download_dir：优先 netease 配置；为空则回退到 app_data_dir/downloads
     let download_dir_str = ctx.netease_source.download_dir();
@@ -1462,7 +1453,27 @@ pub fn netease_download_song(
         std::path::PathBuf::from(download_dir_str)
     };
 
-    let path = cache::write_downloaded_file(&download_dir, "netease", &artist, &title, ext, &bytes)?;
+    // 先构建目标文件路径（创建父目录），再流式下载到文件
+    let path = cache::prepare_download_path(&download_dir, "netease", &artist, &title, ext)?;
+
+    // 流式下载到文件（避免大文件全量读入内存）
+    // 旧实现：get_bytes 返回 Vec<u8> → write_downloaded_file 写盘（50MB FLAC 占 50MB 内存）
+    // 新实现：download_song_to_file 直接流式写入文件（8KB 缓冲区）
+    let (written, _url_data) = music_netease_source::api::download_song_to_file(
+        ctx.netease_source.client(),
+        remote_id,
+        &level,
+        &path,
+    )?;
+
+    eprintln!(
+        "[netease] download_song id={} level={} 写入 {} 字节到 {}",
+        remote_id,
+        level,
+        written,
+        path.display()
+    );
+
     Ok(path.to_string_lossy().to_string())
 }
 

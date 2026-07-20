@@ -170,6 +170,31 @@ pub fn write_downloaded_file(
     Ok(full_path)
 }
 
+/// 仅准备下载文件路径（创建父目录），不写入内容。
+///
+/// 用于流式下载场景：先调用此函数得到目标路径并确保父目录存在，
+/// 再用 `WebHttpClient::download_to_file` 流式写入。
+///
+/// 相比 `write_downloaded_file`：避免把整个文件字节读入 `Vec<u8>` 再写盘。
+pub fn prepare_download_path(
+    download_dir: &std::path::Path,
+    source_name: &str,
+    artist: &str,
+    title: &str,
+    ext: &str,
+) -> Result<PathBuf, String> {
+    let relative = build_relative_path(source_name, artist, title, ext);
+    let full_path = download_dir.join(&relative);
+
+    // 确保父目录存在
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建下载目录失败 '{}': {}", parent.display(), e))?;
+    }
+
+    Ok(full_path)
+}
+
 /// 为已下载到本地的文件构造一个 local [`SourceId`]。
 ///
 /// 用于在库中将歌曲的 source_ids 替换/追加一个 local 引用，

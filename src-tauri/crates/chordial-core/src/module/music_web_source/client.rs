@@ -194,6 +194,49 @@ impl WebHttpClient {
             .map_err(|e| format!("读取响应体失败: {}", e))
     }
 
+    /// 流式下载到文件（避免大文件全量读入内存）。
+    ///
+    /// 用于下载音频文件（FLAC/WAV 可能 50MB+），相比 `get_bytes` + 写盘：
+    /// - 内存占用从 O(file_size) 降到 O(buffer_size)（默认 8KB）
+    /// - 省去 Vec<u8> → 文件 的二次拷贝
+    /// - 支持单独配置下载超时（不受 timeout_secs 限制）
+    ///
+    /// # 参数
+    /// - `url`: 完整下载 URL（CDN URL）
+    /// - `path`: 目标文件路径（父目录应已存在）
+    /// - `download_timeout_secs`: 下载超时秒数（0 = 不限时）
+    pub fn download_to_file(
+        &self,
+        url: &str,
+        path: &std::path::Path,
+        download_timeout_secs: u64,
+    ) -> Result<u64, String> {
+        use std::io::Write;
+
+        let mut rb = self.client.get(url);
+        // 下载大文件时覆盖默认 15s 超时
+        if download_timeout_secs > 0 {
+            rb = rb.timeout(Duration::from_secs(download_timeout_secs));
+        }
+        let rb = self.attach_cookie(rb);
+        let mut resp = rb
+            .send()
+            .map_err(|e| format!("GET {} 失败: {}", url, e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("GET {} 状态码 {}", url, status));
+        }
+
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("创建文件失败 '{}': {}", path.display(), e))?;
+
+        // 流式拷贝：reqwest Response 实现 Read，File 实现 Write
+        let written = std::io::copy(&mut resp, &mut file)
+            .map_err(|e| format!("下载写入失败: {}", e))?;
+        file.flush().map_err(|e| format!("文件 flush 失败: {}", e))?;
+        Ok(written)
+    }
+
     /// 发送 GET 请求并返回完整 URL 文本（用于重定向后的 URL 解析）。
     pub fn get_text(&self, url: &str) -> Result<String, String> {
         let rb = self.client.get(url);

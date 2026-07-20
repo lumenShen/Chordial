@@ -259,6 +259,36 @@ pub fn download_song(
     Ok((bytes, url_data))
 }
 
+/// 下载歌曲到文件（流式，避免大文件全量读入内存）。
+///
+/// 相比 `download_song`：
+/// - 内存占用从 O(file_size) 降到 O(8KB)（流式缓冲区）
+/// - 省去 Vec<u8> → 文件 的二次拷贝
+/// - 下载超时单独配置（默认 300s，足以下载 lossless/hires）
+///
+/// # 参数
+/// - `song_id`: 网易云歌曲 ID
+/// - `level`: 音质等级（"standard"/"higher"/"exhigh"/"lossless"/"hires"）
+/// - `path`: 目标文件路径（父目录应已存在）
+///
+/// # 返回
+/// `(written_bytes, url_data)` — 写入字节数 + URL 元信息（含音质/类型）
+pub fn download_song_to_file(
+    client: &WebHttpClient,
+    song_id: i64,
+    level: &str,
+    path: &std::path::Path,
+) -> Result<(u64, NeteaseSongUrlData), String> {
+    let url_data = get_song_url(client, song_id, level)?;
+    let url = url_data
+        .url
+        .clone()
+        .ok_or_else(|| "歌曲 URL 为空（可能是无版权或 VIP 歌曲）".to_string())?;
+    // 下载超时 300s（足以下载 50MB+ lossless 文件）
+    let written = client.download_to_file(&url, path, 300)?;
+    Ok((written, url_data))
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // 扫码登录
 // ───────────────────────────────────────────────────────────────────────────
