@@ -276,8 +276,13 @@ export function useAmllBridge() {
 		onEmit: () => PlayerStore.closePlayerView(),
 	})
 
-	// 菜单按钮 / 音质标签（暂无功能，预留）
-	store.set(onRequestOpenMenuAtom, { onEmit: () => {} })
+	// 菜单按钮（musicInfo 区唯一的 button）→ 打开歌曲菜单 Sheet
+	// Sheet 由 PlayerView.vue 内挂载的 TrackMenuSheet 监听 isTrackMenuOpen 渲染
+	store.set(onRequestOpenMenuAtom, {
+		onEmit: () => PlayerStore.openTrackMenu(),
+	})
+
+	// 音质标签（暂无功能，预留）
 	store.set(onClickAudioQualityTagAtom, { onEmit: () => {} })
 
 	// ── 2. 应用持久化配置（从 localStorage 读取后写入 Jotai）──
