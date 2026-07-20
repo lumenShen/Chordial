@@ -35,6 +35,9 @@ const LOG_BUFFER_CAP: usize = 500;
 const RECENT_LOGS_DISPLAY: usize = 200;
 
 /// 返回所有可部署来源的固定规格（按 ID 升序）。
+///
+/// 默认端口已错开，避免同时启动多服务时端口冲突：
+/// - netease :3000 | kugou :3001 | qq :3300
 pub fn list_deployable_sources() -> Vec<DeployableSourceSpec> {
     vec![
         DeployableSourceSpec {
@@ -57,7 +60,7 @@ pub fn list_deployable_sources() -> Vec<DeployableSourceSpec> {
             install_command: "npm".into(),
             install_args: vec!["install".into()],
             description: "KuGouMusicApi — 提供酷狗音乐搜索/下载/扫码登录".into(),
-            default_port: 3000,
+            default_port: 3001,
         },
         DeployableSourceSpec {
             id: "qq".into(),
