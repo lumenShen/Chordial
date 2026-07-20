@@ -2126,9 +2126,10 @@ pub fn source_list_web_sources(ctx: State<'_, Arc<AppContext>>) -> Result<Vec<se
         .into_iter()
         .filter(|e| e.source_type.is_web())
         .map(|e| {
-            // 显示名映射：未来可通过 trait 方法提供；当前硬编码 netease → 网易云
+            // 显示名映射：未来可通过 trait 方法提供；当前硬编码 netease/kugou
             let display_name = match e.name.as_str() {
                 "netease" => "网易云音乐",
+                "kugou" => "酷狗音乐",
                 _ => &e.name,
             };
             serde_json::json!({
@@ -2165,55 +2166,89 @@ pub fn source_download_song(
     artist: String,
     level: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    // 校验来源已注册（当前仅 netease 实现，其他来源返回错误）
+    // 校验来源已注册
     let _ = ctx
         .registrar
         .get(&source_name)
         .ok_or_else(|| format!("来源 '{}' 未注册或未启用", source_name))?;
 
-    // 当前仅 netease 实现了下载到文件的能力；其他 Web 来源需各自实现
-    // （未来可通过 trait 扩展方法 `download_to_file` 统一接口）
-    if source_name != chordial_core::module::music_netease_source::NETEASE_SOURCE_NAME {
+    use chordial_core::module::music_kugou_source;
+    use chordial_core::module::music_netease_source;
+
+    // 分支处理：netease 与 kugou 各自走对应的下载 API
+    let (bytes, quality_descriptor, ext, download_dir_str) = if source_name
+        == music_netease_source::NETEASE_SOURCE_NAME
+    {
+        // ── 网易云下载 ──
+        let remote_id = song_entity_id
+            .splitn(3, ':')
+            .nth(1)
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| format!("无效的 entity_id: {}", song_entity_id))?;
+
+        let level_str = level.unwrap_or_else(|| AudioQuality::Exhigh.to_level_str().to_string());
+        let (b, url_data) = music_netease_source::api::download_song(
+            ctx.netease_source.client(),
+            remote_id,
+            &level_str,
+        )?;
+        let qd = url_data.to_quality_descriptor();
+        let e = url_data
+            .r#type
+            .as_deref()
+            .and_then(|t| match t.to_lowercase().as_str() {
+                "flac" => Some("flac"),
+                "mp3" => Some("mp3"),
+                "m4a" => Some("m4a"),
+                _ => None,
+            })
+            .unwrap_or_else(|| match level_str.as_str() {
+                "lossless" | "hires" => "flac",
+                _ => "mp3",
+            });
+        (b, qd, e.to_string(), ctx.netease_source.download_dir())
+    } else if source_name == music_kugou_source::KUGOU_SOURCE_NAME {
+        // ── 酷狗下载 ──
+        // entity_id 格式：song:<hash>，hash 是 32 位十六进制字符串
+        let hash = song_entity_id
+            .splitn(3, ':')
+            .nth(1)
+            .ok_or_else(|| format!("无效的 entity_id: {}", song_entity_id))?;
+        if hash.is_empty() {
+            return Err(format!("无效的 hash: {}", song_entity_id));
+        }
+        // level 可选：酷狗音质字符串（"128"/"320"/"flac"/"high"/"super"），默认 "320"
+        let quality_str = level.unwrap_or_else(|| "320".to_string());
+        let (b, url_data) = music_kugou_source::api::download_song(
+            ctx.kugou_source.client(),
+            hash,
+            &quality_str,
+            None,
+        )?;
+        // 从酷狗返回的 URL 数据构造音质描述符
+        let url_entry = url_data
+            .url
+            .first()
+            .ok_or_else(|| "酷狗返回空 URL 列表".to_string())?;
+        let qd = build_kugou_quality_descriptor(&url_entry.quality, url_entry.bitRate, &url_entry.r#type);
+        let e = match url_entry.r#type.to_lowercase().as_str() {
+            "flac" => "flac",
+            "mp3" => "mp3",
+            "m4a" | "aac" => "m4a",
+            _ => match url_entry.quality.as_str() {
+                "flac" | "high" | "super" => "flac",
+                _ => "mp3",
+            },
+        };
+        (b, qd, e.to_string(), ctx.kugou_source.download_dir())
+    } else {
         return Err(format!(
-            "来源 '{}' 暂不支持下载（仅 netease 实现）",
+            "来源 '{}' 暂不支持下载（仅支持 netease/kugou）",
             source_name
         ));
-    }
+    };
 
-    // 解析网易云 entity_id 中的远程 ID
-    let remote_id = song_entity_id
-        .splitn(3, ':')
-        .nth(1)
-        .and_then(|s| s.parse::<i64>().ok())
-        .ok_or_else(|| format!("无效的 entity_id: {}", song_entity_id))?;
-
-    let level_str = level.unwrap_or_else(|| AudioQuality::Exhigh.to_level_str().to_string());
-    let (bytes, url_data) = music_netease_source::api::download_song(
-        ctx.netease_source.client(),
-        remote_id,
-        &level_str,
-    )?;
-
-    // 从网易云返回数据构造真实音质描述符（包含真实码率 + 编码格式）
-    let quality_descriptor = url_data.to_quality_descriptor();
-
-    // 推断扩展名：优先 url_data.type，其次 level
-    let ext = url_data
-        .r#type
-        .as_deref()
-        .and_then(|t| match t.to_lowercase().as_str() {
-            "flac" => Some("flac"),
-            "mp3" => Some("mp3"),
-            "m4a" => Some("m4a"),
-            _ => None,
-        })
-        .unwrap_or_else(|| match level_str.as_str() {
-            "lossless" | "hires" => "flac",
-            _ => "mp3",
-        });
-
-    // 解析 download_dir：优先 netease 配置；为空则回退到 app_data_dir/downloads
-    let download_dir_str = ctx.netease_source.download_dir();
+    // 解析 download_dir：优先来源配置；为空则回退到 app_data_dir/downloads
     let download_dir = if download_dir_str.is_empty() {
         let config_path = ctx.config.path();
         let parent = config_path
@@ -2224,13 +2259,47 @@ pub fn source_download_song(
         std::path::PathBuf::from(download_dir_str)
     };
 
-    let path = cache::write_downloaded_file(&download_dir, &source_name, &artist, &title, ext, &bytes)?;
+    let path = cache::write_downloaded_file(&download_dir, &source_name, &artist, &title, &ext, &bytes)?;
 
     Ok(serde_json::json!({
         "path": path.to_string_lossy(),
         "quality_descriptor": quality_descriptor,
         "quality_label": quality_descriptor.label(),
     }))
+}
+
+/// 从酷狗返回数据构造音质描述符。
+///
+/// 酷狗 quality 字段为字符串（"128"/"320"/"flac"/"high"/"super"），
+/// 映射到内部 [`AudioQuality`] 后再生成描述符。
+fn build_kugou_quality_descriptor(
+    quality: &str,
+    bit_rate: i64,
+    file_type: &str,
+) -> AudioQualityDescriptor {
+    use chordial_core::module::music_source::types::{AudioCodec, AudioQuality};
+    let aq = match quality.to_lowercase().as_str() {
+        "128" => AudioQuality::Standard,
+        "320" => AudioQuality::Exhigh,
+        "flac" | "high" => AudioQuality::Lossless,
+        "super" => AudioQuality::Hires,
+        _ => AudioQuality::Unknown,
+    };
+    let mut desc = aq.descriptor();
+    // 若接口返回了真实码率，覆盖默认值
+    if bit_rate > 0 {
+        desc.bitrate_kbps = bit_rate as u32;
+    }
+    // 若接口返回了真实编码格式，覆盖默认值
+    if !file_type.is_empty() {
+        desc.codec = match file_type.to_lowercase().as_str() {
+            "flac" => AudioCodec::Flac,
+            "mp3" => AudioCodec::Mp3,
+            "m4a" | "aac" => AudioCodec::Aac,
+            _ => desc.codec,
+        };
+    }
+    desc
 }
 
 /// 比较 online 歌曲与本地库中相同歌曲的音质（通用版本）。

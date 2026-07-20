@@ -15,6 +15,7 @@ const P2pSettingsView = () => import('../views/settings/P2pSettingsView.vue')
 const LyricsSettingsView = () => import('../views/settings/LyricsSettingsView.vue')
 const MaintenanceSettingsView = () => import('../views/settings/MaintenanceSettingsView.vue')
 const NeteaseSettingsView = () => import('../views/settings/NeteaseSettingsView.vue')
+const KugouSettingsView = () => import('../views/settings/KugouSettingsView.vue')
 const PlaylistsView = () => import('../views/PlaylistsView.vue')
 const PlaylistDetailView = () => import('../views/PlaylistDetailView.vue')
 const PlaylistSearchView = () => import('../views/PlaylistSearchView.vue')
@@ -97,6 +98,12 @@ const routes = [
     name: 'MusicSourceNetease',
     component: NeteaseSettingsView,
     meta: { title: '网易云音乐来源' }
+  },
+  {
+    path: '/music-sources/kugou',
+    name: 'MusicSourceKugou',
+    component: KugouSettingsView,
+    meta: { title: '酷狗音乐来源' }
   },
   {
     path: '/track/:trackId',

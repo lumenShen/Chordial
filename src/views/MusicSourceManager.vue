@@ -10,6 +10,7 @@ import {
   rescanAll,
 } from '../api/musicSource';
 import * as neteaseApi from '@/api/musicSource/netease.js';
+import * as kugouApi from '@/api/musicSource/kugou.js';
 import { usePerf } from '@/utils/performanceMonitor.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { useLibraryEvents } from '@/composables/useLibraryEvents.js';
@@ -33,6 +34,14 @@ const neteaseState = ref({
   enabled: false,
   baseUrl: '',
   loggedIn: false,
+  loaded: false,
+});
+
+// 酷狗来源状态
+const kugouState = ref({
+  enabled: false,
+  baseUrl: '',
+  hasCookie: false,
   loaded: false,
 });
 
@@ -80,10 +89,11 @@ watch([isScanning, isAdding], ([scanning, adding]) => {
 const loadData = async () => {
   start('loadData');
   try {
-    const [paths, s, neteaseCfg] = await Promise.all([
+    const [paths, s, neteaseCfg, kugouCfg] = await Promise.all([
       getFolders(),
       getLocalStats(),
       neteaseApi.getConfig().catch(() => null),
+      kugouApi.getConfig().catch(() => null),
     ]);
     folders.value = (paths || []).map((p) => ({
       path: p,
@@ -97,6 +107,15 @@ const loadData = async () => {
         enabled: !!neteaseCfg.enabled,
         baseUrl: neteaseCfg.base_url || '',
         loggedIn: /(^|;\s*)MUSIC_U\s*=/.test(cookie),
+        loaded: true,
+      };
+    }
+    if (kugouCfg) {
+      const cookie = (kugouCfg.cookie || '').trim();
+      kugouState.value = {
+        enabled: !!kugouCfg.enabled,
+        baseUrl: kugouCfg.base_url || '',
+        hasCookie: cookie.length > 0,
         loaded: true,
       };
     }
@@ -181,6 +200,11 @@ const formatFileCount = (n) => {
 // 跳转到网易云来源设置页
 const goToNeteaseSettings = () => {
   router.push('/music-sources/netease');
+};
+
+// 跳转到酷狗来源设置页
+const goToKugouSettings = () => {
+  router.push('/music-sources/kugou');
 };
 </script>
 
@@ -311,6 +335,42 @@ const goToNeteaseSettings = () => {
           </button>
         </div>
       </div>
+
+      <!-- 酷狗音乐来源卡片 -->
+      <div class="source-card card online-source-card" @click="goToKugouSettings" role="button" tabindex="0"
+        @keydown.enter.prevent="goToKugouSettings" @keydown.space.prevent="goToKugouSettings">
+        <div class="source-info">
+          <div class="source-icon kugou-icon">
+            <i class="bi bi-music-note-beamed"></i>
+          </div>
+          <div class="source-details">
+            <h3 class="source-name">
+              酷狗音乐
+              <span class="source-type-badge" :class="kugouState.enabled ? 'enabled' : 'disabled'">
+                {{ kugouState.enabled ? '已启用' : '未启用' }}
+              </span>
+            </h3>
+            <p class="source-path">
+              <template v-if="kugouState.loaded">
+                {{ kugouState.baseUrl || '（未配置 API 服务器）' }}
+              </template>
+              <template v-else>加载中…</template>
+            </p>
+            <div class="source-meta">
+              <span class="meta-tag" :class="kugouState.hasCookie ? 'ok' : 'warn'">
+                <i class="bi" :class="kugouState.hasCookie ? 'bi-check-circle-fill' : 'bi-exclamation-circle-fill'"></i>
+                {{ kugouState.hasCookie ? '已配置 Cookie' : '未配置 Cookie' }}
+              </span>
+              <span class="meta-tag">搜索歌曲 · 在线下载 · LRC 歌词</span>
+            </div>
+          </div>
+        </div>
+        <div class="source-actions">
+          <button class="btn-icon" title="设置" aria-label="设置">
+            <i class="bi bi-chevron-right"></i>
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- Unsupported source notice -->
@@ -326,7 +386,7 @@ const goToNeteaseSettings = () => {
         </p>
         <p class="note-text">
           网盘（WebDisk）和 WebDAV 来源目前后端尚未实现。
-          当前支持本地文件夹与网易云音乐 API 两个来源。
+          当前支持本地文件夹、网易云音乐 API 与酷狗音乐 API 三个来源。
         </p>
       </div>
     </div>
@@ -518,6 +578,15 @@ const goToNeteaseSettings = () => {
 }
 
 .netease-icon i {
+  font-size: 22px;
+}
+
+.kugou-icon {
+  background: linear-gradient(135deg, #0faf53 0%, #2dd470 100%);
+  color: #fff;
+}
+
+.kugou-icon i {
   font-size: 22px;
 }
 

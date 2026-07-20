@@ -188,6 +188,13 @@ pub fn run() {
             commands::netease_download_songs_batch,
             commands::netease_cancel_download_task,
             commands::netease_compare_with_local,
+            // KuGou Music API 来源
+            commands::kugou_get_config,
+            commands::kugou_update_config,
+            commands::kugou_test_connection,
+            commands::kugou_search_songs,
+            commands::kugou_search_artists,
+            commands::kugou_search_albums,
             // 通用云端来源 — 从网络来源实例选择下载
             commands::source_list_web_sources,
             commands::source_download_song,

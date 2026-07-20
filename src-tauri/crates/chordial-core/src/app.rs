@@ -22,6 +22,7 @@
 
 use crate::module::cache::store::CacheStore;
 use crate::module::config::store::ConfigStore;
+use crate::module::music_kugou_source::KugouMusicApiSource;
 use crate::module::music_library::library::MusicLibrary;
 use crate::module::music_localSource;
 use crate::module::music_localSource::source::LocalMusicSource;
@@ -55,6 +56,8 @@ pub struct AppContext {
     pub local_source: Arc<LocalMusicSource>,
     /// 网易云音乐来源实现（运行时配置，启用/禁用由 config 控制）。
     pub netease_source: Arc<NeteaseCloudMusicApiSource>,
+    /// 酷狗音乐来源实现（运行时配置，启用/禁用由 config 控制）。
+    pub kugou_source: Arc<KugouMusicApiSource>,
     /// P2P 资源共享管理器。
     pub p2p: Arc<P2pManager>,
 }
@@ -116,6 +119,20 @@ impl AppContext {
             }
         }
 
+        // ── 酷狗音乐来源（可选，由用户在设置中配置 base_url 后启用）──
+        let kugou_source = Arc::new(
+            KugouMusicApiSource::new(store.clone())
+                .map_err(|e| format!("初始化酷狗来源失败: {}", e))?,
+        );
+        {
+            let cfg = kugou_source.config();
+            if cfg.enabled && !cfg.base_url.is_empty() {
+                if let Err(e) = registrar.register(kugou_source.clone() as Arc<dyn MusicSource>) {
+                    eprintln!("[chordial] 注册酷狗来源失败: {}", e);
+                }
+            }
+        }
+
         // ── P2P 资源共享管理器 ──
         let p2p = P2pManager::new(library.clone(), registrar.clone(), config.clone());
 
@@ -128,6 +145,7 @@ impl AppContext {
             registrar,
             local_source,
             netease_source,
+            kugou_source,
             p2p,
         })
     }
