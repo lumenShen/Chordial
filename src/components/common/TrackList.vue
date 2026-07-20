@@ -45,7 +45,43 @@ const props = defineProps({
   contextMenu: {
     type: Boolean,
     default: true
-  }
+  },
+  // 虚拟列表模式：'container' 自带滚动容器；'page' 使用页面/窗口滚动
+  mode: {
+    type: String,
+    default: 'container',
+    validator: (v) => v === 'container' || v === 'page',
+  },
+  // 是否启用无限滚动加载（用户滑到底部时触发 onLoadMore）
+  infiniteScroll: {
+    type: Boolean,
+    default: false,
+  },
+  // 加载更多回调：() => Promise<void> | Promise<boolean> | void
+  // 返回 false 表示没有更多数据，停止后续触发
+  onLoadMore: {
+    type: Function,
+    default: null,
+  },
+  // 外部控制是否还有更多数据（infiniteScroll 模式下生效）
+  // 优先级高于 useVirtualList 内部判断；为 false 时停止触发 onLoadMore
+  hasMore: {
+    type: Boolean,
+    default: true,
+  },
+  // ── 数量角标 ────────────────────────────────────────────
+  // 是否在每项显示数量角标（用于库内重复音乐/搜索结果去重提示等）
+  showMatchCount: {
+    type: Boolean,
+    default: false,
+  },
+  // 自定义角标计数逻辑：(track) => number | null | undefined
+  // 返回 null/0/undefined 时不显示；返回数字 >0 时显示。
+  // 默认逻辑：取 track.sourceIds?.length（库内歌曲的来源数）
+  getMatchCount: {
+    type: Function,
+    default: null,
+  },
 });
 
 const router = useRouter();
@@ -61,17 +97,63 @@ const { run } = useAnime(() => rootRef.value);
 const tracksRef = computed(() => props.tracks);
 const { coverUrls } = useCoverImages(tracksRef, 'small');
 
+// 无限滚动回调包装：转发 props.onLoadMore，并把 hasMore 同步到 composable
+const handleLoadMore = async () => {
+  if (typeof props.onLoadMore !== 'function') return;
+  const result = await props.onLoadMore();
+  if (result === false) {
+    virtualListApi.hasMore.value = false;
+  }
+};
+
 // 虚拟列表
+const virtualListApi = useVirtualList(tracksRef, {
+  itemHeight: props.itemHeight,
+  bufferSize: 5,
+  containerRef,
+  mode: props.mode,
+  infiniteScroll: props.infiniteScroll && typeof props.onLoadMore === 'function',
+  onLoadMore: handleLoadMore,
+});
+
+// 解构出来用于模板
 const {
   visibleItems,
   totalHeight,
   onScroll,
-  poolSize
-} = useVirtualList(tracksRef, {
-  itemHeight: props.itemHeight,
-  bufferSize: 5,
-  containerRef
-});
+  onPageScroll,
+  poolSize,
+  isLoadingMore,
+  hasMore: vlHasMore,
+  setHasMore,
+} = virtualListApi;
+
+// 同步 props.hasMore → composable 内部状态
+watch(() => props.hasMore, (v) => setHasMore(v), { immediate: true });
+
+// ── 数量角标 ──────────────────────────────────────────
+// 计算每项的角标数字。返回 0 / null / undefined 表示不显示。
+// 默认逻辑：track.sourceIds?.length > 1 时显示来源数（库内歌曲资源分布）
+// 自定义逻辑：父组件传入 getMatchCount 函数
+function getMatchCountFor(track) {
+  if (!props.showMatchCount) return 0;
+  if (typeof props.getMatchCount === 'function') {
+    try {
+      return props.getMatchCount(track) || 0;
+    } catch (e) {
+      return 0;
+    }
+  }
+  // 默认：库内歌曲的 sourceIds 数量（来源数 > 1 才显示，单一来源不显示角标）
+  const n = track?.sourceIds?.length || 0;
+  return n > 1 ? n : 0;
+}
+
+// 角标文案：用于 title tooltip
+function matchCountTitle(count) {
+  if (!count || count <= 0) return '';
+  return `该歌曲在 ${count} 个来源中可用`;
+}
 
 const handleTrackClick = (track) => {
   emit('select', track);
@@ -559,10 +641,13 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
     </div>
 
     <!-- 虚拟列表容器 -->
+    <!-- container 模式：列表拥有独立滚动容器（max-height） -->
+    <!-- page 模式：列表使用页面滚动条，监听 window scroll -->
     <div
       v-if="virtualScroll && tracks.length > 50"
       ref="containerRef"
       class="track-list-body virtual-scroll"
+      :class="{ 'mode-container': mode === 'container', 'mode-page': mode === 'page' }"
       @scroll="onScroll"
     >
       <!-- 可视区域 -->
@@ -592,6 +677,12 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
                 :alt="track.title"
                 type="track"
               />
+              <!-- 数量角标：显示该歌曲在库内/搜索结果中的相同条目数 -->
+              <span
+                v-if="showMatchCount && getMatchCountFor(track) > 0"
+                class="track-match-badge"
+                :title="matchCountTitle(getMatchCountFor(track))"
+              >{{ getMatchCountFor(track) }}</span>
             </div>
             <div class="track-info">
               <div class="track-name">{{ track.title || track.fileName || '未知歌曲' }}</div>
@@ -631,6 +722,15 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
         </div>
       </div>
 
+      <!-- 无限滚动加载指示器 -->
+      <div v-if="infiniteScroll && isLoadingMore" class="load-more-indicator">
+        <span class="vl-spinner"></span>
+        <span>加载更多…</span>
+      </div>
+      <div v-else-if="infiniteScroll && !hasMore && tracks.length > 0" class="load-more-end">
+        已加载全部 {{ tracks.length }} 首
+      </div>
+
       <!-- 性能指示器（开发环境显示） -->
       <div v-if="false" class="perf-indicator">
         DOM: {{ poolSize }} / {{ tracks.length }}
@@ -663,6 +763,12 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
               :alt="track.title"
               type="track"
             />
+            <!-- 数量角标：普通列表与虚拟列表保持一致 -->
+            <span
+              v-if="showMatchCount && getMatchCountFor(track) > 0"
+              class="track-match-badge"
+              :title="matchCountTitle(getMatchCountFor(track))"
+            >{{ getMatchCountFor(track) }}</span>
           </div>
           <div class="track-info">
             <div class="track-name">{{ track.title || track.fileName || '未知歌曲' }}</div>
@@ -994,6 +1100,19 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   -webkit-overflow-scrolling: touch;
 }
 
+/* page 模式：列表使用页面滚动条，容器本身不滚动 */
+.track-list-body.virtual-scroll.mode-page {
+  overflow: visible;
+  max-height: none;
+  /* 移除独立滚动条样式 */
+  -webkit-overflow-scrolling: auto;
+}
+
+/* container 模式：保持默认独立滚动容器 */
+.track-list-body.virtual-scroll.mode-container {
+  /* 使用上面的默认样式 */
+}
+
 .viewport {
   position: relative;
   width: 100%;
@@ -1083,6 +1202,66 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   border-radius: var(--radius-sm);
   overflow: hidden;
   box-shadow: var(--shadow-sm);
+  position: relative;
+}
+
+/* 数量角标：显示在封面右上角的小圆点 + 数字 */
+.track-match-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+  text-align: center;
+  z-index: 2;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  pointer-events: none;
+}
+
+/* 加载更多指示器 */
+.load-more-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px 20px;
+  font-size: 13px;
+  color: var(--text-secondary, #666);
+  border-top: 1px solid var(--border-light, #e8e8e8);
+}
+
+.load-more-indicator .vl-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border-light, #e8e8e8);
+  border-top-color: var(--primary-color, #0078d7);
+  border-radius: 50%;
+  animation: vl-spin 0.8s linear infinite;
+  display: inline-block;
+}
+
+.load-more-end {
+  text-align: center;
+  padding: 16px 20px;
+  font-size: 12px;
+  color: var(--text-tertiary, #999);
+  border-top: 1px solid var(--border-light, #e8e8e8);
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes vl-spin {
+  to { transform: rotate(360deg); }
 }
 
 .track-info {
