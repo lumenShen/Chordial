@@ -124,6 +124,7 @@ export class Song {
     try {
       let lyricText = '';
 
+      // 优先级1：库内 Lyric 实体（已入库的歌曲，如本地扫描或导入的网易云曲目）
       // 始终按 song_id 查询；lyricId 字段仅为元数据，不可作为查询门控。
       // 旧实现 `if (this.lyricId)` 会跳过 lyric_id 为 null 的歌曲，
       // 但 Lyric 实体可能已存在于库中（按 song_id 索引），
@@ -133,7 +134,6 @@ export class Song {
       const lyric = await getLyricOfSong(this.id);
 
       // ── 诊断日志：追踪歌词数据流向 ──
-      // 帮助定位"部分歌曲歌词为空"问题：是库里没有 Lyric 实体，还是实体存在但 text 为空
       console.log('[Song.getLyricsInfo] songId=%s title=%s', this.id, this.title, {
         lyricFound: !!lyric,
         lyricId: lyric?.id ?? null,
@@ -145,9 +145,33 @@ export class Song {
       if (lyric && lyric.text) {
         lyricText = lyric.text;
       } else if (lyric && lyric.sourceId) {
+        // 库内 Lyric 实体存在但 text 为空，通过 sourceId 重新拉取
         const { getLyricText } = await import('@/api/musicSource/musicResource.js');
         lyricText = await getLyricText(lyric.sourceId) || '';
-        console.log('[Song.getLyricsInfo] 通过 sourceId 回查歌词: len=%d', lyricText.length);
+        console.log('[Song.getLyricsInfo] 通过库内 Lyric.sourceId 回查歌词: len=%d', lyricText.length);
+      }
+
+      // 优先级2：在线来源直拉歌词（未入库的在线搜索歌曲）
+      // 场景：用户在搜索页点击网易云歌曲播放，歌曲尚未入库，
+      // 库内无 Lyric 实体，需要通过歌曲自身的 SourceId 调用 getLyricText
+      // 后端 resource::get_lyric_text → source.lyric_text_get(entity_id) → 网易云 /lyric API
+      if (!lyricText) {
+        const neteaseSid = this.sourceIds?.find(
+          (s) => s?.sourceName === 'netease' && s?.entityType === 'Song' && s?.entityId,
+        );
+        if (neteaseSid) {
+          try {
+            const { getLyricText } = await import('@/api/musicSource/musicResource.js');
+            lyricText = (await getLyricText(neteaseSid)) || '';
+            console.log(
+              '[Song.getLyricsInfo] 通过歌曲 SourceId 在线拉取网易云歌词: len=%d, entityId=%s',
+              lyricText.length,
+              neteaseSid.entityId,
+            );
+          } catch (e) {
+            console.warn('[Song.getLyricsInfo] 在线拉取网易云歌词失败:', e);
+          }
+        }
       }
 
       if (!lyricText) {
@@ -155,17 +179,29 @@ export class Song {
         return result;
       }
 
-      // 检测是否为同步歌词 (LRC 格式)
-      // 直接把原始 LRC 文本赋给 syncedLyrics，由 useAmllBridge 的 parseToAmllLyricLines
+      // 检测是否为同步歌词
+      // 直接把原始文本赋给 syncedLyrics，由 useAmllBridge 的 parseToAmllLyricLines
       // 用 parseLyrics (lyricConverter.js) 统一解析 LRC/YRC/QRC/TTML。
       // 不再做 parseSyncedLyrics → formatToLRC 往返转换：
       //   1. 往返是有损的（formatToLRC 丢精度、丢元数据行）
       //   2. parseSyncedLyrics 的 matchAll 缺 g 标志会抛 TypeError 被静默吃掉
       //   3. useAmllBridge 本来就要重新解析，parse→format→parse 是浪费
-      if (/^\[(\d{1,2}):(\d{2})\.(\d{2,3})\]/.test(lyricText)) {
+      //
+      // 格式检测（与 lyricConverter.js parseLyrics 的自动检测保持一致）：
+      //   - YRC: [16210,3460](16210,670,0)还(16880,410,0)没...（网易云逐字）
+      //   - LRC: [mm:ss.xx]歌词（行级同步）
+      //   - 其他: 纯文本
+      const trimmedText = lyricText.trim();
+      const isYrc = /\[\d+,\d+\]\(\d+,\d+,\d+\)/.test(trimmedText);
+      const isLrc = /^\[(\d{1,2}):(\d{2})\.(\d{2,3})\]/.test(trimmedText);
+      if (isYrc || isLrc) {
         result.syncedLyrics = lyricText;
         result.hasSyncedLyrics = true;
-        console.log('[Song.getLyricsInfo] 同步歌词(LRC), len=%d', lyricText.length);
+        console.log(
+          '[Song.getLyricsInfo] 同步歌词(%s), len=%d',
+          isYrc ? 'YRC' : 'LRC',
+          lyricText.length,
+        );
       } else {
         result.plainLyrics = lyricText;
         result.hasPlainLyrics = true;

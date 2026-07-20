@@ -227,14 +227,46 @@ pub fn get_song_url(
 }
 
 /// 获取歌词（含 LRC/YRC/翻译/音译）。
+///
+/// 优先调用 `/lyric/new`（逐字歌词 yrc 更完整，调用 `music.163.com/api/song/lyric/v1` 端点）；
+/// 失败或非 200 时回退到 `/lyric`（旧端点，部分歌曲仅返回 lrc）。
+///
+/// yrc 字段格式示例：
+/// ```text
+/// [16210,3460](16210,670,0)还(16880,410,0)没...
+/// ~~~~1 ~~~2  ~~~~3 ~~4 5 ~6
+/// 1. 歌词行显示开始时间戳(ms)
+/// 2. 歌词行显示总时长(ms)
+/// 3. 逐字显示开始时间戳(ms)
+/// 4. 逐字显示时长(ms)
+/// 5. 未知
+/// 6. 文字
+/// ```
 pub fn get_lyric(
     client: &WebHttpClient,
     song_id: i64,
 ) -> Result<NeteaseLyricResponse, String> {
     let ts = now_ts();
+    let id_str = song_id.to_string();
+
+    // 优先 /lyric/new（yrc 更完整）
+    match client.get_json::<NeteaseLyricResponse>(
+        "/lyric/new",
+        &[("id", &id_str), ("timestamp", ts.as_str())],
+    ) {
+        Ok(resp) if resp.code == 200 => return Ok(resp),
+        Ok(resp) if resp.code == 404 => {
+            // 404 明确表示无此资源，直接返回错误，避免无谓重试
+            return Err(format!("获取歌词失败 code=404 (lyric/new)"));
+        }
+        // 其他错误（网络/解析/限流）→ 回退到 /lyric
+        Ok(_) | Err(_) => {}
+    }
+
+    // 回退 /lyric
     let resp: NeteaseLyricResponse = client.get_json(
         "/lyric",
-        &[("id", &song_id.to_string()), ("timestamp", ts.as_str())],
+        &[("id", &id_str), ("timestamp", ts.as_str())],
     )?;
     if resp.code != 200 {
         return Err(format!("获取歌词失败 code={}", resp.code));
