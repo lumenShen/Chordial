@@ -1366,6 +1366,10 @@ pub fn netease_save_playlist_to_library(
         .map(|t| ctx.netease_source.build_song_from_detail(t))
         .collect();
     let song_ids = ctx.library.add_songs_batch(&songs)?;
+    // ⚠ 关键：add_songs_batch 只修改 library.store 的内存缓存并标记 dirty，
+    // 必须显式调用 library.save() 落盘 music_library.json，否则重启后歌曲全部丢失。
+    // ctx.store.save() 只保存 storage.json（歌单元数据），与 library.store 是两个独立的 PersistentStore。
+    ctx.library.save()?;
 
     let mut playlist = Playlist::new("netease", &detail.name);
     playlist.remote_id = Some(detail.id);
@@ -1478,6 +1482,9 @@ pub fn netease_save_album_to_library(
         .collect();
     let stored_ids = ctx.library.add_songs_batch(&built)?;
     let imported = stored_ids.len();
+    // ⚠ 关键：必须调用 library.save() 落盘 music_library.json，
+    // 否则重启后歌曲全部丢失（ctx.store.save() 只保存 storage.json）。
+    ctx.library.save()?;
     ctx.store.save()?;
 
     let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
