@@ -41,16 +41,20 @@ const loadTracks = async () => {
 };
 
 const loadMore = async () => {
-  if (isLoadingMore.value || !hasMore.value) return;
+  if (isLoadingMore.value || !hasMore.value) return false;
   isLoadingMore.value = true;
   try {
     const data = await library.getSongsPage(tracks.value.length, PAGE_SIZE);
     if (data) {
       tracks.value = [...tracks.value, ...data.songs];
       hasMore.value = tracks.value.length < data.total;
+      // 返回 false 表示已无更多数据；返回 true 表示可能还有更多
+      return hasMore.value;
     }
+    return false;
   } catch (error) {
     console.error('Failed to load more tracks:', error);
+    return false;
   } finally {
     isLoadingMore.value = false;
   }
@@ -61,13 +65,6 @@ const loadMore = async () => {
 function playLoadingSpinner() {
   run(({ animate, loopPresets }) => {
     animate('.loading-state .spinner', { ...loopPresets.spin });
-  });
-}
-
-// 加载更多按钮内的小 spinner
-function playLoadMoreSpinner() {
-  run(({ animate, loopPresets }) => {
-    animate('.spinner-small', { ...loopPresets.spin });
   });
 }
 
@@ -89,17 +86,6 @@ watch(
   (val) => {
     if (val) {
       nextTick(playLoadingSpinner);
-    }
-  },
-  { flush: 'post' }
-);
-
-// 加载更多 spinner
-watch(
-  isLoadingMore,
-  (val) => {
-    if (val) {
-      nextTick(playLoadMoreSpinner);
     }
   },
   { flush: 'post' }
@@ -129,16 +115,14 @@ const handleTrackPlay = (track) => {
       <TrackList
         v-if="tracks.length > 0"
         :tracks="tracks"
+        mode="page"
+        :infinite-scroll="true"
+        :on-load-more="loadMore"
+        :has-more="hasMore"
+        :show-match-count="true"
         @select="handleTrackSelect"
         @play="handleTrackPlay"
       />
-
-      <div v-if="hasMore" class="load-more">
-        <button class="btn btn-secondary" @click="loadMore" :disabled="isLoadingMore">
-          <span v-if="isLoadingMore" class="spinner-small"></span>
-          {{ isLoadingMore ? '加载中...' : `加载更多 (${tracks.length}/${totalCount})` }}
-        </button>
-      </div>
 
       <div v-else-if="tracks.length === 0" class="empty-state">
         <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -162,32 +146,8 @@ const handleTrackPlay = (track) => {
   margin: 0 auto;
 }
 
-.load-more {
-  display: flex;
-  justify-content: center;
-  padding: 24px 0;
-}
-
 /* 禁用全局 .spinner 的 CSS spin 动画，改由 anime.js ANIME_LOOP.spin 驱动 */
 .loading-state .spinner {
   animation: none;
-}
-
-.spinner-small {
-  display: inline-block;
-  width: 16px;
-  height: 16px;
-  border: 2px solid var(--border-light, rgba(0,0,0,0.1));
-  border-top-color: var(--primary-color, #0078d7);
-  border-radius: 50%;
-  margin-right: 8px;
-  vertical-align: middle;
-}
-
-@media (prefers-color-scheme: dark) {
-  .spinner-small {
-    border-color: rgba(255,255,255,0.15);
-    border-top-color: var(--primary-color, #0A84FF);
-  }
 }
 </style>

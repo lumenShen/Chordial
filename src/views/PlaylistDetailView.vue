@@ -473,7 +473,8 @@ onMounted(async () => {
         <TrackList
           v-else
           :tracks="songs"
-          :virtual-scroll="false"
+          :virtual-scroll="true"
+          :show-match-count="true"
           @select="openTrack"
           @play="playSong"
         />

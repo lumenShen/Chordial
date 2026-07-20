@@ -405,7 +405,7 @@ function clearSearch() {
         <h2 class="section-title">
           歌曲 <span class="count-badge">{{ songs.length }}</span>
         </h2>
-        <TrackList :tracks="songs" :virtual-scroll="false" />
+        <TrackList :tracks="songs" :show-match-count="true" />
       </section>
 
       <!-- 歌手 -->
