@@ -90,7 +90,22 @@ impl NeteaseCloudMusicApiSource {
     /// - `store`: 用于持久化配置的存储（通常为 `AppContext.store`）
     pub fn new(store: Arc<PersistentStore>) -> Result<Self, String> {
         let config_key = crate::module::music_web_source::config::config_key(NETEASE_SOURCE_NAME);
-        let config = WebSourceConfig::load(&store, &config_key);
+        let mut config = WebSourceConfig::load(&store, &config_key);
+
+        // 兼容旧数据：如果 cookie 是 ncmapi 返回的 Set-Cookie 原始字符串
+        // （含 Max-Age/Expires/Path 等属性），自动规范化为标准 Cookie 头格式
+        if !config.cookie.is_empty() && needs_cookie_normalization(&config.cookie) {
+            let original_len = config.cookie.len();
+            let normalized = parse_set_cookie_to_header(&config.cookie);
+            eprintln!(
+                "[netease] 初始化时检测到 Set-Cookie 格式的 cookie，已规范化：{} -> {}",
+                original_len,
+                normalized.len()
+            );
+            config.cookie = normalized;
+            // 持久化规范化后的 cookie
+            let _ = store.set(&config_key, &config);
+        }
 
         let client = WebHttpClient::new(
             config.base_url.clone(),
@@ -640,6 +655,25 @@ impl NeteaseCloudMusicApiSource {
 // 私有辅助函数
 // ───────────────────────────────────────────────────────────────────────────
 
+/// 检测 cookie 字符串是否为 Set-Cookie 原始格式（需要规范化）。
+///
+/// 标准 Cookie 请求头格式只含 `NAME=VALUE` 对，不应出现 `Path=`/`Max-Age=`/
+/// `Expires=`/`HttpOnly`/`Secure`/`SameSite=` 等 Set-Cookie 属性。
+fn needs_cookie_normalization(cookie: &str) -> bool {
+    // 标准 Cookie 头不应含这些属性名（不区分大小写）
+    const MARKERS: &[&str] = &[
+        "path=",
+        "max-age=",
+        "expires=",
+        "httponly",
+        "secure",
+        "samesite=",
+        "domain=",
+    ];
+    let lower = cookie.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// 将 ncmapi `/login/qr/check` 返回的 Set-Cookie 串解析为标准 Cookie 请求头格式。
 ///
 /// # 背景
@@ -760,5 +794,27 @@ mod cookie_tests {
     fn test_parse_empty() {
         assert_eq!(parse_set_cookie_to_header(""), "");
         assert_eq!(parse_set_cookie_to_header("   "), "");
+    }
+
+    #[test]
+    fn test_needs_normalization_set_cookie_format() {
+        // 含 Set-Cookie 属性 → 需要规范化
+        assert!(needs_cookie_normalization("MUSIC_U=abc; Path=/; HttpOnly"));
+        assert!(needs_cookie_normalization("MUSIC_U=abc; Max-Age=3600"));
+        assert!(needs_cookie_normalization("MUSIC_U=abc; Expires=Fri, 06 Aug 2094"));
+        assert!(needs_cookie_normalization("MUSIC_U=abc; Secure"));
+        assert!(needs_cookie_normalization("MUSIC_U=abc; SameSite=Lax"));
+        assert!(needs_cookie_normalization("MUSIC_U=abc; Domain=.music.163.com"));
+    }
+
+    #[test]
+    fn test_needs_normalization_standard_cookie() {
+        // 标准 Cookie 头格式 → 不需要规范化
+        assert!(!needs_cookie_normalization(""));
+        assert!(!needs_cookie_normalization("MUSIC_U=abc"));
+        assert!(!needs_cookie_normalization("MUSIC_U=abc; __csrf=xyz"));
+        assert!(!needs_cookie_normalization(
+            "MUSIC_U=abc123; MUSIC_R_U=def456; ntoken_entrance=1"
+        ));
     }
 }
