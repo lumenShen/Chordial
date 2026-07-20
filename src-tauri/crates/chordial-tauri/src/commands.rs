@@ -1269,13 +1269,13 @@ pub fn netease_save_playlist_to_library(
 ) -> Result<Playlist, String> {
     let (detail, tracks) = ctx.netease_source.get_playlist_full(playlist_id)?;
 
-    // 将每首曲目加入库（add_song 会自动合并相同标题/艺术家的歌曲）
-    let mut song_ids = Vec::with_capacity(tracks.len());
-    for track in &tracks {
-        let song = ctx.netease_source.build_song_from_detail(track);
-        let stored_id = ctx.library.add_song(&song)?;
-        song_ids.push(stored_id);
-    }
+    // 批量构建 Song 后一次性入库（add_songs_batch 只反序列化+回写一次）
+    // 旧实现 for-loop + add_song 每首都会全量反序列化+回写，1000 首歌约 80s
+    let songs: Vec<_> = tracks
+        .iter()
+        .map(|t| ctx.netease_source.build_song_from_detail(t))
+        .collect();
+    let song_ids = ctx.library.add_songs_batch(&songs)?;
 
     let mut playlist = Playlist::new("netease", &detail.name);
     playlist.remote_id = Some(detail.id);
@@ -1381,13 +1381,13 @@ pub fn netease_save_album_to_library(
 ) -> Result<serde_json::Value, String> {
     let (album, songs) = ctx.netease_source.get_album_detail(album_id)?;
 
-    let mut imported = 0usize;
-    for track in &songs {
-        let song = ctx.netease_source.build_song_from_detail(track);
-        if ctx.library.add_song(&song).is_ok() {
-            imported += 1;
-        }
-    }
+    // 批量构建 Song 后一次性入库（add_songs_batch 只反序列化+回写一次）
+    let built: Vec<_> = songs
+        .iter()
+        .map(|t| ctx.netease_source.build_song_from_detail(t))
+        .collect();
+    let stored_ids = ctx.library.add_songs_batch(&built)?;
+    let imported = stored_ids.len();
     ctx.store.save()?;
 
     let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
