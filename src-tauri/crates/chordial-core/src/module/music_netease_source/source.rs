@@ -9,7 +9,6 @@ use crate::module::music_web_source::{WebHttpClient, WebSourceConfig};
 use crate::module::storage::persistent::PersistentStore;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// 网易云音乐来源的固定名称。
 pub const NETEASE_SOURCE_NAME: &str = "netease";
@@ -65,6 +64,31 @@ fn parse_remote_id(entity_id: &str) -> Option<i64> {
         return None;
     }
     parts[1].parse::<i64>().ok()
+}
+
+/// 将网易云的 publishTime（毫秒级 Unix 时间戳）转换为年份。
+///
+/// 返回 None 表示时间戳无效（<=0）。
+fn publish_time_to_year(ms: i64) -> Option<u32> {
+    if ms <= 0 {
+        return None;
+    }
+    let secs = (ms / 1000) as u64;
+    let mut days = secs / 86400;
+    let mut year = 1970u32;
+    loop {
+        let days_in_year: u64 = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    Some(year)
+}
+
+fn is_leap_year(year: u32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// 网易云音乐来源。
@@ -136,30 +160,13 @@ impl NeteaseCloudMusicApiSource {
     ///
     /// 会重建 HTTP 客户端以应用新的 base_url / cookie / timeout。
     pub fn update_config(&self, new_config: WebSourceConfig) -> Result<(), String> {
-        // 重建客户端
-        let new_client = WebHttpClient::new(
-            new_config.base_url.clone(),
-            new_config.cookie.clone(),
-            new_config.timeout_secs,
-        )?;
-
         // 持久化
         new_config.flush(&self.store, &self.config_key)?;
 
-        // 应用到内存
-        // 注意：客户端字段需要内部可变性，使用 unsafe 替换是安全的，
-        // 因为 WebHttpClient 内部所有字段都有锁保护，且我们只替换整个客户端
-        // 这里不能直接替换 &self.client（不可变引用），因此采用经典方案：
-        // 将 client 字段改为 RwLock 或者使用 Option 包装
-        // 为保持代码简洁，这里改用 RwLock<WebHttpClient> 在 struct 定义中
-        // 但为了减少改动，我们换种方式：将 client 改为 RwLock<WebHttpClient>
-        // 此处先记录新配置，client 不重建（base_url/cookie 可在运行时通过 set_* 更新）
+        // 应用到内存（base_url/cookie 可在运行时通过 set_* 更新，无需重建客户端）
         self.client.set_base_url(new_config.base_url.clone());
         self.client.set_cookie(new_config.cookie.clone());
         *self.config.write() = new_config;
-
-        // 提示编译器：new_client 已构建但未使用，这里明确丢弃
-        drop(new_client);
 
         Ok(())
     }
@@ -182,18 +189,20 @@ impl NeteaseCloudMusicApiSource {
     /// 从 [`NeteaseSongDetail`] 构建 [`Song`] 模型。
     fn build_song(&self, detail: &NeteaseSongDetail) -> Song {
         let entity_id = build_entity_id(EntityKind::song, detail.id);
-        let song_id = Uuid::new_v4().to_string();
+        let song_id = format!("netease_song_{}", detail.id);
         let artist_names: Vec<String> = if detail.ar.is_empty() {
             vec!["未知艺术家".to_string()]
         } else {
             detail.ar.iter().map(|a| a.name.clone()).collect()
         };
-        let artist_ids: Vec<String> = (0..artist_names.len())
-            .map(|_| Uuid::new_v4().to_string())
-            .collect();
+        let artist_ids: Vec<String> = if detail.ar.is_empty() {
+            vec!["netease_artist_unknown".to_string()]
+        } else {
+            detail.ar.iter().map(|a| format!("netease_artist_{}", a.id)).collect()
+        };
         let album_title = detail.al.as_ref().map(|a| a.name.clone());
-        let album_id = album_title.as_ref().map(|_| Uuid::new_v4().to_string());
-        let lyric_id = Some(Uuid::new_v4().to_string());
+        let album_id = detail.al.as_ref().map(|a| format!("netease_album_{}", a.id));
+        let lyric_id = Some(format!("netease_lyric_{}", detail.id));
 
         let source_id = SourceId {
             source_name: self.name.clone(),
@@ -297,9 +306,9 @@ impl MusicSource for NeteaseCloudMusicApiSource {
         }
         let brief = resp.data.and_then(|d| d.artist);
         Ok(brief.map(|b| Artist {
-            id: Uuid::new_v4().to_string(),
+            id: format!("netease_artist_{}", remote_id),
             name: b.name,
-            bio: None,
+            bio: b.briefDesc,
             source_ids: vec![SourceId {
                 source_name: self.name.clone(),
                 source_type: SourceType::Web(NETEASE_SOURCE_NAME.to_string()),
@@ -316,34 +325,30 @@ impl MusicSource for NeteaseCloudMusicApiSource {
         let Some(remote_id) = parse_remote_id(id) else {
             return Ok(None);
         };
-        // /album 接口
-        #[derive(serde::Deserialize)]
-        struct AlbumResp {
-            #[serde(default)]
-            code: i32,
-            #[serde(default)]
-            album: Option<super::types::NeteaseAlbumBrief>,
-        }
-        let resp: AlbumResp = self
-            .client
-            .get_json("/album", &[("id", &remote_id.to_string())])?;
-        if resp.code != 200 {
-            return Err(format!("获取专辑失败 code={}", resp.code));
-        }
-        let brief = resp.album;
-        Ok(brief.map(|b| Album {
-            id: Uuid::new_v4().to_string(),
-            title: b.name,
-            artist_id: String::new(),
-            cover_url: b.picUrl,
-            song_ids: Vec::new(),
+        let (album, songs) = api::get_album_detail(&self.client, remote_id)?;
+        let artist_id = album
+            .artist
+            .as_ref()
+            .map(|a| format!("netease_artist_{}", a.id))
+            .unwrap_or_default();
+        let song_ids: Vec<String> = songs
+            .iter()
+            .map(|s| format!("netease_song_{}", s.id))
+            .collect();
+        let year = publish_time_to_year(album.publishTime);
+        Ok(Some(Album {
+            id: format!("netease_album_{}", remote_id),
+            title: album.name,
+            artist_id,
+            cover_url: album.picUrl,
+            song_ids,
             source_ids: vec![SourceId {
                 source_name: self.name.clone(),
                 source_type: SourceType::Web(NETEASE_SOURCE_NAME.to_string()),
                 entity_type: EntityType::Album,
                 entity_id: build_entity_id(EntityKind::album, remote_id),
             }],
-            year: None,
+            year,
         }))
     }
 
@@ -397,7 +402,7 @@ impl MusicSource for NeteaseCloudMusicApiSource {
 
         let entity_id = build_lyric_entity_id(remote_id, format);
         Ok(Some(Lyric {
-            id: Uuid::new_v4().to_string(),
+            id: format!("netease_lyric_{}_{}", remote_id, format),
             song_id: song_id.to_string(),
             text: final_text,
             source_id: SourceId {
@@ -416,11 +421,14 @@ impl MusicSource for NeteaseCloudMusicApiSource {
         let Some(remote_id) = parse_remote_id(entity_id) else {
             return Err(format!("无效的 entity_id: {}", entity_id));
         };
-        // 默认使用 exhigh（320 kbps MP3），用户可在配置中调整音质偏好
-        // 后续可扩展为从 config 读取 preferred_level 字段
-        let (bytes, _url_data) =
-            api::download_song(&self.client, remote_id, AudioQuality::Exhigh.to_level_str())?;
-        Ok(bytes)
+        // 使用音质降级下载：从 exhigh 开始向下降级，确保尽可能返回可播放字节
+        // 相比固定 exhigh 的 download_song，能避免 VIP/无版权等级导致的播放失败
+        let result = api::download_song_with_fallback(
+            &self.client,
+            remote_id,
+            Some(AudioQuality::Exhigh.to_level_str()),
+        )?;
+        Ok(result.bytes)
     }
 
     fn song_file_path(&self, _entity_id: &str) -> Option<String> {
@@ -527,9 +535,9 @@ impl NeteaseCloudMusicApiSource {
         let artists = briefs
             .into_iter()
             .map(|b| Artist {
-                id: Uuid::new_v4().to_string(),
+                id: format!("netease_artist_{}", b.id),
                 name: b.name,
-                bio: None,
+                bio: b.briefDesc,
                 source_ids: vec![SourceId {
                     source_name: self.name.clone(),
                     source_type: SourceType::Web(NETEASE_SOURCE_NAME.to_string()),
@@ -555,9 +563,13 @@ impl NeteaseCloudMusicApiSource {
         let albums = briefs
             .into_iter()
             .map(|b| Album {
-                id: Uuid::new_v4().to_string(),
+                id: format!("netease_album_{}", b.id),
                 title: b.name,
-                artist_id: String::new(),
+                artist_id: b
+                    .artist
+                    .as_ref()
+                    .map(|a| format!("netease_artist_{}", a.id))
+                    .unwrap_or_default(),
                 cover_url: b.picUrl,
                 song_ids: Vec::new(),
                 source_ids: vec![SourceId {
@@ -566,7 +578,7 @@ impl NeteaseCloudMusicApiSource {
                     entity_type: EntityType::Album,
                     entity_id: build_entity_id(EntityKind::album, b.id),
                 }],
-                year: None,
+                year: publish_time_to_year(b.publishTime),
             })
             .collect();
         Ok(albums)

@@ -122,35 +122,6 @@ fn parse_year_from_date(s: &str) -> Option<u32> {
     None
 }
 
-/// 从 Unix 毫秒时间戳提取年份（不依赖 chrono/time）。
-///
-/// 使用格里高利历的闰年规则，逐年份减去对应天数。
-/// 适用于 1970..=2100 范围，超出返回 None。
-fn year_from_millis(ms: i64) -> Option<u32> {
-    if ms <= 0 {
-        return None;
-    }
-    let mut days = (ms / 1000 / 86400) as u32;
-    let mut year = 1970u32;
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
-        if year > 2100 {
-            return None;
-        }
-    }
-    Some(year)
-}
-
-/// 判断是否为闰年（格里高利历）。
-fn is_leap_year(y: u32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
-}
-
 /// 酷狗音乐来源。
 ///
 /// 持有一个 [`WebHttpClient`] 实例（连接池复用），配置通过 [`WebSourceConfig`] 持久化。

@@ -291,6 +291,74 @@ pub fn download_song(
     Ok((bytes, url_data))
 }
 
+/// 音质降级下载（返回字节）结果。
+pub struct FallbackBytesResult {
+    /// 实际下载的音质等级字符串（如 "exhigh"）
+    pub level: String,
+    /// 音频文件字节
+    pub bytes: Vec<u8>,
+    /// URL 元信息（含真实音质、编码格式、码率）
+    pub url_data: NeteaseSongUrlData,
+    /// 尝试过的等级（含成功的，按尝试顺序）
+    pub attempted_levels: Vec<String>,
+}
+
+/// 从目标音质开始向下降级下载歌曲字节（返回 `Vec<u8>`）。
+///
+/// 与 [`download_song_to_file_with_fallback`] 行为一致，但将字节保留在内存中
+/// （适合需要立即播放的场景，如 `MusicSource::song_file_get`）。
+///
+/// # 降级策略
+/// 从 `target_level` 开始尝试，若该等级不可用（URL 为空或 API 报错），
+/// 依次向下一等级降级，直到成功或所有等级都试过。
+///
+/// # 返回
+/// - `Ok(FallbackBytesResult)` — 含实际等级、字节、URL 数据、尝试历史
+/// - `Err(String)` — 所有等级都失败时，错误信息聚合每次尝试的原因
+pub fn download_song_with_fallback(
+    client: &WebHttpClient,
+    song_id: i64,
+    target_level: Option<&str>,
+) -> Result<FallbackBytesResult, String> {
+    let levels = build_fallback_levels(target_level);
+    let mut attempted: Vec<String> = Vec::with_capacity(levels.len());
+    let mut errors: Vec<String> = Vec::with_capacity(levels.len());
+
+    for level in levels {
+        attempted.push(level.to_string());
+        match get_song_url(client, song_id, level) {
+            Ok(url_data) => {
+                let Some(url) = url_data.url.as_deref().filter(|s| !s.is_empty()) else {
+                    errors.push(format!("{}: URL 为空（VIP/无版权）", level));
+                    continue;
+                };
+                match client.get_bytes(url) {
+                    Ok(bytes) => {
+                        return Ok(FallbackBytesResult {
+                            level: level.to_string(),
+                            bytes,
+                            url_data,
+                            attempted_levels: attempted,
+                        });
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: 下载失败 {}", level, e));
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", level, e));
+            }
+        }
+    }
+
+    Err(format!(
+        "所有音质等级均不可用（尝试过 {}）：{}",
+        attempted.join(" → "),
+        errors.join("; ")
+    ))
+}
+
 /// 下载歌曲到文件（流式，避免大文件全量读入内存）。
 ///
 /// 相比 `download_song`：

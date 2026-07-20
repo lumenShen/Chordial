@@ -116,6 +116,9 @@ pub struct NeteaseArtistBrief {
     pub img1v1Url: Option<String>,
     #[serde(default)]
     pub picUrl: Option<String>,
+    /// 歌手简介（`/artist/detail` 接口的 `briefDesc` 字段）。
+    #[serde(default)]
+    pub briefDesc: Option<String>,
 }
 
 /// 专辑简略信息。
