@@ -6,6 +6,7 @@ import AppHeader from './AppHeader.vue';
 import AppSidebar from './AppSidebar.vue';
 import AppBottomNav from './AppBottomNav.vue';
 import P2pMatchDialog from '@/components/p2p/P2pMatchDialog.vue';
+import BatchDownloadManager from '@/components/common/BatchDownloadManager.vue';
 import { PlayerControlBar } from '@/components/player';
 import PlayerView from '@/views/PlayerView.vue';
 import { PlayerStore } from '@/stores/player.js'
@@ -79,6 +80,9 @@ function onRouteLeave(el, done) {
 
     <!-- P2P 匹配对话框 + 事件桥接 -->
     <P2pMatchDialog />
+
+    <!-- 批量下载浮窗（监听 netease-download-progress 事件） -->
+    <BatchDownloadManager />
   </div>
 </template>
 

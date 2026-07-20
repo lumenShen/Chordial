@@ -15,6 +15,9 @@ import { useAnime } from '@/composables/useAnime.js';
 import * as playlistApi from '@/api/musicSource/playlists.js';
 import TrackList from '@/components/common/TrackList.vue';
 import PlayerStore from '@/stores/player.js';
+import { useDownloadManager } from '@/stores/downloadManager.js';
+
+const { startBatch: startBatchDownload } = useDownloadManager();
 
 const router = useRouter();
 const route = useRoute();
@@ -229,6 +232,35 @@ function openTrack(track) {
   router.push(`/track/${track.id}`);
 }
 
+// ── 批量下载 ─────────────────────────────────────────
+// 筛选所有带网易云 sourceId 的曲目，构造 BatchDownloadItem 列表，
+// 委托 downloadManager store 在后台静默下载，UI 进度由浮窗显示。
+async function batchDownloadAll() {
+  if (songs.value.length === 0) return;
+  const items = [];
+  for (const s of songs.value) {
+    if (!s?.sourceIds) continue;
+    const sid = s.sourceIds.find((x) => x?.sourceName === 'netease');
+    if (!sid?.entityId) continue;
+    items.push({
+      songEntityId: sid.entityId,
+      title: s.title || '未知',
+      artist: s.getDisplayArtist ? s.getDisplayArtist() : (s.artist || ''),
+      level: null, // 默认 exhigh
+    });
+  }
+  if (items.length === 0) {
+    showToast('当前歌单没有可下载的网易云曲目', 'info');
+    return;
+  }
+  try {
+    const { total } = await startBatchDownload(items);
+    showToast(`已开始后台下载 ${total} 首曲目`, 'success');
+  } catch (e) {
+    showToast(`批量下载启动失败：${e.message || e}`, 'error');
+  }
+}
+
 // ── 工具 ─────────────────────────────────────────────
 function formatTime(ts) {
   if (!ts) return '';
@@ -364,6 +396,14 @@ onMounted(async () => {
               @click="playAll"
             >
               <i class="bi bi-play-fill"></i> 播放全部
+            </button>
+            <button
+              class="btn btn-secondary"
+              :disabled="songs.length === 0"
+              @click="batchDownloadAll"
+              title="将网易云曲目批量下载到本地（后台静默执行）"
+            >
+              <i class="bi bi-cloud-arrow-down"></i> 批量下载
             </button>
             <button class="btn btn-secondary" @click="startEdit">
               <i class="bi bi-pencil"></i> 编辑

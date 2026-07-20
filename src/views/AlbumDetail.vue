@@ -7,6 +7,45 @@ import { getSongsByIds } from '../api/musicSource/musicResource';
 import { useCoverImage } from '@/composables/useCoverImage';
 import { usePerf } from '@/utils/performanceMonitor.js';
 import { useAnime } from '@/composables/useAnime.js';
+import { useDownloadManager } from '@/stores/downloadManager.js';
+
+const { startBatch: startBatchDownload } = useDownloadManager();
+
+// Toast（AlbumDetail 原本没有，最小化新增）
+const toast = ref(null);
+let toastTimer = null;
+function showToast(msg, type = 'info', duration = 2500) {
+  toast.value = { msg, type };
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toast.value = null; }, duration);
+}
+
+// 批量下载：将专辑内带网易云 sourceId 的曲目加入后台下载队列
+async function batchDownloadAll() {
+  if (!sortedTracks.value.length) return;
+  const items = [];
+  for (const s of sortedTracks.value) {
+    if (!s?.sourceIds) continue;
+    const sid = s.sourceIds.find((x) => x?.sourceName === 'netease');
+    if (!sid?.entityId) continue;
+    items.push({
+      songEntityId: sid.entityId,
+      title: s.title || '未知',
+      artist: s.getDisplayArtist ? s.getDisplayArtist() : (s.artist || ''),
+      level: null,
+    });
+  }
+  if (items.length === 0) {
+    showToast('当前专辑没有可下载的网易云曲目', 'info');
+    return;
+  }
+  try {
+    const { total } = await startBatchDownload(items);
+    showToast(`已开始后台下载 ${total} 首曲目`, 'success');
+  } catch (e) {
+    showToast(`批量下载启动失败：${e.message || e}`, 'error');
+  }
+}
 
 const { start, end, log } = usePerf('AlbumDetail');
 
@@ -169,6 +208,15 @@ const handleTrackPlay = (track) => {
               </svg>
               播放全部
             </button>
+            <button
+              class="btn btn-secondary"
+              :disabled="sortedTracks.length === 0"
+              @click="batchDownloadAll"
+              title="将网易云曲目批量下载到本地（后台静默执行）"
+            >
+              <i class="bi bi-cloud-arrow-down"></i>
+              批量下载
+            </button>
             <button class="btn btn-secondary">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"/>
@@ -202,6 +250,13 @@ const handleTrackPlay = (track) => {
         返回专辑列表
       </router-link>
     </div>
+
+    <!-- Toast -->
+    <transition name="toast">
+      <div v-if="toast" :class="['toast', `toast-${toast.type}`]">
+        {{ toast.msg }}
+      </div>
+    </transition>
   </div>
 </template>
 
@@ -338,5 +393,46 @@ const handleTrackPlay = (track) => {
   .album-title {
     color: var(--text-primary, #f6f6f6);
   }
+}
+
+/* Toast */
+.toast {
+  position: fixed;
+  bottom: 32px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 12px 20px;
+  background: var(--bg-secondary, #fff);
+  border: 1px solid var(--border-light, #e8e8e8);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  font-size: 13px;
+  z-index: 1000;
+  max-width: 90vw;
+}
+
+.toast-success {
+  color: #28a745;
+  border-color: #28a745;
+}
+
+.toast-error {
+  color: #dc3545;
+  border-color: #dc3545;
+}
+
+.toast-info {
+  color: var(--primary-color, #0078d7);
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.2s, transform 0.2s;
+}
+
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(10px);
 }
 </style>

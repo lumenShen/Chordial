@@ -182,6 +182,8 @@ pub fn run() {
             commands::netease_save_playlist_to_library,
             commands::netease_save_album_to_library,
             commands::netease_download_song,
+            commands::netease_download_songs_batch,
+            commands::netease_cancel_download_task,
             commands::netease_compare_with_local,
             // 通用云端来源 — 从网络来源实例选择下载
             commands::source_list_web_sources,

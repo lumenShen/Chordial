@@ -183,6 +183,69 @@ export async function downloadSong(songEntityId, title, artist, level = 'exhigh'
 }
 
 /**
+ * 批量下载请求项。
+ * @typedef {Object} BatchDownloadItem
+ * @property {string} songEntityId - 网易云 entity_id（如 "song:123456"）
+ * @property {string} title - 歌曲标题（用于文件命名）
+ * @property {string} artist - 主艺术家名（用于文件命名）
+ * @property {string|null} [level] - 音质等级，null/undefined 默认 exhigh
+ */
+
+/**
+ * 批量下载进度事件 payload（由 `netease-download-progress` 事件推送给前端）。
+ * @typedef {Object} DownloadProgress
+ * @property {string} task_id - 任务 ID（与启动时返回的一致）
+ * @property {number} index - 当前完成的索引（0-based）
+ * @property {number} total - 总曲目数
+ * @property {'completed'|'failed'|'cancelled'} status - 单曲状态
+ * @property {string} title - 当前曲目标题
+ * @property {string} artist - 当前曲目艺术家
+ * @property {string|null} path - 成功时的文件路径
+ * @property {string|null} error - 失败时的错误信息
+ * @property {number} succeeded - 已成功下载数
+ * @property {number} failed - 已失败数
+ */
+
+/**
+ * 批量下载网易云歌曲到本地（后台静默执行）。
+ *
+ * 命令立即返回 `task_id`，下载在后台线程逐首进行。每完成一首（成功/失败）
+ * 通过 `netease-download-progress` 事件推送进度，前端需 listen 该事件更新 UI。
+ * 完成或取消后，后台线程会自动从注册表中移除该 task_id。
+ *
+ * @param {BatchDownloadItem[]} songs - 待下载曲目列表
+ * @returns {Promise<{ task_id: string, total: number }>} 任务 ID + 总曲目数
+ */
+export async function downloadSongsBatch(songs) {
+  return transport.command('netease_download_songs_batch', {
+    songs: (songs || []).map((s) => ({
+      songEntityId: s.songEntityId,
+      title: s.title,
+      artist: s.artist,
+      level: s.level ?? null,
+    })),
+  });
+}
+
+/**
+ * 取消指定的批量下载任务。
+ *
+ * 取消是协作式的：后台线程在下下一首曲目开始前检查取消标志并提前退出。
+ * 正在进行中的单曲下载不会被中断。
+ *
+ * @param {string} taskId - `downloadSongsBatch` 返回的任务 ID
+ * @returns {Promise<boolean>} true 表示找到并标记取消，false 表示任务不存在或已完成
+ */
+export async function cancelDownloadTask(taskId) {
+  return transport.command('netease_cancel_download_task', { taskId });
+}
+
+/**
+ * 批量下载进度事件名（用于前端 listen）。
+ */
+export const DOWNLOAD_PROGRESS_EVENT = 'netease-download-progress';
+
+/**
  * 比较 online 歌曲与本地库中相同歌曲的音质。
  * @param {string} title
  * @param {string} artist
