@@ -305,6 +305,136 @@ pub struct KugouAlbumInfo {
     pub language: String,
 }
 
+/// `/album/detail?album_id=xxx` 响应（含 singer_id 等更完整字段）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouAlbumDetailResponse {
+    #[serde(default)]
+    pub status: i32,
+    #[serde(default)]
+    pub err_code: i32,
+    #[serde(default)]
+    pub data: KugouAlbumDetail,
+}
+
+/// `/album/detail` 响应的专辑详情（含 singer_id，便于填充 Album.artist_id）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouAlbumDetail {
+    #[serde(default)]
+    pub album_id: String,
+    #[serde(default)]
+    pub album_name: String,
+    #[serde(default)]
+    pub singer_id: i64,
+    #[serde(default)]
+    pub singer_name: String,
+    #[serde(default)]
+    pub publish_date: String,
+    #[serde(default)]
+    pub sizable_cover: String,
+    #[serde(default)]
+    pub cover: String,
+    #[serde(default)]
+    pub intro: String,
+    #[serde(default)]
+    pub language: String,
+    #[serde(default)]
+    pub song_count: i64,
+}
+
+/// `/album/songs?album_id=xxx&page=1&pagesize=100` 响应。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouAlbumSongsResponse {
+    #[serde(default)]
+    pub status: i32,
+    #[serde(default)]
+    pub err_code: i32,
+    #[serde(default)]
+    pub data: KugouAlbumSongsData,
+}
+
+/// `/album/songs` 响应数据。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouAlbumSongsData {
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub list: Vec<KugouSongBrief>,
+}
+
+/// `/artist/detail?id=xxx` 响应。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouArtistDetailResponse {
+    #[serde(default)]
+    pub status: i32,
+    #[serde(default)]
+    pub err_code: i32,
+    #[serde(default)]
+    pub data: KugouArtistDetail,
+}
+
+/// `/artist/detail` 响应的歌手详情（含简介、粉丝数等）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouArtistDetail {
+    #[serde(default)]
+    pub singer_id: i64,
+    #[serde(default)]
+    pub singer_name: String,
+    /// 别名字段（部分响应使用小写）
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub intro: String,
+    /// 别名字段
+    #[serde(default)]
+    pub brief: String,
+    #[serde(default)]
+    pub img: String,
+    /// 别名字段
+    #[serde(default)]
+    pub image: String,
+    #[serde(default)]
+    pub song_count: i64,
+    /// 别名字段
+    #[serde(default)]
+    pub songs: i64,
+    #[serde(default)]
+    pub album_count: i64,
+    /// 别名字段
+    #[serde(default)]
+    pub albums: i64,
+    #[serde(default)]
+    pub fans: i64,
+}
+
+impl KugouArtistDetail {
+    /// 取歌手名（兼容 singer_name 和 name）
+    pub fn name(&self) -> &str {
+        if !self.singer_name.is_empty() {
+            &self.singer_name
+        } else {
+            &self.name
+        }
+    }
+
+    /// 取简介（兼容 intro 和 brief）
+    pub fn intro(&self) -> &str {
+        if !self.intro.is_empty() {
+            &self.intro
+        } else {
+            &self.brief
+        }
+    }
+
+    /// 取头像 URL（兼容 img 和 image）
+    pub fn image_url(&self) -> &str {
+        if !self.img.is_empty() {
+            &self.img
+        } else {
+            &self.image
+        }
+    }
+}
+
 // ── 歌词 ─────────────────────────────────────────────────────
 
 /// `/search/lyric?hash=xxx` 响应。
@@ -365,4 +495,123 @@ pub struct KugouLyricResponse {
     /// 解码后的纯文本歌词（仅 decode=true 时存在）
     #[serde(default)]
     pub decodeContent: String,
+}
+
+// ── 扫码登录 ─────────────────────────────────────────────────
+
+/// `/login/qr/key` 响应。
+///
+/// KuGouMusicApi 调用 `https://login-user.kugou.com/v2/qrcode`，
+/// 返回的 key 用于后续生成二维码和轮询扫码状态。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouQrKeyResponse {
+    #[serde(default)]
+    pub status: i32,
+    #[serde(default)]
+    pub err_code: i32,
+    #[serde(default)]
+    pub data: KugouQrKeyData,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouQrKeyData {
+    /// 二维码 key（用于 /login/qr/create 和 /login/qr/check）
+    #[serde(default)]
+    pub qrcode: String,
+}
+
+/// `/login/qr/create` 响应。
+///
+/// KuGouMusicApi 将 key 组装为 `https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode={key}`，
+/// 然后可选生成 base64 图片。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouQrCreateResponse {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub status: i32,
+    #[serde(default)]
+    pub body: KugouQrCreateBody,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouQrCreateBody {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub data: KugouQrCreateData,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouQrCreateData {
+    /// 二维码 URL（可用于前端 qrcode 库生成图片）
+    #[serde(default)]
+    pub url: String,
+    /// Base64 data URL（当请求带 qrimg=true 时返回）
+    #[serde(default)]
+    pub base64: String,
+}
+
+/// `/login/qr/check` 响应。
+///
+/// KuGouMusicApi 调用 `https://login-user.kugou.com/v2/get_userinfo_qrcode`。
+/// - status 0: 二维码已过期
+/// - status 1: 等待扫码
+/// - status 2: 已扫码，待确认
+/// - status 4: 授权登录成功（返回 token + userid）
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouQrCheckResponse {
+    #[serde(default)]
+    pub status: i32,
+    #[serde(default)]
+    pub err_code: i32,
+    #[serde(default)]
+    pub data: KugouQrCheckData,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct KugouQrCheckData {
+    /// 扫码状态：0=过期, 1=等待, 2=已扫码, 4=授权成功
+    #[serde(default)]
+    pub status: i32,
+    /// 授权成功时返回的 token
+    #[serde(default)]
+    pub token: String,
+    /// 授权成功时返回的 userid
+    #[serde(default)]
+    pub userid: i64,
+}
+
+/// 酷狗扫码状态枚举（与网易云 QrCheckStatus 对齐）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KugouQrCheckStatus {
+    Expired,
+    Waiting,
+    Scanned,
+    Authorized,
+    Unknown,
+}
+
+impl KugouQrCheckStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Waiting => "waiting",
+            Self::Scanned => "scanned",
+            Self::Authorized => "authorized",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<i32> for KugouQrCheckStatus {
+    fn from(status: i32) -> Self {
+        match status {
+            0 => Self::Expired,
+            1 => Self::Waiting,
+            2 => Self::Scanned,
+            4 => Self::Authorized,
+            _ => Self::Unknown,
+        }
+    }
 }

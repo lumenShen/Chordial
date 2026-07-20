@@ -43,16 +43,27 @@
 
       <div class="setting-item column">
         <div class="setting-info">
-          <label class="setting-label">Cookie（可选）</label>
+          <label class="setting-label">登录状态</label>
           <span class="setting-desc">
-            含 dfid / mid / token / userid 等字段，登录后可访问 VIP 歌曲。
-            手动从浏览器或 App 抓包复制，以分号分隔。
+            扫码登录后可访问 VIP 歌曲。
+            <span v-if="loginStatus.loggedIn" class="login-badge ok">
+              <i class="bi bi-check-circle-fill"></i> 已登录<span v-if="loginStatus.userid">（用户 {{ loginStatus.userid }}）</span>
+            </span>
+            <span v-else class="login-badge warn">
+              <i class="bi bi-exclamation-circle-fill"></i> 未登录
+            </span>
           </span>
         </div>
         <div class="login-actions">
+          <button class="action-btn primary" @click="openQrLogin">
+            <i class="bi bi-qr-code"></i> 扫码登录
+          </button>
+          <button v-if="loginStatus.loggedIn" class="action-btn" @click="logout">
+            <i class="bi bi-box-arrow-right"></i> 退出登录
+          </button>
           <button class="action-btn ghost" @click="showManualCookie = !showManualCookie">
             <i class="bi bi" :class="showManualCookie ? 'bi-chevron-up' : 'bi-chevron-down'"></i>
-            {{ showManualCookie ? '收起' : '展开' }} Cookie 输入
+            手动填入 Cookie
           </button>
         </div>
         <textarea
@@ -134,6 +145,90 @@
       </div>
     </div>
 
+    <!-- 扫码登录 Modal -->
+    <teleport to="body">
+      <transition name="fade">
+        <div v-if="qrLogin.visible" class="qr-modal-mask" @click.self="closeQrLogin">
+          <div class="qr-modal" role="dialog" aria-modal="true">
+            <div class="qr-modal-header">
+              <h3 class="qr-modal-title">
+                <i class="bi bi-qr-code"></i> 酷狗扫码登录
+              </h3>
+              <button class="qr-modal-close" @click="closeQrLogin" aria-label="关闭">
+                <i class="bi bi-x-lg"></i>
+              </button>
+            </div>
+
+            <div class="qr-modal-body">
+              <!-- loading: 正在获取二维码 -->
+              <div v-if="qrLogin.phase === 'loading'" class="qr-loading">
+                <div class="qr-spinner"></div>
+                <p>正在获取二维码…</p>
+              </div>
+
+              <!-- 二维码展示 -->
+              <div v-else-if="qrLogin.phase === 'showing' || qrLogin.phase === 'polling'" class="qr-showing">
+                <div class="qr-image-wrap" :class="{ expired: qrLogin.status === 'expired' }">
+                  <img v-if="qrLogin.qrimg" :src="qrLogin.qrimg" alt="酷狗登录二维码" class="qr-image" />
+                  <div v-else class="qr-fallback">
+                    <p>无法显示二维码图片</p>
+                    <p class="qr-url">{{ qrLogin.qrurl }}</p>
+                  </div>
+                  <!-- 过期遮罩 -->
+                  <div v-if="qrLogin.status === 'expired'" class="qr-expired-overlay">
+                    <i class="bi bi-clock-history"></i>
+                    <p>二维码已过期</p>
+                    <button class="action-btn primary" @click="refreshQr">
+                      <i class="bi bi-arrow-clockwise"></i> 重新获取
+                    </button>
+                  </div>
+                </div>
+
+                <div class="qr-status">
+                  <div v-if="qrLogin.status === 'waiting'" class="status-text waiting">
+                    <i class="bi bi-hourglass-split"></i> 请使用酷狗音乐 App 扫码
+                  </div>
+                  <div v-else-if="qrLogin.status === 'scanned'" class="status-text scanned">
+                    <i class="bi bi-phone"></i> 已扫码，请在手机上确认登录
+                  </div>
+                  <div v-else-if="qrLogin.status === 'authorized'" class="status-text authorized">
+                    <i class="bi bi-check-circle-fill"></i> 授权成功
+                  </div>
+                  <div v-else-if="qrLogin.status === 'expired'" class="status-text expired">
+                    <i class="bi bi-clock-history"></i> 二维码已过期，请重新获取
+                  </div>
+                  <div v-else-if="qrLogin.error" class="status-text error">
+                    <i class="bi bi-x-circle-fill"></i> {{ qrLogin.error }}
+                  </div>
+                </div>
+
+                <!-- "我已扫码"按钮：仅在 waiting 状态显示，乐观切到 scanned 并立即 check -->
+                <button
+                  v-if="qrLogin.status === 'waiting'"
+                  class="action-btn primary qr-scanned-btn"
+                  @click="manualScanned"
+                >
+                  <i class="bi bi-phone"></i> 我已扫码
+                </button>
+              </div>
+
+              <!-- 成功 -->
+              <div v-else-if="qrLogin.phase === 'success'" class="qr-success">
+                <i class="bi bi-check-circle-fill success-icon"></i>
+                <h4>登录成功</h4>
+                <p v-if="qrLogin.userid">用户 ID：{{ qrLogin.userid }}</p>
+                <button class="action-btn primary" @click="closeQrLogin">完成</button>
+              </div>
+            </div>
+
+            <div class="qr-modal-footer">
+              <span class="qr-tip">使用酷狗音乐 App 扫描左侧二维码即可登录</span>
+            </div>
+          </div>
+        </div>
+      </transition>
+    </teleport>
+
     <!-- Toast -->
     <transition name="fade">
       <div v-if="toast" class="toast" :class="toast.type">
@@ -188,6 +283,7 @@ function showToast(message, type = 'info', duration = 3000) {
 async function loadConfig() {
   try {
     config.value = await kugouApi.getConfig();
+    updateLoginStatus();
   } catch (e) {
     showToast(`加载配置失败：${e.message || e}`, 'error');
   }
@@ -232,6 +328,187 @@ async function testConnection() {
     showToast(`连接测试异常：${e.message || e}`, 'error');
   } finally {
     testing.value = false;
+  }
+}
+
+// ── 登录状态 ──────────────────────────────────────────────────
+const loginStatus = ref({
+  loggedIn: false,
+  userid: '',
+});
+
+function updateLoginStatus() {
+  const cookie = (config.value.cookie || '').trim();
+  const match = /(^|;\s*)userid\s*=\s*(\d+)/.exec(cookie);
+  loginStatus.value = {
+    loggedIn: /(^|;\s*)token\s*=/.test(cookie) && !!match,
+    userid: match ? match[2] : '',
+  };
+}
+
+// ── 扫码登录 Modal ────────────────────────────────────────────
+const qrLogin = ref({
+  visible: false,
+  phase: 'loading',  // loading | showing | polling | success
+  status: 'waiting',  // waiting | scanned | authorized | expired | unknown
+  key: '',
+  qrurl: '',
+  qrimg: '',
+  userid: '',
+  error: '',
+});
+
+let pollAbort = false;
+let pollingActive = false;
+
+async function openQrLogin() {
+  qrLogin.value = {
+    visible: true,
+    phase: 'loading',
+    status: 'waiting',
+    key: '',
+    qrurl: '',
+    qrimg: '',
+    userid: '',
+    error: '',
+  };
+  pollAbort = false;
+  await fetchQr();
+}
+
+async function fetchQr() {
+  try {
+    const key = await kugouApi.loginQrKey();
+    qrLogin.value.key = key;
+    const data = await kugouApi.loginQrCreate(key, true);
+    qrLogin.value.qrurl = data.url || '';
+    qrLogin.value.qrimg = data.base64 || '';
+    qrLogin.value.phase = 'showing';
+    qrLogin.value.status = 'waiting';
+    startPolling();
+  } catch (e) {
+    qrLogin.value.error = e.message || String(e);
+    showToast(`获取二维码失败：${e.message || e}`, 'error');
+  }
+}
+
+function refreshQr() {
+  stopPolling();
+  qrLogin.value.error = '';
+  qrLogin.value.status = 'waiting';
+  qrLogin.value.phase = 'loading';
+  qrLogin.value.qrimg = '';
+  qrLogin.value.qrurl = '';
+  fetchQr();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function startPolling() {
+  if (pollingActive) return;
+  pollingActive = true;
+  pollingLoop();
+}
+
+async function pollingLoop() {
+  await sleep(1000);
+  while (pollingActive && qrLogin.value.visible && !pollAbort) {
+    const key = qrLogin.value.key;
+    if (!key) {
+      await sleep(500);
+      continue;
+    }
+    try {
+      const resp = await kugouApi.loginQrCheck(key);
+      if (!pollingActive || !qrLogin.value.visible || pollAbort) break;
+      // statusText: 'expired' | 'waiting' | 'scanned' | 'authorized' | 'unknown'
+      qrLogin.value.status = resp.statusText || 'unknown';
+      if (resp.userid) qrLogin.value.userid = String(resp.userid);
+      if (resp.statusText === 'authorized') {
+        try {
+          await loadConfig();
+          updateLoginStatus();
+        } catch (e) {
+          console.warn('登录成功后刷新配置失败:', e);
+        }
+        qrLogin.value.phase = 'success';
+        showToast('登录成功', 'success');
+        break;
+      }
+      if (resp.statusText === 'expired') {
+        break;
+      }
+      await sleep(1500);
+    } catch (e) {
+      qrLogin.value.error = e.message || String(e);
+      console.warn('[qr poll] check 失败，2s 后重试:', e);
+      await sleep(2000);
+    }
+  }
+  pollingActive = false;
+}
+
+async function manualScanned() {
+  if (qrLogin.value.status !== 'waiting') return;
+  qrLogin.value.status = 'scanned';
+  const key = qrLogin.value.key;
+  if (!key) return;
+  try {
+    const resp = await kugouApi.loginQrCheck(key);
+    if (!qrLogin.value.visible) return;
+    qrLogin.value.status = resp.statusText || 'unknown';
+    if (resp.userid) qrLogin.value.userid = String(resp.userid);
+    if (resp.statusText === 'authorized') {
+      try {
+        await loadConfig();
+        updateLoginStatus();
+      } catch (e) {
+        console.warn('登录成功后刷新配置失败:', e);
+      }
+      qrLogin.value.phase = 'success';
+      stopPolling();
+      showToast('登录成功', 'success');
+    }
+  } catch (e) {
+    qrLogin.value.error = e.message || String(e);
+  }
+}
+
+function stopPolling() {
+  pollingActive = false;
+}
+
+function closeQrLogin() {
+  pollAbort = true;
+  stopPolling();
+  qrLogin.value.visible = false;
+}
+
+async function logout() {
+  if (!confirm('确定退出酷狗登录？清除 Cookie 后将无法访问 VIP 歌曲。')) return;
+  // 清除 token 和 userid，保留其他 cookie 字段（如 dfid/mid）
+  const existing = (config.value.cookie || '').trim();
+  if (existing) {
+    const kept = existing
+      .split(';')
+      .map((s) => s.trim())
+      .filter((s) => {
+        const k = s.split('=')[0]?.trim();
+        return k && k !== 'token' && k !== 'userid';
+      })
+      .join('; ');
+    config.value.cookie = kept;
+  } else {
+    config.value.cookie = '';
+  }
+  try {
+    await kugouApi.updateConfig(config.value);
+    updateLoginStatus();
+    showToast('已退出登录', 'info');
+  } catch (e) {
+    showToast(`退出失败：${e.message || e}`, 'error');
   }
 }
 
@@ -614,5 +891,307 @@ onMounted(async () => {
     width: 100%;
     justify-content: center;
   }
+}
+</style>
+
+<style>
+/* 非 scoped：teleport 到 body 的元素需要全局样式 */
+.qr-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  padding: 16px;
+}
+
+.qr-modal {
+  width: 100%;
+  max-width: 400px;
+  background: var(--bg-primary, #fff);
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.qr-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-light, #e8e8e8);
+}
+
+.qr-modal-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary, #333);
+}
+
+.qr-modal-title i {
+  color: var(--primary-color, #0078d7);
+}
+
+.qr-modal-close {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary, #666);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+  font-size: 14px;
+  transition: background 0.2s;
+}
+
+.qr-modal-close:hover {
+  background: var(--bg-hover, rgba(0, 0, 0, 0.05));
+  color: var(--text-primary, #333);
+}
+
+.qr-modal-body {
+  padding: 28px 20px;
+  min-height: 320px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+}
+
+.qr-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  color: var(--text-secondary, #666);
+  font-size: 14px;
+}
+
+.qr-spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid var(--border-light, #e8e8e8);
+  border-top-color: var(--primary-color, #0078d7);
+  border-radius: 50%;
+  animation: qr-spin 0.9s linear infinite;
+}
+
+@keyframes qr-spin {
+  to { transform: rotate(360deg); }
+}
+
+.qr-showing {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+}
+
+.qr-image-wrap {
+  position: relative;
+  padding: 12px;
+  background: #fff;
+  border-radius: 12px;
+  border: 1px solid var(--border-light, #e8e8e8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.qr-image-wrap.expired {
+  opacity: 0.5;
+}
+
+.qr-image {
+  width: 220px;
+  height: 220px;
+  object-fit: contain;
+  display: block;
+}
+
+.qr-fallback {
+  width: 220px;
+  height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-secondary, #666);
+}
+
+.qr-url {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  word-break: break-all;
+}
+
+.qr-expired-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  font-size: 14px;
+  color: var(--text-secondary, #666);
+}
+
+.qr-expired-overlay i {
+  font-size: 32px;
+  color: var(--text-tertiary, #999);
+}
+
+.qr-status {
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  text-align: center;
+}
+
+.qr-scanned-btn {
+  margin-top: 4px;
+  padding: 8px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--primary-color, #0078d7);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s;
+}
+
+.qr-scanned-btn:hover {
+  background: var(--primary-hover, #0064b8);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 120, 215, 0.3);
+}
+
+.qr-scanned-btn:active {
+  transform: translateY(0);
+}
+
+.status-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-weight: 500;
+}
+
+.status-text.waiting {
+  color: var(--text-secondary, #666);
+  background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+}
+
+.status-text.scanned {
+  color: #0078d7;
+  background: rgba(0, 120, 215, 0.1);
+}
+
+.status-text.authorized {
+  color: #28a745;
+  background: rgba(40, 167, 69, 0.12);
+}
+
+.status-text.expired {
+  color: #b8860b;
+  background: rgba(255, 193, 7, 0.15);
+}
+
+.status-text.error {
+  color: #dc3545;
+  background: rgba(220, 53, 69, 0.12);
+}
+
+.qr-success {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.qr-success .success-icon {
+  font-size: 48px;
+  color: #28a745;
+}
+
+.qr-success h4 {
+  margin: 0;
+  font-size: 18px;
+  color: var(--text-primary, #333);
+}
+
+.qr-success p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-secondary, #666);
+}
+
+.qr-modal-footer {
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-light, #e8e8e8);
+  text-align: center;
+}
+
+.qr-tip {
+  font-size: 12px;
+  color: var(--text-tertiary, #999);
+}
+
+@media (max-width: 480px) {
+  .qr-modal {
+    max-width: 100%;
+  }
+  .qr-image,
+  .qr-fallback {
+    width: 180px;
+    height: 180px;
+  }
+}
+
+/* 登录状态徽章 */
+.login-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 6px;
+}
+
+.login-badge.ok {
+  background: rgba(40, 167, 69, 0.12);
+  color: #28a745;
+}
+
+.login-badge.warn {
+  background: rgba(255, 193, 7, 0.15);
+  color: #b8860b;
 }
 </style>

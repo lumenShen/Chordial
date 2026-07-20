@@ -32,7 +32,7 @@ impl SearchType {
     }
 }
 
-/// 生成 Unix 毫秒时间戳字符串（破坏 ncmapi 风格服务端的 2 分钟缓存）。
+/// 生成 Unix 毫秒时间戳字符串（破坏服务端 2 分钟缓存）。
 fn now_ts() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ms = SystemTime::now()
@@ -305,4 +305,154 @@ pub fn get_album_info(
         ));
     }
     resp.data.into_iter().next().ok_or_else(|| "专辑信息为空".to_string())
+}
+
+/// 获取专辑详情（含 singer_id 等更完整字段）。
+///
+/// `/album/detail?album_id=<id>`
+///
+/// 相比 [`get_album_info`]，此接口返回 `singer_id`（数值），
+/// 便于填充 [`crate::module::music_library::models::Album::artist_id`]。
+pub fn get_album_detail(
+    client: &WebHttpClient,
+    album_id: &str,
+) -> Result<KugouAlbumDetail, String> {
+    let ts = now_ts();
+    let resp: KugouAlbumDetailResponse = client.get_json(
+        "/album/detail",
+        &[
+            ("album_id", album_id),
+            ("timestamp", ts.as_str()),
+        ],
+    )?;
+    if resp.status != 1 {
+        return Err(format!(
+            "获取专辑详情失败 status={}, err_code={}",
+            resp.status, resp.err_code
+        ));
+    }
+    Ok(resp.data)
+}
+
+/// 获取专辑歌曲列表（分页）。
+///
+/// `/album/songs?album_id=<id>&page=<page>&pagesize=<pagesize>`
+///
+/// # 返回
+/// `(songs, total)` — 歌曲列表 + 总数（用于分页判断）
+pub fn get_album_songs(
+    client: &WebHttpClient,
+    album_id: &str,
+    page: u32,
+    pagesize: u32,
+) -> Result<(Vec<KugouSongBrief>, i64), String> {
+    let ts = now_ts();
+    let resp: KugouAlbumSongsResponse = client.get_json(
+        "/album/songs",
+        &[
+            ("album_id", album_id),
+            ("page", &page.to_string()),
+            ("pagesize", &pagesize.to_string()),
+            ("timestamp", ts.as_str()),
+        ],
+    )?;
+    if resp.status != 1 {
+        return Err(format!(
+            "获取专辑歌曲列表失败 status={}, err_code={}",
+            resp.status, resp.err_code
+        ));
+    }
+    Ok((resp.data.list, resp.data.total))
+}
+
+// ── 歌手详情 ─────────────────────────────────────────────────
+
+/// 获取歌手详情（含简介、头像、粉丝数）。
+///
+/// `/artist/detail?id=<singer_id>`
+pub fn get_artist_detail(
+    client: &WebHttpClient,
+    singer_id: i64,
+) -> Result<KugouArtistDetail, String> {
+    let ts = now_ts();
+    let resp: KugouArtistDetailResponse = client.get_json(
+        "/artist/detail",
+        &[
+            ("id", &singer_id.to_string()),
+            ("timestamp", ts.as_str()),
+        ],
+    )?;
+    if resp.status != 1 {
+        return Err(format!(
+            "获取歌手详情失败 status={}, err_code={}",
+            resp.status, resp.err_code
+        ));
+    }
+    Ok(resp.data)
+}
+
+// ── 扫码登录 ─────────────────────────────────────────────────
+
+/// 第 1 步：获取扫码登录的 key。
+///
+/// 调用 `/login/qr/key`，返回 key 字符串。
+pub fn login_qr_key(client: &WebHttpClient) -> Result<String, String> {
+    let ts = now_ts();
+    let resp: super::types::KugouQrKeyResponse = client.get_json(
+        "/login/qr/key",
+        &[("timestamp", ts.as_str())],
+    )?;
+    if resp.status != 1 {
+        return Err(format!("获取扫码 key 失败 status={}, err_code={}", resp.status, resp.err_code));
+    }
+    if resp.data.qrcode.is_empty() {
+        return Err("API 未返回 qrcode key".to_string());
+    }
+    Ok(resp.data.qrcode)
+}
+
+/// 第 2 步：用 key 生成二维码。
+///
+/// `qrimg = true` 时 KuGouMusicApi 返回 base64 data URL。
+pub fn login_qr_create(
+    client: &WebHttpClient,
+    key: &str,
+    qrimg: bool,
+) -> Result<super::types::KugouQrCreateData, String> {
+    let ts = now_ts();
+    let resp: super::types::KugouQrCreateResponse = client.get_json(
+        "/login/qr/create",
+        &[
+            ("key", key),
+            ("qrimg", if qrimg { "true" } else { "false" }),
+            ("timestamp", ts.as_str()),
+        ],
+    )?;
+    if resp.body.code != 200 {
+        return Err(format!("生成二维码失败 code={}", resp.body.code));
+    }
+    Ok(resp.body.data)
+}
+
+/// 第 3 步：轮询扫码状态。
+///
+/// 返回 [`super::types::KugouQrCheckResponse`]，调用方根据 `data.status` 判断：
+/// - 0: 二维码过期
+/// - 1: 等待扫码
+/// - 2: 已扫码，待确认
+/// - 4: 授权成功（data.token + data.userid）
+pub fn login_qr_check(
+    client: &WebHttpClient,
+    key: &str,
+) -> Result<super::types::KugouQrCheckResponse, String> {
+    let ts = now_ts();
+    let resp: super::types::KugouQrCheckResponse = client.get_json(
+        "/login/qr/check",
+        &[
+            ("key", key),
+            ("timestamp", ts.as_str()),
+        ],
+    )?;
+    // 所有 status 都是业务状态，不是错误
+    Ok(resp)
 }

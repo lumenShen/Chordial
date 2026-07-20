@@ -2207,7 +2207,6 @@ pub fn kugou_login_qr_create(
     key: String,
     qrimg: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    use chordial_core::module::music_kugou_source::types::KugouQrCheckStatus;
     let data = ctx.kugou_source.login_qr_create(&key, qrimg.unwrap_or(true))?;
     Ok(serde_json::json!({
         "url": data.url,
