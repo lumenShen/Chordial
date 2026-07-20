@@ -45,6 +45,35 @@ pub fn run() {
                 }
             });
 
+            // ── 自动启动已配置的部署源服务 ──
+            // 读取 auto_start && enabled 的来源 ID，并行 spawn 启动任务
+            // （非阻塞：失败仅 eprintln，不影响主程序启动）
+            let deployer = ctx.source_deployer.clone();
+            let auto_start_ids = deployer.list_auto_start_ids();
+            if !auto_start_ids.is_empty() {
+                eprintln!(
+                    "[chordial] auto-starting {} source service(s): {:?}",
+                    auto_start_ids.len(),
+                    auto_start_ids
+                );
+                for source_id in auto_start_ids {
+                    let d = deployer.clone();
+                    tauri::async_runtime::spawn(async move {
+                        match d.start_source(&source_id).await {
+                            Ok(()) => {
+                                eprintln!("[chordial] auto-started: {}", source_id);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[chordial] auto-start failed for {}: {}",
+                                    source_id, e
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+
             // 注入为 Tauri State，供各命令通过 State<'_, Arc<AppContext>> 提取
             app.manage(ctx);
             Ok(())
@@ -233,6 +262,22 @@ pub fn run() {
             commands::playlist_remove_song,
             commands::playlist_reorder_songs,
             commands::playlist_count,
+            // Source Deployer — 音乐源服务快速部署工具
+            commands::source_deployer_list,
+            commands::source_deployer_get,
+            commands::source_deployer_get_config,
+            commands::source_deployer_update_config,
+            commands::source_deployer_set_auto_start,
+            commands::source_deployer_set_enabled,
+            commands::source_deployer_check_toolchain,
+            commands::source_deployer_clone,
+            commands::source_deployer_pull,
+            commands::source_deployer_install,
+            commands::source_deployer_start,
+            commands::source_deployer_stop,
+            commands::source_deployer_remove,
+            commands::source_deployer_get_logs,
+            commands::source_deployer_get_base_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

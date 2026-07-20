@@ -15,6 +15,7 @@ const P2pSettingsView = () => import('../views/settings/P2pSettingsView.vue')
 const LyricsSettingsView = () => import('../views/settings/LyricsSettingsView.vue')
 const LyricPrioritySettingsView = () => import('../views/settings/LyricPrioritySettingsView.vue')
 const MaintenanceSettingsView = () => import('../views/settings/MaintenanceSettingsView.vue')
+const SourceDeployerView = () => import('../views/settings/SourceDeployerView.vue')
 const NeteaseSettingsView = () => import('../views/settings/NeteaseSettingsView.vue')
 const KugouSettingsView = () => import('../views/settings/KugouSettingsView.vue')
 const QqSettingsView = () => import('../views/settings/QqSettingsView.vue')
@@ -161,6 +162,12 @@ const routes = [
         name: 'SettingsMaintenance',
         component: MaintenanceSettingsView,
         meta: { title: '数据维护' }
+      },
+      {
+        path: 'source-deployer',
+        name: 'SettingsSourceDeployer',
+        component: SourceDeployerView,
+        meta: { title: '音乐源服务部署' }
       }
     ]
   },

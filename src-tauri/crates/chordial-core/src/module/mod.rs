@@ -22,6 +22,7 @@
 //! | [`playlist`] | 歌单系统（本地保存 + 在线搜索） |
 //! | [`lyric_preference`] | 歌词优先级系统（来源/格式分级） |
 //! | [`p2p`] | P2P 资源共享（实例间对等交换曲库） |
+//! | [`source_deployer`] | 音乐源服务快速部署工具（git clone + npm install + 进程管理） |
 
 pub mod cache;
 pub mod config;
@@ -38,4 +39,5 @@ pub mod p2p;
 pub mod perf;
 pub mod platform;
 pub mod playlist;
+pub mod source_deployer;
 pub mod storage;

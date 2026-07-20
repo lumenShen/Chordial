@@ -33,6 +33,7 @@ use crate::module::music_source::registrar::{SourceCleanup, SourceRegistrar};
 use crate::module::music_source::traits::MusicSource;
 use crate::module::p2p::P2pManager;
 use crate::module::perf;
+use crate::module::source_deployer::SourceDeployer;
 use crate::module::storage::persistent::PersistentStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,6 +62,8 @@ pub struct AppContext {
     pub kugou_source: Arc<KugouMusicApiSource>,
     /// QQ 音乐来源实现（运行时配置，启用/禁用由 config 控制）。
     pub qq_source: Arc<QqMusicApiSource>,
+    /// 音乐源服务快速部署器（git clone + npm install + 进程管理）。
+    pub source_deployer: Arc<SourceDeployer>,
     /// P2P 资源共享管理器。
     pub p2p: Arc<P2pManager>,
 }
@@ -150,6 +153,9 @@ impl AppContext {
             }
         }
 
+        // ── 音乐源服务快速部署器（git clone + npm install + 进程管理）──
+        let source_deployer = Arc::new(SourceDeployer::new(store.clone(), data_dir.clone()));
+
         // ── P2P 资源共享管理器 ──
         let p2p = P2pManager::new(library.clone(), registrar.clone(), config.clone());
 
@@ -164,6 +170,7 @@ impl AppContext {
             netease_source,
             kugou_source,
             qq_source,
+            source_deployer,
             p2p,
         })
     }

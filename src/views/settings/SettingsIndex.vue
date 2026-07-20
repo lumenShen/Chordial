@@ -50,6 +50,15 @@
         </div>
         <i class="bi bi-chevron-right card-arrow"></i>
       </router-link>
+
+      <router-link :to="{ name: 'SettingsSourceDeployer' }" class="index-card">
+        <div class="card-icon"><i class="bi bi-rocket-takeoff"></i></div>
+        <div class="card-body">
+          <h3 class="card-title">音乐源服务部署</h3>
+          <p class="card-desc">一键部署网易云 / 酷狗 / QQ 音乐 API 服务，支持启动时自动运行</p>
+        </div>
+        <i class="bi bi-chevron-right card-arrow"></i>
+      </router-link>
     </div>
   </div>
 </template>
