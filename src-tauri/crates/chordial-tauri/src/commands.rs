@@ -782,6 +782,58 @@ pub fn library_get_source_ids_of_song(
     serde_json::to_value(&ids).map_err(|e| format!("序列化失败: {}", e))
 }
 
+/// 删除指定的本地音频文件并移除库内对应的 Local SourceId。
+///
+/// 适用场景：
+/// - 批量下载替换旧版本时删除旧文件
+/// - 手动清理某个本地文件
+///
+/// 与 `local_remove_folder` / `local_rescan` 不同，此命令只处理单个文件，
+/// 不依赖 `LocalMusicSource` 索引（旧文件可能从未被本地源索引）。
+///
+/// # 参数
+/// - `file_path`: 本地音频文件的绝对路径
+///
+/// # 返回
+/// `true` 表示找到并清理了库内 SourceId（物理文件无论是否存在都已尝试删除）
+#[tauri::command]
+pub fn library_delete_song_file(
+    ctx: State<'_, Arc<AppContext>>,
+    app: AppHandle,
+    file_path: String,
+) -> Result<bool, String> {
+    let removed = ctx.library.delete_local_file_and_source(&file_path)?;
+    ctx.library.save()?;
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
+    Ok(removed)
+}
+
+/// 手动去重：保留每首"逻辑歌曲"中音质最高的本地文件，删除其他本地副本。
+///
+/// 按 (title_lower, sorted_artist_names_lower) 分组所有歌曲，每组内：
+/// - 比较所有 Local 来源的文件扩展名推断音质
+/// - 保留 rank 最高的本地文件
+/// - 删除其他本地文件 + 移除其 SourceId
+///
+/// Web 来源（如 netease）不参与去重，保留不动。
+///
+/// # 返回
+/// `{ removed_files: string[], kept_files: number, groups_processed: number }`
+#[tauri::command]
+pub fn library_dedup_keep_highest_quality(
+    ctx: State<'_, Arc<AppContext>>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    let (removed, kept, groups) = ctx.library.dedup_keep_highest_quality()?;
+    ctx.library.save()?;
+    let _ = app.emit(LIBRARY_CHANGED_EVENT, ());
+    Ok(serde_json::json!({
+        "removed_files": removed,
+        "kept_files": kept,
+        "groups_processed": groups,
+    }))
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // P2P 资源共享命令
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1525,7 +1577,32 @@ pub struct BatchDownloadItem {
     /// 主艺术家名（用于文件命名）
     artist: String,
     /// 音质等级（"standard"/"higher"/"exhigh"/"lossless"/"hires"），None 默认 exhigh
+    #[serde(default)]
     level: Option<String>,
+}
+
+/// 批量下载去重策略（前端传入）。
+///
+/// - `none`: 不去重，直接下载（默认）
+/// - `skip_if_equal`: 本地与目标音质相同时跳过；本地更高也跳过
+/// - `replace_if_better`: 本地音质低于在线时下载新版本并删除本地旧文件；
+///   本地音质 ≥ 在线时跳过
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupStrategy {
+    /// 不去重（默认）
+    None,
+    /// 本地已有相同或更高音质 → 跳过
+    SkipIfEqual,
+    /// 本地音质 < 在线 → 下载并替换（删除旧文件）
+    /// 本地音质 ≥ 在线 → 跳过
+    ReplaceIfBetter,
+}
+
+impl Default for DedupStrategy {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 /// 批量下载进度事件 payload。
@@ -1537,7 +1614,7 @@ struct DownloadProgress {
     index: usize,
     /// 总曲目数
     total: usize,
-    /// 状态：completed / failed / cancelled
+    /// 状态：completed / failed / cancelled / skipped / replaced
     status: &'static str,
     /// 当前曲目标题（前端展示用）
     title: String,
@@ -1547,19 +1624,38 @@ struct DownloadProgress {
     path: Option<String>,
     /// 失败时的错误信息
     error: Option<String>,
-    /// 已成功下载数
+    /// 已成功下载数（含 replaced）
     succeeded: usize,
     /// 已失败数
     failed: usize,
+    /// 已跳过数（含 SkipIfEqual 与 ReplaceIfBetter 中的"本地已更好"场景）
+    skipped: usize,
+    /// 实际下载到的音质等级（如 "exhigh"），降级时可能与目标不同
+    actual_level: Option<String>,
+    /// 单曲处理动作描述（前端展示用）：downloaded / skipped / replaced
+    action: Option<&'static str>,
 }
 
 /// 批量下载网易云歌曲到本地（后台静默执行）。
 ///
-/// 命令立即返回 `task_id`，下载在后台线程逐首进行。每完成一首（成功/失败）
+/// 命令立即返回 `task_id`，下载在后台线程逐首进行。每完成一首（成功/失败/跳过/替换）
 /// 通过 `netease-download-progress` 事件推送进度，前端 listen 该事件更新 UI。
 ///
 /// # 参数
 /// - `songs`: 待下载曲目列表（每个含 song_entity_id/title/artist/level）
+/// - `target_level`: 全局目标音质，覆盖每个 item 的 level。None 时使用 item.level
+/// - `dedup_strategy`: 去重策略，详见 [`DedupStrategy`]
+///
+/// # 音质降级
+/// 每首曲目按目标音质开始尝试，若该等级不可用（VIP/无版权/URL 为空），
+/// 自动向下降级（hires→lossless→exhigh→higher→standard），直到成功或全部失败。
+/// 实际下载到的等级通过 `actual_level` 字段返回。
+///
+/// # 去重逻辑
+/// - `none`: 直接下载
+/// - `skip_if_equal`: 查询本地匹配，若有相同或更高音质 → 跳过
+/// - `replace_if_better`: 查询本地匹配，若本地音质 < 目标 → 下载并删除本地旧文件；
+///   若本地音质 ≥ 目标 → 跳过
 ///
 /// # 返回
 /// `{ task_id: string, total: number }` — 任务 ID + 总曲目数
@@ -1568,6 +1664,8 @@ pub fn netease_download_songs_batch(
     ctx: State<'_, Arc<AppContext>>,
     app: AppHandle,
     songs: Vec<BatchDownloadItem>,
+    target_level: Option<String>,
+    dedup_strategy: Option<DedupStrategy>,
 ) -> Result<serde_json::Value, String> {
     if songs.is_empty() {
         return Err("待下载列表为空".to_string());
@@ -1597,34 +1695,71 @@ pub fn netease_download_songs_batch(
         std::path::PathBuf::from(download_dir_str)
     };
 
+    let strategy = dedup_strategy.unwrap_or_default();
+
     // 克隆 Arc<AppContext> 到后台线程
     let ctx = ctx.inner().clone();
     let app_handle = app.clone();
-    // task_id 在闭包内会被 clone 多次（每首曲目 emit 一个事件），
-    // 这里将其 move 进闭包；外层返回时使用 task_id_for_return（提前 clone 一份）。
     let task_id_for_return = task_id.clone();
 
     std::thread::spawn(move || {
         let mut succeeded = 0usize;
         let mut failed = 0usize;
+        let mut skipped = 0usize;
+
+        // 辅助闭包：emit 进度事件（减少重复代码）
+        let emit_progress = |app: &AppHandle,
+                             task_id: &str,
+                             index: usize,
+                             total: usize,
+                             status: &'static str,
+                             title: &str,
+                             artist: &str,
+                             path: Option<String>,
+                             error: Option<String>,
+                             succeeded: usize,
+                             failed: usize,
+                             skipped: usize,
+                             actual_level: Option<String>,
+                             action: Option<&'static str>| {
+            let _ = app.emit(
+                DOWNLOAD_PROGRESS_EVENT,
+                DownloadProgress {
+                    task_id: task_id.to_string(),
+                    index,
+                    total,
+                    status,
+                    title: title.to_string(),
+                    artist: artist.to_string(),
+                    path,
+                    error,
+                    succeeded,
+                    failed,
+                    skipped,
+                    actual_level,
+                    action,
+                },
+            );
+        };
 
         for (index, item) in songs.iter().enumerate() {
             // 检查取消标志
             if cancel_flag.load(Ordering::SeqCst) {
-                let _ = app_handle.emit(
-                    DOWNLOAD_PROGRESS_EVENT,
-                    DownloadProgress {
-                        task_id: task_id.clone(),
-                        index,
-                        total,
-                        status: "cancelled",
-                        title: item.title.clone(),
-                        artist: item.artist.clone(),
-                        path: None,
-                        error: Some("用户取消".to_string()),
-                        succeeded,
-                        failed,
-                    },
+                emit_progress(
+                    &app_handle,
+                    &task_id,
+                    index,
+                    total,
+                    "cancelled",
+                    &item.title,
+                    &item.artist,
+                    None,
+                    Some("用户取消".to_string()),
+                    succeeded,
+                    failed,
+                    skipped,
+                    None,
+                    None,
                 );
                 eprintln!(
                     "[netease] 批量下载 task={} 被取消（已完成 {}/{}）",
@@ -1634,14 +1769,12 @@ pub fn netease_download_songs_batch(
                 return;
             }
 
-            let level = item
-                .level
-                .clone()
+            // 目标音质：优先 target_level，其次 item.level，最后默认 exhigh
+            let level_str = target_level
+                .as_deref()
+                .or(item.level.as_deref())
+                .map(|s| s.to_string())
                 .unwrap_or_else(|| AudioQuality::Exhigh.to_level_str().to_string());
-            let ext = match level.as_str() {
-                "lossless" | "hires" => "flac",
-                _ => "mp3",
-            };
 
             // 解析 remote_id
             let remote_id = item.song_entity_id.splitn(3, ':').nth(1).and_then(|s| s.parse::<i64>().ok());
@@ -1649,27 +1782,87 @@ pub fn netease_download_songs_batch(
                 Some(id) => id,
                 None => {
                     failed += 1;
-                    let _ = app_handle.emit(
-                        DOWNLOAD_PROGRESS_EVENT,
-                        DownloadProgress {
-                            task_id: task_id.clone(),
-                            index,
-                            total,
-                            status: "failed",
-                            title: item.title.clone(),
-                            artist: item.artist.clone(),
-                            path: None,
-                            error: Some(format!("无效的 entity_id: {}", item.song_entity_id)),
-                            succeeded,
-                            failed,
-                        },
+                    emit_progress(
+                        &app_handle,
+                        &task_id,
+                        index,
+                        total,
+                        "failed",
+                        &item.title,
+                        &item.artist,
+                        None,
+                        Some(format!("无效的 entity_id: {}", item.song_entity_id)),
+                        succeeded,
+                        failed,
+                        skipped,
+                        None,
+                        None,
                     );
                     continue;
                 }
             };
 
-            // 准备路径 + 流式下载
-            let result: Result<PathBuf, String> = (|| {
+            // ── 去重检查 ──
+            // 策略为 SkipIfEqual / ReplaceIfBetter 时，先查询本地匹配
+            if strategy != DedupStrategy::None {
+                let local_matches = find_local_matches(&ctx, &item.title, &item.artist);
+                if let Some(best_local) = best_local_quality(&local_matches) {
+                    let target_quality = AudioQuality::from_level_str(&level_str);
+                    let comparison = cache::compare_quality(best_local.quality, target_quality);
+
+                    let should_skip = match strategy {
+                        DedupStrategy::SkipIfEqual => {
+                            // 本地 ≥ 目标 → 跳过
+                            matches!(
+                                comparison,
+                                cache::QualityComparison::LocalBetter | cache::QualityComparison::Equal
+                            )
+                        }
+                        DedupStrategy::ReplaceIfBetter => {
+                            // 本地 ≥ 目标 → 跳过；本地 < 目标 → 下载并替换
+                            matches!(
+                                comparison,
+                                cache::QualityComparison::LocalBetter | cache::QualityComparison::Equal
+                            )
+                        }
+                        DedupStrategy::None => false,
+                    };
+
+                    if should_skip {
+                        skipped += 1;
+                        emit_progress(
+                            &app_handle,
+                            &task_id,
+                            index,
+                            total,
+                            "skipped",
+                            &item.title,
+                            &item.artist,
+                            best_local.file_path.clone(),
+                            Some(format!(
+                                "本地已有 {} 音质（{}）",
+                                best_local.quality.to_level_str(),
+                                best_local.quality_label
+                            )),
+                            succeeded,
+                            failed,
+                            skipped,
+                            None,
+                            Some("skipped"),
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // ── 下载（含降级） ──
+            // 扩展名按目标音质预推断；实际下载到的音质可能不同，但文件名保留目标等级标识
+            let ext = match level_str.as_str() {
+                "lossless" | "hires" => "flac",
+                _ => "mp3",
+            };
+
+            let download_result: Result<(PathBuf, String), String> = (|| {
                 let path = cache::prepare_download_path(
                     &download_dir,
                     "netease",
@@ -1677,37 +1870,68 @@ pub fn netease_download_songs_batch(
                     &item.title,
                     ext,
                 )?;
-                let (written, _url_data) = music_netease_source::api::download_song_to_file(
+                let result = music_netease_source::api::download_song_to_file_with_fallback(
                     ctx.netease_source.client(),
                     remote_id,
-                    &level,
+                    Some(level_str.as_str()),
                     &path,
                 )?;
-                let _ = written; // 写入字节数（日志已在外层打印）
-                Ok(path)
+                Ok((path, result.level))
             })();
 
-            match result {
-                Ok(path) => {
+            match download_result {
+                Ok((path, actual_level)) => {
                     succeeded += 1;
+
+                    // ── 替换策略：删除本地旧文件 ──
+                    let mut replaced_paths: Vec<String> = Vec::new();
+                    if strategy == DedupStrategy::ReplaceIfBetter {
+                        let local_matches = find_local_matches(&ctx, &item.title, &item.artist);
+                        for m in local_matches.iter() {
+                            // 跳过刚下载的新文件
+                            if m.file_path.as_deref() == Some(path.to_str().unwrap_or("")) {
+                                continue;
+                            }
+                            if let Some(fp) = m.file_path.as_ref() {
+                                if let Ok(true) = ctx.library.delete_local_file_and_source(fp) {
+                                    replaced_paths.push(fp.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    let action: Option<&'static str> = if !replaced_paths.is_empty() {
+                        Some("replaced")
+                    } else {
+                        Some("downloaded")
+                    };
+
                     eprintln!(
-                        "[netease] 批量下载 task={} {}/{} 成功：{} - {}",
-                        task_id, index + 1, total, item.artist, item.title
+                        "[netease] 批量下载 task={} {}/{} 成功：{} - {}（实际音质 {}，替换 {} 个旧文件）",
+                        task_id,
+                        index + 1,
+                        total,
+                        item.artist,
+                        item.title,
+                        actual_level,
+                        replaced_paths.len()
                     );
-                    let _ = app_handle.emit(
-                        DOWNLOAD_PROGRESS_EVENT,
-                        DownloadProgress {
-                            task_id: task_id.clone(),
-                            index,
-                            total,
-                            status: "completed",
-                            title: item.title.clone(),
-                            artist: item.artist.clone(),
-                            path: Some(path.to_string_lossy().to_string()),
-                            error: None,
-                            succeeded,
-                            failed,
-                        },
+
+                    emit_progress(
+                        &app_handle,
+                        &task_id,
+                        index,
+                        total,
+                        if replaced_paths.is_empty() { "completed" } else { "replaced" },
+                        &item.title,
+                        &item.artist,
+                        Some(path.to_string_lossy().to_string()),
+                        None,
+                        succeeded,
+                        failed,
+                        skipped,
+                        Some(actual_level),
+                        action,
                     );
                 }
                 Err(e) => {
@@ -1716,28 +1940,29 @@ pub fn netease_download_songs_batch(
                         "[netease] 批量下载 task={} {}/{} 失败：{} - {}：{}",
                         task_id, index + 1, total, item.artist, item.title, e
                     );
-                    let _ = app_handle.emit(
-                        DOWNLOAD_PROGRESS_EVENT,
-                        DownloadProgress {
-                            task_id: task_id.clone(),
-                            index,
-                            total,
-                            status: "failed",
-                            title: item.title.clone(),
-                            artist: item.artist.clone(),
-                            path: None,
-                            error: Some(e),
-                            succeeded,
-                            failed,
-                        },
+                    emit_progress(
+                        &app_handle,
+                        &task_id,
+                        index,
+                        total,
+                        "failed",
+                        &item.title,
+                        &item.artist,
+                        None,
+                        Some(e),
+                        succeeded,
+                        failed,
+                        skipped,
+                        None,
+                        None,
                     );
                 }
             }
         }
 
         eprintln!(
-            "[netease] 批量下载 task={} 完成：成功 {}，失败 {}，总计 {}",
-            task_id, succeeded, failed, total
+            "[netease] 批量下载 task={} 完成：成功 {}，失败 {}，跳过 {}，总计 {}",
+            task_id, succeeded, failed, skipped, total
         );
         unregister_download_task(&task_id);
     });
@@ -1746,6 +1971,62 @@ pub fn netease_download_songs_batch(
         "task_id": task_id_for_return,
         "total": total,
     }))
+}
+
+/// 本地匹配项（用于去重比较）。
+struct LocalMatch {
+    file_path: Option<String>,
+    quality: AudioQuality,
+    quality_label: String,
+}
+
+/// 按标题+艺术家在本地库中查找匹配歌曲，返回每个匹配项的文件路径与推断音质。
+///
+/// 复用 `library.search_songs` 的模糊匹配能力，结果与 `source_compare_with_local`
+/// 命令保持一致，但返回强类型 [`LocalMatch`] 便于后续比较。
+fn find_local_matches(ctx: &Arc<AppContext>, title: &str, artist: &str) -> Vec<LocalMatch> {
+    let title_lower = title.to_lowercase();
+    let artist_lower = artist.to_lowercase();
+
+    let candidates = ctx.library.search_songs(title);
+    candidates
+        .into_iter()
+        .filter(|s| s.title.to_lowercase().contains(&title_lower))
+        .filter(|s| {
+            if artist.is_empty() {
+                return true;
+            }
+            s.artist_names
+                .iter()
+                .any(|a| a.to_lowercase().contains(&artist_lower))
+        })
+        .filter_map(|s| {
+            let local_path = s
+                .source_ids
+                .iter()
+                .find(|sid| sid.source_name == "local")
+                .map(|sid| sid.entity_id.clone());
+            let descriptor = local_path
+                .as_ref()
+                .and_then(|p| std::path::Path::new(p).extension())
+                .and_then(|e| e.to_str())
+                .map(AudioQualityDescriptor::from_extension)
+                .unwrap_or_else(AudioQualityDescriptor::unknown);
+            let quality = AudioQuality::from(descriptor.rank);
+            Some(LocalMatch {
+                file_path: local_path,
+                quality_label: descriptor.label(),
+                quality,
+            })
+        })
+        .collect()
+}
+
+/// 从本地匹配项中选出音质最高的（rank 最大；同 rank 任选其一）。
+fn best_local_quality(matches: &[LocalMatch]) -> Option<&LocalMatch> {
+    matches
+        .iter()
+        .max_by(|a, b| a.quality.cmp(&b.quality))
 }
 
 /// 取消指定的批量下载任务。

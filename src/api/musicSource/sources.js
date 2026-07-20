@@ -271,3 +271,45 @@ export async function maintenanceRepairReferences() {
 export async function debugInspectSongLyrics(songId) {
   return transport.command('debug_inspect_song_lyrics', { songId });
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 音乐去重 — 批量下载替换 + 手动去重
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 删除指定本地音频文件 + 移除库内对应的 Local SourceId。
+ *
+ * 主要用于"批量下载替换更低音质本地文件"场景：当在线版本下载成功后，
+ * 调用此函数删除本地已有的低音质版本，避免重复占用空间。
+ *
+ * 后端行为：
+ * 1. 规范化路径（含 canonicalize），匹配 entity_id
+ * 2. 删除物理文件（如存在）
+ * 3. 从对应 Song 实体的 source_ids 中移除 Local SourceId
+ * 4. 触发空实体清理（如该 Song 已无任何来源则被移除）
+ *
+ * @param {string} filePath - 文件绝对路径
+ * @returns {Promise<boolean>} true 表示库中找到并清理；false 表示库中无此文件记录（仍尝试删物理文件）
+ */
+export async function libraryDeleteSongFile(filePath) {
+  return transport.command('library_delete_song_file', { filePath });
+}
+
+/**
+ * 手动去重：保留每首"逻辑歌曲"中音质最高的本地文件，删除其余版本。
+ *
+ * 按 (title_lower, sorted_artist_names_lower) 分组所有含 Local 来源的歌曲，
+ * 每组内按文件扩展名推断音质 rank，保留 rank 最高的 Local 文件，删除其他。
+ * Web 来源（如 netease）记录保留不动，仅清理本地重复文件。
+ *
+ * 触发场景：用户在"设置 → 维护"页面点击"音乐去重"按钮。
+ *
+ * @returns {Promise<{
+ *   removed_files: string[],
+ *   removed_count: number,
+ *   groups_processed: number,
+ * }>}
+ */
+export async function libraryDedupKeepHighestQuality() {
+  return transport.command('library_dedup_keep_highest_quality');
+}

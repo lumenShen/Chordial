@@ -94,6 +94,26 @@
           </button>
         </div>
       </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <label class="setting-label">音乐去重（保留最高音质）</label>
+          <span class="setting-desc">
+            按 (标题 + 艺术家) 分组所有本地文件，每组只保留音质最高的版本，删除其他重复文件。
+            Web 来源（如网易云）记录不受影响。删除前请确保已停止播放。耗时取决于库大小。
+          </span>
+        </div>
+        <div class="setting-control">
+          <button
+            class="btn btn-primary"
+            :class="{ confirming: pendingAction === 'dedup_keep_highest' }"
+            :disabled="busy !== null"
+            @click="confirmAction('dedup_keep_highest')"
+          >
+            {{ pendingAction === 'dedup_keep_highest' ? '确认去重' : '去重' }}
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- 清理操作 -->
@@ -192,6 +212,7 @@ import {
   maintenanceClearStorage,
   maintenanceResetAll,
   maintenanceRepairReferences,
+  libraryDedupKeepHighestQuality,
 } from '@/api/tauri';
 
 const rootRef = useTemplateRef('root');
@@ -296,6 +317,14 @@ async function executeAction(action) {
       case 'repair_references':
         result = await maintenanceRepairReferences();
         showToast(result.message || '引用已修复', 'success', 5000);
+        break;
+      case 'dedup_keep_highest':
+        result = await libraryDedupKeepHighestQuality();
+        showToast(
+          `去重完成：处理 ${result.groups_processed} 组，删除 ${result.removed_count} 个重复文件`,
+          'success',
+          5000,
+        );
         break;
     }
     // 操作完成后刷新统计

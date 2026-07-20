@@ -147,6 +147,9 @@ pub fn run() {
             commands::library_get_albums_by_artist,
             commands::library_get_songs_in_album,
             commands::library_get_source_ids_of_song,
+            // MusicLibrary — 文件管理 & 去重
+            commands::library_delete_song_file,
+            commands::library_dedup_keep_highest_quality,
             // P2P 资源共享
             commands::p2p_status,
             commands::p2p_start_server,

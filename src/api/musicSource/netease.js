@@ -192,31 +192,51 @@ export async function downloadSong(songEntityId, title, artist, level = 'exhigh'
  */
 
 /**
+ * 批量下载去重策略。
+ * - `none`: 不去重（默认）
+ * - `skip_if_equal`: 本地已有相同或更高音质 → 跳过
+ * - `replace_if_better`: 本地音质 < 目标 → 下载并替换（删除旧文件）；本地音质 ≥ 目标 → 跳过
+ * @typedef {'none'|'skip_if_equal'|'replace_if_better'} DedupStrategy
+ */
+
+/**
  * 批量下载进度事件 payload（由 `netease-download-progress` 事件推送给前端）。
  * @typedef {Object} DownloadProgress
  * @property {string} task_id - 任务 ID（与启动时返回的一致）
  * @property {number} index - 当前完成的索引（0-based）
  * @property {number} total - 总曲目数
- * @property {'completed'|'failed'|'cancelled'} status - 单曲状态
+ * @property {'completed'|'failed'|'cancelled'|'skipped'|'replaced'} status - 单曲状态
  * @property {string} title - 当前曲目标题
  * @property {string} artist - 当前曲目艺术家
- * @property {string|null} path - 成功时的文件路径
- * @property {string|null} error - 失败时的错误信息
- * @property {number} succeeded - 已成功下载数
+ * @property {string|null} path - 成功时的文件路径（skipped 时为本地的文件路径）
+ * @property {string|null} error - 失败时的错误信息（skipped 时为跳过原因）
+ * @property {number} succeeded - 已成功下载数（含 replaced）
  * @property {number} failed - 已失败数
+ * @property {number} skipped - 已跳过数
+ * @property {string|null} actual_level - 实际下载到的音质等级（如 "exhigh"），降级时可能与目标不同
+ * @property {'downloaded'|'skipped'|'replaced'|null} action - 单曲处理动作描述
  */
 
 /**
  * 批量下载网易云歌曲到本地（后台静默执行）。
  *
- * 命令立即返回 `task_id`，下载在后台线程逐首进行。每完成一首（成功/失败）
+ * 命令立即返回 `task_id`，下载在后台线程逐首进行。每完成一首（成功/失败/跳过/替换）
  * 通过 `netease-download-progress` 事件推送进度，前端需 listen 该事件更新 UI。
  * 完成或取消后，后台线程会自动从注册表中移除该 task_id。
  *
+ * # 音质降级
+ * 每首曲目按目标音质开始尝试，若该等级不可用（VIP/无版权/URL 为空），
+ * 自动向下降级（hires→lossless→exhigh→higher→standard），直到成功或全部失败。
+ * 实际下载到的等级通过 `actual_level` 字段返回。
+ *
  * @param {BatchDownloadItem[]} songs - 待下载曲目列表
+ * @param {Object} [options]
+ * @param {string|null} [options.targetLevel=null] - 全局目标音质，覆盖每个 item 的 level
+ * @param {DedupStrategy|null} [options.dedupStrategy=null] - 去重策略
  * @returns {Promise<{ task_id: string, total: number }>} 任务 ID + 总曲目数
  */
-export async function downloadSongsBatch(songs) {
+export async function downloadSongsBatch(songs, options = {}) {
+  const { targetLevel = null, dedupStrategy = null } = options;
   return transport.command('netease_download_songs_batch', {
     songs: (songs || []).map((s) => ({
       songEntityId: s.songEntityId,
@@ -224,6 +244,8 @@ export async function downloadSongsBatch(songs) {
       artist: s.artist,
       level: s.level ?? null,
     })),
+    targetLevel,
+    dedupStrategy,
   });
 }
 

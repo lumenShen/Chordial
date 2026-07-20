@@ -2,6 +2,7 @@
 import { ref, shallowRef, onMounted, watch, nextTick, useTemplateRef, computed } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import TrackList from '../components/common/TrackList.vue';
+import BatchDownloadDialog from '../components/common/BatchDownloadDialog.vue';
 import { getAlbum } from '../api/album';
 import { getSongsByIds } from '../api/musicSource/musicResource';
 import { useCoverImage } from '@/composables/useCoverImage';
@@ -20,8 +21,14 @@ function showToast(msg, type = 'info', duration = 2500) {
   toastTimer = setTimeout(() => { toast.value = null; }, duration);
 }
 
-// 批量下载：将专辑内带网易云 sourceId 的曲目加入后台下载队列
-async function batchDownloadAll() {
+// 批量下载：弹出配置对话框 → 用户选择音质与去重策略 → 启动后台下载
+const batchDialog = ref({
+  visible: false,
+  items: [],
+  starting: false,
+});
+
+function openBatchDialog() {
   if (!sortedTracks.value.length) return;
   const items = [];
   for (const s of sortedTracks.value) {
@@ -39,11 +46,23 @@ async function batchDownloadAll() {
     showToast('当前专辑没有可下载的网易云曲目', 'info');
     return;
   }
+  batchDialog.value.items = items;
+  batchDialog.value.visible = true;
+}
+
+async function onBatchConfirm({ targetLevel, dedupStrategy }) {
+  batchDialog.value.starting = true;
   try {
-    const { total } = await startBatchDownload(items);
+    const { total } = await startBatchDownload(batchDialog.value.items, {
+      targetLevel,
+      dedupStrategy,
+    });
     showToast(`已开始后台下载 ${total} 首曲目`, 'success');
+    batchDialog.value.visible = false;
   } catch (e) {
     showToast(`批量下载启动失败：${e.message || e}`, 'error');
+  } finally {
+    batchDialog.value.starting = false;
   }
 }
 
@@ -211,7 +230,7 @@ const handleTrackPlay = (track) => {
             <button
               class="btn btn-secondary"
               :disabled="sortedTracks.length === 0"
-              @click="batchDownloadAll"
+              @click="openBatchDialog"
               title="将网易云曲目批量下载到本地（后台静默执行）"
             >
               <i class="bi bi-cloud-arrow-down"></i>
@@ -250,6 +269,14 @@ const handleTrackPlay = (track) => {
         返回专辑列表
       </router-link>
     </div>
+
+    <!-- 批量下载配置对话框 -->
+    <BatchDownloadDialog
+      v-model="batchDialog.visible"
+      :total="batchDialog.items.length"
+      :loading="batchDialog.starting"
+      @confirm="onBatchConfirm"
+    />
 
     <!-- Toast -->
     <transition name="toast">

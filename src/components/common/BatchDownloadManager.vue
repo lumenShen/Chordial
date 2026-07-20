@@ -21,23 +21,27 @@ const cancellingIds = ref(new Set());
 
 const hasTasks = computed(() => taskList.value.length > 0);
 
-/** 单个任务进度百分比 0-100 */
+/** 单个任务进度百分比 0-100（skipped 也算已处理） */
 function taskProgress(task) {
   if (!task.total) return 0;
-  return Math.round(((task.succeeded + task.failed) / task.total) * 100);
+  const done = (task.succeeded || 0) + (task.failed || 0) + (task.skipped || 0);
+  return Math.round((done / task.total) * 100);
 }
 
 /** 任务状态文字 */
 function taskStatusText(task) {
+  const skipped = task.skipped || 0;
   switch (task.status) {
     case 'running':
-      return `下载中 ${task.succeeded + task.failed}/${task.total}`;
+      return `下载中 ${task.succeeded + task.failed + skipped}/${task.total}`;
     case 'completed':
-      return `完成 ${task.succeeded} 首`;
+      return skipped > 0
+        ? `完成 ${task.succeeded} 首 · 跳过 ${skipped}`
+        : `完成 ${task.succeeded} 首`;
     case 'completed_with_errors':
-      return `完成 ${task.succeeded} 成功 / ${task.failed} 失败`;
+      return `完成 ${task.succeeded} 成功 / ${task.failed} 失败${skipped > 0 ? ` · 跳过 ${skipped}` : ''}`;
     case 'cancelled':
-      return `已取消（${task.succeeded} 已下载）`;
+      return `已取消（${task.succeeded} 已下载${skipped > 0 ? ` · ${skipped} 跳过` : ''}）`;
     default:
       return task.status;
   }
@@ -111,6 +115,7 @@ function togglePanel() {
         <div v-if="taskList.length > 1" class="bdm-summary">
           总计 {{ totalProgress.total }} 首 ·
           成功 {{ totalProgress.succeeded }} ·
+          跳过 {{ totalProgress.skipped }} ·
           失败 {{ totalProgress.failed }}
         </div>
 

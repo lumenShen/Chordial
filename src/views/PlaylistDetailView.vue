@@ -14,6 +14,7 @@ import { useRouter, useRoute } from 'vue-router';
 import { useAnime } from '@/composables/useAnime.js';
 import * as playlistApi from '@/api/musicSource/playlists.js';
 import TrackList from '@/components/common/TrackList.vue';
+import BatchDownloadDialog from '@/components/common/BatchDownloadDialog.vue';
 import PlayerStore from '@/stores/player.js';
 import { useDownloadManager } from '@/stores/downloadManager.js';
 
@@ -233,9 +234,15 @@ function openTrack(track) {
 }
 
 // ── 批量下载 ─────────────────────────────────────────
-// 筛选所有带网易云 sourceId 的曲目，构造 BatchDownloadItem 列表，
-// 委托 downloadManager store 在后台静默下载，UI 进度由浮窗显示。
-async function batchDownloadAll() {
+// 弹出配置对话框 → 用户选择目标音质与去重策略 → 启动后台下载。
+// 对话框关闭/确认由 BatchDownloadDialog 组件 emit 控制。
+const batchDialog = ref({
+  visible: false,
+  items: [],
+  starting: false,
+});
+
+function openBatchDialog() {
   if (songs.value.length === 0) return;
   const items = [];
   for (const s of songs.value) {
@@ -246,18 +253,30 @@ async function batchDownloadAll() {
       songEntityId: sid.entityId,
       title: s.title || '未知',
       artist: s.getDisplayArtist ? s.getDisplayArtist() : (s.artist || ''),
-      level: null, // 默认 exhigh
+      level: null, // 由对话框的 targetLevel 覆盖
     });
   }
   if (items.length === 0) {
     showToast('当前歌单没有可下载的网易云曲目', 'info');
     return;
   }
+  batchDialog.value.items = items;
+  batchDialog.value.visible = true;
+}
+
+async function onBatchConfirm({ targetLevel, dedupStrategy }) {
+  batchDialog.value.starting = true;
   try {
-    const { total } = await startBatchDownload(items);
+    const { total } = await startBatchDownload(batchDialog.value.items, {
+      targetLevel,
+      dedupStrategy,
+    });
     showToast(`已开始后台下载 ${total} 首曲目`, 'success');
+    batchDialog.value.visible = false;
   } catch (e) {
     showToast(`批量下载启动失败：${e.message || e}`, 'error');
+  } finally {
+    batchDialog.value.starting = false;
   }
 }
 
@@ -400,7 +419,7 @@ onMounted(async () => {
             <button
               class="btn btn-secondary"
               :disabled="songs.length === 0"
-              @click="batchDownloadAll"
+              @click="openBatchDialog"
               title="将网易云曲目批量下载到本地（后台静默执行）"
             >
               <i class="bi bi-cloud-arrow-down"></i> 批量下载
@@ -492,6 +511,14 @@ onMounted(async () => {
         <span>{{ toast.msg }}</span>
       </div>
     </transition>
+
+    <!-- 批量下载配置对话框 -->
+    <BatchDownloadDialog
+      v-model="batchDialog.visible"
+      :total="batchDialog.items.length"
+      :loading="batchDialog.starting"
+      @confirm="onBatchConfirm"
+    />
   </div>
 </template>
 

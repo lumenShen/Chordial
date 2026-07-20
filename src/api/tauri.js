@@ -26,6 +26,9 @@ export {
   maintenanceRepairReferences,
   // 诊断命令 — 歌词问题排查
   debugInspectSongLyrics,
+  // 音乐去重 — 批量下载替换 + 手动去重
+  libraryDeleteSongFile,
+  libraryDedupKeepHighestQuality,
 } from './musicSource/sources.js';
 
 // ── Music Library: CRUD + 搜索 + 关系查询 ──────────

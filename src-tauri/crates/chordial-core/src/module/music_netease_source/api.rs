@@ -321,6 +321,109 @@ pub fn download_song_to_file(
     Ok((written, url_data))
 }
 
+/// 音质降级下载结果。
+pub struct FallbackDownloadResult {
+    /// 实际下载的音质等级字符串（如 "exhigh"）
+    pub level: String,
+    /// 实际写入的字节数
+    pub written_bytes: u64,
+    /// URL 元信息（含真实音质、编码格式、码率）
+    pub url_data: NeteaseSongUrlData,
+    /// 尝试过的等级（含成功的，按尝试顺序）
+    pub attempted_levels: Vec<String>,
+}
+
+/// 从目标音质开始向下降级下载歌曲到文件。
+///
+/// 降级策略：从 `target_level` 开始尝试，若该等级不可用（URL 为空或 API 报错），
+/// 依次向下一等级降级，直到成功或所有等级都试过。
+///
+/// 降级顺序由 [`build_fallback_levels`] 生成，例如：
+/// - target = "hires" → ["hires", "lossless", "exhigh", "higher", "standard"]
+/// - target = "lossless" → ["lossless", "exhigh", "higher", "standard"]
+/// - target = "exhigh" → ["exhigh", "higher", "standard"]
+/// - target = None / "unknown" → ["exhigh", "higher", "standard"]
+///
+/// # 判定不可用的条件（任一即降级）
+/// 1. `get_song_url` 返回 `Err`（API 错误码或网络错误）
+/// 2. 返回的 `url_data.url` 为 `None` 或空字符串（VIP / 无版权）
+///
+/// # 返回
+/// - `Ok(FallbackDownloadResult)` — 含实际等级、写入字节、URL 数据、尝试历史
+/// - `Err(String)` — 所有等级都失败时，错误信息聚合每次尝试的原因
+pub fn download_song_to_file_with_fallback(
+    client: &WebHttpClient,
+    song_id: i64,
+    target_level: Option<&str>,
+    path: &std::path::Path,
+) -> Result<FallbackDownloadResult, String> {
+    let levels = build_fallback_levels(target_level);
+    let mut attempted: Vec<String> = Vec::with_capacity(levels.len());
+    let mut errors: Vec<String> = Vec::with_capacity(levels.len());
+
+    for level in levels {
+        attempted.push(level.to_string());
+        match get_song_url(client, song_id, level) {
+            Ok(url_data) => {
+                let Some(url) = url_data.url.as_deref().filter(|s| !s.is_empty()) else {
+                    errors.push(format!("{}: URL 为空（VIP/无版权）", level));
+                    continue;
+                };
+                match client.download_to_file(url, path, 300) {
+                    Ok(written) => {
+                        return Ok(FallbackDownloadResult {
+                            level: level.to_string(),
+                            written_bytes: written,
+                            url_data,
+                            attempted_levels: attempted,
+                        });
+                    }
+                    Err(e) => {
+                        // 下载字节失败（网络 IO）通常与等级无关，但仍尝试下一等级
+                        errors.push(format!("{}: 下载失败 {}", level, e));
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", level, e));
+            }
+        }
+    }
+
+    Err(format!(
+        "所有音质等级均不可用（尝试过 {}）：{}",
+        attempted.join(" → "),
+        errors.join("; ")
+    ))
+}
+
+/// 构造音质降级顺序（从目标等级到最低等级）。
+///
+/// 若 `target` 为 None / "unknown" / 非法值，从 `exhigh` 开始降级。
+fn build_fallback_levels(target: Option<&str>) -> Vec<&'static str> {
+    use super::types::AudioQuality;
+    let start = target
+        .and_then(|s| {
+            let q = AudioQuality::from_level_str(s);
+            (q != AudioQuality::Unknown).then_some(q)
+        })
+        .unwrap_or(AudioQuality::Exhigh);
+
+    let all = [
+        AudioQuality::Hires,
+        AudioQuality::Lossless,
+        AudioQuality::Exhigh,
+        AudioQuality::Higher,
+        AudioQuality::Standard,
+    ];
+    // 从 start 开始向下降级（含 start）
+    all.iter()
+        .copied()
+        .filter(|q| *q <= start)
+        .map(|q| q.to_level_str())
+        .collect()
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // 扫码登录
 // ───────────────────────────────────────────────────────────────────────────
@@ -517,5 +620,38 @@ mod tests {
         assert_eq!(AudioQuality::from_extension("flac"), AudioQuality::Lossless);
         assert_eq!(AudioQuality::from_extension("MP3"), AudioQuality::Exhigh);
         assert_eq!(AudioQuality::from_extension("wav"), AudioQuality::Hires);
+    }
+
+    #[test]
+    fn test_build_fallback_levels_from_hires() {
+        let levels = build_fallback_levels(Some("hires"));
+        assert_eq!(
+            levels,
+            vec!["hires", "lossless", "exhigh", "higher", "standard"]
+        );
+    }
+
+    #[test]
+    fn test_build_fallback_levels_from_lossless() {
+        let levels = build_fallback_levels(Some("lossless"));
+        assert_eq!(levels, vec!["lossless", "exhigh", "higher", "standard"]);
+    }
+
+    #[test]
+    fn test_build_fallback_levels_from_exhigh() {
+        let levels = build_fallback_levels(Some("exhigh"));
+        assert_eq!(levels, vec!["exhigh", "higher", "standard"]);
+    }
+
+    #[test]
+    fn test_build_fallback_levels_none_defaults_to_exhigh() {
+        let levels = build_fallback_levels(None);
+        assert_eq!(levels, vec!["exhigh", "higher", "standard"]);
+    }
+
+    #[test]
+    fn test_build_fallback_levels_unknown_falls_back() {
+        let levels = build_fallback_levels(Some("nonexistent"));
+        assert_eq!(levels, vec!["exhigh", "higher", "standard"]);
     }
 }
