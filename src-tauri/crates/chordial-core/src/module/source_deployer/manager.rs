@@ -569,6 +569,27 @@ fn now_secs() -> u64 {
 }
 
 /// 同步执行版本命令，返回 stdout 字符串（trim 后）。失败返回 None。
+///
+/// Windows 上通过 `cmd /c` 调用以正确解析 .cmd/.bat 扩展名并继承用户 PATH。
+#[cfg(target_os = "windows")]
+fn run_version_command(cmd: &str, args: &[&str]) -> Option<String> {
+    let mut full: Vec<&str> = vec!["/c", cmd];
+    full.extend(args);
+    let output = std::process::Command::new("cmd")
+        .args(&full)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() || !output.status.success() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn run_version_command(cmd: &str, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new(cmd)
         .args(args)
