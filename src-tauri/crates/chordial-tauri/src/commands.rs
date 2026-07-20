@@ -2107,6 +2107,85 @@ pub fn netease_compare_with_local(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// 酷狗音乐来源命令 — 配置/测试/搜索
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// 获取酷狗来源配置（base_url / cookie / 超时 / 启用 / 下载目录）。
+#[tauri::command]
+pub fn kugou_get_config(ctx: State<'_, Arc<AppContext>>) -> Result<WebSourceConfig, String> {
+    Ok(ctx.kugou_source.config())
+}
+
+/// 更新酷狗来源配置并持久化。
+///
+/// 重建 HTTP 客户端以应用新的 base_url / cookie / timeout。
+#[tauri::command]
+pub fn kugou_update_config(
+    ctx: State<'_, Arc<AppContext>>,
+    config: WebSourceConfig,
+) -> Result<(), String> {
+    ctx.kugou_source.update_config(config)
+}
+
+/// 测试与酷狗 API 服务器的连通性。
+///
+/// 通过发起一次 page=1 pagesize=1 的搜索请求验证 base_url + cookie 是否有效。
+#[tauri::command]
+pub fn kugou_test_connection(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::Value, String> {
+    let cfg = ctx.kugou_source.config();
+    if cfg.base_url.is_empty() {
+        return Err("API base_url 未配置".to_string());
+    }
+    let result = ctx.kugou_source.search_songs("test");
+    Ok(serde_json::json!({
+        "ok": result.is_ok(),
+        "error": result.err(),
+        "base_url": cfg.base_url,
+    }))
+}
+
+/// 在线搜索歌曲（返回库内 Song 模型，附带 kugou SourceId）。
+#[tauri::command]
+pub fn kugou_search_songs(
+    ctx: State<'_, Arc<AppContext>>,
+    query: String,
+) -> Result<Vec<Song>, String> {
+    ctx.kugou_source.search_songs(&query)
+}
+
+/// 在线搜索歌手（返回库内 Artist 模型）。
+///
+/// 酷狗 API 使用 1-based page/pagesize；此处将前端 limit/offset 转换为对应分页。
+#[tauri::command]
+pub fn kugou_search_artists(
+    ctx: State<'_, Arc<AppContext>>,
+    query: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<Artist>, String> {
+    let pagesize = limit.unwrap_or(30);
+    let offset_val = offset.unwrap_or(0);
+    let page = (offset_val / pagesize.max(1)) + 1;
+    ctx.kugou_source.search_artists(&query, page, pagesize)
+}
+
+/// 在线搜索专辑（返回库内 Album 模型）。
+///
+/// 酷狗 API 使用 1-based page/pagesize；此处将前端 limit/offset 转换为对应分页。
+#[tauri::command]
+pub fn kugou_search_albums(
+    ctx: State<'_, Arc<AppContext>>,
+    query: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<Album>, String> {
+    let pagesize = limit.unwrap_or(30);
+    let offset_val = offset.unwrap_or(0);
+    let page = (offset_val / pagesize.max(1)) + 1;
+    ctx.kugou_source.search_albums(&query, page, pagesize)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // 通用云端来源命令 — 从网络来源实例选择一个云端音乐源进行下载/比较
 // ══════════════════════════════════════════════════════════════════════════════
 
