@@ -14,6 +14,10 @@
         <i class="bi bi-music-note-list"></i>
         <span>歌词与播放器</span>
       </router-link>
+      <router-link :to="{ name: 'SettingsLyricPriority' }" class="nav-item" active-class="active">
+        <i class="bi bi-list-ol"></i>
+        <span>歌词优先级</span>
+      </router-link>
       <router-link :to="{ name: 'SettingsMaintenance' }" class="nav-item" active-class="active">
         <i class="bi bi-wrench-adjustable"></i>
         <span>数据维护</span>

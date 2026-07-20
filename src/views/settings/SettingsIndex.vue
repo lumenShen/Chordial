@@ -33,6 +33,15 @@
         <i class="bi bi-chevron-right card-arrow"></i>
       </router-link>
 
+      <router-link :to="{ name: 'SettingsLyricPriority' }" class="index-card">
+        <div class="card-icon"><i class="bi bi-list-ol"></i></div>
+        <div class="card-body">
+          <h3 class="card-title">歌词优先级</h3>
+          <p class="card-desc">多来源歌词排序、逐字格式偏好、本地与在线来源选择</p>
+        </div>
+        <i class="bi bi-chevron-right card-arrow"></i>
+      </router-link>
+
       <router-link :to="{ name: 'SettingsMaintenance' }" class="index-card">
         <div class="card-icon"><i class="bi bi-wrench-adjustable"></i></div>
         <div class="card-body">

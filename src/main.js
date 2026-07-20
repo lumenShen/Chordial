@@ -3,6 +3,7 @@ import App from "./App.vue";
 import router from "./routers";
 import { initWindowState } from '@/api/window.js';
 import { AmllSettingsStore } from '@/stores/amllSettings.js';
+import { LyricPreferenceStore } from '@/stores/lyricPreference.js';
 import { initLibraryEvents } from '@/composables/useLibraryEvents.js';
 
 import './style.css'
@@ -12,6 +13,9 @@ import '@applemusic-like-lyrics/core/style.css';
 
 // 初始化 AMLL 配置（从 localStorage 读取持久化设置）
 AmllSettingsStore.init();
+
+// 初始化歌词优先级配置（从后端 config.json 读取，异步加载，失败不阻塞启动）
+LyricPreferenceStore.init();
 
 const app = createApp(App);
 

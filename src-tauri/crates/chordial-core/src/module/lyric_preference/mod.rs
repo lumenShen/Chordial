@@ -95,6 +95,12 @@ impl LyricFormat {
 
 /// 歌词来源类型 — 与 [`crate::module::music_source::types::SourceType`] 对应，
 /// 但仅保留与歌词相关的来源。
+///
+/// 新增来源时需同步：
+/// 1. 此处枚举变体
+/// 2. [`Self::from_source_name`] 中的映射
+/// 3. [`Self::default_weight`] 中的权重
+/// 4. [`Self::display_name`] 中的中文显示名
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum LyricSourceKind {
@@ -102,14 +108,22 @@ pub enum LyricSourceKind {
     Local,
     /// 网易云音乐
     Netease,
+    /// 酷狗音乐
+    Kugou,
+    /// QQ 音乐
+    Qq,
 }
 
 impl LyricSourceKind {
     /// 从来源名称解析。
+    ///
+    /// 名称需与对应 `MusicSource::name()` 返回值一致（如 `"netease"`、`"kugou"`、`"qq"`）。
     pub fn from_source_name(name: &str) -> Option<Self> {
         match name {
             "local" => Some(Self::Local),
             "netease" => Some(Self::Netease),
+            "kugou" => Some(Self::Kugou),
+            "qq" => Some(Self::Qq),
             _ => None,
         }
     }
@@ -117,8 +131,30 @@ impl LyricSourceKind {
     /// 默认优先级权重（数字越大越优先）。
     pub fn default_weight(self) -> u8 {
         match self {
-            Self::Local => 10,
-            Self::Netease => 5,
+            Self::Local => 40,
+            Self::Netease => 30,
+            Self::Kugou => 20,
+            Self::Qq => 10,
+        }
+    }
+
+    /// 用户可读的来源名称（用于设置页显示）。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Local => "本地",
+            Self::Netease => "网易云",
+            Self::Kugou => "酷狗",
+            Self::Qq => "QQ 音乐",
+        }
+    }
+
+    /// 来源标识（与 `MusicSource::name()` 一致，用于序列化和后端查找）。
+    pub fn source_name(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Netease => "netease",
+            Self::Kugou => "kugou",
+            Self::Qq => "qq",
         }
     }
 }
@@ -145,7 +181,14 @@ pub struct LyricPreference {
 }
 
 fn default_source_order() -> Vec<LyricSourceKind> {
-    vec![LyricSourceKind::Local, LyricSourceKind::Netease]
+    // 默认顺序：本地 → 网易云 → 酷狗 → QQ
+    // 顺序与 default_weight 一致：权重高的排在前面
+    vec![
+        LyricSourceKind::Local,
+        LyricSourceKind::Netease,
+        LyricSourceKind::Kugou,
+        LyricSourceKind::Qq,
+    ]
 }
 
 fn default_prefer_word_by_word() -> bool {
@@ -164,16 +207,38 @@ impl Default for LyricPreference {
 
 impl LyricPreference {
     /// 从 ConfigStore 加载配置。
+    ///
+    /// 加载后会做规范化：把未在 `source_order` 中但已支持的来源追加到末尾，
+    /// 避免老版本用户升级到新版本后新增来源（如 KuGou/QQ）永远选不到。
     pub fn load(config: &crate::module::config::store::ConfigStore) -> Self {
-        config
-            .get::<Self>("lyric_preference")
-            .unwrap_or_default()
+        let mut pref: Self = config.get::<Self>("lyric_preference").unwrap_or_default();
+        pref.normalize_source_order();
+        pref
     }
 
     /// 保存到 ConfigStore（自动防抖落盘）。
     pub fn save(&self, config: &crate::module::config::store::ConfigStore) -> Result<(), String> {
         config.set("lyric_preference", self)?;
         Ok(())
+    }
+
+    /// 规范化 `source_order`：
+    /// - 移除未知/重复项
+    /// - 追加未在列表中的已知来源到末尾
+    pub fn normalize_source_order(&mut self) {
+        let known = default_source_order();
+        let mut seen = std::collections::HashSet::new();
+        self.source_order.retain(|s| {
+            let known_known = known.contains(s);
+            let inserted = seen.insert(*s);
+            known_known && inserted
+        });
+        for k in known {
+            if !seen.contains(&k) {
+                self.source_order.push(k);
+                seen.insert(k);
+            }
+        }
     }
 }
 
@@ -270,7 +335,12 @@ mod tests {
     #[test]
     fn test_prefer_word_by_word_local() {
         let pref = LyricPreference {
-            source_order: vec![LyricSourceKind::Local, LyricSourceKind::Netease],
+            source_order: vec![
+                LyricSourceKind::Local,
+                LyricSourceKind::Netease,
+                LyricSourceKind::Kugou,
+                LyricSourceKind::Qq,
+            ],
             prefer_word_by_word: true,
             fallback_to_online_for_word_by_word: false,
         };
@@ -301,5 +371,73 @@ mod tests {
     fn test_empty_candidates() {
         let pref = LyricPreference::default();
         assert!(select_best(&[], &pref).is_none());
+    }
+
+    #[test]
+    fn test_normalize_merges_new_sources() {
+        // 模拟老版本用户：只配置了 Local + Netease
+        let mut pref = LyricPreference {
+            source_order: vec![LyricSourceKind::Local, LyricSourceKind::Netease],
+            prefer_word_by_word: true,
+            fallback_to_online_for_word_by_word: false,
+        };
+        pref.normalize_source_order();
+        // 规范化后应包含全部 4 个来源，且原有顺序保留
+        assert_eq!(
+            pref.source_order,
+            vec![
+                LyricSourceKind::Local,
+                LyricSourceKind::Netease,
+                LyricSourceKind::Kugou,
+                LyricSourceKind::Qq,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_normalize_dedup() {
+        let mut pref = LyricPreference {
+            source_order: vec![
+                LyricSourceKind::Local,
+                LyricSourceKind::Local,
+                LyricSourceKind::Netease,
+            ],
+            prefer_word_by_word: true,
+            fallback_to_online_for_word_by_word: false,
+        };
+        pref.normalize_source_order();
+        assert_eq!(pref.source_order.len(), 4);
+        assert_eq!(pref.source_order[0], LyricSourceKind::Local);
+    }
+
+    #[test]
+    fn test_default_source_order_has_all_sources() {
+        let pref = LyricPreference::default();
+        assert_eq!(pref.source_order.len(), 4);
+        assert!(pref.source_order.contains(&LyricSourceKind::Local));
+        assert!(pref.source_order.contains(&LyricSourceKind::Netease));
+        assert!(pref.source_order.contains(&LyricSourceKind::Kugou));
+        assert!(pref.source_order.contains(&LyricSourceKind::Qq));
+    }
+
+    #[test]
+    fn test_from_source_name_all() {
+        assert_eq!(
+            LyricSourceKind::from_source_name("local"),
+            Some(LyricSourceKind::Local)
+        );
+        assert_eq!(
+            LyricSourceKind::from_source_name("netease"),
+            Some(LyricSourceKind::Netease)
+        );
+        assert_eq!(
+            LyricSourceKind::from_source_name("kugou"),
+            Some(LyricSourceKind::Kugou)
+        );
+        assert_eq!(
+            LyricSourceKind::from_source_name("qq"),
+            Some(LyricSourceKind::Qq)
+        );
+        assert_eq!(LyricSourceKind::from_source_name("unknown"), None);
     }
 }

@@ -111,6 +111,13 @@ export class Song {
 
   /**
    * 获取歌词信息（同步/异步兼容，优先从缓存）
+   *
+   * 优先走后端 `lyric_get_preferred` 命令，由后端按用户配置的歌词优先级
+   * （来源顺序 + 格式偏好）综合选出"最佳"歌词。
+   *
+   * 兜底路径：若后端命令失败（如歌曲未入库、所有来源都拿不到），回退到旧的
+   * "库内 Lyric + 在线网易云" 两路查询，保证未入库搜索歌曲也能拉到歌词。
+   *
    * @returns {Promise<{plainLyrics: string, syncedLyrics: string, hasSyncedLyrics: boolean, hasPlainLyrics: boolean}>}
    */
   async getLyricsInfo() {
@@ -124,52 +131,64 @@ export class Song {
     try {
       let lyricText = '';
 
-      // 优先级1：库内 Lyric 实体（已入库的歌曲，如本地扫描或导入的网易云曲目）
-      // 始终按 song_id 查询；lyricId 字段仅为元数据，不可作为查询门控。
-      // 旧实现 `if (this.lyricId)` 会跳过 lyric_id 为 null 的歌曲，
-      // 但 Lyric 实体可能已存在于库中（按 song_id 索引），
-      // 导致已扫描歌曲的歌词无法显示。
-      // 后端 getLyricOfSong 用 JSON 层字段匹配，~0.1ms，无性能担忧。
-      const { getLyricOfSong } = await import('@/api/musicSource/library.js');
-      const lyric = await getLyricOfSong(this.id);
-
-      // ── 诊断日志：追踪歌词数据流向 ──
-      console.log('[Song.getLyricsInfo] songId=%s title=%s', this.id, this.title, {
-        lyricFound: !!lyric,
-        lyricId: lyric?.id ?? null,
-        lyricTextLen: lyric?.text?.length ?? 0,
-        lyricTextPreview: lyric?.text ? lyric.text.slice(0, 80) : null,
-        hasSourceId: !!lyric?.sourceId,
-      });
-
-      if (lyric && lyric.text) {
-        lyricText = lyric.text;
-      } else if (lyric && lyric.sourceId) {
-        // 库内 Lyric 实体存在但 text 为空，通过 sourceId 重新拉取
-        const { getLyricText } = await import('@/api/musicSource/musicResource.js');
-        lyricText = await getLyricText(lyric.sourceId) || '';
-        console.log('[Song.getLyricsInfo] 通过库内 Lyric.sourceId 回查歌词: len=%d', lyricText.length);
+      // 优先级 1：后端 lyric_get_preferred 命令（按用户偏好综合所有来源）
+      // 后端会自动遍历 song.source_ids 中所有已注册来源（Local/Netease/Kugou/Qq），
+      // 调用 select_best 选出得分最高的候选歌词
+      try {
+        const { getPreferred } = await import('@/api/musicSource/lyricPreference.js');
+        const preferred = await getPreferred(this.id);
+        if (preferred && preferred.text) {
+          lyricText = preferred.text;
+          console.log(
+            '[Song.getLyricsInfo] 后端 lyric_get_preferred 命中 source=%s format=%s candidates=%d',
+            preferred.source,
+            preferred.format,
+            preferred.candidates_count,
+          );
+        }
+      } catch (e) {
+        console.warn('[Song.getLyricsInfo] lyric_get_preferred 调用失败，回退到旧路径:', e);
       }
 
-      // 优先级2：在线来源直拉歌词（未入库的在线搜索歌曲）
-      // 场景：用户在搜索页点击网易云歌曲播放，歌曲尚未入库，
-      // 库内无 Lyric 实体，需要通过歌曲自身的 SourceId 调用 getLyricText
-      // 后端 resource::get_lyric_text → source.lyric_text_get(entity_id) → 网易云 /lyric API
+      // 优先级 2（兜底）：库内 Lyric 实体 + 在线网易云直拉
+      // 仅在后端命令未拿到歌词时执行，避免重复请求
       if (!lyricText) {
-        const neteaseSid = this.sourceIds?.find(
-          (s) => s?.sourceName === 'netease' && s?.entityType === 'Song' && s?.entityId,
-        );
-        if (neteaseSid) {
-          try {
-            const { getLyricText } = await import('@/api/musicSource/musicResource.js');
-            lyricText = (await getLyricText(neteaseSid)) || '';
-            console.log(
-              '[Song.getLyricsInfo] 通过歌曲 SourceId 在线拉取网易云歌词: len=%d, entityId=%s',
-              lyricText.length,
-              neteaseSid.entityId,
-            );
-          } catch (e) {
-            console.warn('[Song.getLyricsInfo] 在线拉取网易云歌词失败:', e);
+        const { getLyricOfSong } = await import('@/api/musicSource/library.js');
+        const lyric = await getLyricOfSong(this.id);
+
+        console.log('[Song.getLyricsInfo] 兜底路径 songId=%s title=%s', this.id, this.title, {
+          lyricFound: !!lyric,
+          lyricId: lyric?.id ?? null,
+          lyricTextLen: lyric?.text?.length ?? 0,
+          hasSourceId: !!lyric?.sourceId,
+        });
+
+        if (lyric && lyric.text) {
+          lyricText = lyric.text;
+        } else if (lyric && lyric.sourceId) {
+          // 库内 Lyric 实体存在但 text 为空，通过 sourceId 重新拉取
+          const { getLyricText } = await import('@/api/musicSource/musicResource.js');
+          lyricText = await getLyricText(lyric.sourceId) || '';
+        }
+
+        // 库内无歌词：尝试通过歌曲自身的网易云 SourceId 在线拉取
+        // 场景：搜索页点击未入库歌曲播放
+        if (!lyricText) {
+          const neteaseSid = this.sourceIds?.find(
+            (s) => s?.sourceName === 'netease' && s?.entityType === 'Song' && s?.entityId,
+          );
+          if (neteaseSid) {
+            try {
+              const { getLyricText } = await import('@/api/musicSource/musicResource.js');
+              lyricText = (await getLyricText(neteaseSid)) || '';
+              console.log(
+                '[Song.getLyricsInfo] 兜底在线拉取网易云歌词: len=%d, entityId=%s',
+                lyricText.length,
+                neteaseSid.entityId,
+              );
+            } catch (e) {
+              console.warn('[Song.getLyricsInfo] 兜底在线拉取网易云歌词失败:', e);
+            }
           }
         }
       }

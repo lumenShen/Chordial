@@ -195,6 +195,10 @@ pub fn run() {
             commands::kugou_search_songs,
             commands::kugou_search_artists,
             commands::kugou_search_albums,
+            // KuGou 扫码登录
+            commands::kugou_login_qr_key,
+            commands::kugou_login_qr_create,
+            commands::kugou_login_qr_check,
             // QQ Music API 来源
             commands::qq_get_config,
             commands::qq_update_config,
@@ -217,6 +221,7 @@ pub fn run() {
             // 歌词优先级 — 多来源选择
             commands::lyric_preference_get,
             commands::lyric_preference_set,
+            commands::lyric_source_list,
             commands::lyric_get_preferred,
             // 歌单 — 本地 CRUD + 曲目管理
             commands::playlist_list,

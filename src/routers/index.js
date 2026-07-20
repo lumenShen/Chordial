@@ -13,6 +13,7 @@ const SettingsView = () => import('../views/SettingsView.vue')
 const GeneralSettingsView = () => import('../views/settings/GeneralSettingsView.vue')
 const P2pSettingsView = () => import('../views/settings/P2pSettingsView.vue')
 const LyricsSettingsView = () => import('../views/settings/LyricsSettingsView.vue')
+const LyricPrioritySettingsView = () => import('../views/settings/LyricPrioritySettingsView.vue')
 const MaintenanceSettingsView = () => import('../views/settings/MaintenanceSettingsView.vue')
 const NeteaseSettingsView = () => import('../views/settings/NeteaseSettingsView.vue')
 const KugouSettingsView = () => import('../views/settings/KugouSettingsView.vue')
@@ -148,6 +149,12 @@ const routes = [
         name: 'SettingsLyrics',
         component: LyricsSettingsView,
         meta: { title: '歌词与播放器' }
+      },
+      {
+        path: 'lyric-priority',
+        name: 'SettingsLyricPriority',
+        component: LyricPrioritySettingsView,
+        meta: { title: '歌词优先级' }
       },
       {
         path: 'maintenance',
