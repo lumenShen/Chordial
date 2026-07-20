@@ -75,6 +75,8 @@ const state = reactive({
     // 真共享 DOM portal 目标（动态 Teleport）
     coverPortalTarget: null,          // markRaw DOM 元素，PlayerView 内的封面 portal 容器
     metaPortalTarget: null,           // markRaw DOM 元素，PlayerView 内的元信息 portal 容器
+    // ── AMLL MenuButton 触发的歌曲菜单 Sheet（bindSheet）────────
+    isTrackMenuOpen: false,           // AMLL onRequestOpenMenuAtom 触发的歌曲菜单是否展开
   }
 });
 
@@ -131,6 +133,7 @@ const getters = {
   playerViewTransitioning: computed(() => state.ui.playerViewTransitioning),
   coverPortalTarget: computed(() => state.ui.coverPortalTarget),
   metaPortalTarget: computed(() => state.ui.metaPortalTarget),
+  isTrackMenuOpen: computed(() => state.ui.isTrackMenuOpen),
 };
 
 // 格式化时间
@@ -695,6 +698,21 @@ const actions = {
   setPortalTargets(coverEl = null, metaEl = null) {
     state.ui.coverPortalTarget = coverEl ? markRaw(coverEl) : null;
     state.ui.metaPortalTarget = metaEl ? markRaw(metaEl) : null;
+  },
+
+  /**
+   * 打开 AMLL MenuButton 触发的歌曲菜单 Sheet。
+   * 由 useAmllBridge 中 onRequestOpenMenuAtom 回调调用。
+   */
+  openTrackMenu() {
+    state.ui.isTrackMenuOpen = true;
+  },
+
+  /**
+   * 关闭歌曲菜单 Sheet。
+   */
+  closeTrackMenu() {
+    state.ui.isTrackMenuOpen = false;
   },
 
   /**
