@@ -29,6 +29,8 @@ export class Song {
     this.sourceIds = (data.source_ids ?? data.sourceIds ?? []).map(
       (s) => (s instanceof SourceId ? s : new SourceId(s)),
     );
+    /** 封面图片 URL（网络来源直接提供，优先于 sourceIds 的 chordial:// 协议） */
+    this.coverUrl = data.cover_url ?? data.coverUrl ?? null;
   }
 
   // ── 显示辅助 ────────────────────────────────────
@@ -88,6 +90,13 @@ export class Song {
    * @returns {Promise<{url: string, release: Function}|null>}
    */
   async acquireCoverResource(_size = 'medium') {
+    // 优先级1: 网络来源直接提供的 coverUrl（避免 chordial:// 协议二次拉取）
+    // 网易云搜索/详情接口已返回 al.picUrl，直接用 URL 不走 /album 接口
+    if (this.coverUrl) {
+      return { url: this.coverUrl, release: () => {} };
+    }
+
+    // 优先级2: 通过 chordial:// 协议从本地音频标签提取封面
     if (this.sourceIds && this.sourceIds.length > 0) {
       try {
         const { buildImageUrl } = await import('@/api/musicSource/chordialUrl.js');

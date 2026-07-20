@@ -100,7 +100,9 @@ const formatDuration = (seconds) => {
 };
 
 const getCoverUrl = (track) => {
-  // 优先使用从 ResourceManager 加载的封面
+  // 优先使用网络来源直接提供的 coverUrl（避免 chordial:// 协议二次拉取）
+  if (track.coverUrl) return track.coverUrl;
+  // 其次使用从 ResourceManager 加载的封面
   return coverUrls.value.get(track.id) || track.album?.coverUrl || '';
 };
 

@@ -217,6 +217,9 @@ impl NeteaseCloudMusicApiSource {
             lyric_id,
             source_ids: vec![source_id],
             year: None,
+            // 网易云 al.picUrl 直接作为封面 URL，前端无需通过 chordial:// 协议二次拉取
+            // 避免song id 被当成 album id 调 /album 接口导致 404/405 限流
+            cover_url: detail.al.as_ref().and_then(|a| a.picUrl.clone()),
         }
     }
 }
@@ -429,7 +432,7 @@ impl MusicSource for NeteaseCloudMusicApiSource {
         if !self.is_enabled() {
             return Err("网易云来源未启用".to_string());
         }
-        // entity_id 可能是 album:<id>，也可能直接是图片 URL
+        // entity_id 可能是 album:<id> / song:<id>，也可能直接是图片 URL
         // 若是 URL，直接下载
         if entity_id.starts_with("http://") || entity_id.starts_with("https://") {
             return self.client.get_bytes(entity_id);
@@ -438,24 +441,51 @@ impl MusicSource for NeteaseCloudMusicApiSource {
         let Some(remote_id) = parse_remote_id(entity_id) else {
             return Err(format!("无效的 entity_id: {}", entity_id));
         };
-        // 获取专辑详情拿到 picUrl
-        #[derive(serde::Deserialize)]
-        struct AlbumResp {
-            #[serde(default)]
-            code: i32,
-            #[serde(default)]
-            album: Option<super::types::NeteaseAlbumBrief>,
-        }
-        let resp: AlbumResp = self
-            .client
-            .get_json("/album", &[("id", &remote_id.to_string())])?;
-        if resp.code != 200 {
-            return Err(format!("获取专辑失败 code={}", resp.code));
-        }
-        let pic_url = resp
-            .album
-            .and_then(|a| a.picUrl)
-            .ok_or_else(|| "专辑无封面 URL".to_string())?;
+
+        // 根据 entity_id 前缀选择 API：
+        // - album:<id> → /album?id=<id> 拿 album.picUrl
+        // - song:<id>  → /song/detail?ids=<id> 拿 songs[0].al.picUrl
+        //   （旧实现统一调 /album，把 song id 当 album id 导致 404）
+        let pic_url = if entity_id.starts_with("song:") {
+            #[derive(serde::Deserialize)]
+            struct SongDetailResp {
+                #[serde(default)]
+                code: i32,
+                #[serde(default)]
+                songs: Vec<super::types::NeteaseSongDetail>,
+            }
+            let resp: SongDetailResp = self.client.get_json(
+                "/song/detail",
+                &[("ids", &remote_id.to_string())],
+            )?;
+            if resp.code != 200 {
+                return Err(format!("获取歌曲详情失败 code={}", resp.code));
+            }
+            resp.songs
+                .into_iter()
+                .next()
+                .and_then(|s| s.al.and_then(|a| a.picUrl))
+                .ok_or_else(|| "歌曲无封面 URL".to_string())?
+        } else {
+            // album:<id> 或裸 id → /album 接口
+            #[derive(serde::Deserialize)]
+            struct AlbumResp {
+                #[serde(default)]
+                code: i32,
+                #[serde(default)]
+                album: Option<super::types::NeteaseAlbumBrief>,
+            }
+            let resp: AlbumResp = self
+                .client
+                .get_json("/album", &[("id", &remote_id.to_string())])?;
+            if resp.code != 200 {
+                return Err(format!("获取专辑失败 code={}", resp.code));
+            }
+            resp.album
+                .and_then(|a| a.picUrl)
+                .ok_or_else(|| "专辑无封面 URL".to_string())?
+        };
+
         self.client.get_bytes(&pic_url)
     }
 

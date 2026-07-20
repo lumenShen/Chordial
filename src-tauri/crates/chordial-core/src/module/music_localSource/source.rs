@@ -454,6 +454,8 @@ impl LocalMusicSource {
             lyric_id,
             source_ids: vec![source_id],
             year: meta.year,
+            // 本地来源通过 chordial:// 协议从音频标签提取封面，无直接 URL
+            cover_url: None,
         }
     }
 
