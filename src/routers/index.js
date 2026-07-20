@@ -16,6 +16,7 @@ const LyricsSettingsView = () => import('../views/settings/LyricsSettingsView.vu
 const MaintenanceSettingsView = () => import('../views/settings/MaintenanceSettingsView.vue')
 const NeteaseSettingsView = () => import('../views/settings/NeteaseSettingsView.vue')
 const KugouSettingsView = () => import('../views/settings/KugouSettingsView.vue')
+const QqSettingsView = () => import('../views/settings/QqSettingsView.vue')
 const PlaylistsView = () => import('../views/PlaylistsView.vue')
 const PlaylistDetailView = () => import('../views/PlaylistDetailView.vue')
 const PlaylistSearchView = () => import('../views/PlaylistSearchView.vue')
@@ -104,6 +105,12 @@ const routes = [
     name: 'MusicSourceKugou',
     component: KugouSettingsView,
     meta: { title: '酷狗音乐来源' }
+  },
+  {
+    path: '/music-sources/qq',
+    name: 'MusicSourceQq',
+    component: QqSettingsView,
+    meta: { title: 'QQ 音乐来源' }
   },
   {
     path: '/track/:trackId',

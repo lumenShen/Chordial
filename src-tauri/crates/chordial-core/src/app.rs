@@ -27,6 +27,7 @@ use crate::module::music_library::library::MusicLibrary;
 use crate::module::music_localSource;
 use crate::module::music_localSource::source::LocalMusicSource;
 use crate::module::music_netease_source::NeteaseCloudMusicApiSource;
+use crate::module::music_qq_source::QqMusicApiSource;
 use crate::module::music_source::manager::SourceManager;
 use crate::module::music_source::registrar::{SourceCleanup, SourceRegistrar};
 use crate::module::music_source::traits::MusicSource;
@@ -58,6 +59,8 @@ pub struct AppContext {
     pub netease_source: Arc<NeteaseCloudMusicApiSource>,
     /// 酷狗音乐来源实现（运行时配置，启用/禁用由 config 控制）。
     pub kugou_source: Arc<KugouMusicApiSource>,
+    /// QQ 音乐来源实现（运行时配置，启用/禁用由 config 控制）。
+    pub qq_source: Arc<QqMusicApiSource>,
     /// P2P 资源共享管理器。
     pub p2p: Arc<P2pManager>,
 }
@@ -133,6 +136,20 @@ impl AppContext {
             }
         }
 
+        // ── QQ 音乐来源（可选，由用户在设置中配置 base_url 后启用）──
+        let qq_source = Arc::new(
+            QqMusicApiSource::new(store.clone())
+                .map_err(|e| format!("初始化 QQ 音乐来源失败: {}", e))?,
+        );
+        {
+            let cfg = qq_source.config();
+            if cfg.enabled && !cfg.base_url.is_empty() {
+                if let Err(e) = registrar.register(qq_source.clone() as Arc<dyn MusicSource>) {
+                    eprintln!("[chordial] 注册 QQ 音乐来源失败: {}", e);
+                }
+            }
+        }
+
         // ── P2P 资源共享管理器 ──
         let p2p = P2pManager::new(library.clone(), registrar.clone(), config.clone());
 
@@ -146,6 +163,7 @@ impl AppContext {
             local_source,
             netease_source,
             kugou_source,
+            qq_source,
             p2p,
         })
     }
