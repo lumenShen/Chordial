@@ -356,9 +356,7 @@ impl SourceDeployer {
 
         let _scope = perf::scope("source_deployer.install");
         eprintln!("[source_deployer] installing deps for {}", source_id);
-        let output = Command::new(&spec.install_command)
-            .args(&spec.install_args)
-            .current_dir(&target_dir)
+        let output = spawn_npm(&spec.install_command, &spec.install_args, Some(&target_dir), None)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -420,16 +418,18 @@ impl SourceDeployer {
             source_id, port
         );
 
-        let mut child = Command::new(&spec.start_command)
-            .args(&spec.start_args)
-            .current_dir(&target_dir)
-            .env("PORT", port.to_string())
-            .env("NODE_ENV", "production")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("启动服务失败: {}", e))?;
+        let mut child = spawn_npm(
+            &spec.start_command,
+            &spec.start_args,
+            Some(&target_dir),
+            Some(("PORT", port.to_string())),
+        )
+        .env("NODE_ENV", "production")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("启动服务失败: {}", e))?;
 
         let pid = child.id();
         let stdout = child.stdout.take();
@@ -569,6 +569,51 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// 构造一个调用 `npm`（或其它 Node 工具）的异步 `Command`。
+///
+/// Windows 上 `npm` 是 `npm.cmd` 批处理文件，`Command::new("npm")` 在 Tauri 进程的
+/// PATH 下可能找不到 `.cmd` 扩展名，因此通过 `cmd /c npm ...` 调用，让 shell 解析
+/// 扩展名并继承用户 PATH。macOS/Linux 直接调用。
+///
+/// 返回的 `Command` 已设置好 `current_dir` 与首个环境变量，调用方可继续链式添加
+/// `.env(...)` / `.stdout(...)` / `.stderr(...)` / `.kill_on_drop(...)` / `.spawn()`
+/// 或 `.output()`。
+fn spawn_npm(
+    cmd: &str,
+    args: &[String],
+    current_dir: Option<&std::path::Path>,
+    first_env: Option<(&str, String)>,
+) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        // cmd /c <cmd> <args...>
+        let mut full: Vec<String> = vec!["/c".into(), cmd.into()];
+        full.extend(args.iter().cloned());
+        let mut command = Command::new("cmd");
+        command.args(&full);
+        if let Some(dir) = current_dir {
+            command.current_dir(dir);
+        }
+        if let Some((k, v)) = first_env {
+            command.env(k, v);
+        }
+        command
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = Command::new(cmd);
+        command.args(args);
+        if let Some(dir) = current_dir {
+            command.current_dir(dir);
+        }
+        if let Some((k, v)) = first_env {
+            command.env(k, v);
+        }
+        command
+    }
 }
 
 /// 同步执行版本命令，返回 stdout 字符串（trim 后）。失败返回 None。
