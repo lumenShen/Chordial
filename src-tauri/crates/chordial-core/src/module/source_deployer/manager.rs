@@ -38,14 +38,17 @@ const RECENT_LOGS_DISPLAY: usize = 200;
 ///
 /// 默认端口已错开，避免同时启动多服务时端口冲突：
 /// - netease :3000 | kugou :3001 | qq :3300
+///
+/// `start_command` 直接用 `node` 而非 `npm start`：避免 Windows 上 `cmd /c npm.cmd`
+/// 转发到 node 后立即退出的行为（误判为服务退出）。
 pub fn list_deployable_sources() -> Vec<DeployableSourceSpec> {
     vec![
         DeployableSourceSpec {
             id: "netease".into(),
             display_name: "网易云音乐".into(),
             git_url: "https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced.git".into(),
-            start_command: "npm".into(),
-            start_args: vec!["start".into()],
+            start_command: "node".into(),
+            start_args: vec!["app.js".into()],
             install_command: "npm".into(),
             install_args: vec!["install".into()],
             description: "NeteaseCloudMusicApi Enhanced — 提供网易云搜索/下载/扫码登录".into(),
@@ -55,8 +58,8 @@ pub fn list_deployable_sources() -> Vec<DeployableSourceSpec> {
             id: "kugou".into(),
             display_name: "酷狗音乐".into(),
             git_url: "https://github.com/MakcRe/KuGouMusicApi.git".into(),
-            start_command: "npm".into(),
-            start_args: vec!["start".into()],
+            start_command: "node".into(),
+            start_args: vec!["app.js".into()],
             install_command: "npm".into(),
             install_args: vec!["install".into()],
             description: "KuGouMusicApi — 提供酷狗音乐搜索/下载/扫码登录".into(),
@@ -66,8 +69,8 @@ pub fn list_deployable_sources() -> Vec<DeployableSourceSpec> {
             id: "qq".into(),
             display_name: "QQ 音乐".into(),
             git_url: "https://github.com/jsososo/QQMusicApi.git".into(),
-            start_command: "npm".into(),
-            start_args: vec!["start".into()],
+            start_command: "node".into(),
+            start_args: vec!["./bin/www".into()],
             install_command: "npm".into(),
             install_args: vec!["install".into()],
             description: "QQMusicApi — 提供 QQ 音乐搜索/下载/歌词".into(),
@@ -571,11 +574,11 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 构造一个调用 `npm`（或其它 Node 工具）的异步 `Command`。
+/// 构造一个调用 `npm` 或 `node` 的异步 `Command`。
 ///
 /// Windows 上 `npm` 是 `npm.cmd` 批处理文件，`Command::new("npm")` 在 Tauri 进程的
 /// PATH 下可能找不到 `.cmd` 扩展名，因此通过 `cmd /c npm ...` 调用，让 shell 解析
-/// 扩展名并继承用户 PATH。macOS/Linux 直接调用。
+/// 扩展名并继承用户 PATH。`node` 是 `.exe` 文件，可直接调用，无需 shell 包装。
 ///
 /// 返回的 `Command` 已设置好 `current_dir` 与首个环境变量，调用方可继续链式添加
 /// `.env(...)` / `.stdout(...)` / `.stderr(...)` / `.kill_on_drop(...)` / `.spawn()`
@@ -586,34 +589,36 @@ fn spawn_npm(
     current_dir: Option<&std::path::Path>,
     first_env: Option<(&str, String)>,
 ) -> Command {
+    // 判断是否需要通过 shell 调用（Windows 上 npm/npx 等是 .cmd 文件）
     #[cfg(target_os = "windows")]
     {
-        // cmd /c <cmd> <args...>
-        let mut full: Vec<String> = vec!["/c".into(), cmd.into()];
-        full.extend(args.iter().cloned());
-        let mut command = Command::new("cmd");
-        command.args(&full);
-        if let Some(dir) = current_dir {
-            command.current_dir(dir);
+        let needs_shell = matches!(cmd, "npm" | "npx" | "yarn" | "pnpm");
+        if needs_shell {
+            // cmd /c <cmd> <args...>
+            let mut full: Vec<String> = vec!["/c".into(), cmd.into()];
+            full.extend(args.iter().cloned());
+            let mut command = Command::new("cmd");
+            command.args(&full);
+            if let Some(dir) = current_dir {
+                command.current_dir(dir);
+            }
+            if let Some((k, v)) = first_env {
+                command.env(k, v);
+            }
+            return command;
         }
-        if let Some((k, v)) = first_env {
-            command.env(k, v);
-        }
-        command
     }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut command = Command::new(cmd);
-        command.args(args);
-        if let Some(dir) = current_dir {
-            command.current_dir(dir);
-        }
-        if let Some((k, v)) = first_env {
-            command.env(k, v);
-        }
-        command
+    // node 或其它 .exe 程序：直接调用
+    let mut command = Command::new(cmd);
+    command.args(args);
+    if let Some(dir) = current_dir {
+        command.current_dir(dir);
     }
+    if let Some((k, v)) = first_env {
+        command.env(k, v);
+    }
+    command
 }
 
 /// 同步执行版本命令，返回 stdout 字符串（trim 后）。失败返回 None。
