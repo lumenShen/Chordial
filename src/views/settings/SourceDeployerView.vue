@@ -68,7 +68,7 @@
 
       <div v-if="src.config.last_error" class="error-banner">
         <i class="bi bi-exclamation-triangle-fill"></i>
-        <span>{{ src.config.last_error }}</span>
+        <pre class="error-text">{{ src.config.last_error }}</pre>
       </div>
 
       <!-- 配置 -->
@@ -767,7 +767,7 @@ function showToast(message, type = 'info', duration = 3000) {
 
 .error-banner {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   padding: 10px 12px;
   border-radius: 8px;
@@ -775,6 +775,22 @@ function showToast(message, type = 'info', duration = 3000) {
   color: #dc3545;
   font-size: 13px;
   margin-bottom: 12px;
+}
+
+.error-banner > i {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.error-text {
+  margin: 0;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  flex: 1;
+  min-width: 0;
 }
 
 /* 设置项 */

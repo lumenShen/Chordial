@@ -407,6 +407,18 @@ impl SourceDeployer {
             return Err(format!("项目尚未克隆，请先 clone: {}", target_dir.display()));
         }
 
+        // 启动前检查 node_modules 是否存在；缺失则自动 npm install
+        // （用户可能只 clone 了仓库但没装依赖，直接 node app.js 会因找不到 express 退出）
+        let node_modules = target_dir.join("node_modules");
+        if !node_modules.exists() {
+            eprintln!(
+                "[source_deployer] {} missing node_modules, auto-running npm install",
+                source_id
+            );
+            // 复用 install_source 的逻辑（含状态更新）
+            self.install_source(source_id).await?;
+        }
+
         let cfg = self
             .configs
             .read()
@@ -483,9 +495,10 @@ impl SourceDeployer {
         let processes = self.processes.clone();
         let configs_lock = self.configs.clone();
         let store = self.store.clone();
+        let logs_arc = logs.clone();
         let sid = source_id.to_string();
         tokio::spawn(async move {
-            wait_task(sid, child, stop_rx, processes, configs_lock, store).await;
+            wait_task(sid, child, stop_rx, processes, configs_lock, store, logs_arc).await;
         });
 
         // 更新配置：标记为 running
@@ -675,6 +688,7 @@ async fn wait_task(
     processes: Arc<RwLock<HashMap<String, Arc<RunningProcess>>>>,
     configs_lock: Arc<RwLock<HashMap<String, DeployConfig>>>,
     store: Arc<PersistentStore>,
+    logs: Arc<RwLock<VecDeque<String>>>,
 ) {
     // 等待进程退出 OR 收到停止信号
     let (was_stopped, status) = tokio::select! {
@@ -686,8 +700,14 @@ async fn wait_task(
         }
     };
 
+    // 给 stdout/stderr reader 一点时间把最后的输出刷入 logs
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
     // 子进程已退出，从 processes map 移除（若已由 stop_source 移除则无操作）
     processes.write().remove(&source_id);
+
+    // 读取最近日志（用于错误诊断）
+    let recent_logs: Vec<String> = logs.read().iter().take(8).cloned().collect();
 
     // 更新配置
     let mut configs = configs_lock.write();
@@ -704,13 +724,20 @@ async fn wait_task(
     cfg.last_status = new_status.as_str().to_string();
     cfg.last_stopped_at = now_secs();
     if !was_stopped {
-        cfg.last_error = match &status {
-            Some(s) => format!("进程异常退出: {}", s),
+        // 拼接 exit code 和最近日志，让前端直接看到真实错误（如 Cannot find module 'express'）
+        let exit_desc = match &status {
+            Some(s) => format!("exit code: {}", s.code().unwrap_or(-1)),
             None => "等待进程退出失败".to_string(),
         };
+        let mut err = format!("进程异常退出: {}", exit_desc);
+        if !recent_logs.is_empty() {
+            err.push_str("\n最近日志:\n");
+            err.push_str(&recent_logs.join("\n"));
+        }
+        cfg.last_error = err;
         eprintln!(
-            "[source_deployer] {} exited unexpectedly: {:?}",
-            source_id, status
+            "[source_deployer] {} exited unexpectedly: {:?} | logs: {:?}",
+            source_id, status, recent_logs
         );
     } else {
         cfg.last_error.clear();
