@@ -12,7 +12,6 @@ const router = useRouter();
 const { isDesktop } = usePlatform();
 
 const rootRef = useTemplateRef('root');
-const dragRegionRef = useTemplateRef('dragRegion');
 const { run } = useAnime(() => rootRef.value);
 
 // header 三段区块错峰入场（fadeInDown + stagger）
@@ -55,9 +54,10 @@ const goToSettings = () => {
   <!--
     AppHeader - 浮动胶囊式顶栏
     - header 容器：sticky 全宽，仅负责布局占位、safe-area-top padding 和 drag region
-    - 顶部 drag region：全宽覆盖，作为窗口拖动区 + LiquidGlass 的 mouseContainer
+    - 顶部 drag region：全宽覆盖，作为 Tauri 窗口拖动区（pointer-events:none，
+      不拦截鼠标，因此不作为 LiquidGlass 的 mouseContainer）
     - 浮动胶囊：LiquidGlass 包裹的 page-title + 搜索框 + 图标按钮 + WindowControls
-      elasticity 鼠标跟随响应整个 drag region 范围
+      elasticity 鼠标跟随响应胶囊自身范围（库组件默认行为）
   -->
   <header ref="root" class="app-header">
     <!-- 窗口拖动区域 - 仅桌面端，全宽覆盖顶部 -->
@@ -66,9 +66,8 @@ const goToSettings = () => {
     <LiquidGlass
       :corner-radius="999"
       :elasticity="0.35"
-      :mouse-container="dragRegionRef"
       padding="0 16px"
-      class="header-pill"
+      extra-class="header-pill"
     >
       <div class="header-content">
         <div class="header-left">

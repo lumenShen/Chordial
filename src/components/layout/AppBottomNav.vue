@@ -111,7 +111,7 @@ watch(() => route.path, () => {
       :corner-radius="999"
       :elasticity="0.35"
       padding="0 16px"
-      class="nav-glass"
+      extra-class="nav-glass"
     >
       <div ref="indicator" class="nav-indicator"></div>
       <router-link v-for="item in navItems" :key="item.path" :to="item.path" class="bottom-nav-item"

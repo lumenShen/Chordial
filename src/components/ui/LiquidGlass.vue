@@ -22,24 +22,25 @@ export const LIQUID_GLASS_PRESETS = {
  * - 内置用户预设参数（折射模式=标准, 位移量表=150, 模糊量=0.1, 饱和度=130%,
  *   像差强度=2, 弹性=0.35）
  * - 注入项目主题色背景（浅色/深色模式自动适配）
- * - 透传所有库组件 props 和事件，支持覆盖默认预设
+ * - 透传所有库组件 props 和 onClick 回调
  *
  * 库组件内部管理：
  * - SVG filter 定义和生命周期（挂载/卸载自动清理）
- * - elasticity 鼠标跟随（通过 mouseContainer / globalMousePos 控制）
+ * - elasticity 鼠标跟随（默认响应玻璃自身范围；如需响应外部容器，
+ *   通过 mouseContainer 传入 HTMLElement，注意容器必须能接收 mousemove）
  * - hover/click 交互效果
+ *
+ * 注意：
+ * - 库组件不 emit `click` 事件，而是通过 `onClick` prop 回调处理点击。
+ *   本包装组件接收 `onClick` prop 并透传，父组件用 `@click="handler"` 即可
+ *   （无 emits 声明时，Vue 会自动把 `@click` 解释为 `onClick` prop）。
+ * - 不要把 `pointer-events:none` 的元素作为 mouseContainer，它无法触发
+ *   mousemove 事件，且会触发库组件内部 watchEffect 的递归更新。
  *
  * 用法：
  * ```vue
  * <LiquidGlass :corner-radius="32" padding="0 16px" :elasticity="0.2">
  *   <nav>...</nav>
- * </LiquidGlass>
- * ```
- *
- * 对于需要 mouseContainer 的场景（如 AppHeader 顶部 drag region 作为鼠标响应区）：
- * ```vue
- * <LiquidGlass :mouse-container="dragRegionRef" :elasticity="0.35">
- *   <button>...</button>
  * </LiquidGlass>
  * ```
  */
@@ -68,14 +69,19 @@ const props = withDefaults(
     overLight?: boolean;
     /** CSS 内边距 */
     padding?: string;
-    /** 鼠标容器 ref（用于父容器响应鼠标） */
-    mouseContainer?: ReturnType<typeof import("vue").ref<HTMLElement | null>>;
+    /**
+     * 鼠标容器 HTMLElement（用于父容器响应鼠标）
+     * 注意：必须是能接收 mousemove 事件的元素，不能是 pointer-events:none
+     */
+    mouseContainer?: HTMLElement | null;
     /** 全局鼠标位置（手动控制） */
     globalMousePos?: { x: number; y: number };
     /** 鼠标位置偏移 */
     mouseOffset?: { x: number; y: number };
-    /** 额外 CSS 类 */
-    class?: string;
+    /** 点击回调（库组件通过 onClick prop 处理点击，非 emit click 事件） */
+    onClick?: () => void;
+    /** 额外 CSS 类（避免与 Vue 保留的 class 属性冲突） */
+    extraClass?: string;
     /** 额外内联样式 */
     style?: Record<string, string>;
   }>(),
@@ -85,10 +91,6 @@ const props = withDefaults(
     padding: "0px",
   },
 );
-
-defineEmits<{
-  click: [];
-}>();
 
 // 合并用户 style 与项目主题色背景
 const mergedStyle = computed<Record<string, string>>(() => ({
@@ -101,8 +103,10 @@ const mergedStyle = computed<Record<string, string>>(() => ({
   ...props.style,
 }));
 
-// 合并用户 class 与项目默认 class
-const mergedClass = computed(() => ["chordial-liquid-glass", props.class].filter(Boolean).join(" "));
+// 合并用户 extraClass 与项目默认 class
+const mergedClass = computed(() =>
+  ["chordial-liquid-glass", props.extraClass].filter(Boolean).join(" "),
+);
 </script>
 
 <template>
@@ -120,17 +124,19 @@ const mergedClass = computed(() => ["chordial-liquid-glass", props.class].filter
     :mouse-container="mouseContainer"
     :global-mouse-pos="globalMousePos"
     :mouse-offset="mouseOffset"
+    :on-click="onClick"
     :class="mergedClass"
     :style="mergedStyle"
-    @click="$emit('click')"
   >
     <slot />
   </LibLiquidGlass>
 </template>
 
-<style scoped>
+<style>
+/* 项目主题样式：深色模式适配
+   注意：库组件返回 Fragment（多根节点），scoped 样式无法自动应用，
+   因此使用非 scoped 全局样式 + .chordial-liquid-glass 精确选择器 */
 .chordial-liquid-glass {
-  /* 深色模式：深灰玻璃底色 */
   @media (prefers-color-scheme: dark) {
     background: rgba(40, 40, 45, 0.5) !important;
     border-color: rgba(255, 255, 255, 0.15) !important;

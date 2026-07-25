@@ -357,7 +357,7 @@ defineExpose({
         ]"
         :style="sheetStyle"
       >
-        <LiquidGlass :corner-radius="24" :elasticity="0" padding="0" class="bs-sheet-glass">
+        <LiquidGlass :corner-radius="24" :elasticity="0" padding="0" extra-class="bs-sheet-glass">
           <div
             class="bs-handle-area"
             @pointerdown="onHandlePointerDown"
@@ -376,7 +376,7 @@ defineExpose({
             @pointercancel="onPointerUp"
           >
             <div class="bs-header-left">
-              <LiquidGlass :corner-radius="999" :elasticity="0.35" padding="0" class="bs-icon-glass">
+              <LiquidGlass :corner-radius="999" :elasticity="0.35" padding="0" extra-class="bs-icon-glass">
                 <button
                   v-if="showBack"
                   class="bs-icon-btn"
@@ -388,7 +388,7 @@ defineExpose({
               </LiquidGlass>
               <h3 class="bs-title">{{ title }}</h3>
             </div>
-            <LiquidGlass :corner-radius="999" :elasticity="0.35" padding="0" class="bs-icon-glass">
+            <LiquidGlass :corner-radius="999" :elasticity="0.35" padding="0" extra-class="bs-icon-glass">
               <button
                 class="bs-icon-btn bs-close"
                 @click="onClose"

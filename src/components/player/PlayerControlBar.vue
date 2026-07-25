@@ -4,7 +4,7 @@
       :corner-radius="38"
       :elasticity="0.2"
       padding="0.5rem 1rem"
-      class="bar-glass"
+      extra-class="bar-glass"
     >
       <!-- 模糊封面背景层 -->
       <div class="bar-bg" v-if="albumCoverUrl">
