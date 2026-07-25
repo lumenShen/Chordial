@@ -167,6 +167,7 @@ function initAudioElement() {
 const audioEventHandlers = {
   timeupdate: null,
   loadedmetadata: null,
+  durationchange: null,
   canplay: null,
   waiting: null,
   ended: null,
@@ -188,16 +189,38 @@ function setupAudioEvents() {
     if (now - lastTimeUpdate < TIME_UPDATE_THROTTLE) return;
     lastTimeUpdate = now;
 
-    state.currentTime = audio.currentTime || 0;
+    const _ct = audio.currentTime;
+    // 仅在 _ct 为有限数时更新，避免 NaN/Infinity 覆盖 state.currentTime
+    // （seek 期间或加载异常时 audio.currentTime 可能短暂为 NaN）
+    if (Number.isFinite(_ct)) {
+      state.currentTime = _ct;
+    }
   };
   audio.addEventListener('timeupdate', audioEventHandlers.timeupdate);
 
-  // 加载完成
+  // 加载完成 — duration 在此时首次可用
   audioEventHandlers.loadedmetadata = () => {
-    state.duration = audio.duration || 0;
+    const d = audio.duration;
+    // audio.duration 在某些流式协议下可能为 NaN/Infinity，
+    // 此时回退到 track.duration（来自后端元数据），确保 AMLL 进度条 max 不为 0
+    if (Number.isFinite(d) && d > 0) {
+      state.duration = d;
+    } else if (state.currentTrack?.duration && state.currentTrack.duration > 0) {
+      state.duration = state.currentTrack.duration;
+    }
     state.isLoading = false;
   };
   audio.addEventListener('loadedmetadata', audioEventHandlers.loadedmetadata);
+
+  // duration 变化 — 流式加载时 duration 可能逐步精确（Infinity → 有限值）
+  // 必须监听此事件以确保 state.duration 最终拿到真实时长
+  audioEventHandlers.durationchange = () => {
+    const d = audio.duration;
+    if (Number.isFinite(d) && d > 0) {
+      state.duration = d;
+    }
+  };
+  audio.addEventListener('durationchange', audioEventHandlers.durationchange);
 
   // 可以播放
   audioEventHandlers.canplay = () => {
@@ -245,6 +268,9 @@ function cleanupAudioEvents() {
   }
   if (audioEventHandlers.loadedmetadata) {
     audio.removeEventListener('loadedmetadata', audioEventHandlers.loadedmetadata);
+  }
+  if (audioEventHandlers.durationchange) {
+    audio.removeEventListener('durationchange', audioEventHandlers.durationchange);
   }
   if (audioEventHandlers.canplay) {
     audio.removeEventListener('canplay', audioEventHandlers.canplay);
@@ -404,15 +430,44 @@ const actions = {
 
   /**
    * 跳转到指定时间
+   *
+   * clamp 上限优先级：audio.duration > state.duration > Infinity（不 clamp）
+   * 这样即使 duration 暂时为 0/NaN（流式协议下 loadedmetadata 未触发或
+   * audio.duration 为 Infinity），也不会错误地把 clampedTime 压成 0，
+   * 进而把 audio.currentTime 设为 0（表现为"拖动后回到开头"）。
+   *
    * @param {number} time - 时间（秒）
    */
   seek(time) {
     perf.start('PlayerStore.seek');
-    if (state.audioElement) {
-      const clampedTime = Math.max(0, Math.min(time, state.duration));
-      state.audioElement.currentTime = clampedTime;
-      state.currentTime = clampedTime;
+    const audio = state.audioElement;
+    if (!audio) {
+      perf.end('PlayerStore.seek');
+      return;
     }
+
+    // 选择有效的 clamp 上限：优先 audio.duration（真实音频时长），
+    // 其次 state.duration（可能来自 track.duration 或已同步的 audio.duration）
+    const audioDur = Number.isFinite(audio.duration) ? audio.duration : 0;
+    const stateDur = Number.isFinite(state.duration) ? state.duration : 0;
+    const effectiveDuration = audioDur > 0 ? audioDur : (stateDur > 0 ? stateDur : Infinity);
+
+    // 只有 time 是有效数字才 clamp；非有限数直接忽略
+    let clampedTime;
+    if (!Number.isFinite(time)) {
+      perf.end('PlayerStore.seek');
+      return;
+    }
+    clampedTime = effectiveDuration === Infinity
+      ? Math.max(0, time)
+      : Math.max(0, Math.min(time, effectiveDuration));
+
+    try {
+      audio.currentTime = clampedTime;
+    } catch (e) {
+      console.error('[seek] 设置 currentTime 失败:', e);
+    }
+    state.currentTime = clampedTime;
     perf.end('PlayerStore.seek');
   },
 

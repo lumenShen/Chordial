@@ -235,7 +235,9 @@ export function useAmllBridge() {
 	store.set(onRequestPrevSongAtom, { onEmit: () => PlayerStore.playPrevious() })
 	store.set(onRequestNextSongAtom, { onEmit: () => PlayerStore.playNext() })
 	// 进度条拖动（毫秒 → 秒）
-	store.set(onSeekPositionAtom, { onEmit: (ms) => PlayerStore.seek(ms / 1000) })
+	store.set(onSeekPositionAtom, { onEmit: (ms) => {
+		PlayerStore.seek(ms / 1000)
+	} })
 	// 音量滑块（0-1）
 	store.set(onChangeVolumeAtom, { onEmit: (v) => PlayerStore.setVolume(v) })
 

@@ -1,44 +1,48 @@
 <template>
-  <div class="player-control-bar" ref="root" :style="glassStyle" @mouseenter="onEnter" @mouseleave="onLeave" @mousemove="onMouseMove">
-    <!-- 模糊封面背景层 -->
-    <div class="bar-bg" v-if="albumCoverUrl">
-      <img :src="albumCoverUrl" alt="" />
-    </div>
-
-    <div class="controls-section">
-      <!-- 专辑封面（真共享 DOM：动态 Teleport 到 PlayerView portal） -->
-      <div class="album-cover-slot">
-        <Teleport :to="coverPortalTarget" :disabled="!coverPortalTarget">
-          <div class="album-cover-thumb" ref="coverThumb" v-if="albumCoverUrl" @click="openPlayerView" data-shared="cover">
-            <img :src="albumCoverUrl" alt="专辑封面" />
-          </div>
-          <div class="album-cover-thumb placeholder" ref="coverThumb" v-else @click="openPlayerView" data-shared="cover">
-            <i class="bi bi-disc-fill"></i>
-          </div>
-        </Teleport>
+  <div class="player-control-bar" ref="root">
+    <LiquidGlass
+      :corner-radius="38"
+      :elasticity="0.2"
+      padding="0.5rem 1rem"
+      class="bar-glass"
+    >
+      <!-- 模糊封面背景层 -->
+      <div class="bar-bg" v-if="albumCoverUrl">
+        <img :src="albumCoverUrl" alt="" />
       </div>
 
-      <!-- 歌曲信息（真共享 DOM：动态 Teleport 到 PlayerView portal） -->
-      <div class="track-info-slot">
-        <Teleport :to="metaPortalTarget" :disabled="!metaPortalTarget">
-          <div class="track-info" v-if="trackTitle" data-shared="meta">
-            <span class="track-title">{{ trackTitle }}</span>
-            <span class="track-meta">{{ trackMeta }}</span>
-          </div>
-        </Teleport>
+      <div class="controls-section">
+        <!-- 专辑封面（真共享 DOM：动态 Teleport 到 PlayerView portal） -->
+        <div class="album-cover-slot">
+          <Teleport :to="coverPortalTarget" :disabled="!coverPortalTarget">
+            <div class="album-cover-thumb" ref="coverThumb" v-if="albumCoverUrl" @click="openPlayerView" data-shared="cover">
+              <img :src="albumCoverUrl" alt="专辑封面" />
+            </div>
+            <div class="album-cover-thumb placeholder" ref="coverThumb" v-else @click="openPlayerView" data-shared="cover">
+              <i class="bi bi-disc-fill"></i>
+            </div>
+          </Teleport>
+        </div>
+
+        <!-- 歌曲信息（真共享 DOM：动态 Teleport 到 PlayerView portal） -->
+        <div class="track-info-slot">
+          <Teleport :to="metaPortalTarget" :disabled="!metaPortalTarget">
+            <div class="track-info" v-if="trackTitle" data-shared="meta">
+              <span class="track-title">{{ trackTitle }}</span>
+              <span class="track-meta">{{ trackMeta }}</span>
+            </div>
+          </Teleport>
+        </div>
+
+        <button class="control-btn play-btn" @click="togglePlay">
+          <i :class="isPlaying ? 'bi bi-pause-fill' : 'bi bi-play-fill'"></i>
+        </button>
+
+        <button class="control-btn" @click="$emit('next')">
+          <i class="bi bi-skip-end-fill"></i>
+        </button>
       </div>
-
-      <button class="control-btn play-btn" @click="togglePlay">
-        <i :class="isPlaying ? 'bi bi-pause-fill' : 'bi bi-play-fill'"></i>
-      </button>
-
-      <button class="control-btn" @click="$emit('next')">
-        <i class="bi bi-skip-end-fill"></i>
-      </button>
-    </div>
-
-    <!-- 液态玻璃 SVG filter 定义 -->
-    <LiquidGlassFilter v-bind="filterProps" />
+    </LiquidGlass>
   </div>
 </template>
 
@@ -49,15 +53,14 @@
  * 提供播放控制、歌曲信息展示、封面模糊背景等功能。
  * 从 PlayerStore 读取当前播放状态和歌曲元数据。
  *
- * 液态玻璃：通过 useLiquidGlass composable 为悬浮控制条提供
+ * 液态玻璃：使用 LiquidGlass 组件为悬浮控制条提供
  * 边缘折射 + 磨砂模糊效果，与 AppHeader / AppBottomNav 统一风格。
  */
 import { computed, onMounted, useTemplateRef } from 'vue'
 import { PlayerStore } from '@/stores/player.js'
 import { usePerf } from '@/utils/performanceMonitor.js'
 import { useAnime } from '@/composables/useAnime.js'
-import { useLiquidGlass, LIQUID_GLASS_PRESETS } from '@/composables/useLiquidGlass.js'
-import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue'
+import LiquidGlass from '@/components/ui/LiquidGlass.vue'
 
 const { log } = usePerf('PlayerControlBar')
 
@@ -68,14 +71,6 @@ const { run } = useAnime(() => rootRef.value)
 // 真共享 DOM：动态 Teleport 目标（PlayerView 打开时设为 portal 容器）
 const coverPortalTarget = computed(() => PlayerStore.coverPortalTarget.value)
 const metaPortalTarget = computed(() => PlayerStore.metaPortalTarget.value)
-
-// 液态玻璃：控制条本身较扁平，scale 取小值避免边缘过度扭曲
-const { glassStyle, onEnter, onLeave, onMouseMove, filterProps } = useLiquidGlass({
-  ...LIQUID_GLASS_PRESETS.user,
-  elasticity: 0.2,          // 控制栏轻微鼠标跟随
-  interactive: false,
-  borderRadius: 'calc(var(--bottom-nav-height) * 0.6)',
-})
 
 // 入场动画：控制栏向上淡入
 onMounted(() => {
@@ -199,21 +194,18 @@ const formatTime = (seconds) => {
   position: fixed;
   bottom: calc(1.5rem + var(--safe-area-bottom));
   right: 0.9rem;
-  height: var(--bottom-nav-height);
-  padding: 0.5rem 1rem;
   transition: bottom var(--transition-slow);
-  /* 液态玻璃底色：backdrop-filter 由 useLiquidGlass inline style 注入 */
-  background: rgba(255, 255, 255, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  justify-content: center;
+}
+
+.bar-glass {
+  height: var(--bottom-nav-height);
+  display: flex;
+  align-items: center;
   justify-content: center;
   overflow: hidden;
   isolation: isolate;
-  /* GPU: 悬浮控制条 backdrop 降模糊半径+合成层 */
-  will-change: backdrop-filter;
-  contain: layout paint;
+  position: relative;
 }
 
 /* 模糊封面背景层 */

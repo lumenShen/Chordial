@@ -4,8 +4,7 @@ import { computed, onMounted, useTemplateRef, watch, nextTick } from 'vue';
 import PlayerStore from '@/stores/player.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { ANIME_SPRINGS } from '@/utils/animePresets.js';
-import { useLiquidGlass, LIQUID_GLASS_PRESETS } from '@/composables/useLiquidGlass.js';
-import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
+import LiquidGlass from '@/components/ui/LiquidGlass.vue';
 
 const route = useRoute();
 
@@ -15,13 +14,8 @@ const rootRef = useTemplateRef('root');
 const indicatorRef = useTemplateRef('indicator');
 const { run, animate } = useAnime(() => rootRef.value);
 
-// 液态玻璃效果：应用用户预设（标准折射 + 像差 + 弹性）
-// - 居左浮动胶囊，圆角 = 高度的一半形成完整胶囊形态
-// - elasticity 鼠标跟随通过 @mousemove 触发
-const { glassStyle, onEnter, onLeave, onMouseMove, filterProps } = useLiquidGlass({
-  ...LIQUID_GLASS_PRESETS.user,
-  borderRadius: 'calc(var(--bottom-nav-height) / 2)',
-});
+// 使用 LiquidGlass 库组件提供液态玻璃效果（折射 + 像差 + 弹性 + 鼠标跟随）
+// 圆角 = 999 形成完整胶囊形态，由 LiquidGlass 内部管理 SVG filter 与 hover 交互
 
 // 导航项错峰入场（fadeInUp + stagger）
 onMounted(() => {
@@ -112,30 +106,21 @@ watch(() => route.path, () => {
 </script>
 
 <template>
-  <!--
-    玻璃扭曲由 useLiquidGlass composable 通过 inline style 注入 backdrop-filter 实现：
-    - blur() saturate() 各向同性磨砂模糊
-    - url(#filterId) 引用 SVG filter 做边缘折射
-    - LiquidGlassFilter 渲染 SVG filter 定义
-  -->
-  <nav
-    ref="root"
-    class="app-bottom-nav"
-    :class="{ 'with-player': hasCurrentTrack }"
-    :style="glassStyle"
-    @mouseenter="onEnter"
-    @mouseleave="onLeave"
-    @mousemove="onMouseMove"
-  >
-    <div ref="indicator" class="nav-indicator"></div>
-    <router-link v-for="item in navItems" :key="item.path" :to="item.path" class="bottom-nav-item"
-      :class="{ active: isActive(item.path) }">
-      <i :class="item.icon" class="bottom-nav-icon"></i>
-      <span class="bottom-nav-text">{{ item.name }}</span>
-    </router-link>
-  </nav>
-
-  <LiquidGlassFilter v-bind="filterProps" />
+  <div ref="root" class="app-bottom-nav" :class="{ 'with-player': hasCurrentTrack }">
+    <LiquidGlass
+      :corner-radius="999"
+      :elasticity="0.35"
+      padding="0 16px"
+      class="nav-glass"
+    >
+      <div ref="indicator" class="nav-indicator"></div>
+      <router-link v-for="item in navItems" :key="item.path" :to="item.path" class="bottom-nav-item"
+        :class="{ active: isActive(item.path) }">
+        <i :class="item.icon" class="bottom-nav-icon"></i>
+        <span class="bottom-nav-text">{{ item.name }}</span>
+      </router-link>
+    </LiquidGlass>
+  </div>
 </template>
 
 <style scoped>
@@ -144,26 +129,19 @@ watch(() => route.path, () => {
   bottom: 1.5rem;
   /* 桌面端：居左浮动胶囊 */
   left: 1.5rem;
-  /* 浅色模式：乳白玻璃底色（实际折射/模糊由 backdrop-filter 提供） */
-  background: rgba(255, 255, 255, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  z-index: 100;
+  transition: bottom var(--transition-slow);
+}
+
+/* 玻璃容器：由 LiquidGlass 提供背景、边框、阴影、圆角、模糊与折射 */
+.nav-glass {
   height: var(--bottom-nav-height);
-  /* 胶囊圆角：高度的一半形成完整胶囊形态（composable 也通过 borderRadius 注入，此处作为 CSS 默认值） */
-  border-radius: calc(var(--bottom-nav-height) / 2);
-  /* auto 宽度：根据内容撑开，形成浮动胶囊 */
+  display: flex;
+  align-items: center;
+  gap: 4px;
   width: fit-content;
   max-width: calc(100vw - 3rem);
-
-  display: flex;
-  justify-content: space-around;
-  align-items: center;
-  z-index: 100;
-  padding: 0 16px;
   padding-bottom: var(--safe-area-bottom);
-  transition: bottom var(--transition-slow);
   overflow: hidden;
   isolation: isolate;
 }
@@ -226,21 +204,15 @@ watch(() => route.path, () => {
     right: 1rem;
     left: 1rem;
     transform: none;
-    width: auto;
     bottom: var(--player-bar-height, 100px);
+  }
+
+  .nav-glass {
+    width: auto;
   }
 }
 
 @media (prefers-color-scheme: dark) {
-  .app-bottom-nav {
-    /* 暗色模式：深灰色半透明玻璃 + 细白边 */
-    background: rgba(40, 40, 45, 0.5);
-    border-color: rgba(255, 255, 255, 0.15);
-    box-shadow:
-      0 8px 24px rgba(0, 0, 0, 0.35),
-      inset 0 1px 0 rgba(255, 255, 255, 0.1);
-  }
-
   .bottom-nav-item.active {
     color: var(--primary-color);
   }

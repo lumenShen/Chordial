@@ -1,153 +1,142 @@
+<script lang="ts">
+/**
+ * 用户预设参数（与 useLiquidGlass 时代的 LIQUID_GLASS_PRESETS.user 保持一致）
+ */
+export const LIQUID_GLASS_PRESETS = {
+  user: {
+    displacementScale: 150,
+    blurAmount: 0.1,
+    saturation: 130,
+    aberrationIntensity: 2,
+    elasticity: 0.35,
+    mode: "standard" as const,
+  },
+} as const;
+</script>
+
 <script setup lang="ts">
 /**
- * LiquidGlass 液态玻璃显示组件
+ * LiquidGlass - 项目统一的液态玻璃包装组件
  *
- * 参考 codepen.io/Mikhail-Bespalov/pen/MYwrMNy 与 liquid-glass-react 实现思路：
- * - SVG `feImage` + `feGaussianBlur` + `feDisplacementMap` 组合实现透镜扭曲
- * - 用径向渐变 SVG data URI 作为位移映射图（中心无位移，边缘强位移）
- * - `backdrop-filter: blur() saturate() url(#filterId)` 引用 SVG 滤镜实现背景液态模糊
+ * 基于 @wxperia/liquid-glass-vue 的 <LiquidGlass> 组件封装：
+ * - 内置用户预设参数（折射模式=标准, 位移量表=150, 模糊量=0.1, 饱和度=130%,
+ *   像差强度=2, 弹性=0.35）
+ * - 注入项目主题色背景（浅色/深色模式自动适配）
+ * - 透传所有库组件 props 和事件，支持覆盖默认预设
  *
- * 本组件只是 `useLiquidGlass` composable 的便利封装：
- *   - 内部使用 composable 管理状态
- *   - 渲染 `<LiquidGlassFilter>` 承载 SVG filter 定义
- *   - 适用于需要独立液态玻璃容器的场景（如装饰性玻璃卡片）
+ * 库组件内部管理：
+ * - SVG filter 定义和生命周期（挂载/卸载自动清理）
+ * - elasticity 鼠标跟随（通过 mouseContainer / globalMousePos 控制）
+ * - hover/click 交互效果
  *
- * 对于既有元素的"贴皮"改造（如按钮、导航），推荐直接使用 composable + filter 组件，
- * 避免引入额外包裹层。
+ * 用法：
+ * ```vue
+ * <LiquidGlass :corner-radius="32" padding="0 16px" :elasticity="0.2">
+ *   <nav>...</nav>
+ * </LiquidGlass>
+ * ```
+ *
+ * 对于需要 mouseContainer 的场景（如 AppHeader 顶部 drag region 作为鼠标响应区）：
+ * ```vue
+ * <LiquidGlass :mouse-container="dragRegionRef" :elasticity="0.35">
+ *   <button>...</button>
+ * </LiquidGlass>
+ * ```
  */
 import { computed } from "vue";
-import { useLiquidGlass } from "@/composables/useLiquidGlass.js";
-import LiquidGlassFilter from "./LiquidGlassFilter.vue";
-
-type Tag = "div" | "button" | "span" | "section" | "article";
+import { LiquidGlass as LibLiquidGlass } from "@wxperia/liquid-glass-vue";
 
 const props = withDefaults(
   defineProps<{
-    /** 宽度，任意合法 CSS 长度 */
-    width?: string;
-    /** 高度，任意合法 CSS 长度 */
-    height?: string;
-    /** 圆角，任意合法 CSS 值（如 '50%', '16px', '999px'） */
-    borderRadius?: string;
-    /**
-     * 位移基准强度。
-     * - 当 primitiveUnits="objectBoundingBox" 时，该值表示元素尺寸的倍数。
-     *   例如 0.006 表示最大偏移元素宽/高的 0.6%，仅产生边缘微妙折射。
-     * - 图一风格建议 0.004-0.008；强烈液态扭曲可提高到 0.03-0.05。
-     */
-    scale?: number;
-    /** hover 时的位移强度 */
-    hoverScale?: number;
-    /** 是否启用 hover 放大效果 */
-    interactive?: boolean;
-    /** 渲染的 HTML 标签 */
-    tag?: Tag;
-    /** 背景模糊半径（CSS 像素单位），默认 12px */
-    blur?: number;
-    /** 位移映射图平滑核（objectBoundingBox 单位），越大越柔和 */
-    mapBlur?: number;
-    /** 噪声频率，用于增加液态流动感（0 表示关闭） */
-    turbulence?: number;
-    /**
-     * 自定义位移映射图（base64 / data URI / URL）。
-     * - 优先使用此 prop；未提供则使用内置 PNG base64
-     * - 推荐使用包含噪声纹理的 PNG（如 codepen 原版使用的 displacement map）
-     */
-    displacementMapSrc?: string;
+    /** 位移量表（控制边缘变形强度） */
+    displacementScale?: number;
+    /** 模糊量（0-1，控制背景模糊强度） */
+    blurAmount?: number;
+    /** 饱和度百分比（控制背景色彩饱和度） */
+    saturation?: number;
+    /** 像差强度（控制 RGB 通道分离强度） */
+    aberrationIntensity?: number;
+    /** 弹性（0-1，控制玻璃向光标延伸的程度） */
+    elasticity?: number;
+    /** 圆角（像素值） */
+    cornerRadius?: number;
+    /** 折射模式 */
+    mode?: "standard" | "polar" | "prominent" | "shader";
+    /** 着色器效果类型（仅 mode='shader' 时有效） */
+    effect?: "flowingLiquid" | "liquidGlass" | "transparentIce" | "unevenGlass" | "mosaicGlass";
+    /** 是否在浅色背景上 */
+    overLight?: boolean;
+    /** CSS 内边距 */
+    padding?: string;
+    /** 鼠标容器 ref（用于父容器响应鼠标） */
+    mouseContainer?: ReturnType<typeof import("vue").ref<HTMLElement | null>>;
+    /** 全局鼠标位置（手动控制） */
+    globalMousePos?: { x: number; y: number };
+    /** 鼠标位置偏移 */
+    mouseOffset?: { x: number; y: number };
+    /** 额外 CSS 类 */
+    class?: string;
+    /** 额外内联样式 */
+    style?: Record<string, string>;
   }>(),
   {
-    width: "20rem",
-    height: "20rem",
-    borderRadius: "50%",
-    /* 图一风格：轻微边缘折射，强磨砂模糊 */
-    scale: 0.015,
-    hoverScale: 0.03,
-    interactive: true,
-    tag: "div",
-    /* CSS blur() 是像素单位，各向同性，避免细长元素横向拉丝 */
-    blur: 12,
-    mapBlur: 0.03,
-    turbulence: 0,
-    displacementMapSrc: "",
+    ...LIQUID_GLASS_PRESETS.user,
+    cornerRadius: 999,
+    padding: "0px",
   },
 );
 
-// 将 props 转为 composable options getter（保持响应式）
-const { glassStyle, onEnter, onLeave, filterProps } = useLiquidGlass(() => ({
-  blur: props.blur,
-  scale: props.scale,
-  hoverScale: props.hoverScale,
-  interactive: props.interactive,
-  mapBlur: props.mapBlur,
-  turbulence: props.turbulence,
-  displacementMapSrc: props.displacementMapSrc,
-  borderRadius: props.borderRadius,
+defineEmits<{
+  click: [];
+}>();
+
+// 合并用户 style 与项目主题色背景
+const mergedStyle = computed<Record<string, string>>(() => ({
+  // 项目主题：半透明乳白磨砂玻璃底色
+  // 库组件本身不提供背景色，需通过 style 注入
+  background: "rgba(255, 255, 255, 0.22)",
+  border: "1px solid rgba(255, 255, 255, 0.35)",
+  boxShadow:
+    "0 8px 24px rgba(0, 0, 0, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.5)",
+  ...props.style,
 }));
 
-const rootStyle = computed<Record<string, string>>(() => ({
-  width: props.width,
-  height: props.height,
-  ...glassStyle.value,
-  display: "block",
-}));
+// 合并用户 class 与项目默认 class
+const mergedClass = computed(() => ["chordial-liquid-glass", props.class].filter(Boolean).join(" "));
 </script>
 
 <template>
-  <component
-    :is="tag"
-    class="liquid-glass"
-    :style="rootStyle"
-    @mouseenter="onEnter"
-    @mouseleave="onLeave"
+  <LibLiquidGlass
+    :displacement-scale="displacementScale"
+    :blur-amount="blurAmount"
+    :saturation="saturation"
+    :aberration-intensity="aberrationIntensity"
+    :elasticity="elasticity"
+    :corner-radius="cornerRadius"
+    :mode="mode"
+    :effect="effect"
+    :over-light="overLight"
+    :padding="padding"
+    :mouse-container="mouseContainer"
+    :global-mouse-pos="globalMousePos"
+    :mouse-offset="mouseOffset"
+    :class="mergedClass"
+    :style="mergedStyle"
+    @click="$emit('click')"
   >
     <slot />
-  </component>
-
-  <LiquidGlassFilter v-bind="filterProps" />
+  </LibLiquidGlass>
 </template>
 
 <style scoped>
-.liquid-glass {
-  position: relative;
-  /* button 元素重置 */
-  appearance: none;
-  -webkit-appearance: none;
-  padding: 0;
-  margin: 0;
-  font: inherit;
-  color: inherit;
-  /* 图一风格：厚实乳白磨砂玻璃 */
-  background: rgba(255, 255, 255, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.45);
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.55);
-  cursor: pointer;
-  outline: none;
-  box-sizing: border-box;
-}
-
-.liquid-glass:focus-visible {
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.45),
-    0 0 0 4px rgba(0, 122, 255, 0.5),
-    0 8px 24px rgba(0, 0, 0, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.55);
-}
-
-@media (prefers-color-scheme: dark) {
-  .liquid-glass {
-    background: rgba(40, 40, 45, 0.55);
-    border-color: rgba(255, 255, 255, 0.18);
+.chordial-liquid-glass {
+  /* 深色模式：深灰玻璃底色 */
+  @media (prefers-color-scheme: dark) {
+    background: rgba(40, 40, 45, 0.5) !important;
+    border-color: rgba(255, 255, 255, 0.15) !important;
     box-shadow:
       0 8px 24px rgba(0, 0, 0, 0.35),
-      inset 0 1px 0 rgba(255, 255, 255, 0.12);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .liquid-glass {
-    transition: none;
+      inset 0 1px 0 rgba(255, 255, 255, 0.1) !important;
   }
 }
 </style>

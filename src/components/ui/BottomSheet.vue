@@ -2,8 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, useTemplateRef } from "vue";
 import { useAnime } from "@/composables/useAnime";
 import { ANIME_LAYOUT } from "@/utils/animePresets";
-import { useLiquidGlass, LIQUID_GLASS_PRESETS } from "@/composables/useLiquidGlass.js";
-import LiquidGlassFilter from "@/components/ui/LiquidGlassFilter.vue";
+import LiquidGlass from "@/components/ui/LiquidGlass.vue";
 
 type SheetDetent = "medium" | "large";
 
@@ -50,29 +49,6 @@ const isDesktop = ref(false);
 let resizeObserver: ResizeObserver | null = null;
 
 const { animate, enter, exit, spring, useLayout } = useAnime();
-
-// ── 液态玻璃（Sheet 主体） ──────────────────────────────────
-// Sheet 是大面积浮动容器，scale 取极小值避免内容明显扭曲；
-// blur 较强保证背景内容不干扰 Sheet 内信息阅读。
-const { glassStyle: sheetGlassStyle, filterProps: sheetFilterProps } = useLiquidGlass({
-  ...LIQUID_GLASS_PRESETS.user,
-  elasticity: 0,            // 大面积容器不做鼠标跟随
-  interactive: false,
-  mapBlur: 0.02,
-});
-
-// ── 液态玻璃（Sheet 头部图标按钮：返回 / 关闭） ───────────
-// 小尺寸圆形按钮，与 AppHeader / WindowControls 风格一致。
-const {
-  glassStyle: iconBtnGlassStyle,
-  onEnter: onIconBtnEnter,
-  onLeave: onIconBtnLeave,
-  onMouseMove: onIconBtnMouseMove,
-  filterProps: iconBtnFilterProps,
-} = useLiquidGlass({
-  ...LIQUID_GLASS_PRESETS.user,
-  borderRadius: '50%',
-});
 
 // ── 内部列表项 FLIP ──────────────────────────────────────────
 // 通过 MutationObserver 自动监听 content 子树变化，配合 createLayout 执行 FLIP
@@ -379,64 +355,58 @@ defineExpose({
           `bs-sheet--${currentDetent}`,
           { 'bs-sheet--desktop': isDesktop },
         ]"
-        :style="[sheetStyle, sheetGlassStyle]"
+        :style="sheetStyle"
       >
-        <div
-          class="bs-handle-area"
-          @pointerdown="onHandlePointerDown"
-          @pointermove="onPointerMove"
-          @pointerup="onPointerUp"
-          @pointercancel="onPointerUp"
-        >
-          <div class="bs-handle" />
-        </div>
-
-        <div
-          class="bs-header"
-          @pointerdown="onHeaderPointerDown"
-          @pointermove="onPointerMove"
-          @pointerup="onPointerUp"
-          @pointercancel="onPointerUp"
-        >
-          <div class="bs-header-left">
-            <button
-              v-if="showBack"
-              class="bs-icon-btn"
-              :style="iconBtnGlassStyle"
-              @click="onBack"
-              @mouseenter="onIconBtnEnter"
-              @mouseleave="onIconBtnLeave"
-              @mousemove="onIconBtnMouseMove"
-              aria-label="返回"
-            >
-              <i class="bi bi-chevron-left" style="font-size:18px"></i>
-            </button>
-            <h3 class="bs-title">{{ title }}</h3>
-          </div>
-          <button
-            class="bs-icon-btn bs-close"
-            :style="iconBtnGlassStyle"
-            @click="onClose"
-            @mouseenter="onIconBtnEnter"
-            @mouseleave="onIconBtnLeave"
-            @mousemove="onIconBtnMouseMove"
-            aria-label="关闭"
+        <LiquidGlass :corner-radius="24" :elasticity="0" padding="0" class="bs-sheet-glass">
+          <div
+            class="bs-handle-area"
+            @pointerdown="onHandlePointerDown"
+            @pointermove="onPointerMove"
+            @pointerup="onPointerUp"
+            @pointercancel="onPointerUp"
           >
-            <i class="bi bi-x-lg" style="font-size:16px"></i>
-          </button>
-        </div>
+            <div class="bs-handle" />
+          </div>
 
-        <div
-          ref="content"
-          class="bs-content"
-          @wheel="onContentWheel"
-        >
-          <slot />
-        </div>
+          <div
+            class="bs-header"
+            @pointerdown="onHeaderPointerDown"
+            @pointermove="onPointerMove"
+            @pointerup="onPointerUp"
+            @pointercancel="onPointerUp"
+          >
+            <div class="bs-header-left">
+              <LiquidGlass :corner-radius="999" :elasticity="0.35" padding="0" class="bs-icon-glass">
+                <button
+                  v-if="showBack"
+                  class="bs-icon-btn"
+                  @click="onBack"
+                  aria-label="返回"
+                >
+                  <i class="bi bi-chevron-left" style="font-size:18px"></i>
+                </button>
+              </LiquidGlass>
+              <h3 class="bs-title">{{ title }}</h3>
+            </div>
+            <LiquidGlass :corner-radius="999" :elasticity="0.35" padding="0" class="bs-icon-glass">
+              <button
+                class="bs-icon-btn bs-close"
+                @click="onClose"
+                aria-label="关闭"
+              >
+                <i class="bi bi-x-lg" style="font-size:16px"></i>
+              </button>
+            </LiquidGlass>
+          </div>
 
-        <!-- 液态玻璃 SVG filter 定义（Sheet 主体 + 图标按钮） -->
-        <LiquidGlassFilter v-bind="sheetFilterProps" />
-        <LiquidGlassFilter v-bind="iconBtnFilterProps" />
+          <div
+            ref="content"
+            class="bs-content"
+            @wheel="onContentWheel"
+          >
+            <slot />
+          </div>
+        </LiquidGlass>
       </div>
     </div>
   </Teleport>
@@ -457,19 +427,20 @@ defineExpose({
 .bs-sheet {
   width: 100%;
   max-width: 480px;
-  /* 液态玻璃底色：半透明以便 backdrop-filter 显示磨砂效果 */
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid rgba(255, 255, 255, 0.5);
   border-radius: var(--radius-xl) var(--radius-xl) 0 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  box-shadow:
-    0 -8px 40px rgba(0, 0, 0, 0.15),
-    inset 0 1px 0 rgba(255, 255, 255, 0.6);
-  overflow: hidden;
   touch-action: none;
+}
+
+.bs-sheet-glass {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   isolation: isolate;
+  border-radius: inherit;
 }
 
 .bs-sheet--medium {
@@ -532,22 +503,17 @@ defineExpose({
 }
 
 .bs-icon-btn {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  /* 液态玻璃底色：backdrop-filter 由 composable inline style 注入 */
-  background: rgba(255, 255, 255, 0.22);
-  color: var(--text-secondary);
+  width: 34px;
+  height: 34px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  color: var(--text-primary);
   display: flex;
   align-items: center;
   justify-content: center;
-  cursor: pointer;
-  padding: 0;
-  flex-shrink: 0;
-  transition: color 0.15s, transform 0.15s;
-  will-change: backdrop-filter;
-  contain: paint;
 }
 
 .bs-icon-btn:active {
@@ -589,17 +555,8 @@ defineExpose({
 }
 
 @media (prefers-color-scheme: dark) {
-  .bs-sheet {
-    background: rgba(28, 28, 30, 0.72);
-    border-color: rgba(255, 255, 255, 0.15);
-    box-shadow:
-      0 -8px 40px rgba(0, 0, 0, 0.5),
-      inset 0 1px 0 rgba(255, 255, 255, 0.1);
-  }
-
   .bs-icon-btn {
-    background: rgba(40, 40, 45, 0.5);
-    border-color: rgba(255, 255, 255, 0.15);
+    color: var(--text-primary);
   }
 }
 </style>

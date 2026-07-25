@@ -29,6 +29,7 @@
     "@tauri-apps/plugin-opener": "^2.5.4",
     "@tauri-apps/plugin-window-state": "^2.4.1",
     "@vueuse/core": "^14.3.0",
+    "@wxperia/liquid-glass-vue": "^1.0.9",
     "animejs": "^4.5.0",
     "bootstrap-icons": "^1.13.1",
     "framer-motion": "^12.42.2",
