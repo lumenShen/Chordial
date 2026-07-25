@@ -77,6 +77,8 @@ const state = reactive({
     metaPortalTarget: null,           // markRaw DOM 元素，PlayerView 内的元信息 portal 容器
     // ── AMLL MenuButton 触发的歌曲菜单 Sheet（bindSheet）────────
     isTrackMenuOpen: false,           // AMLL onRequestOpenMenuAtom 触发的歌曲菜单是否展开
+    // ── AMLL bottomControls 播放列表按钮触发的播放队列 Sheet ────
+    isPlayQueueOpen: false,           // 横向布局底部第一个按钮（type="playlist"）触发的播放队列是否展开
   }
 });
 
@@ -134,6 +136,7 @@ const getters = {
   coverPortalTarget: computed(() => state.ui.coverPortalTarget),
   metaPortalTarget: computed(() => state.ui.metaPortalTarget),
   isTrackMenuOpen: computed(() => state.ui.isTrackMenuOpen),
+  isPlayQueueOpen: computed(() => state.ui.isPlayQueueOpen),
 };
 
 // 格式化时间
@@ -713,6 +716,21 @@ const actions = {
    */
   closeTrackMenu() {
     state.ui.isTrackMenuOpen = false;
+  },
+
+  /**
+   * 打开播放队列 Sheet。
+   * 由 PlayerView 中 AMLL bottomControls 第一个按钮（type="playlist"）的点击事件触发。
+   */
+  openPlayQueue() {
+    state.ui.isPlayQueueOpen = true;
+  },
+
+  /**
+   * 关闭播放队列 Sheet。
+   */
+  closePlayQueue() {
+    state.ui.isPlayQueueOpen = false;
   },
 
   /**
