@@ -3,12 +3,26 @@ import { computed, onMounted, useTemplateRef, watch, nextTick } from 'vue';
 import { useRoute } from 'vue-router';
 import { useAnime } from '@/composables/useAnime.js';
 import { ANIME_SPRINGS } from '@/utils/animePresets.js';
+import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
 
 const route = useRoute();
 
 const rootRef = useTemplateRef('root');
 const indicatorRef = useTemplateRef('indicator');
 const { run, animate } = useAnime(() => rootRef.value);
+
+// ===== 液态玻璃 composable =====
+// 侧边栏参数：位移强度较低（侧边栏较高，避免过度扭曲），饱和度增强
+const lg = useLiquidGlass({
+  displacementScale: 20,
+  blurAmount: 0.0625,
+  saturation: 180,
+  aberrationIntensity: 2,
+  elasticity: 0.15,
+  overLight: false,
+  mode: 'standard',
+  interactive: true,
+});
 
 // 菜单项错峰入场（slideInLeft + stagger）
 onMounted(() => {
@@ -26,6 +40,8 @@ onMounted(() => {
   });
   // 初始化 active 指示器
   nextTick(updateIndicator);
+  // 绑定 glassRef 到 sidebar 根元素
+  lg.glassRef.value = rootRef.value;
 });
 
 const navItems = [
@@ -100,10 +116,25 @@ function updateIndicator() {
 watch(() => route.path, () => {
   nextTick(updateIndicator);
 });
+
+// warp 层样式：backdrop-filter 做磨砂，filter 做 SVG 边缘色散
+const warpStyle = computed(() => ({
+  backdropFilter: lg.backdropFilter.value,
+  WebkitBackdropFilter: lg.backdropFilter.value,
+  filter: lg.svgFilter.value,
+}));
 </script>
 
 <template>
   <aside ref="root" class="app-sidebar">
+    <!--
+      玻璃扭曲层。
+      - backdrop-filter 先对 <aside> 背后的内容做磨砂/饱和
+      - filter: url(#id) 再对模糊后的结果做边缘色散与折射
+      - pointer-events:none 不拦截导航项点击
+    -->
+    <span class="glass-warp" aria-hidden="true" :style="warpStyle" />
+
     <div ref="indicator" class="nav-indicator"></div>
     <nav class="sidebar-nav">
       <router-link
@@ -125,6 +156,113 @@ watch(() => route.path, () => {
       </router-link>
     </div>
   </aside>
+
+  <!--
+    液态玻璃 SVG filter 定义（由 useLiquidGlass composable 提供参数）。
+    - 完整 RGB 三通道色散实现
+    - filter id 由 composable 的 useId 生成，多实例安全
+  -->
+  <svg class="liquid-glass-defs" aria-hidden="true" focusable="false">
+    <defs>
+      <radialGradient :id="`${lg.filterId}-edge-mask`" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="black" stop-opacity="0" />
+        <stop :offset="`${lg.edgeMaskMiddleOffset.value}%`" stop-color="black" stop-opacity="0" />
+        <stop offset="100%" stop-color="white" stop-opacity="1" />
+      </radialGradient>
+      <filter
+        :id="lg.filterId"
+        x="-35%"
+        y="-35%"
+        width="170%"
+        height="170%"
+        color-interpolation-filters="sRGB"
+      >
+        <feImage
+          :href="lg.displacementMapUrl.value"
+          :xlink:href="lg.displacementMapUrl.value"
+          x="0"
+          y="0"
+          width="100%"
+          height="100%"
+          result="DISPLACEMENT_MAP"
+          preserveAspectRatio="xMidYMid slice"
+        />
+        <feColorMatrix
+          in="DISPLACEMENT_MAP"
+          type="matrix"
+          values="0.3 0.3 0.3 0 0
+                  0.3 0.3 0.3 0 0
+                  0.3 0.3 0.3 0 0
+                  0 0 0 1 0"
+          result="EDGE_INTENSITY"
+        />
+        <feComponentTransfer in="EDGE_INTENSITY" result="EDGE_MASK">
+          <feFuncA type="discrete" :tableValues="lg.edgeMaskTableValues.value" />
+        </feComponentTransfer>
+        <feOffset in="SourceGraphic" dx="0" dy="0" result="CENTER_ORIGINAL" />
+        <feDisplacementMap
+          in="SourceGraphic"
+          in2="DISPLACEMENT_MAP"
+          :scale="lg.redScale.value"
+          xChannelSelector="R"
+          yChannelSelector="B"
+          result="RED_DISPLACED"
+        />
+        <feColorMatrix
+          in="RED_DISPLACED"
+          type="matrix"
+          values="1 0 0 0 0
+                  0 0 0 0 0
+                  0 0 0 0 0
+                  0 0 0 1 0"
+          result="RED_CHANNEL"
+        />
+        <feDisplacementMap
+          in="SourceGraphic"
+          in2="DISPLACEMENT_MAP"
+          :scale="lg.greenScale.value"
+          xChannelSelector="R"
+          yChannelSelector="B"
+          result="GREEN_DISPLACED"
+        />
+        <feColorMatrix
+          in="GREEN_DISPLACED"
+          type="matrix"
+          values="0 0 0 0 0
+                  0 1 0 0 0
+                  0 0 0 0 0
+                  0 0 0 1 0"
+          result="GREEN_CHANNEL"
+        />
+        <feDisplacementMap
+          in="SourceGraphic"
+          in2="DISPLACEMENT_MAP"
+          :scale="lg.blueScale.value"
+          xChannelSelector="R"
+          yChannelSelector="B"
+          result="BLUE_DISPLACED"
+        />
+        <feColorMatrix
+          in="BLUE_DISPLACED"
+          type="matrix"
+          values="0 0 0 0 0
+                  0 0 0 0 0
+                  0 0 1 0 0
+                  0 0 0 1 0"
+          result="BLUE_CHANNEL"
+        />
+        <feBlend in="GREEN_CHANNEL" in2="BLUE_CHANNEL" mode="screen" result="GB_COMBINED" />
+        <feBlend in="RED_CHANNEL" in2="GB_COMBINED" mode="screen" result="RGB_COMBINED" />
+        <feGaussianBlur in="RGB_COMBINED" :stdDeviation="lg.aberrationBlur.value" result="ABERRATED_BLURRED" />
+        <feComposite in="ABERRATED_BLURRED" in2="EDGE_MASK" operator="in" result="EDGE_ABERRATION" />
+        <feComponentTransfer in="EDGE_MASK" result="INVERTED_MASK">
+          <feFuncA type="table" tableValues="1 0" />
+        </feComponentTransfer>
+        <feComposite in="CENTER_ORIGINAL" in2="INVERTED_MASK" operator="in" result="CENTER_CLEAN" />
+        <feComposite in="EDGE_ABERRATION" in2="CENTER_CLEAN" operator="over" />
+      </filter>
+    </defs>
+  </svg>
 </template>
 
 <style scoped>
@@ -135,11 +273,29 @@ watch(() => route.path, () => {
   flex-direction: column;
   margin: 28px 16px;
   left: 2rem;  border-radius: calc(var(--bottom-nav-height) * 0.5);
-  background: var(--bg-glass);
-  border: 1px solid var(--border-light);
+  /* 玻璃效果由 .glass-warp 层提供，此处移除 background/border */
+  overflow: hidden;
 
   height: fit-content;
   position: relative;
+}
+
+/* 玻璃扭曲层：backdrop-filter 做磨砂，filter 做边缘色散 */
+.glass-warp {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* SVG defs：仅承载 filter 定义，不占布局空间 */
+.liquid-glass-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  overflow: hidden;
 }
 
 /* active 指示器（绝对定位背景，由 anime.js animate translateY/height 垂直滑动） */
@@ -152,7 +308,7 @@ watch(() => route.path, () => {
   background: var(--primary-light);
   border-radius: var(--radius-md);
   opacity: 0;
-  z-index: 0;
+  z-index: 1;
   pointer-events: none;
   will-change: transform, height, opacity;
 }
@@ -175,7 +331,7 @@ watch(() => route.path, () => {
   cursor: pointer;
   font-weight: 500;
   position: relative;
-  z-index: 1;
+  z-index: 2;
 }
 
 .nav-item:hover {
