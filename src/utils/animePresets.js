@@ -27,13 +27,13 @@ import { spring, stagger } from 'animejs';
  */
 export const ANIME_SPRINGS = {
   // 默认弹簧 — 平滑无回弹
-  default:   spring({ bounce: 0,    duration: 500 }),
+  default:   spring({ bounce: 0.2, duration: 500 }),
   // 灵敏弹簧 — 快速响应
-  sensitive: spring({ bounce: 0,    duration: 280 }),
+  sensitive: spring({ bounce: 0.3, duration: 250 }),
   // 弹跳弹簧 — 可见回弹
-  bouncy:    spring({ bounce: 0.65, duration: 650 }),
+  bouncy:    spring({ bounce: 0.4, duration: 450 }),
   // 强力弹簧 — 强力到位
-  powerful:  spring({ bounce: 0.15, duration: 850 }),
+  powerful: spring({ bounce: 0.5, duration: 450 }),
 };
 
 /**
