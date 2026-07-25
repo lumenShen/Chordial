@@ -5,6 +5,7 @@ import PlayerStore from '@/stores/player.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { ANIME_SPRINGS } from '@/utils/animePresets.js';
 import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
+import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
 
 const route = useRoute();
 
@@ -14,8 +15,16 @@ const rootRef = useTemplateRef('root');
 const indicatorRef = useTemplateRef('indicator');
 const { run, animate } = useAnime(() => rootRef.value);
 
-// ===== 液态玻璃 composable（使用全局默认参数） =====
-const lg = useLiquidGlass();
+// 液态玻璃效果：通过 composable 统一封装
+// - blur 较强（磨砂模糊），scale 较小（仅边缘轻微折射）
+// - 与 AppHeader / PlayerControlBar / WindowControls 共用同一套实现
+const { glassStyle, onEnter, onLeave, filterProps } = useLiquidGlass({
+  blur: 10,
+  scale: 0.012,
+  hoverScale: 0.018,
+  mapBlur: 0.03,
+  interactive: false, // 导航栏整体不做 hover 折射变化
+});
 
 // 导航项错峰入场（fadeInUp + stagger）
 onMounted(() => {
@@ -33,8 +42,6 @@ onMounted(() => {
   });
   // 初始化 active 指示器
   nextTick(updateIndicator);
-  // 绑定 glassRef 到 nav 根元素
-  lg.glassRef.value = rootRef.value;
 });
 
 const navItems = [
@@ -105,25 +112,23 @@ function updateIndicator() {
 watch(() => route.path, () => {
   nextTick(updateIndicator);
 });
-
-// warp 层样式：backdrop-filter 包含 blur + saturate + url(#id)
-// url(#id) 必须在 backdrop-filter 里，让 SVG 滤镜作用于 backdrop（玻璃背后的内容）
-const warpStyle = computed(() => ({
-  backdropFilter: lg.backdropFilter.value,
-  WebkitBackdropFilter: lg.backdropFilter.value,
-}));
 </script>
 
 <template>
-  <nav ref="root" class="app-bottom-nav" :class="{ 'with-player': hasCurrentTrack }">
-    <!--
-      玻璃扭曲层。
-      - backdrop-filter 先对 <nav> 背后的内容做磨砂/饱和
-      - filter: url(#id) 再对模糊后的结果做边缘色散与折射
-      - pointer-events:none 不拦截导航项点击
-    -->
-    <span class="glass-warp" aria-hidden="true" :style="warpStyle" />
-
+  <!--
+    玻璃扭曲由 useLiquidGlass composable 通过 inline style 注入 backdrop-filter 实现：
+    - blur() saturate() 各向同性磨砂模糊
+    - url(#filterId) 引用 SVG filter 做边缘折射
+    - LiquidGlassFilter 渲染 SVG filter 定义
+  -->
+  <nav
+    ref="root"
+    class="app-bottom-nav"
+    :class="{ 'with-player': hasCurrentTrack }"
+    :style="glassStyle"
+    @mouseenter="onEnter"
+    @mouseleave="onLeave"
+  >
     <div ref="indicator" class="nav-indicator"></div>
     <router-link v-for="item in navItems" :key="item.path" :to="item.path" class="bottom-nav-item"
       :class="{ active: isActive(item.path) }">
@@ -132,21 +137,26 @@ const warpStyle = computed(() => ({
     </router-link>
   </nav>
 
+  <LiquidGlassFilter v-bind="filterProps" />
 </template>
 
 <style scoped>
 .app-bottom-nav {
   position: fixed;
   bottom: 1.5rem;
-  left: 2rem;
-  border-radius: calc(var(--bottom-nav-height) * 0.5);
-  /* 浅色模式：乳白玻璃底色 */
-  background: rgba(255, 255, 255, 0.18);
+  /* 桌面端：居中浮动胶囊 */
+  left: 50%;
+  transform: translateX(-50%);
+  /* 浅色模式：乳白玻璃底色（实际折射/模糊由 backdrop-filter 提供） */
+  background: rgba(255, 255, 255, 0.22);
   border: 1px solid rgba(255, 255, 255, 0.35);
   box-shadow:
     0 8px 24px rgba(0, 0, 0, 0.08),
     inset 0 1px 0 rgba(255, 255, 255, 0.5);
   height: var(--bottom-nav-height);
+  /* auto 宽度：根据内容撑开，形成浮动胶囊 */
+  width: fit-content;
+  max-width: calc(100vw - 2rem);
 
   display: flex;
   justify-content: space-around;
@@ -156,33 +166,7 @@ const warpStyle = computed(() => ({
   padding-bottom: var(--safe-area-bottom);
   transition: bottom var(--transition-slow);
   overflow: hidden;
-}
-
-/* 玻璃扭曲层：backdrop-filter 做磨砂，filter 做边缘色散 */
-.glass-warp {
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  z-index: 0;
-}
-
-/* SVG defs：仅承载 filter 定义，不占布局空间 */
-.liquid-glass-defs {
-  position: absolute;
-  width: 0;
-  height: 0;
-  pointer-events: none;
-  overflow: hidden;
-}
-
-@media (max-width: 767px) {
-  .app-bottom-nav {
-    /* 当播放器显示时，底部导航向上移动 */
-    right: 1rem;
-    left: 1rem;
-    bottom: var(--player-bar-height, 100px);
-  }
+  isolation: isolate;
 }
 
 /* active 指示器（绝对定位背景胶囊，由 anime.js animate translateX/width 滑动） */
@@ -209,7 +193,7 @@ const warpStyle = computed(() => ({
   text-decoration: none;
   transition: color var(--transition-fast);
   border-radius: var(--radius-md);
-  flex: 1;
+  flex: 0 0 auto;
   font-weight: 500;
   min-width: 0;
   position: relative;
@@ -237,13 +221,14 @@ const warpStyle = computed(() => ({
   text-overflow: ellipsis;
 }
 
-/* 桌面端：底部导航居中显示，限制最大宽度避免横向铺满 */
-@media (min-width: 1024px) {
+@media (max-width: 767px) {
   .app-bottom-nav {
-    left: 50%;
-    transform: translateX(-50%);
-    /* 桌面端不铺满，保留两侧留白 */
-    right: auto;
+    /* 移动端：占满宽度减去边距，向上避让播放器控制栏 */
+    right: 1rem;
+    left: 1rem;
+    transform: none;
+    width: auto;
+    bottom: var(--player-bar-height, 100px);
   }
 }
 

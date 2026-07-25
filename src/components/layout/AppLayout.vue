@@ -99,7 +99,7 @@ function onRouteLeave(el, done) {
 
 .main-content {
   flex: 1;
-  padding-bottom: var(--player-bar-height, 100px);
+  padding-bottom: calc(var(--bottom-nav-height) + var(--player-bar-height) + var(--safe-area-bottom));
   display: flex;
   flex-direction: column;
   overflow: hidden;

@@ -6,11 +6,27 @@ import {
   minimizeWindow,
   toggleMaximize,
 } from '@/api/window.js';
+import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
+import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
 
 const emit = defineEmits(['toggle-always-on-top', 'close', 'minimize', 'maximize']);
 
 const isAlwaysOnTop = ref(false);
 const isMaximized = ref(false);
+
+// 液态玻璃：所有窗口控制按钮共享同一 filter
+const {
+  glassStyle,
+  onEnter,
+  onLeave,
+  filterProps,
+} = useLiquidGlass({
+  blur: 10,
+  scale: 0.012,
+  hoverScale: 0.02,
+  interactive: true,
+  borderRadius: '50%',
+});
 
 async function handleToggleAlwaysOnTop() {
   isAlwaysOnTop.value = await toggleAlwaysOnTop();
@@ -39,17 +55,6 @@ onMounted(async () => {
 
 <template>
   <div class="window-controls">
-    <!-- 置顶按钮 -->
-    <!-- <button
-      class="window-btn"
-      :class="{ active: isAlwaysOnTop }"
-      aria-label="切换窗口置顶"
-      title="置顶窗口"
-      @click="handleToggleAlwaysOnTop"
-    >
-      <i :class="isAlwaysOnTop ? 'bi bi-pin-fill' : 'bi bi-pin'"></i>
-    </button> -->
-
     <!-- 分隔线 -->
     <div class="divider"></div>
 
@@ -58,7 +63,10 @@ onMounted(async () => {
       class="window-btn"
       aria-label="最小化窗口"
       title="最小化"
+      :style="glassStyle"
       @click="handleMinimizeWindow"
+      @mouseenter="onEnter"
+      @mouseleave="onLeave"
     >
       <i class="bi bi-dash-lg"></i>
     </button>
@@ -68,7 +76,10 @@ onMounted(async () => {
       class="window-btn"
       aria-label="最大化/还原窗口"
       :title="isMaximized ? '还原' : '最大化'"
+      :style="glassStyle"
       @click="handleToggleMaximize"
+      @mouseenter="onEnter"
+      @mouseleave="onLeave"
     >
       <i :class="isMaximized ? 'bi bi-fullscreen-exit' : 'bi bi-fullscreen'"></i>
     </button>
@@ -78,10 +89,16 @@ onMounted(async () => {
       class="window-btn close-btn"
       aria-label="关闭窗口"
       title="关闭"
+      :style="glassStyle"
       @click="handleCloseWindow"
+      @mouseenter="onEnter"
+      @mouseleave="onLeave"
     >
       <i class="bi bi-x-lg"></i>
     </button>
+
+    <!-- 液态玻璃 SVG filter 定义 -->
+    <LiquidGlassFilter v-bind="filterProps" />
   </div>
 </template>
 
@@ -103,24 +120,24 @@ onMounted(async () => {
 .window-btn {
   width: 36px;
   height: 36px;
-  border: none;
+  border: 1px solid rgba(255, 255, 255, 0.35);
   border-radius: 50%;
-  /* background-color: rgba(15, 15, 15, 0.05); */
+  /* 液态玻璃底色：backdrop-filter 由 composable inline style 注入 */
+  background: rgba(255, 255, 255, 0.22);
   color: var(--text-secondary);
-  border: 1px solid var(--border-light);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.2s ease;
-  -webkit-app-region: no-drag;  backdrop-filter: saturate(180%) blur(20px);
-  background: var(--bg-glass);
-  border-bottom: 1px solid var(--border-light);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  transition: color 0.2s ease, transform 0.2s ease;
+  -webkit-app-region: no-drag;
+  padding: 0;
+  font: inherit;
+  will-change: backdrop-filter;
+  contain: paint;
 }
 
 .window-btn:hover {
-  background-color: rgba(15, 15, 15, 0.08);
   color: var(--text-primary);
 }
 
@@ -149,12 +166,12 @@ onMounted(async () => {
 /* 深色模式适配 */
 @media (prefers-color-scheme: dark) {
   .window-btn {
-    background-color: rgba(255, 255, 255, 0.1);
+    background: rgba(40, 40, 45, 0.5);
+    border-color: rgba(255, 255, 255, 0.15);
     color: var(--text-secondary);
   }
 
   .window-btn:hover {
-    background-color: rgba(255, 255, 255, 0.15);
     color: var(--text-primary);
   }
 

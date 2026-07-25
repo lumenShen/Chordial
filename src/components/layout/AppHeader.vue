@@ -5,6 +5,7 @@ import WindowControls from '@/components/WindowControls.vue';
 import { usePlatform } from '@/composables/usePlatform.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
+import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -13,12 +14,6 @@ const { isDesktop } = usePlatform();
 
 const rootRef = useTemplateRef('root');
 const { run } = useAnime(() => rootRef.value);
-
-// 共享 liquid glass 实例：所有 icon-btn 复用同一个 SVG filter（节省内存）
-// 使用全局默认参数；icon-btn 不需要鼠标弹性形变
-const lg = useLiquidGlass({
-  interactive: false,
-});
 
 // header 三段区块错峰入场（fadeInDown + stagger）
 onMounted(() => {
@@ -55,6 +50,30 @@ const handleSearch = () => {
 const goToSettings = () => {
   router.push('/settings');
 };
+
+// ── 液态玻璃效果（搜索框 + 图标按钮共用同一份 composable 实例） ──
+// 三者使用同一 filterId 引用同一 SVG filter，避免重复定义；
+// 视觉差异通过各自的 .search-box / .icon-btn CSS 覆盖 background/border 实现。
+const { glassStyle: searchGlassStyle, filterProps: searchFilterProps } = useLiquidGlass({
+  blur: 12,
+  scale: 0.008,
+  hoverScale: 0.014,
+  interactive: false,
+});
+
+// 图标按钮：所有按钮共享同一 filter（同一 feDisplacementMap），
+// 因此任一按钮 hover 都会触发共享滤镜的 scale 动画，所有按钮边缘折射同步增强。
+const {
+  glassStyle: iconBtnGlassStyle,
+  onEnter: onIconBtnEnter,
+  onLeave: onIconBtnLeave,
+  filterProps: iconBtnFilterProps,
+} = useLiquidGlass({
+  blur: 10,
+  scale: 0.012,
+  hoverScale: 0.02,
+  interactive: true,
+});
 </script>
 
 <template>
@@ -68,7 +87,10 @@ const goToSettings = () => {
     </div>
 
     <div class="header-center">
-      <div class="search-box">
+      <div
+        class="search-box"
+        :style="searchGlassStyle"
+      >
         <i class="bi bi-search search-icon"></i>
         <input
           v-model="searchQuery"
@@ -80,51 +102,32 @@ const goToSettings = () => {
     </div>
 
     <div class="header-right">
-      <button class="icon-btn settings-btn" title="设置" @click="goToSettings">
-        <span class="icon-btn__warp" aria-hidden="true"></span>
+      <button
+        class="icon-btn settings-btn"
+        title="设置"
+        :style="iconBtnGlassStyle"
+        @click="goToSettings"
+        @mouseenter="onIconBtnEnter"
+        @mouseleave="onIconBtnLeave"
+      >
         <i class="bi bi-gear"></i>
       </button>
-      <button class="icon-btn notification-btn" title="通知">
-        <span class="icon-btn__warp" aria-hidden="true"></span>
+      <button
+        class="icon-btn notification-btn"
+        title="通知"
+        :style="iconBtnGlassStyle"
+        @mouseenter="onIconBtnEnter"
+        @mouseleave="onIconBtnLeave"
+      >
         <i class="bi bi-bell"></i>
       </button>
       <!-- 窗口控制按钮 - 仅桌面端 -->
       <WindowControls v-if="isDesktop" />
     </div>
 
-    <!-- 共享 liquid glass SVG filter 定义（所有 icon-btn 复用） -->
-    <svg class="liquid-glass-defs" aria-hidden="true" focusable="false">
-      <defs>
-        <radialGradient :id="`${lg.filterId}-edge-mask`" cx="50%" cy="50%" r="50%">
-          <stop offset="0%" stop-color="black" stop-opacity="0" />
-          <stop :offset="`${lg.edgeMaskMiddleOffset.value}%`" stop-color="black" stop-opacity="0" />
-          <stop offset="100%" stop-color="white" stop-opacity="1" />
-        </radialGradient>
-        <filter :id="lg.filterId" x="-35%" y="-35%" width="170%" height="170%" color-interpolation-filters="sRGB">
-          <feImage :href="lg.displacementMapUrl.value" :xlink:href="lg.displacementMapUrl.value" x="0" y="0" width="100%" height="100%" result="DISPLACEMENT_MAP" preserveAspectRatio="xMidYMid slice" />
-          <feColorMatrix in="DISPLACEMENT_MAP" type="matrix" values="0.3 0.3 0.3 0 0 0.3 0.3 0.3 0 0 0.3 0.3 0.3 0 0 0 0 0 1 0" result="EDGE_INTENSITY" />
-          <feComponentTransfer in="EDGE_INTENSITY" result="EDGE_MASK">
-            <feFuncA type="discrete" :tableValues="lg.edgeMaskTableValues.value" />
-          </feComponentTransfer>
-          <feOffset in="SourceGraphic" dx="0" dy="0" result="CENTER_ORIGINAL" />
-          <feDisplacementMap in="SourceGraphic" in2="DISPLACEMENT_MAP" :scale="lg.redScale.value" xChannelSelector="R" yChannelSelector="B" result="RED_DISPLACED" />
-          <feColorMatrix in="RED_DISPLACED" type="matrix" values="1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0" result="RED_CHANNEL" />
-          <feDisplacementMap in="SourceGraphic" in2="DISPLACEMENT_MAP" :scale="lg.greenScale.value" xChannelSelector="R" yChannelSelector="B" result="GREEN_DISPLACED" />
-          <feColorMatrix in="GREEN_DISPLACED" type="matrix" values="0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0" result="GREEN_CHANNEL" />
-          <feDisplacementMap in="SourceGraphic" in2="DISPLACEMENT_MAP" :scale="lg.blueScale.value" xChannelSelector="R" yChannelSelector="B" result="BLUE_DISPLACED" />
-          <feColorMatrix in="BLUE_DISPLACED" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0" result="BLUE_CHANNEL" />
-          <feBlend in="GREEN_CHANNEL" in2="BLUE_CHANNEL" mode="screen" result="GB_COMBINED" />
-          <feBlend in="RED_CHANNEL" in2="GB_COMBINED" mode="screen" result="RGB_COMBINED" />
-          <feGaussianBlur in="RGB_COMBINED" :stdDeviation="lg.aberrationBlur.value" result="ABERRATED_BLURRED" />
-          <feComposite in="ABERRATED_BLURRED" in2="EDGE_MASK" operator="in" result="EDGE_ABERRATION" />
-          <feComponentTransfer in="EDGE_MASK" result="INVERTED_MASK">
-            <feFuncA type="table" tableValues="1 0" />
-          </feComponentTransfer>
-          <feComposite in="CENTER_ORIGINAL" in2="INVERTED_MASK" operator="in" result="CENTER_CLEAN" />
-          <feComposite in="EDGE_ABERRATION" in2="CENTER_CLEAN" operator="over" />
-        </filter>
-      </defs>
-    </svg>
+    <!-- 搜索框 + 图标按钮共用的液态玻璃 filter 定义 -->
+    <LiquidGlassFilter v-bind="searchFilterProps" />
+    <LiquidGlassFilter v-bind="iconBtnFilterProps" />
   </header>
 </template>
 
@@ -196,7 +199,16 @@ const goToSettings = () => {
   position: relative;
   display: flex;
   align-items: center;
-
+  /* 液态玻璃底色：backdrop-filter 由 composable inline style 注入 */
+  background: rgba(255, 255, 255, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 19px;
+  box-shadow:
+    0 4px 12px rgba(0, 0, 0, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  /* GPU: 输入框 backdrop 独立合成层 */
+  will-change: backdrop-filter;
+  contain: paint;
 }
 
 .search-icon {
@@ -205,32 +217,27 @@ const goToSettings = () => {
   font-size: 14px;
   color: var(--text-tertiary);
   pointer-events: none;
+  z-index: 1;
 }
 
 .search-box input {
   width: 100%;
   height: 38px;
   padding: 0 16px 0 40px;
-  border: 1px solid var(--border-light);
-  border-radius: 19px;
-  background: var(--bg-glass);
+  border: none;
+  background: transparent;
   color: var(--text-primary);
   font-size: 14px;
   font-weight: 400;
   transition: all var(--transition-normal);
   -webkit-app-region: no-drag;
-  backdrop-filter: saturate(180%) blur(12px);
-  -webkit-backdrop-filter: saturate(180%) blur(12px);
-  /* GPU: 输入框 backdrop 独立合成层 */
-  will-change: backdrop-filter;
-  contain: paint;
+  outline: none;
+  font-family: inherit;
 }
 
 .search-box input:focus {
-  outline: none;
-  border-color: var(--primary-color);
-  background: var(--bg-secondary);
-  box-shadow: 0 0 0 4px var(--primary-light);
+  /* 不再切换背景色：液态玻璃背景已统一，focus 仅通过 box-shadow 提示 */
+  box-shadow: inset 0 0 0 2px var(--primary-color);
 }
 
 .search-box input::placeholder {
@@ -248,64 +255,34 @@ const goToSettings = () => {
 .icon-btn {
   width: 36px;
   height: 36px;
-  border: none;
+  border: 1px solid rgba(255, 255, 255, 0.35);
   border-radius: 50%;
-  background: var(--bg-glass);
+  /* 液态玻璃底色：backdrop-filter 由 composable inline style 注入 */
+  background: rgba(255, 255, 255, 0.22);
   color: var(--text-secondary);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  /* backdrop-filter 由内部 .icon-btn__warp 层提供（liquid glass） */
-  border: 1px solid var(--border-light);
-  transition: all var(--transition-fast);
+  transition: color var(--transition-fast), transform var(--transition-fast);
   -webkit-app-region: no-drag;
-  /* warp 层裁剪在圆角内 */
-  position: relative;
-  overflow: hidden;
-  /* GPU: 限制重绘范围 */
+  /* GPU: 小图标 backdrop 最小化模糊半径 */
+  will-change: backdrop-filter;
   contain: paint;
+  padding: 0;
+  font: inherit;
 }
 
 .icon-btn:hover {
-  background: var(--bg-hover);
   color: var(--text-primary);
 }
 
 .icon-btn:active {
   transform: scale(0.92);
-  background: var(--bg-active);
 }
 
 .icon-btn i {
   font-size: 16px;
-  /* 高于 warp 层（z-index: 0） */
-  position: relative;
-  z-index: 1;
-}
-
-/* liquid glass 扭曲层：所有 icon-btn 共享同一个 SVG filter */
-.icon-btn__warp {
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  z-index: 0;
-  /* backdrop-filter 包含 blur + saturate + url(#id)，url(#id) 必须在 backdrop-filter 里 */
-  backdrop-filter: v-bind('lg.backdropFilter.value');
-  -webkit-backdrop-filter: v-bind('lg.backdropFilter.value');
-  /* GPU: 独立合成层 */
-  will-change: backdrop-filter;
-  contain: paint;
-}
-
-/* SVG defs：仅承载 filter 定义，不占布局空间 */
-.liquid-glass-defs {
-  position: absolute;
-  width: 0;
-  height: 0;
-  pointer-events: none;
-  overflow: hidden;
 }
 
 @media (max-width: 768px) {
@@ -323,7 +300,7 @@ const goToSettings = () => {
   }
 
   .header-center {
-  margin: 0 20px;
+    margin: 0 20px;
     max-width: none;
   }
 
@@ -358,10 +335,8 @@ const goToSettings = () => {
   }
 
   .header-center {
-    /* margin: 0 8px; */
-  margin: 0 20px;
+    margin: 0 20px;
     max-width: none;
-    /* max-width: 120px; */
   }
 
   .search-box input::placeholder {
@@ -386,24 +361,25 @@ const goToSettings = () => {
     background-clip: text;
   }
 
-  .search-box input {
-    background: var(--bg-glass);
-    border-color: var(--border-light);
+  .search-box {
+    background: rgba(40, 40, 45, 0.5);
+    border-color: rgba(255, 255, 255, 0.15);
+    box-shadow:
+      0 4px 12px rgba(0, 0, 0, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
   }
 
   .search-box input:focus {
-    background: var(--bg-secondary);
-    border-color: var(--primary-color);
-    box-shadow: 0 0 0 4px var(--primary-light);
+    box-shadow: inset 0 0 0 2px var(--primary-color);
   }
 
   .icon-btn {
-    background: var(--bg-glass);
+    background: rgba(40, 40, 45, 0.5);
+    border-color: rgba(255, 255, 255, 0.15);
     color: var(--text-secondary);
   }
 
   .icon-btn:hover {
-    background: var(--bg-hover);
     color: var(--text-primary);
   }
 }

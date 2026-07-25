@@ -1,14 +1,6 @@
 <template>
-  <div class="player-control-bar" ref="root">
-    <!--
-      玻璃扭曲层。
-      - backdrop-filter 先对背后内容做磨砂/饱和
-      - filter: url(#id) 再对模糊后的结果做边缘色散与折射
-      - pointer-events:none 不拦截控件点击
-    -->
-    <span class="glass-warp" aria-hidden="true" :style="warpStyle" />
-
-    <!-- 模糊封面背景 -->
+  <div class="player-control-bar" ref="root" :style="glassStyle">
+    <!-- 模糊封面背景层 -->
     <div class="bar-bg" v-if="albumCoverUrl">
       <img :src="albumCoverUrl" alt="" />
     </div>
@@ -44,45 +36,10 @@
         <i class="bi bi-skip-end-fill"></i>
       </button>
     </div>
-  </div>
 
-  <!--
-    液态玻璃 SVG filter 定义（由 useLiquidGlass composable 提供参数）。
-    - 完整 RGB 三通道色散实现
-    - filter id 由 composable 的 useId 生成，多实例安全
-  -->
-  <svg class="liquid-glass-defs" aria-hidden="true" focusable="false">
-    <defs>
-      <radialGradient :id="`${lg.filterId}-edge-mask`" cx="50%" cy="50%" r="50%">
-        <stop offset="0%" stop-color="black" stop-opacity="0" />
-        <stop :offset="`${lg.edgeMaskMiddleOffset.value}%`" stop-color="black" stop-opacity="0" />
-        <stop offset="100%" stop-color="white" stop-opacity="1" />
-      </radialGradient>
-      <filter :id="lg.filterId" x="-35%" y="-35%" width="170%" height="170%" color-interpolation-filters="sRGB">
-        <feImage :href="lg.displacementMapUrl.value" :xlink:href="lg.displacementMapUrl.value" x="0" y="0" width="100%" height="100%" result="DISPLACEMENT_MAP" preserveAspectRatio="xMidYMid slice" />
-        <feColorMatrix in="DISPLACEMENT_MAP" type="matrix" values="0.3 0.3 0.3 0 0 0.3 0.3 0.3 0 0 0.3 0.3 0.3 0 0 0 0 0 1 0" result="EDGE_INTENSITY" />
-        <feComponentTransfer in="EDGE_INTENSITY" result="EDGE_MASK">
-          <feFuncA type="discrete" :tableValues="lg.edgeMaskTableValues.value" />
-        </feComponentTransfer>
-        <feOffset in="SourceGraphic" dx="0" dy="0" result="CENTER_ORIGINAL" />
-        <feDisplacementMap in="SourceGraphic" in2="DISPLACEMENT_MAP" :scale="lg.redScale.value" xChannelSelector="R" yChannelSelector="B" result="RED_DISPLACED" />
-        <feColorMatrix in="RED_DISPLACED" type="matrix" values="1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0" result="RED_CHANNEL" />
-        <feDisplacementMap in="SourceGraphic" in2="DISPLACEMENT_MAP" :scale="lg.greenScale.value" xChannelSelector="R" yChannelSelector="B" result="GREEN_DISPLACED" />
-        <feColorMatrix in="GREEN_DISPLACED" type="matrix" values="0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0" result="GREEN_CHANNEL" />
-        <feDisplacementMap in="SourceGraphic" in2="DISPLACEMENT_MAP" :scale="lg.blueScale.value" xChannelSelector="R" yChannelSelector="B" result="BLUE_DISPLACED" />
-        <feColorMatrix in="BLUE_DISPLACED" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0" result="BLUE_CHANNEL" />
-        <feBlend in="GREEN_CHANNEL" in2="BLUE_CHANNEL" mode="screen" result="GB_COMBINED" />
-        <feBlend in="RED_CHANNEL" in2="GB_COMBINED" mode="screen" result="RGB_COMBINED" />
-        <feGaussianBlur in="RGB_COMBINED" :stdDeviation="lg.aberrationBlur.value" result="ABERRATED_BLURRED" />
-        <feComposite in="ABERRATED_BLURRED" in2="EDGE_MASK" operator="in" result="EDGE_ABERRATION" />
-        <feComponentTransfer in="EDGE_MASK" result="INVERTED_MASK">
-          <feFuncA type="table" tableValues="1 0" />
-        </feComponentTransfer>
-        <feComposite in="CENTER_ORIGINAL" in2="INVERTED_MASK" operator="in" result="CENTER_CLEAN" />
-        <feComposite in="EDGE_ABERRATION" in2="CENTER_CLEAN" operator="over" />
-      </filter>
-    </defs>
-  </svg>
+    <!-- 液态玻璃 SVG filter 定义 -->
+    <LiquidGlassFilter v-bind="filterProps" />
+  </div>
 </template>
 
 <script setup>
@@ -91,12 +48,16 @@
  *
  * 提供播放控制、歌曲信息展示、封面模糊背景等功能。
  * 从 PlayerStore 读取当前播放状态和歌曲元数据。
+ *
+ * 液态玻璃：通过 useLiquidGlass composable 为悬浮控制条提供
+ * 边缘折射 + 磨砂模糊效果，与 AppHeader / AppBottomNav 统一风格。
  */
 import { computed, onMounted, useTemplateRef } from 'vue'
 import { PlayerStore } from '@/stores/player.js'
 import { usePerf } from '@/utils/performanceMonitor.js'
 import { useAnime } from '@/composables/useAnime.js'
 import { useLiquidGlass } from '@/composables/useLiquidGlass.js'
+import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue'
 
 const { log } = usePerf('PlayerControlBar')
 
@@ -104,28 +65,24 @@ const rootRef = useTemplateRef('root')
 const coverThumbRef = useTemplateRef('coverThumb')
 const { run } = useAnime(() => rootRef.value)
 
-// ===== 液态玻璃 composable =====
-// 液态玻璃 composable（使用全局默认参数）
-const lg = useLiquidGlass()
-
-// warp 层样式：backdrop-filter 包含 blur + saturate + url(#id)
-// url(#id) 必须在 backdrop-filter 里，让 SVG 滤镜作用于 backdrop（玻璃背后的内容）
-const warpStyle = computed(() => ({
-  backdropFilter: lg.backdropFilter.value,
-  WebkitBackdropFilter: lg.backdropFilter.value,
-}))
-
 // 真共享 DOM：动态 Teleport 目标（PlayerView 打开时设为 portal 容器）
 const coverPortalTarget = computed(() => PlayerStore.coverPortalTarget.value)
 const metaPortalTarget = computed(() => PlayerStore.metaPortalTarget.value)
+
+// 液态玻璃：控制条本身较扁平，scale 取小值避免边缘过度扭曲
+const { glassStyle, filterProps } = useLiquidGlass({
+  blur: 14,
+  scale: 0.01,
+  hoverScale: 0.016,
+  interactive: false,
+  borderRadius: 'calc(var(--bottom-nav-height) * 0.6)',
+})
 
 // 入场动画：控制栏向上淡入
 onMounted(() => {
   run(({ animate, presets }) => {
     animate(rootRef.value, { ...presets.fadeInUp })
   })
-  // 绑定 glassRef 到控制栏根元素
-  lg.glassRef.value = rootRef.value
 })
 
 const props = defineProps({
@@ -246,33 +203,18 @@ const formatTime = (seconds) => {
   height: var(--bottom-nav-height);
   padding: 0.5rem 1rem;
   transition: bottom var(--transition-slow);
-  border-radius: calc(var(--bottom-nav-height) * 0.6);
-  background: var(--bg-glass);
-  border: 1px solid var(--border-light);
+  /* 液态玻璃底色：backdrop-filter 由 useLiquidGlass inline style 注入 */
+  background: rgba(255, 255, 255, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5);
   justify-content: center;
   overflow: hidden;
   isolation: isolate;
-  /* GPU: 悬浮控制条合成层 */
+  /* GPU: 悬浮控制条 backdrop 降模糊半径+合成层 */
+  will-change: backdrop-filter;
   contain: layout paint;
-}
-
-/* 玻璃扭曲层：backdrop-filter 做磨砂，filter 做边缘色散 */
-.glass-warp {
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  z-index: 0;
-  will-change: backdrop-filter, filter;
-}
-
-/* SVG defs：仅承载 filter 定义，不占布局空间 */
-.liquid-glass-defs {
-  position: absolute;
-  width: 0;
-  height: 0;
-  pointer-events: none;
-  overflow: hidden;
 }
 
 /* 模糊封面背景层 */
@@ -445,6 +387,16 @@ const formatTime = (seconds) => {
   .track-info {
     flex: 1;
     max-width: none;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .player-control-bar {
+    background: rgba(40, 40, 45, 0.5);
+    border-color: rgba(255, 255, 255, 0.15);
+    box-shadow:
+      0 8px 24px rgba(0, 0, 0, 0.35),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
   }
 }
 </style>
