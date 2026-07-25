@@ -3,7 +3,6 @@ import { computed, onMounted, onBeforeUnmount } from 'vue'
 import { animate } from 'animejs';
 import { ANIME_PRESETS } from '@/utils/animePresets.js';
 import AppHeader from './AppHeader.vue';
-import AppSidebar from './AppSidebar.vue';
 import AppBottomNav from './AppBottomNav.vue';
 import P2pMatchDialog from '@/components/p2p/P2pMatchDialog.vue';
 import BatchDownloadManager from '@/components/common/BatchDownloadManager.vue';
@@ -51,8 +50,6 @@ function onRouteLeave(el, done) {
     <AppHeader />
     
     <div class="layout-body">
-      <AppSidebar class="sidebar-desktop" />
-      
       <main class="main-content">
         <div class="content-wrapper">
           <router-view v-slot="{ Component }">
@@ -100,18 +97,8 @@ function onRouteLeave(el, done) {
   overflow: hidden;
 }
 
-.sidebar-desktop {
-  flex-shrink: 0;
-  position: fixed;
-  left: 0;
-  top: var(--header-height, 60px);
-  bottom: var(--player-bar-height, 100px);
-  z-index: 50;
-}
-
 .main-content {
   flex: 1;
-  margin-left: var(--sidebar-width, 200px);
   padding-bottom: var(--player-bar-height, 100px);
   display: flex;
   flex-direction: column;
@@ -126,12 +113,7 @@ function onRouteLeave(el, done) {
 }
 
 @media (max-width: 1023px) {
-  .sidebar-desktop {
-    display: none;
-  }
-
   .main-content {
-    margin-left: 0;
     /* 移动端需要同时考虑底栏、播放器和系统导航栏的高度 */
     padding-bottom: calc(var(--bottom-nav-height) + var(--player-bar-height) + var(--safe-area-bottom));
   }
