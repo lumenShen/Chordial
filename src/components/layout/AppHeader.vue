@@ -15,14 +15,8 @@ const rootRef = useTemplateRef('root');
 const { run } = useAnime(() => rootRef.value);
 
 // 共享 liquid glass 实例：所有 icon-btn 复用同一个 SVG filter（节省内存）
-// 小尺寸按钮（36x36）使用低位移强度和柔和色散
+// 使用全局默认参数；icon-btn 不需要鼠标弹性形变
 const lg = useLiquidGlass({
-  displacementScale: 15,
-  blurAmount: 0.0625,
-  saturation: 180,
-  aberrationIntensity: 1.5,
-  elasticity: 0.15,
-  mode: 'standard',
   interactive: false,
 });
 
@@ -297,11 +291,11 @@ const goToSettings = () => {
   border-radius: inherit;
   pointer-events: none;
   z-index: 0;
+  /* backdrop-filter 包含 blur + saturate + url(#id)，url(#id) 必须在 backdrop-filter 里 */
   backdrop-filter: v-bind('lg.backdropFilter.value');
   -webkit-backdrop-filter: v-bind('lg.backdropFilter.value');
-  filter: v-bind('lg.svgFilter.value');
   /* GPU: 独立合成层 */
-  will-change: backdrop-filter, filter;
+  will-change: backdrop-filter;
   contain: paint;
 }
 

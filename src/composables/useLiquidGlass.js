@@ -47,16 +47,16 @@ const MODE_MAPS = {
 }
 
 /**
- * 默认参数（对齐 liquid-glass-react 顶层 LiquidGlass 默认值）
+ * 默认参数（按项目视觉风格调整：强折射 + 高饱和 + 亮背景模式）
  */
 const DEFAULTS = {
-  displacementScale: 70,
-  blurAmount: 0.0625,
-  saturation: 140,
+  displacementScale: 180,
+  blurAmount: 0,
+  saturation: 180,
   aberrationIntensity: 2,
-  elasticity: 0.15,
+  elasticity: 1,
   cornerRadius: 999,
-  overLight: false,
+  overLight: true,
   mode: 'standard',
 }
 
@@ -238,15 +238,20 @@ export function useLiquidGlass(options = {}) {
   })
 
   // ===== backdrop-filter 样式（warp 层）=====
-  // 注意：与原库一致，backdrop-filter 只做 blur + saturate（各向同性磨砂）
-  // SVG 位移滤镜通过独立的 `filter: url(#id)` 应用，作用于 backdrop 层
+  // 关键：url(#id) 必须合并到 backdrop-filter 中，让 SVG 位移滤镜作用于
+  // 玻璃背后的页面内容（backdrop），这才是液态折射效果的来源。
+  // 错误做法是把 url(#id) 放到 filter 属性——filter 作用于元素自身内容，
+  // 而 warp 层是空 span，没有内容可被 filter 处理，导致效果完全失效。
   const backdropFilter = computed(() => {
     const blur = (overLight.value ? 12 : 4) + blurAmount.value * 32
-    return `blur(${blur}px) saturate(${saturation.value}%)`
+    const base = `blur(${blur}px) saturate(${saturation.value}%)`
+    // Firefox 对 backdrop-filter: url(#id) 支持不全，降级为仅 blur+saturate
+    if (isFirefox) return base
+    return `${base} url(#${filterId})`
   })
 
-  // ===== filter 样式（SVG 位移滤镜，作用于 warp 层）=====
-  // Firefox 不支持 backdrop-filter 之外的 url(#id)，返回 null 跳过
+  // 保留 svgFilter 供特殊情况使用（如直接对有内容元素应用 filter）
+  // 默认场景应使用 backdropFilter
   const svgFilter = computed(() =>
     isFirefox ? null : `url(#${filterId})`,
   )

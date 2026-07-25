@@ -105,23 +105,14 @@ const coverThumbRef = useTemplateRef('coverThumb')
 const { run } = useAnime(() => rootRef.value)
 
 // ===== 液态玻璃 composable =====
-// 悬浮播放控制条参数：位移强度较低，模糊稍强（控制条较小）
-const lg = useLiquidGlass({
-  displacementScale: 20,
-  blurAmount: 0.125,
-  saturation: 180,
-  aberrationIntensity: 2,
-  elasticity: 0.15,
-  overLight: false,
-  mode: 'standard',
-  interactive: true,
-})
+// 液态玻璃 composable（使用全局默认参数）
+const lg = useLiquidGlass()
 
-// warp 层样式：backdrop-filter 做磨砂，filter 做 SVG 边缘色散
+// warp 层样式：backdrop-filter 包含 blur + saturate + url(#id)
+// url(#id) 必须在 backdrop-filter 里，让 SVG 滤镜作用于 backdrop（玻璃背后的内容）
 const warpStyle = computed(() => ({
   backdropFilter: lg.backdropFilter.value,
   WebkitBackdropFilter: lg.backdropFilter.value,
-  filter: lg.svgFilter.value,
 }))
 
 // 真共享 DOM：动态 Teleport 目标（PlayerView 打开时设为 portal 容器）

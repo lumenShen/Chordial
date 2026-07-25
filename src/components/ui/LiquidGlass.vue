@@ -136,11 +136,11 @@ const containerStyle = computed<Record<string, string>>(() => ({
   transition: "transform 0.2s ease-out",
 }));
 
-// warp 层样式：backdrop-filter 做磨砂，filter 做 SVG 边缘色散
-const warpStyle = computed<Record<string, string | null>>(() => ({
+// warp 层样式：backdrop-filter 包含 blur + saturate + url(#id)
+// url(#id) 必须在 backdrop-filter 里，让 SVG 滤镜作用于 backdrop（玻璃背后的内容）
+const warpStyle = computed<Record<string, string>>(() => ({
   backdropFilter: lg.backdropFilter.value,
   WebkitBackdropFilter: lg.backdropFilter.value,
-  filter: lg.svgFilter.value,
 }));
 
 // 边框层样式（screen 混合）

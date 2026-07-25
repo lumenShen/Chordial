@@ -14,18 +14,8 @@ const rootRef = useTemplateRef('root');
 const indicatorRef = useTemplateRef('indicator');
 const { run, animate } = useAnime(() => rootRef.value);
 
-// ===== 液态玻璃 composable（替换原内联 SVG filter） =====
-// 底部导航条参数：位移强度较低，避免边缘过度扭曲；色散柔和
-const lg = useLiquidGlass({
-  displacementScale: 150,        // 比按钮稍弱，避免导航条边缘明显色散
-  blurAmount: 0.0625,
-  saturation: 180,
-  aberrationIntensity: 2,
-  elasticity: 0.15,
-  overLight: false,
-  mode: 'standard',
-  interactive: true,
-});
+// ===== 液态玻璃 composable（使用全局默认参数） =====
+const lg = useLiquidGlass();
 
 // 导航项错峰入场（fadeInUp + stagger）
 onMounted(() => {
@@ -116,11 +106,11 @@ watch(() => route.path, () => {
   nextTick(updateIndicator);
 });
 
-// warp 层样式：backdrop-filter 做磨砂，filter 做 SVG 边缘色散
+// warp 层样式：backdrop-filter 包含 blur + saturate + url(#id)
+// url(#id) 必须在 backdrop-filter 里，让 SVG 滤镜作用于 backdrop（玻璃背后的内容）
 const warpStyle = computed(() => ({
   backdropFilter: lg.backdropFilter.value,
   WebkitBackdropFilter: lg.backdropFilter.value,
-  filter: lg.svgFilter.value,
 }));
 </script>
 
@@ -141,12 +131,6 @@ const warpStyle = computed(() => ({
       <span class="bottom-nav-text">{{ item.name }}</span>
     </router-link>
   </nav>
-
-  <!--
-    液态玻璃 SVG filter 定义（由 useLiquidGlass composable 提供参数）。
-    - 完整 RGB 三通道色散实现
-    - filter id 由 composable 的 useId 生成，多实例安全
-  -->
 
 </template>
 
