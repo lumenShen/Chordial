@@ -3,7 +3,7 @@
     <div class="section-header">
       <h2 class="section-title">音乐源服务部署</h2>
       <p class="section-subtitle">
-        一键部署网易云 / 酷狗 / QQ 音乐 API 服务到本地，并设置程序启动时自动运行
+        一键部署网易云 / 酷狗音乐 API 服务到本地，并设置程序启动时自动运行
       </p>
     </div>
 
@@ -226,7 +226,6 @@ import { useAnime } from '@/composables/useAnime.js';
 import * as deployerApi from '@/api/musicSource/deployer.js';
 import * as neteaseApi from '@/api/musicSource/netease.js';
 import * as kugouApi from '@/api/musicSource/kugou.js';
-import * as qqApi from '@/api/musicSource/qq.js';
 
 const rootRef = useTemplateRef('root');
 const { run } = useAnime(() => rootRef.value);
@@ -487,11 +486,6 @@ async function autoConfigureBaseUrl(src) {
       cfg.base_url = baseUrl;
       cfg.enabled = true;
       await kugouApi.updateConfig(cfg);
-    } else if (src.spec.id === 'qq') {
-      const cfg = await qqApi.getConfig();
-      cfg.base_url = baseUrl;
-      cfg.enabled = true;
-      await qqApi.updateConfig(cfg);
     }
     showToast(`${src.spec.display_name} 的 base_url 已自动配置为 ${baseUrl}`, 'success');
   } catch (e) {
@@ -534,7 +528,6 @@ function sourceIcon(id) {
   return {
     netease: 'bi-cloud-arrow-down',
     kugou: 'bi-music-note-beamed',
-    qq: 'bi-music-player',
   }[id] || 'bi-cloud';
 }
 

@@ -17,7 +17,6 @@
 //! | [`music_web_source`] | Web 来源基础设施（HTTP 客户端 + 配置） |
 //! | [`music_netease_source`] | 网易云音乐来源（NeteaseCloudMusicApi） |
 //! | [`music_kugou_source`] | 酷狗音乐来源（KuGouMusicApi） |
-//! | [`music_qq_source`] | QQ 音乐来源（QQMusicApi） |
 //! | [`music_library`] | 音乐库（Song/Artist/Album/Lyric CRUD + 关系） |
 //! | [`playlist`] | 歌单系统（本地保存 + 在线搜索） |
 //! | [`lyric_preference`] | 歌词优先级系统（来源/格式分级） |
@@ -32,7 +31,6 @@ pub mod music_library;
 #[allow(non_snake_case)]
 pub mod music_localSource;
 pub mod music_netease_source;
-pub mod music_qq_source;
 pub mod music_source;
 pub mod music_web_source;
 pub mod p2p;

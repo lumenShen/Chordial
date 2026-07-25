@@ -54,7 +54,7 @@ impl DeployStatus {
 /// 字段按大小降序排列以减少结构体 padding。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeployableSourceSpec {
-    /// 来源 ID（`"netease"` / `"kugou"` / `"qq"`），与 `WebSourceConfig` 的来源名对齐。
+    /// 来源 ID（`"netease"` / `"kugou"`），与 `WebSourceConfig` 的来源名对齐。
     pub id: String,
     /// 展示名（如 `"网易云音乐"`）。
     pub display_name: String,

@@ -228,13 +228,6 @@ pub fn run() {
             commands::kugou_login_qr_key,
             commands::kugou_login_qr_create,
             commands::kugou_login_qr_check,
-            // QQ Music API 来源
-            commands::qq_get_config,
-            commands::qq_update_config,
-            commands::qq_test_connection,
-            commands::qq_search_songs,
-            commands::qq_search_artists,
-            commands::qq_search_albums,
             // 通用云端来源 — 从网络来源实例选择下载
             commands::source_list_web_sources,
             commands::source_download_song,

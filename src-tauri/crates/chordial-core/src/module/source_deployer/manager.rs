@@ -37,7 +37,7 @@ const RECENT_LOGS_DISPLAY: usize = 200;
 /// 返回所有可部署来源的固定规格（按 ID 升序）。
 ///
 /// 默认端口已错开，避免同时启动多服务时端口冲突：
-/// - netease :3000 | kugou :3001 | qq :3300
+/// - netease :3000 | kugou :3001
 ///
 /// `start_command` 直接用 `node` 而非 `npm start`：避免 Windows 上 `cmd /c npm.cmd`
 /// 转发到 node 后立即退出的行为（误判为服务退出）。
@@ -64,17 +64,6 @@ pub fn list_deployable_sources() -> Vec<DeployableSourceSpec> {
             install_args: vec!["install".into()],
             description: "KuGouMusicApi — 提供酷狗音乐搜索/下载/扫码登录".into(),
             default_port: 3001,
-        },
-        DeployableSourceSpec {
-            id: "qq".into(),
-            display_name: "QQ 音乐".into(),
-            git_url: "https://github.com/jsososo/QQMusicApi.git".into(),
-            start_command: "node".into(),
-            start_args: vec!["./bin/www".into()],
-            install_command: "npm".into(),
-            install_args: vec!["install".into()],
-            description: "QQMusicApi — 提供 QQ 音乐搜索/下载/歌词".into(),
-            default_port: 3300,
         },
     ]
 }
@@ -390,7 +379,7 @@ impl SourceDeployer {
 
     /// 启动服务。
     ///
-    /// - 通过 `PORT` 环境变量传入端口（NeteaseCloudMusicApi / KuGou / QQMusicApi 都遵守此约定）
+    /// - 通过 `PORT` 环境变量传入端口（NeteaseCloudMusicApi / KuGou 都遵守此约定）
     /// - 子进程设置 `kill_on_drop(true)`：deployer 退出时自动清理子进程
     /// - 启动后 spawn 一个 `wait_task` 等待退出并清理状态
     pub async fn start_source(&self, source_id: &str) -> Result<(), String> {
@@ -754,11 +743,10 @@ mod tests {
     #[test]
     fn test_spec_ids() {
         let specs = list_deployable_sources();
-        assert_eq!(specs.len(), 3);
+        assert_eq!(specs.len(), 2);
         let ids: Vec<_> = specs.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"netease"));
         assert!(ids.contains(&"kugou"));
-        assert!(ids.contains(&"qq"));
     }
 
     #[test]

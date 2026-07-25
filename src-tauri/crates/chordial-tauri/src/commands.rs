@@ -2238,85 +2238,6 @@ pub fn kugou_login_qr_check(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// QQ 音乐来源命令 — 配置/测试/搜索
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// 获取 QQ 来源配置（base_url / cookie / 超时 / 启用 / 下载目录）。
-#[tauri::command]
-pub fn qq_get_config(ctx: State<'_, Arc<AppContext>>) -> Result<WebSourceConfig, String> {
-    Ok(ctx.qq_source.config())
-}
-
-/// 更新 QQ 来源配置并持久化。
-///
-/// 重建 HTTP 客户端以应用新的 base_url / cookie / timeout。
-#[tauri::command]
-pub fn qq_update_config(
-    ctx: State<'_, Arc<AppContext>>,
-    config: WebSourceConfig,
-) -> Result<(), String> {
-    ctx.qq_source.update_config(config)
-}
-
-/// 测试与 QQ API 服务器的连通性。
-///
-/// 通过发起一次 pageNo=1 pageSize=1 的搜索请求验证 base_url + cookie 是否有效。
-#[tauri::command]
-pub fn qq_test_connection(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::Value, String> {
-    let cfg = ctx.qq_source.config();
-    if cfg.base_url.is_empty() {
-        return Err("API base_url 未配置".to_string());
-    }
-    let result = ctx.qq_source.search_songs("test");
-    Ok(serde_json::json!({
-        "ok": result.is_ok(),
-        "error": result.err(),
-        "base_url": cfg.base_url,
-    }))
-}
-
-/// 在线搜索 QQ 歌曲（返回库内 Song 模型，附带 qq SourceId）。
-#[tauri::command]
-pub fn qq_search_songs(
-    ctx: State<'_, Arc<AppContext>>,
-    query: String,
-) -> Result<Vec<Song>, String> {
-    ctx.qq_source.search_songs(&query)
-}
-
-/// 在线搜索 QQ 歌手（返回库内 Artist 模型）。
-///
-/// QQ 音乐 API 使用 1-based pageNo/pageSize；此处将前端 limit/offset 转换为对应分页。
-#[tauri::command]
-pub fn qq_search_artists(
-    ctx: State<'_, Arc<AppContext>>,
-    query: String,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Vec<Artist>, String> {
-    let page_size = limit.unwrap_or(30);
-    let offset_val = offset.unwrap_or(0);
-    let page_no = (offset_val / page_size.max(1)) + 1;
-    ctx.qq_source.search_artists(&query, page_no, page_size)
-}
-
-/// 在线搜索 QQ 专辑（返回库内 Album 模型）。
-///
-/// QQ 音乐 API 使用 1-based pageNo/pageSize；此处将前端 limit/offset 转换为对应分页。
-#[tauri::command]
-pub fn qq_search_albums(
-    ctx: State<'_, Arc<AppContext>>,
-    query: String,
-    limit: Option<u32>,
-    offset: Option<u32>,
-) -> Result<Vec<Album>, String> {
-    let page_size = limit.unwrap_or(30);
-    let offset_val = offset.unwrap_or(0);
-    let page_no = (offset_val / page_size.max(1)) + 1;
-    ctx.qq_source.search_albums(&query, page_no, page_size)
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
 // 通用云端来源命令 — 从网络来源实例选择一个云端音乐源进行下载/比较
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -2336,11 +2257,10 @@ pub fn source_list_web_sources(ctx: State<'_, Arc<AppContext>>) -> Result<Vec<se
         .into_iter()
         .filter(|e| e.source_type.is_web())
         .map(|e| {
-            // 显示名映射：未来可通过 trait 方法提供；当前硬编码 netease/kugou/qq
+            // 显示名映射：未来可通过 trait 方法提供；当前硬编码 netease/kugou
             let display_name = match e.name.as_str() {
                 "netease" => "网易云音乐",
                 "kugou" => "酷狗音乐",
-                "qq" => "QQ 音乐",
                 _ => &e.name,
             };
             serde_json::json!({
@@ -2385,9 +2305,8 @@ pub fn source_download_song(
 
     use chordial_core::module::music_kugou_source;
     use chordial_core::module::music_netease_source;
-    use chordial_core::module::music_qq_source;
 
-    // 分支处理：netease / kugou / qq 各自走对应的下载 API
+    // 分支处理：netease / kugou 各自走对应的下载 API
     let (bytes, quality_descriptor, ext, download_dir_str) = if source_name
         == music_netease_source::NETEASE_SOURCE_NAME
     {
@@ -2453,33 +2372,9 @@ pub fn source_download_song(
             },
         };
         (b, qd, e.to_string(), ctx.kugou_source.download_dir())
-    } else if source_name == music_qq_source::QQ_SOURCE_NAME {
-        // ── QQ 音乐下载 ──
-        // entity_id 格式：song:<songmid>，songmid 是字符串标识
-        let songmid = song_entity_id
-            .splitn(3, ':')
-            .nth(1)
-            .ok_or_else(|| format!("无效的 entity_id: {}", song_entity_id))?;
-        if songmid.is_empty() {
-            return Err(format!("无效的 songmid: {}", song_entity_id));
-        }
-        // level 可选：QQ 音质字符串（"128"/"320"/"m4a"/"ape"/"flac"），默认 "320"
-        let quality_str = level.unwrap_or_else(|| "320".to_string());
-        let (b, _url_data) = music_qq_source::api::download_song(
-            ctx.qq_source.client(),
-            songmid,
-            &quality_str,
-        )?;
-        let qd = build_qq_quality_descriptor(&quality_str);
-        let e = match quality_str.to_lowercase().as_str() {
-            "flac" | "ape" => "flac",
-            "m4a" | "aac" => "m4a",
-            _ => "mp3",
-        };
-        (b, qd, e.to_string(), ctx.qq_source.download_dir())
     } else {
         return Err(format!(
-            "来源 '{}' 暂不支持下载（仅支持 netease/kugou/qq）",
+            "来源 '{}' 暂不支持下载（仅支持 netease/kugou）",
             source_name
         ));
     };
@@ -2535,25 +2430,6 @@ fn build_kugou_quality_descriptor(
             _ => desc.codec,
         };
     }
-    desc
-}
-
-/// 从 QQ 音乐请求音质字符串构造音质描述符。
-///
-/// QQ 音乐 quality 字符串（`"128"` / `"320"` / `"m4a"` / `"ape"` / `"flac"`）映射到内部 [`AudioQuality`]。
-/// 由于 `/song/url` 仅返回 URL 字符串而无码率/编码等元数据，这里基于请求音质推断描述符。
-fn build_qq_quality_descriptor(quality: &str) -> AudioQualityDescriptor {
-    use chordial_core::module::music_source::types::{AudioCodec, AudioQuality};
-    let (aq, codec) = match quality.to_lowercase().as_str() {
-        "128" => (AudioQuality::Standard, AudioCodec::Mp3),
-        "320" => (AudioQuality::Exhigh, AudioCodec::Mp3),
-        "m4a" => (AudioQuality::Higher, AudioCodec::Aac),
-        "ape" => (AudioQuality::Lossless, AudioCodec::Ape),
-        "flac" => (AudioQuality::Lossless, AudioCodec::Flac),
-        _ => (AudioQuality::Unknown, AudioCodec::Unknown),
-    };
-    let mut desc = aq.descriptor();
-    desc.codec = codec;
     desc
 }
 
@@ -2721,7 +2597,6 @@ pub fn lyric_source_list(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::
         LyricSourceKind::Local,
         LyricSourceKind::Netease,
         LyricSourceKind::Kugou,
-        LyricSourceKind::Qq,
     ];
 
     let list: Vec<serde_json::Value> = all_kinds
@@ -2941,7 +2816,7 @@ pub fn playlist_count(ctx: State<'_, Arc<AppContext>>) -> Result<usize, String> 
 // ══════════════════════════════════════════════════════════════════════════════
 //
 // 提供 git clone → npm install → npm start 的全链路自动化部署，
-// 让用户一键在本地拉起 NeteaseCloudMusicApi / KuGouMusicApi / QQMusicApi 服务。
+// 让用户一键在本地拉起 NeteaseCloudMusicApi / KuGouMusicApi 服务。
 // 配置（端口 / auto_start / auto_configure_base_url）持久化到 PersistentStore。
 
 /// 列出所有可部署来源的完整信息（规格 + 配置 + 运行时状态）。
@@ -3074,7 +2949,7 @@ pub fn source_deployer_get_logs(
 }
 
 /// 获取某来源服务的 `base_url`（`http://localhost:<port>`）。
-/// 用于部署成功后自动配置对应来源（netease/kugou/qq）的 base_url。
+/// 用于部署成功后自动配置对应来源（netease/kugou）的 base_url。
 #[tauri::command]
 pub fn source_deployer_get_base_url(
     ctx: State<'_, Arc<AppContext>>,

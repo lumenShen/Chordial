@@ -2,11 +2,11 @@
  * 音乐源服务快速部署工具 API — 后端 source_deployer_* 命令
  *
  * 提供 git clone → npm install → npm start 的全链路自动化部署，
- * 让用户一键在本地拉起 NeteaseCloudMusicApi / KuGouMusicApi / QQMusicApi 服务，
+ * 让用户一键在本地拉起 NeteaseCloudMusicApi / KuGouMusicApi 服务，
  * 并可设置程序启动时自动运行。
  *
  * 部署完成后可通过 `getBaseUrl` 拿到 `http://localhost:<port>`，
- * 再调用对应来源（netease/kugou/qq）的 `updateConfig` 写回 `base_url`。
+ * 再调用对应来源（netease/kugou）的 `updateConfig` 写回 `base_url`。
  */
 
 import { transport } from '@/api/transport';
@@ -18,7 +18,7 @@ import { transport } from '@/api/transport';
 /**
  * 可部署的音乐源服务规格（后端固定信息）。
  * @typedef {Object} DeployableSourceSpec
- * @property {string} id - 来源 ID（`"netease"` / `"kugou"` / `"qq"`）
+ * @property {string} id - 来源 ID（`"netease"` / `"kugou"`）
  * @property {string} display_name - 展示名（如 `"网易云音乐"`）
  * @property {string} git_url - GitHub 仓库地址
  * @property {string} start_command - 启动命令（通常 `"npm"`）
@@ -85,7 +85,7 @@ export async function listSources() {
 
 /**
  * 获取单个来源的完整信息。
- * @param {string} sourceId - 来源 ID（`"netease"` / `"kugou"` / `"qq"`）
+ * @param {string} sourceId - 来源 ID（`"netease"` / `"kugou"`）
  * @returns {Promise<SourceDeployInfo>}
  */
 export async function getSource(sourceId) {
@@ -113,7 +113,7 @@ export async function getLogs(sourceId, n = 200) {
 
 /**
  * 获取某来源服务的 base_url（`http://localhost:<port>`）。
- * 用于部署成功后自动配置对应来源（netease/kugou/qq）的 base_url。
+ * 用于部署成功后自动配置对应来源（netease/kugou）的 base_url。
  * @param {string} sourceId
  * @returns {Promise<string|null>}
  */

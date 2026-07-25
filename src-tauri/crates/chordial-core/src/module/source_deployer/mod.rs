@@ -1,7 +1,7 @@
 //! 音乐源服务快速部署工具。
 //!
 //! 提供 git clone → npm install → npm start 的全链路自动化部署，
-//! 让用户一键在本地拉起 NeteaseCloudMusicApi / KuGouMusicApi / QQMusicApi 服务，
+//! 让用户一键在本地拉起 NeteaseCloudMusicApi / KuGouMusicApi 服务，
 //! 并可设置程序启动时自动运行。
 //!
 //! # 模块结构

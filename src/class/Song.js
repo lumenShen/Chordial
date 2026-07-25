@@ -132,7 +132,7 @@ export class Song {
       let lyricText = '';
 
       // 优先级 1：后端 lyric_get_preferred 命令（按用户偏好综合所有来源）
-      // 后端会自动遍历 song.source_ids 中所有已注册来源（Local/Netease/Kugou/Qq），
+      // 后端会自动遍历 song.source_ids 中所有已注册来源（Local/Netease/Kugou），
       // 调用 select_best 选出得分最高的候选歌词
       try {
         const { getPreferred } = await import('@/api/musicSource/lyricPreference.js');

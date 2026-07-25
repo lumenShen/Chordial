@@ -27,7 +27,6 @@ export const LyricSourceKind = {
   Local: 'local',
   Netease: 'netease',
   Kugou: 'kugou',
-  Qq: 'qq',
 };
 
 /**
@@ -37,7 +36,6 @@ export const LYRIC_SOURCE_DISPLAY_NAMES = {
   [LyricSourceKind.Local]: '本地',
   [LyricSourceKind.Netease]: '网易云',
   [LyricSourceKind.Kugou]: '酷狗',
-  [LyricSourceKind.Qq]: 'QQ 音乐',
 };
 
 /**
@@ -47,12 +45,11 @@ export const DEFAULT_SOURCE_ORDER = [
   LyricSourceKind.Local,
   LyricSourceKind.Netease,
   LyricSourceKind.Kugou,
-  LyricSourceKind.Qq,
 ];
 
 /**
  * @typedef {Object} LyricPreference
- * @property {string[]} source_order - 来源优先级（如 ['local', 'netease', 'kugou', 'qq']）
+ * @property {string[]} source_order - 来源优先级（如 ['local', 'netease', 'kugou']）
  * @property {boolean} prefer_word_by_word - 是否优先逐字歌词
  * @property {boolean} fallback_to_online_for_word_by_word - 本地有逐字时是否仍尝试在线获取
  */

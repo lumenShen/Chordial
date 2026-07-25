@@ -11,7 +11,6 @@ import {
 } from '../api/musicSource';
 import * as neteaseApi from '@/api/musicSource/netease.js';
 import * as kugouApi from '@/api/musicSource/kugou.js';
-import * as qqApi from '@/api/musicSource/qq.js';
 import { usePerf } from '@/utils/performanceMonitor.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { useLibraryEvents } from '@/composables/useLibraryEvents.js';
@@ -40,14 +39,6 @@ const neteaseState = ref({
 
 // 酷狗来源状态
 const kugouState = ref({
-  enabled: false,
-  baseUrl: '',
-  hasCookie: false,
-  loaded: false,
-});
-
-// QQ 音乐来源状态
-const qqState = ref({
   enabled: false,
   baseUrl: '',
   hasCookie: false,
@@ -98,12 +89,11 @@ watch([isScanning, isAdding], ([scanning, adding]) => {
 const loadData = async () => {
   start('loadData');
   try {
-    const [paths, s, neteaseCfg, kugouCfg, qqCfg] = await Promise.all([
+    const [paths, s, neteaseCfg, kugouCfg] = await Promise.all([
       getFolders(),
       getLocalStats(),
       neteaseApi.getConfig().catch(() => null),
       kugouApi.getConfig().catch(() => null),
-      qqApi.getConfig().catch(() => null),
     ]);
     folders.value = (paths || []).map((p) => ({
       path: p,
@@ -125,15 +115,6 @@ const loadData = async () => {
       kugouState.value = {
         enabled: !!kugouCfg.enabled,
         baseUrl: kugouCfg.base_url || '',
-        hasCookie: cookie.length > 0,
-        loaded: true,
-      };
-    }
-    if (qqCfg) {
-      const cookie = (qqCfg.cookie || '').trim();
-      qqState.value = {
-        enabled: !!qqCfg.enabled,
-        baseUrl: qqCfg.base_url || '',
         hasCookie: cookie.length > 0,
         loaded: true,
       };
@@ -224,11 +205,6 @@ const goToNeteaseSettings = () => {
 // 跳转到酷狗来源设置页
 const goToKugouSettings = () => {
   router.push('/music-sources/kugou');
-};
-
-// 跳转到 QQ 音乐来源设置页
-const goToQqSettings = () => {
-  router.push('/music-sources/qq');
 };
 </script>
 
@@ -395,42 +371,6 @@ const goToQqSettings = () => {
           </button>
         </div>
       </div>
-
-      <!-- QQ 音乐来源卡片 -->
-      <div class="source-card card online-source-card" @click="goToQqSettings" role="button" tabindex="0"
-        @keydown.enter.prevent="goToQqSettings" @keydown.space.prevent="goToQqSettings">
-        <div class="source-info">
-          <div class="source-icon qq-icon">
-            <i class="bi bi-music-note-list"></i>
-          </div>
-          <div class="source-details">
-            <h3 class="source-name">
-              QQ 音乐
-              <span class="source-type-badge" :class="qqState.enabled ? 'enabled' : 'disabled'">
-                {{ qqState.enabled ? '已启用' : '未启用' }}
-              </span>
-            </h3>
-            <p class="source-path">
-              <template v-if="qqState.loaded">
-                {{ qqState.baseUrl || '（未配置 API 服务器）' }}
-              </template>
-              <template v-else>加载中…</template>
-            </p>
-            <div class="source-meta">
-              <span class="meta-tag" :class="qqState.hasCookie ? 'ok' : 'warn'">
-                <i class="bi" :class="qqState.hasCookie ? 'bi-check-circle-fill' : 'bi-exclamation-circle-fill'"></i>
-                {{ qqState.hasCookie ? '已配置 Cookie' : '未配置 Cookie' }}
-              </span>
-              <span class="meta-tag">搜索歌曲 · 在线下载 · LRC 歌词</span>
-            </div>
-          </div>
-        </div>
-        <div class="source-actions">
-          <button class="btn-icon" title="设置" aria-label="设置">
-            <i class="bi bi-chevron-right"></i>
-          </button>
-        </div>
-      </div>
     </div>
 
     <!-- Unsupported source notice -->
@@ -446,7 +386,7 @@ const goToQqSettings = () => {
         </p>
         <p class="note-text">
           网盘（WebDisk）和 WebDAV 来源目前后端尚未实现。
-          当前支持本地文件夹、网易云音乐 API、酷狗音乐 API 与 QQ 音乐 API 四个来源。
+          当前支持本地文件夹、网易云音乐 API 与酷狗音乐 API 三个来源。
         </p>
       </div>
     </div>
@@ -647,15 +587,6 @@ const goToQqSettings = () => {
 }
 
 .kugou-icon i {
-  font-size: 22px;
-}
-
-.qq-icon {
-  background: linear-gradient(135deg, #12b7f5 0%, #4a9eff 100%);
-  color: #fff;
-}
-
-.qq-icon i {
   font-size: 22px;
 }
 

@@ -22,10 +22,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum LyricFormat {
-    /// 逐字歌词（网易云 YRC / QQ 音乐 QRC / TTML）
+    /// 逐字歌词（网易云 YRC / QRC / TTML）
     /// 字级时间戳，支持 AMLL 风格的字符渐变
     Yrc,
-    /// QQ 音乐逐字歌词
+    /// QRC 逐字歌词
     Qrc,
     /// Apple Music TTML 格式
     Ttml,
@@ -110,20 +110,17 @@ pub enum LyricSourceKind {
     Netease,
     /// 酷狗音乐
     Kugou,
-    /// QQ 音乐
-    Qq,
 }
 
 impl LyricSourceKind {
     /// 从来源名称解析。
     ///
-    /// 名称需与对应 `MusicSource::name()` 返回值一致（如 `"netease"`、`"kugou"`、`"qq"`）。
+    /// 名称需与对应 `MusicSource::name()` 返回值一致（如 `"netease"`、`"kugou"`）。
     pub fn from_source_name(name: &str) -> Option<Self> {
         match name {
             "local" => Some(Self::Local),
             "netease" => Some(Self::Netease),
             "kugou" => Some(Self::Kugou),
-            "qq" => Some(Self::Qq),
             _ => None,
         }
     }
@@ -134,7 +131,6 @@ impl LyricSourceKind {
             Self::Local => 40,
             Self::Netease => 30,
             Self::Kugou => 20,
-            Self::Qq => 10,
         }
     }
 
@@ -144,7 +140,6 @@ impl LyricSourceKind {
             Self::Local => "本地",
             Self::Netease => "网易云",
             Self::Kugou => "酷狗",
-            Self::Qq => "QQ 音乐",
         }
     }
 
@@ -154,7 +149,6 @@ impl LyricSourceKind {
             Self::Local => "local",
             Self::Netease => "netease",
             Self::Kugou => "kugou",
-            Self::Qq => "qq",
         }
     }
 }
@@ -181,13 +175,12 @@ pub struct LyricPreference {
 }
 
 fn default_source_order() -> Vec<LyricSourceKind> {
-    // 默认顺序：本地 → 网易云 → 酷狗 → QQ
+    // 默认顺序：本地 → 网易云 → 酷狗
     // 顺序与 default_weight 一致：权重高的排在前面
     vec![
         LyricSourceKind::Local,
         LyricSourceKind::Netease,
         LyricSourceKind::Kugou,
-        LyricSourceKind::Qq,
     ]
 }
 
@@ -209,7 +202,7 @@ impl LyricPreference {
     /// 从 ConfigStore 加载配置。
     ///
     /// 加载后会做规范化：把未在 `source_order` 中但已支持的来源追加到末尾，
-    /// 避免老版本用户升级到新版本后新增来源（如 KuGou/QQ）永远选不到。
+    /// 避免老版本用户升级到新版本后新增来源（如 KuGou）永远选不到。
     pub fn load(config: &crate::module::config::store::ConfigStore) -> Self {
         let mut pref: Self = config.get::<Self>("lyric_preference").unwrap_or_default();
         pref.normalize_source_order();
@@ -339,7 +332,6 @@ mod tests {
                 LyricSourceKind::Local,
                 LyricSourceKind::Netease,
                 LyricSourceKind::Kugou,
-                LyricSourceKind::Qq,
             ],
             prefer_word_by_word: true,
             fallback_to_online_for_word_by_word: false,
@@ -382,14 +374,13 @@ mod tests {
             fallback_to_online_for_word_by_word: false,
         };
         pref.normalize_source_order();
-        // 规范化后应包含全部 4 个来源，且原有顺序保留
+        // 规范化后应包含全部 3 个来源，且原有顺序保留
         assert_eq!(
             pref.source_order,
             vec![
                 LyricSourceKind::Local,
                 LyricSourceKind::Netease,
                 LyricSourceKind::Kugou,
-                LyricSourceKind::Qq,
             ]
         );
     }
@@ -406,18 +397,17 @@ mod tests {
             fallback_to_online_for_word_by_word: false,
         };
         pref.normalize_source_order();
-        assert_eq!(pref.source_order.len(), 4);
+        assert_eq!(pref.source_order.len(), 3);
         assert_eq!(pref.source_order[0], LyricSourceKind::Local);
     }
 
     #[test]
     fn test_default_source_order_has_all_sources() {
         let pref = LyricPreference::default();
-        assert_eq!(pref.source_order.len(), 4);
+        assert_eq!(pref.source_order.len(), 3);
         assert!(pref.source_order.contains(&LyricSourceKind::Local));
         assert!(pref.source_order.contains(&LyricSourceKind::Netease));
         assert!(pref.source_order.contains(&LyricSourceKind::Kugou));
-        assert!(pref.source_order.contains(&LyricSourceKind::Qq));
     }
 
     #[test]
@@ -433,10 +423,6 @@ mod tests {
         assert_eq!(
             LyricSourceKind::from_source_name("kugou"),
             Some(LyricSourceKind::Kugou)
-        );
-        assert_eq!(
-            LyricSourceKind::from_source_name("qq"),
-            Some(LyricSourceKind::Qq)
         );
         assert_eq!(LyricSourceKind::from_source_name("unknown"), None);
     }
