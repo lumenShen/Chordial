@@ -1,5 +1,5 @@
 <template>
-  <div class="player-control-bar" ref="root" :style="glassStyle">
+  <div class="player-control-bar" ref="root" :style="glassStyle" @mouseenter="onEnter" @mouseleave="onLeave" @mousemove="onMouseMove">
     <!-- 模糊封面背景层 -->
     <div class="bar-bg" v-if="albumCoverUrl">
       <img :src="albumCoverUrl" alt="" />
@@ -56,7 +56,7 @@ import { computed, onMounted, useTemplateRef } from 'vue'
 import { PlayerStore } from '@/stores/player.js'
 import { usePerf } from '@/utils/performanceMonitor.js'
 import { useAnime } from '@/composables/useAnime.js'
-import { useLiquidGlass } from '@/composables/useLiquidGlass.js'
+import { useLiquidGlass, LIQUID_GLASS_PRESETS } from '@/composables/useLiquidGlass.js'
 import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue'
 
 const { log } = usePerf('PlayerControlBar')
@@ -70,10 +70,9 @@ const coverPortalTarget = computed(() => PlayerStore.coverPortalTarget.value)
 const metaPortalTarget = computed(() => PlayerStore.metaPortalTarget.value)
 
 // 液态玻璃：控制条本身较扁平，scale 取小值避免边缘过度扭曲
-const { glassStyle, filterProps } = useLiquidGlass({
-  blur: 14,
-  scale: 0.01,
-  hoverScale: 0.016,
+const { glassStyle, onEnter, onLeave, onMouseMove, filterProps } = useLiquidGlass({
+  ...LIQUID_GLASS_PRESETS.user,
+  elasticity: 0.2,          // 控制栏轻微鼠标跟随
   interactive: false,
   borderRadius: 'calc(var(--bottom-nav-height) * 0.6)',
 })

@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, useTemplateRef } from "vue";
 import { useAnime } from "@/composables/useAnime";
 import { ANIME_LAYOUT } from "@/utils/animePresets";
-import { useLiquidGlass } from "@/composables/useLiquidGlass.js";
+import { useLiquidGlass, LIQUID_GLASS_PRESETS } from "@/composables/useLiquidGlass.js";
 import LiquidGlassFilter from "@/components/ui/LiquidGlassFilter.vue";
 
 type SheetDetent = "medium" | "large";
@@ -55,9 +55,8 @@ const { animate, enter, exit, spring, useLayout } = useAnime();
 // Sheet 是大面积浮动容器，scale 取极小值避免内容明显扭曲；
 // blur 较强保证背景内容不干扰 Sheet 内信息阅读。
 const { glassStyle: sheetGlassStyle, filterProps: sheetFilterProps } = useLiquidGlass({
-  blur: 20,
-  scale: 0.004,
-  hoverScale: 0.004,
+  ...LIQUID_GLASS_PRESETS.user,
+  elasticity: 0,            // 大面积容器不做鼠标跟随
   interactive: false,
   mapBlur: 0.02,
 });
@@ -68,12 +67,10 @@ const {
   glassStyle: iconBtnGlassStyle,
   onEnter: onIconBtnEnter,
   onLeave: onIconBtnLeave,
+  onMouseMove: onIconBtnMouseMove,
   filterProps: iconBtnFilterProps,
 } = useLiquidGlass({
-  blur: 8,
-  scale: 0.012,
-  hoverScale: 0.02,
-  interactive: true,
+  ...LIQUID_GLASS_PRESETS.user,
   borderRadius: '50%',
 });
 
@@ -409,6 +406,7 @@ defineExpose({
               @click="onBack"
               @mouseenter="onIconBtnEnter"
               @mouseleave="onIconBtnLeave"
+              @mousemove="onIconBtnMouseMove"
               aria-label="返回"
             >
               <i class="bi bi-chevron-left" style="font-size:18px"></i>
@@ -421,6 +419,7 @@ defineExpose({
             @click="onClose"
             @mouseenter="onIconBtnEnter"
             @mouseleave="onIconBtnLeave"
+            @mousemove="onIconBtnMouseMove"
             aria-label="关闭"
           >
             <i class="bi bi-x-lg" style="font-size:16px"></i>

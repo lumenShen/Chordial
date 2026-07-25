@@ -4,7 +4,7 @@ import { computed, onMounted, useTemplateRef, watch, nextTick } from 'vue';
 import PlayerStore from '@/stores/player.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { ANIME_SPRINGS } from '@/utils/animePresets.js';
-import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
+import { useLiquidGlass, LIQUID_GLASS_PRESETS } from '@/composables/useLiquidGlass.js';
 import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
 
 const route = useRoute();
@@ -15,15 +15,12 @@ const rootRef = useTemplateRef('root');
 const indicatorRef = useTemplateRef('indicator');
 const { run, animate } = useAnime(() => rootRef.value);
 
-// 液态玻璃效果：通过 composable 统一封装
-// - blur 较强（磨砂模糊），scale 较小（仅边缘轻微折射）
-// - 与 AppHeader / PlayerControlBar / WindowControls 共用同一套实现
-const { glassStyle, onEnter, onLeave, filterProps } = useLiquidGlass({
-  blur: 10,
-  scale: 0.012,
-  hoverScale: 0.018,
-  mapBlur: 0.03,
-  interactive: false, // 导航栏整体不做 hover 折射变化
+// 液态玻璃效果：应用用户预设（标准折射 + 像差 + 弹性）
+// - 居左浮动胶囊，圆角 = 高度的一半形成完整胶囊形态
+// - elasticity 鼠标跟随通过 @mousemove 触发
+const { glassStyle, onEnter, onLeave, onMouseMove, filterProps } = useLiquidGlass({
+  ...LIQUID_GLASS_PRESETS.user,
+  borderRadius: 'calc(var(--bottom-nav-height) / 2)',
 });
 
 // 导航项错峰入场（fadeInUp + stagger）
@@ -128,6 +125,7 @@ watch(() => route.path, () => {
     :style="glassStyle"
     @mouseenter="onEnter"
     @mouseleave="onLeave"
+    @mousemove="onMouseMove"
   >
     <div ref="indicator" class="nav-indicator"></div>
     <router-link v-for="item in navItems" :key="item.path" :to="item.path" class="bottom-nav-item"
@@ -144,9 +142,8 @@ watch(() => route.path, () => {
 .app-bottom-nav {
   position: fixed;
   bottom: 1.5rem;
-  /* 桌面端：居中浮动胶囊 */
-  left: 50%;
-  transform: translateX(-50%);
+  /* 桌面端：居左浮动胶囊 */
+  left: 1.5rem;
   /* 浅色模式：乳白玻璃底色（实际折射/模糊由 backdrop-filter 提供） */
   background: rgba(255, 255, 255, 0.22);
   border: 1px solid rgba(255, 255, 255, 0.35);
@@ -154,9 +151,11 @@ watch(() => route.path, () => {
     0 8px 24px rgba(0, 0, 0, 0.08),
     inset 0 1px 0 rgba(255, 255, 255, 0.5);
   height: var(--bottom-nav-height);
+  /* 胶囊圆角：高度的一半形成完整胶囊形态（composable 也通过 borderRadius 注入，此处作为 CSS 默认值） */
+  border-radius: calc(var(--bottom-nav-height) / 2);
   /* auto 宽度：根据内容撑开，形成浮动胶囊 */
   width: fit-content;
-  max-width: calc(100vw - 2rem);
+  max-width: calc(100vw - 3rem);
 
   display: flex;
   justify-content: space-around;

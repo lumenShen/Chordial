@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router';
 import WindowControls from '@/components/WindowControls.vue';
 import { usePlatform } from '@/composables/usePlatform.js';
 import { useAnime } from '@/composables/useAnime.js';
-import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
+import { useLiquidGlass, LIQUID_GLASS_PRESETS } from '@/composables/useLiquidGlass.js';
 import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
 
 const route = useRoute();
@@ -55,9 +55,8 @@ const goToSettings = () => {
 // 三者使用同一 filterId 引用同一 SVG filter，避免重复定义；
 // 视觉差异通过各自的 .search-box / .icon-btn CSS 覆盖 background/border 实现。
 const { glassStyle: searchGlassStyle, filterProps: searchFilterProps } = useLiquidGlass({
-  blur: 12,
-  scale: 0.008,
-  hoverScale: 0.014,
+  ...LIQUID_GLASS_PRESETS.user,
+  elasticity: 0,           // 搜索框不做鼠标跟随
   interactive: false,
 });
 
@@ -67,12 +66,11 @@ const {
   glassStyle: iconBtnGlassStyle,
   onEnter: onIconBtnEnter,
   onLeave: onIconBtnLeave,
+  onMouseMove: onIconBtnMouseMove,
   filterProps: iconBtnFilterProps,
 } = useLiquidGlass({
-  blur: 10,
-  scale: 0.012,
-  hoverScale: 0.02,
-  interactive: true,
+  ...LIQUID_GLASS_PRESETS.user,
+  borderRadius: '50%',
 });
 </script>
 
@@ -109,6 +107,7 @@ const {
         @click="goToSettings"
         @mouseenter="onIconBtnEnter"
         @mouseleave="onIconBtnLeave"
+        @mousemove="onIconBtnMouseMove"
       >
         <i class="bi bi-gear"></i>
       </button>
@@ -118,6 +117,7 @@ const {
         :style="iconBtnGlassStyle"
         @mouseenter="onIconBtnEnter"
         @mouseleave="onIconBtnLeave"
+        @mousemove="onIconBtnMouseMove"
       >
         <i class="bi bi-bell"></i>
       </button>

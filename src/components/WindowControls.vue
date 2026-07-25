@@ -6,7 +6,7 @@ import {
   minimizeWindow,
   toggleMaximize,
 } from '@/api/window.js';
-import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
+import { useLiquidGlass, LIQUID_GLASS_PRESETS } from '@/composables/useLiquidGlass.js';
 import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
 
 const emit = defineEmits(['toggle-always-on-top', 'close', 'minimize', 'maximize']);
@@ -19,12 +19,10 @@ const {
   glassStyle,
   onEnter,
   onLeave,
+  onMouseMove,
   filterProps,
 } = useLiquidGlass({
-  blur: 10,
-  scale: 0.012,
-  hoverScale: 0.02,
-  interactive: true,
+  ...LIQUID_GLASS_PRESETS.user,
   borderRadius: '50%',
 });
 
@@ -67,6 +65,7 @@ onMounted(async () => {
       @click="handleMinimizeWindow"
       @mouseenter="onEnter"
       @mouseleave="onLeave"
+      @mousemove="onMouseMove"
     >
       <i class="bi bi-dash-lg"></i>
     </button>
@@ -80,6 +79,7 @@ onMounted(async () => {
       @click="handleToggleMaximize"
       @mouseenter="onEnter"
       @mouseleave="onLeave"
+      @mousemove="onMouseMove"
     >
       <i :class="isMaximized ? 'bi bi-fullscreen-exit' : 'bi bi-fullscreen'"></i>
     </button>
@@ -93,6 +93,7 @@ onMounted(async () => {
       @click="handleCloseWindow"
       @mouseenter="onEnter"
       @mouseleave="onLeave"
+      @mousemove="onMouseMove"
     >
       <i class="bi bi-x-lg"></i>
     </button>
