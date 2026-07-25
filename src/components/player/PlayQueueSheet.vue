@@ -13,11 +13,13 @@
  *   - 当前播放项高亮（左侧强调条 + 背景色 + 序号替换为播放图标）
  *   - 单击直接播放（不跳转）
  *   - Sheet 打开 / 当前曲目变化时自动滚动到当前项
+ *   - 使用虚拟列表（useVirtualList）只渲染可见区域 + 缓冲区，保证大队列滚动流畅
  */
-import { ref, computed, watch, nextTick, shallowRef } from 'vue';
+import { ref, computed, watch, nextTick, shallowRef, onUnmounted } from 'vue';
 import BottomSheet from '@/components/ui/BottomSheet.vue';
 import { PlayerStore } from '@/stores/player.js';
 import { useCoverImages } from '@/composables/useCoverImage';
+import { useVirtualList } from '@/composables/useVirtualList';
 
 // ── Sheet 可见性 ────────────────────────────────────────────
 const visible = computed({
@@ -68,16 +70,54 @@ function playTrack(track) {
   PlayerStore.play(track, playlist.value);
 }
 
-// ── 自动滚动到当前项 ────────────────────────────────────────
-const listRef = ref(null);
-const currentTrackEl = ref(null);
+// ── 虚拟列表 ────────────────────────────────────────────────
+// 每项固定高度 56px = padding-top(8) + cover(40) + padding-bottom(8)
+// 桌面/移动端一致（移动端仅横向 grid 列宽变化，纵向高度不变）
+const ITEM_HEIGHT = 56;
+const containerRef = ref(null);
 
+const {
+  visibleItems,
+  totalHeight,
+  onScroll,
+  scrollToIndex,
+  updateContainerHeight,
+} = useVirtualList(tracksRef, {
+  itemHeight: ITEM_HEIGHT,
+  bufferSize: 5,
+  containerRef,
+  mode: 'container',
+});
+
+// 监听容器尺寸变化（BottomSheet 入场动画、窗口缩放等），
+// useVirtualList 内部仅监听 window resize，无法捕获 sheet 动画期间的高度变化。
+let resizeObserver = null;
+watch(containerRef, (el, oldEl) => {
+  if (oldEl && resizeObserver) {
+    resizeObserver.disconnect();
+    resizeObserver = null;
+  }
+  if (el) {
+    resizeObserver = new ResizeObserver(() => updateContainerHeight());
+    resizeObserver.observe(el);
+  }
+});
+
+onUnmounted(() => {
+  if (resizeObserver) {
+    resizeObserver.disconnect();
+    resizeObserver = null;
+  }
+});
+
+// ── 自动滚动到当前项 ────────────────────────────────────────
+// 虚拟列表下当前项可能不在 DOM 中，无法用 scrollIntoView；
+// 改用 scrollToIndex 直接定位到当前索引。
 async function scrollCurrentIntoView() {
   await nextTick();
-  const el = currentTrackEl.value;
-  if (!el || !listRef.value) return;
-  // 使用 nearest 避免横向居中干扰
-  el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  if (currentIndex.value < 0) return;
+  updateContainerHeight();
+  scrollToIndex(currentIndex.value);
 }
 
 // Sheet 打开时或当前曲目变化时滚动定位
@@ -118,50 +158,57 @@ function onClose() {
         </span>
       </header>
 
-      <!-- 队列列表 -->
-      <div ref="listRef" class="pqs-list">
-        <div
-          v-for="(track, index) in playlist"
-          :key="track.id"
-          :ref="el => { if (index === currentIndex) currentTrackEl = el; }"
-          class="pqs-item"
-          :class="{ 'pqs-item--current': index === currentIndex }"
-          @click="playTrack(track)"
-        >
-          <!-- 序号 / 播放图标 -->
-          <div class="pqs-col-number">
-            <template v-if="index === currentIndex">
-              <span class="pqs-playing-icon" :class="{ 'is-playing': PlayerStore.state.isPlaying }">
-                <span class="bar" />
-                <span class="bar" />
-                <span class="bar" />
-              </span>
-            </template>
-            <span v-else class="pqs-index">{{ index + 1 }}</span>
-          </div>
-
-          <!-- 封面 -->
-          <div class="pqs-cover">
-            <img
-              v-if="getCoverUrl(track)"
-              :src="getCoverUrl(track)"
-              :alt="track.title"
-              loading="lazy"
-            />
-            <i v-else class="bi bi-music-note-beamed pqs-cover-placeholder" />
-          </div>
-
-          <!-- 标题 + 艺术家 -->
-          <div class="pqs-info">
-            <div class="pqs-title">{{ track.title || '未知歌曲' }}</div>
-            <div class="pqs-artist">
-              {{ track.getDisplayArtist ? track.getDisplayArtist() : (track.artist || '未知歌手') }}
+      <!-- 虚拟列表滚动容器 -->
+      <div
+        ref="containerRef"
+        class="pqs-list"
+        @scroll="onScroll"
+      >
+        <!-- 可视区域：用 totalHeight 撑开真实滚动条高度 -->
+        <div class="pqs-viewport" :style="{ height: totalHeight + 'px' }">
+          <div
+            v-for="{ item: track, index, offsetY } in visibleItems"
+            :key="track.id"
+            class="pqs-item pqs-item--virtual"
+            :class="{ 'pqs-item--current': index === currentIndex }"
+            :style="{ transform: `translateY(${offsetY}px)` }"
+            @click="playTrack(track)"
+          >
+            <!-- 序号 / 播放图标 -->
+            <div class="pqs-col-number">
+              <template v-if="index === currentIndex">
+                <span class="pqs-playing-icon" :class="{ 'is-playing': PlayerStore.state.isPlaying }">
+                  <span class="bar" />
+                  <span class="bar" />
+                  <span class="bar" />
+                </span>
+              </template>
+              <span v-else class="pqs-index">{{ index + 1 }}</span>
             </div>
-          </div>
 
-          <!-- 时长 -->
-          <div class="pqs-duration">
-            {{ track.getFormattedDuration ? track.getFormattedDuration() : formatDuration(track.duration) }}
+            <!-- 封面 -->
+            <div class="pqs-cover">
+              <img
+                v-if="getCoverUrl(track)"
+                :src="getCoverUrl(track)"
+                :alt="track.title"
+                loading="lazy"
+              />
+              <i v-else class="bi bi-music-note-beamed pqs-cover-placeholder" />
+            </div>
+
+            <!-- 标题 + 艺术家 -->
+            <div class="pqs-info">
+              <div class="pqs-title">{{ track.title || '未知歌曲' }}</div>
+              <div class="pqs-artist">
+                {{ track.getDisplayArtist ? track.getDisplayArtist() : (track.artist || '未知歌手') }}
+              </div>
+            </div>
+
+            <!-- 时长 -->
+            <div class="pqs-duration">
+              {{ track.getFormattedDuration ? track.getFormattedDuration() : formatDuration(track.duration) }}
+            </div>
           </div>
         </div>
       </div>
@@ -213,13 +260,21 @@ function onClose() {
   color: var(--accent-primary, #ff375f);
 }
 
-/* ── 列表 ──────────────────────────────────────────────────── */
+/* ── 列表（虚拟滚动容器）──────────────────────────────────── */
 .pqs-list {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: var(--space-2, 8px) 0;
+  position: relative;
+}
+
+/* 可视区域：撑开真实滚动条高度 */
+.pqs-viewport {
+  position: relative;
+  width: 100%;
 }
 
 /* ── 列表项 ────────────────────────────────────────────────── */
@@ -233,6 +288,16 @@ function onClose() {
   transition: background 0.15s ease;
   position: relative;
   user-select: none;
+}
+
+/* 虚拟列表项：绝对定位 + 显式高度 + 性能隔离 */
+.pqs-item--virtual {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 56px;
+  contain: layout style paint;
+  will-change: transform;
 }
 
 .pqs-item:hover {
