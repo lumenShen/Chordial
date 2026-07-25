@@ -2,25 +2,43 @@
   <Teleport to="body">
     <div ref="root" class="player-view" tabindex="0" @keydown="onKeydown">
       <!-- AMLL React 播放器挂载点 -->
-      <div ref="amllContainer" class="amll-container" />
+      <div ref="amllContainer" class="amll-container" @click="onAmllClick" />
       <!-- 顶部窗口拖动区域（仅桌面端）
            pointer-events:none 让点击穿透到 AMLL 的 ControlThumb；
            -webkit-app-region:drag 由 Tauri native 层识别用于拖动窗口 -->
       <div v-if="isDesktop" class="drag-region" />
+
+      <!-- AMLL MenuButton 触发的歌曲菜单 Sheet -->
+      <TrackMenuSheet />
+
+      <!-- AMLL bottomControls 第一个按钮（type="playlist"）触发的播放队列 Sheet -->
+      <PlayQueueSheet />
     </div>
   </Teleport>
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { createRoot } from 'react-dom/client'
 import { createElement } from 'react'
 import { AmllPlayer } from '@/amll/AmllPlayer.jsx'
 import { useAmllBridge } from '@/amll/useAmllBridge.js'
 import { PlayerStore } from '@/stores/player.js'
 import { usePlatform } from '@/composables/usePlatform.js'
+import { useWakeLock } from '@/composables/useWakeLock.js'
+import TrackMenuSheet from '@/components/player/TrackMenuSheet.vue'
+import PlayQueueSheet from '@/components/player/PlayQueueSheet.vue'
 
 const { isDesktop } = usePlatform()
+
+// 屏幕唤醒锁：PlayerView 已挂载（即 isPlayerViewOpen=true）且 isPlaying=true 时
+// 阻止系统自动关闭屏幕 / 进入休眠。组件卸载时由 onScopeDispose 自动释放。
+const { setActive: setWakeLockActive } = useWakeLock()
+watch(
+  () => PlayerStore.state.isPlaying,
+  (playing) => setWakeLockActive(playing),
+  { immediate: true }
+)
 
 const root = ref(null)
 const amllContainer = ref(null)
@@ -40,6 +58,33 @@ function onKeydown(e) {
   } else if (e.key === ' ') {
     e.preventDefault()
     PlayerStore.togglePlay()
+  }
+}
+
+/**
+ * AMLL 容器点击事件委托。
+ *
+ * PrebuiltLyricPlayer 内部 horizontalLayout 的 bottomControls 第一个按钮
+ * （PrebuiltToggleIconButton type="playlist"）未暴露 onClick prop，
+ * 这里通过 DOM 选择器识别该按钮的点击，触发播放队列 Sheet。
+ *
+ * 选择器说明：
+ *   .-DaA0W_bottomControls 是 AMLL 横向布局底部控件容器的 hashed class
+ *   （对应源码 horizontal.module.css 中的 "bottomControls"）
+ *   > button:first-child 选取第一个按钮（即 type="playlist"）
+ *
+ * 使用事件委托而非直接 addEventListener 的原因：
+ *   - React 渲染是异步的，首次挂载后 DOM 可能稍后才出现
+ *   - AMLL 在 horizontal/vertical 布局切换时会重新渲染 bottomControls
+ *   - 事件委托天然支持 DOM 重新渲染，无需手动重绑
+ */
+function onAmllClick(e) {
+  const target = e.target
+  if (!(target instanceof Element)) return
+  // closest() 兼容按钮内部 svg/icon 子元素点击
+  const btn = target.closest('.-DaA0W_bottomControls > button:first-child')
+  if (btn) {
+    PlayerStore.openPlayQueue()
   }
 }
 
