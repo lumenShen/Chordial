@@ -428,10 +428,13 @@ pub fn login_qr_create(
             ("timestamp", ts.as_str()),
         ],
     )?;
-    if resp.body.code != 200 {
-        return Err(format!("生成二维码失败 code={}", resp.body.code));
+    if resp.status != 1 {
+        return Err(format!(
+            "生成二维码失败 status={}, err_code={}",
+            resp.status, resp.err_code
+        ));
     }
-    Ok(resp.body.data)
+    Ok(resp.data)
 }
 
 /// 第 3 步：轮询扫码状态。

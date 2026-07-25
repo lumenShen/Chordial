@@ -524,20 +524,14 @@ pub struct KugouQrKeyData {
 ///
 /// KuGouMusicApi 将 key 组装为 `https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode={key}`，
 /// 然后可选生成 base64 图片。
+///
+/// 响应结构与酷狗其它端点一致：`status == 1` 表示成功，`err_code == 0` 表示无错误。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KugouQrCreateResponse {
     #[serde(default)]
-    pub code: i32,
-    #[serde(default)]
     pub status: i32,
     #[serde(default)]
-    pub body: KugouQrCreateBody,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct KugouQrCreateBody {
-    #[serde(default)]
-    pub code: i32,
+    pub err_code: i32,
     #[serde(default)]
     pub data: KugouQrCreateData,
 }
@@ -545,10 +539,10 @@ pub struct KugouQrCreateBody {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KugouQrCreateData {
     /// 二维码 URL（可用于前端 qrcode 库生成图片）
-    #[serde(default)]
+    #[serde(default, alias = "qrcode")]
     pub url: String,
     /// Base64 data URL（当请求带 qrimg=true 时返回）
-    #[serde(default)]
+    #[serde(default, alias = "qrimg")]
     pub base64: String,
 }
 
