@@ -1,8 +1,9 @@
 <script setup>
-import { ref, shallowRef, onMounted, watch, nextTick, useTemplateRef } from 'vue';
+import { ref, shallowRef, onMounted, watch, useTemplateRef } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import AlbumList from '../components/common/AlbumList.vue';
 import TrackList from '../components/common/TrackList.vue';
+import GradualBlur from '@/components/ui/GradualBlur.vue';
 import { getArtist } from '../api/artist';
 import { getAlbumsByIds } from '../api/album';
 import { getSongsByIds } from '../api/musicSource/musicResource';
@@ -68,18 +69,6 @@ watch(() => artist.value?.id, (newId) => {
   }
 });
 
-// 数据加载完成后触入场动画
-watch(isLoading, (loading) => {
-  if (!loading && artist.value) {
-    nextTick(() => {
-      run(({ animate, presets, staggerPresets }) => {
-        animate('.artist-hero', { ...presets.fadeInUp });
-        animate('.section', { ...presets.listItemEnter, delay: staggerPresets.normal() });
-      });
-    });
-  }
-});
-
 const getCoverUrl = () => {
   // 优先使用从 ResourceManager 加载的封面
   return coverUrl.value || '';
@@ -90,12 +79,34 @@ const handleTrackSelect = (track) => {
 };
 
 const handleTrackPlay = (track) => {
-  console.log('Play track:', track);
+  // TODO: 接入播放逻辑
 };
 </script>
 
 <template>
-  <div class="artist-detail-page">
+  <div class="artist-detail-page page-container">
+    <!-- 顶部渐进模糊：内容从 header 下方渐显，消除滚动时 overflow 硬切割子元素的观感 -->
+    <!-- target=page 用 fixed 定位贴视口；top 偏移到 header 下方；zIndex -50 → 实际 50，位于内容之上、header(100)之下 -->
+    <GradualBlur
+      target="page"
+      position="top"
+      height="5rem"
+      :z-index="-50"
+      :strength="2"
+      :div-count="4"
+      :style="{ top: 'calc(var(--header-height) + var(--safe-area-top))' }"
+    />
+    <!-- 底部渐进模糊：内容渐隐到底栏上方，消除底部硬切割 -->
+    <GradualBlur
+      target="page"
+      position="bottom"
+      height="5rem"
+      :z-index="-50"
+      :strength="2"
+      :div-count="4"
+      :style="{ bottom: 'calc(var(--bottom-nav-height) + var(--player-bar-height) + var(--safe-area-bottom))' }"
+    />
+
     <div v-if="isLoading" class="loading-state">
       <div class="spinner"></div>
     </div>
@@ -103,9 +114,9 @@ const handleTrackPlay = (track) => {
     <template v-else-if="artist">
       <div class="artist-hero">
         <div class="artist-cover-wrapper">
-          <img 
-            v-if="getCoverUrl()" 
-            :src="getCoverUrl()" 
+          <img
+            v-if="getCoverUrl()"
+            :src="getCoverUrl()"
             class="artist-cover"
             :alt="artist.name"
           />
@@ -157,8 +168,12 @@ const handleTrackPlay = (track) => {
         <div class="section-header">
           <h2 class="section-title">热门歌曲</h2>
         </div>
-        <TrackList 
-          :tracks="artist.tracks.slice(0, 10)" 
+        <!-- mode=page 使用外层 .content-wrapper 滚动，避免自带 max-height 滚动容器造成多层滚动条 -->
+        <!-- :virtual-scroll=false 仅 10 首歌无需虚拟列表，避免独立滚动容器 -->
+        <TrackList
+          :tracks="artist.tracks.slice(0, 10)"
+          mode="page"
+          :virtual-scroll="false"
           @select="handleTrackSelect"
           @play="handleTrackPlay"
         />
@@ -182,20 +197,19 @@ const handleTrackPlay = (track) => {
 
 <style scoped>
 .artist-detail-page {
-  max-width: 1200px;
-  margin: 0 auto;
+  /* max-width 和 margin 由 .page-container 提供 */
 }
 
 .artist-hero {
   display: flex;
-  gap: 32px;
-  margin-bottom: 40px;
+  gap: 28px;
+  margin-bottom: 28px;
 }
 
 .artist-cover-wrapper {
   flex-shrink: 0;
-  width: 240px;
-  height: 240px;
+  width: 200px;
+  height: 200px;
   border-radius: 50%;
   overflow: hidden;
   box-shadow: var(--shadow-md, 0 4px 6px rgba(0, 0, 0, 0.1));
@@ -279,7 +293,7 @@ const handleTrackPlay = (track) => {
 }
 
 .section {
-  margin-bottom: 40px;
+  margin-bottom: 28px;
 }
 
 /* 覆盖全局 .spinner 的 CSS 旋转，改由 anime.js 驱动 */
@@ -303,11 +317,13 @@ const handleTrackPlay = (track) => {
     flex-direction: column;
     align-items: center;
     text-align: center;
+    gap: 20px;
+    margin-bottom: 24px;
   }
 
   .artist-cover-wrapper {
-    width: 180px;
-    height: 180px;
+    width: 160px;
+    height: 160px;
   }
 
   .artist-name {
@@ -320,6 +336,10 @@ const handleTrackPlay = (track) => {
 
   .section-title {
     font-size: 18px;
+  }
+
+  .section {
+    margin-bottom: 24px;
   }
 }
 
