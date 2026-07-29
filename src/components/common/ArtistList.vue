@@ -1,10 +1,14 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted, watch, nextTick, useTemplateRef } from 'vue';
+import { computed, ref, onMounted, onUnmounted, watch, nextTick, useTemplateRef, inject } from 'vue';
 import { useRouter } from 'vue-router';
 import { useCoverImages } from '@/composables/useCoverImage';
 import { useVirtualList } from '@/composables/useVirtualList';
 import { useAnime } from '@/composables/useAnime.js';
 import CoverImage from './CoverImage.vue';
+
+// 注入外层滚动容器（AppLayout 提供的 .content-wrapper ref）
+// page 模式虚拟列表使用外层滚动，避免自身 max-height 滚动容器截断圆形封面
+const appScrollContainer = inject('appScrollContainer', null);
 
 const props = defineProps({
   artists: {
@@ -52,16 +56,21 @@ const itemHeight = computed(() => {
 });
 
 // 虚拟列表（网格模式）
+// mode=page 使用外层 .content-wrapper 滚动，不再自带 max-height 滚动容器，
+// 避免歌手圆形封面下半圆被容器底部截断，同时消除双层滚动条。
 const {
   visibleItems,
   totalHeight,
   onScroll,
+  onPageScroll,
   poolSize
 } = useVirtualList(artistsRef, {
   itemHeight: itemHeight.value,
   bufferSize: 3,
   containerRef,
   columns: columns.value,
+  mode: 'page',
+  scrollContainer: appScrollContainer,
 });
 
 // 监听容器宽度变化
@@ -143,12 +152,11 @@ const getAlbumCount = (artist) => {
 
 <template>
   <div ref="root" class="artist-list-wrapper">
-    <!-- 虚拟列表容器 -->
+    <!-- 虚拟列表容器（page 模式：使用外层 .content-wrapper 滚动，自身无滚动条） -->
     <div
       v-if="virtualScroll && artists.length > 30"
       ref="containerRef"
-      class="artist-list virtual-scroll"
-      @scroll="onScroll"
+      class="artist-list virtual-scroll mode-page"
     >
       <!-- 可视区域 -->
       <div class="viewport" :style="{ height: totalHeight + 'px' }">
@@ -232,6 +240,14 @@ const getAlbumCount = (artist) => {
   max-height: 600px;
   -webkit-overflow-scrolling: touch;
   display: block; /* 覆盖 grid 布局 */
+}
+
+/* page 模式：使用外层 .content-wrapper 滚动，自身无滚动条、无高度限制，
+   避免圆形歌手封面被容器底部截断，同时消除双层滚动条。 */
+.artist-list.virtual-scroll.mode-page {
+  overflow: visible;
+  max-height: none;
+  -webkit-overflow-scrolling: auto;
 }
 
 .viewport {
