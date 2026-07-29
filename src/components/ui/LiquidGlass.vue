@@ -38,7 +38,7 @@ const props = withDefaults(
     aberrationIntensity?: number;
     /** 弹性（0-1，控制玻璃向光标延伸的程度） */
     elasticity?: number;
-    /** 圆角（像素值） */
+    /** 圆角（像素值），默认 100px */
     cornerRadius?: number;
     /** 折射模式 */
     mode?: "standard" | "polar" | "prominent" | "shader";
@@ -59,7 +59,7 @@ const props = withDefaults(
     saturation: 130,
     aberrationIntensity: 2,
     elasticity: 0.35,
-    cornerRadius: 999,
+    cornerRadius: 100,
     mode: "standard",
     overLight: false,
     padding: "0px",
