@@ -1,139 +1,396 @@
 <script setup>
-import { useRoute } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { computed, onMounted, useTemplateRef, watch, nextTick } from 'vue';
 import PlayerStore from '@/stores/player.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { ANIME_SPRINGS } from '@/utils/animePresets.js';
 import LiquidGlass from '@/components/ui/LiquidGlass.vue';
+import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
+import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
 
 const route = useRoute();
+const router = useRouter();
 
 const hasCurrentTrack = computed(() => PlayerStore.hasCurrentTrack.value);
 
 const rootRef = useTemplateRef('root');
 const indicatorRef = useTemplateRef('indicator');
 const { run, animate } = useAnime(() => rootRef.value);
+const {
+  glassStyle: indicatorGlassStyle,
+  filterProps: indicatorFilterProps,
+} = useLiquidGlass(() => ({
+  refractionMode: 'standard',
+  displacementScale: 80,
+  blurAmount: 0.12,
+  saturation: 160,
+  aberration: 1,
+  elasticity: 0,
+  borderRadius: '999px',
+  interactive: false,
+}));
 
-// 使用 LiquidGlass 库组件提供液态玻璃效果（折射 + 像差 + 弹性 + 鼠标跟随）
-// 圆角 = 999 形成完整胶囊形态，由 LiquidGlass 内部管理 SVG filter 与 hover 交互
+const navItems = [
+  { path: '/', name: '首页', icon: 'bi-house' },
+  { path: '/tracks', name: '歌曲', icon: 'bi-music-note-beamed' },
+  { path: '/artists', name: '歌手', icon: 'bi-people' },
+  { path: '/albums', name: '专辑', icon: 'bi-disc' },
+  { path: '/playlists', name: '歌单', icon: 'bi-music-note-list' },
+  { path: '/music-sources', name: '音乐源', icon: 'bi-folder' },
+];
 
-// 导航项错峰入场（fadeInUp + stagger）
+const isActive = (path) => {
+  if (path === '/') return route.path === '/';
+  return route.path.startsWith(path);
+};
+
+const getCurrentIndexFromRoute = () => {
+  const idx = navItems.findIndex((item) => isActive(item.path));
+  return idx >= 0 ? idx : 0;
+};
+const MAX_DEFORM_PX = 22;
+const DEFORM_THRESHOLD_PX = 6;
+const MAX_VELOCITY_DEFORM = 22;
+const VELOCITY_THRESHOLD = 0.5;
+const VELOCITY_NORMALIZE_BASE = 25;
+const PAUSE_DURATION_MS = 80;
+const PAUSE_VELOCITY_THRESHOLD = 1.5;
+const SMOOTHING_FACTOR = 0.3;
+const BOUNDARY_DAMPING = 0.3;
+const DRAG_START_THRESHOLD = 8;
+
+let lastIndicatorX = 0;
+let lastIndicatorW = 0;
+let isIndicatorMoving = false;
+let currentAnimation = null;
+
+let isDragging = false;
+let potentialDrag = false;
+let suppressClick = false;
+let pointerStartX = 0;
+let pointerStartY = 0;
+let lastPointerX = 0;
+let lastTimestamp = 0;
+let dragOffsetX = 0;
+let dragStartIndex = 0;
+let baseItemWidth = 0;
+let smoothedVelocity = 0;
+let initialDragDirection = 0;
+let lastActiveTimestamp = 0;
+let pauseDetected = false;
+let activePointerId = null;
+function getAnchorPositions() {
+  const root = rootRef.value;
+  if (!root) return [];
+  const items = root.querySelectorAll('.bottom-nav-item');
+  const navRect = root.getBoundingClientRect();
+  return Array.from(items).map((item) => {
+    const rect = item.getBoundingClientRect();
+    return rect.left - navRect.left;
+  });
+}
+
+function getSlotWidth() {
+  const positions = getAnchorPositions();
+  if (positions.length < 2) return 0;
+  return positions[1] - positions[0];
+}
+
+function computeVelocityDeform() {
+  const absVelocity = Math.abs(smoothedVelocity);
+  const now = Date.now();
+
+  if (absVelocity >= PAUSE_VELOCITY_THRESHOLD) {
+    lastActiveTimestamp = now;
+  }
+  if (lastActiveTimestamp > 0 && absVelocity < PAUSE_VELOCITY_THRESHOLD) {
+    if (now - lastActiveTimestamp >= PAUSE_DURATION_MS) {
+      pauseDetected = true;
+      initialDragDirection = 0;
+      lastActiveTimestamp = 0;
+    }
+  }
+
+  if (absVelocity < VELOCITY_THRESHOLD) return 0;
+
+  if (initialDragDirection === 0 || pauseDetected) {
+    initialDragDirection = smoothedVelocity > 0 ? 1 : -1;
+    pauseDetected = false;
+  }
+
+  const normalized = Math.min(absVelocity / VELOCITY_NORMALIZE_BASE, 1);
+  const eased = Math.sqrt(normalized);
+  const deform = eased * MAX_VELOCITY_DEFORM;
+  const currentDir = smoothedVelocity > 0 ? 1 : -1;
+  return currentDir === initialDragDirection ? deform : -deform * 0.5;
+}
+function applyDragTransform() {
+  const indicator = indicatorRef.value;
+  const positions = getAnchorPositions();
+  if (!indicator || positions.length === 0) return;
+
+  const baseX = positions[dragStartIndex] ?? 0;
+  const deformAmount = computeVelocityDeform();
+  const x = baseX + dragOffsetX;
+  const w = Math.max(baseItemWidth + deformAmount, 0);
+
+  indicator.style.transform = `translateX(${x}px)`;
+  indicator.style.width = `${w}px`;
+
+  lastIndicatorX = x;
+  lastIndicatorW = w;
+}
+
+function onPointerDown(e) {
+  if (e.button !== undefined && e.button !== 0) return;
+  potentialDrag = true;
+  pointerStartX = e.clientX;
+  pointerStartY = e.clientY;
+  lastPointerX = e.clientX;
+  lastTimestamp = Date.now();
+}
+
+function onPointerMove(e) {
+  if (!potentialDrag && !isDragging) return;
+
+  if (potentialDrag && !isDragging) {
+    const dx = e.clientX - pointerStartX;
+    const dy = e.clientY - pointerStartY;
+    if (Math.abs(dx) > DRAG_START_THRESHOLD && Math.abs(dx) > Math.abs(dy)) {
+      startDrag(e);
+    } else {
+      return;
+    }
+  }
+
+  if (!isDragging) return;
+
+  const now = Date.now();
+  const moveDx = e.clientX - lastPointerX;
+  const dt = Math.max(now - lastTimestamp, 1);
+  const velocity = moveDx / (dt / 16);
+  smoothedVelocity = smoothedVelocity * (1 - SMOOTHING_FACTOR) + velocity * SMOOTHING_FACTOR;
+  lastPointerX = e.clientX;
+  lastTimestamp = now;
+
+  const totalDx = e.clientX - pointerStartX;
+  if (dragStartIndex === 0 && totalDx < 0) {
+    dragOffsetX = totalDx * BOUNDARY_DAMPING;
+  } else if (dragStartIndex === navItems.length - 1 && totalDx > 0) {
+    dragOffsetX = totalDx * BOUNDARY_DAMPING;
+  } else {
+    dragOffsetX = totalDx;
+  }
+
+  applyDragTransform();
+}
+function startDrag(e) {
+  isDragging = true;
+  potentialDrag = false;
+  dragStartIndex = getCurrentIndexFromRoute();
+  const items = rootRef.value?.querySelectorAll('.bottom-nav-item');
+  baseItemWidth = items?.[dragStartIndex]?.getBoundingClientRect().width ?? 0;
+  dragOffsetX = 0;
+  smoothedVelocity = 0;
+  initialDragDirection = 0;
+  pauseDetected = false;
+  lastActiveTimestamp = 0;
+
+  if (currentAnimation) {
+    currentAnimation.pause();
+    currentAnimation = null;
+  }
+  indicatorRef.value?.classList.add('moving');
+  isIndicatorMoving = true;
+
+  activePointerId = e.pointerId;
+  if (rootRef.value && e.pointerId !== undefined) {
+    try { rootRef.value.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+  }
+}
+
+function endDrag() {
+  if (!isDragging) return;
+  isDragging = false;
+
+  if (activePointerId !== null && rootRef.value) {
+    try { rootRef.value.releasePointerCapture(activePointerId); } catch (_) { /* ignore */ }
+    activePointerId = null;
+  }
+
+  const slotWidth = getSlotWidth();
+  const movedSlots = slotWidth > 0 ? Math.round(dragOffsetX / slotWidth) : 0;
+  let newIndex = dragStartIndex + movedSlots;
+  newIndex = Math.max(0, Math.min(navItems.length - 1, newIndex));
+
+  suppressClick = true;
+  setTimeout(() => { suppressClick = false; }, 120);
+
+  if (newIndex !== dragStartIndex) {
+    router.push(navItems[newIndex].path);
+  } else {
+    updateIndicator();
+  }
+}
+function onPointerUp() {
+  potentialDrag = false;
+  if (isDragging) endDrag();
+}
+
+function onPointerCancel() {
+  potentialDrag = false;
+  if (isDragging) {
+    isDragging = false;
+    if (activePointerId !== null && rootRef.value) {
+      try { rootRef.value.releasePointerCapture(activePointerId); } catch (_) { /* ignore */ }
+      activePointerId = null;
+    }
+    updateIndicator();
+  }
+}
+
+function onRootClickCapture(e) {
+  if (suppressClick) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}
+function updateIndicator() {
+  if (isDragging) return;
+
+  const root = rootRef.value;
+  const indicator = indicatorRef.value;
+  if (!root || !indicator) return;
+
+  if (currentAnimation) {
+    currentAnimation.pause();
+    currentAnimation = null;
+  }
+  indicator.classList.remove('moving');
+  isIndicatorMoving = false;
+
+  const activeEl = root.querySelector('.bottom-nav-item.active');
+  if (!activeEl) {
+    currentAnimation = animate(indicator, { opacity: 0, duration: 200, ease: ANIME_SPRINGS.sensitive });
+    return;
+  }
+  const navRect = root.getBoundingClientRect();
+  const itemRect = activeEl.getBoundingClientRect();
+  const targetX = itemRect.left - navRect.left;
+  const targetW = itemRect.width;
+
+  const isFirstRender = lastIndicatorW === 0;
+  if (isFirstRender) {
+    currentAnimation = animate(indicator, {
+      translateX: targetX,
+      width: targetW,
+      opacity: 1,
+      duration: 420,
+      ease: ANIME_SPRINGS.bouncy,
+    });
+    lastIndicatorX = targetX;
+    lastIndicatorW = targetW;
+    return;
+  }
+
+  const distance = Math.abs(targetX - lastIndicatorX);
+  const normalizedDist = navRect.width > 0 ? Math.min(distance / navRect.width, 1) : 0;
+  const easedDist = Math.sqrt(normalizedDist);
+  const deformAmount = distance < DEFORM_THRESHOLD_PX ? 0 : easedDist * MAX_DEFORM_PX;
+  if (deformAmount > 0) {
+    indicator.classList.add('moving');
+    isIndicatorMoving = true;
+    currentAnimation = animate(indicator, {
+      translateX: targetX,
+      width: [
+        { value: targetW + deformAmount, duration: 150 },
+        { value: targetW, duration: 400 },
+      ],
+      opacity: 1,
+      duration: 550,
+      ease: ANIME_SPRINGS.bouncy,
+      onComplete: () => {
+        indicator.classList.remove('moving');
+        isIndicatorMoving = false;
+        currentAnimation = null;
+      },
+    });
+  } else {
+    currentAnimation = animate(indicator, {
+      translateX: targetX,
+      width: targetW,
+      opacity: 1,
+      duration: 320,
+      ease: ANIME_SPRINGS.bouncy,
+      onComplete: () => {
+        indicator.classList.remove('moving');
+        isIndicatorMoving = false;
+        currentAnimation = null;
+      },
+    });
+  }
+
+  lastIndicatorX = targetX;
+  lastIndicatorW = targetW;
+}
+
 onMounted(() => {
   run(({ animate, stagger, presets }) => {
     animate('.bottom-nav-item', {
       ...presets.fadeInUp,
       delay: stagger(50),
       onComplete: () => {
-        // 清除内联 transform，恢复 CSS :hover / .active 过渡
         rootRef.value?.querySelectorAll('.bottom-nav-item').forEach((el) => {
           el.style.transform = '';
         });
       },
     });
   });
-  // 初始化 active 指示器
   nextTick(updateIndicator);
 });
 
-const navItems = [
-  {
-    path: '/',
-    name: '首页',
-    icon: 'bi-house'
-  },
-  {
-    path: '/tracks',
-    name: '歌曲',
-    icon: 'bi-music-note-beamed'
-  },
-  {
-    path: '/artists',
-    name: '歌手',
-    icon: 'bi-people'
-  },
-  {
-    path: '/albums',
-    name: '专辑',
-    icon: 'bi-disc'
-  },
-  {
-    path: '/playlists',
-    name: '歌单',
-    icon: 'bi-music-note-list'
-  },
-  {
-    path: '/music-sources',
-    name: '音乐源',
-    icon: 'bi-folder'
-  }
-];
-
-const isActive = (path) => {
-  if (path === '/') {
-    return route.path === '/';
-  }
-  return route.path.startsWith(path);
-};
-
-// active 指示器滑动动画（anime.js spring 物理，替代 CSS transition 的生硬切换）
-function updateIndicator() {
-  const root = rootRef.value;
-  const indicator = indicatorRef.value;
-  if (!root || !indicator) return;
-  const activeEl = root.querySelector('.bottom-nav-item.active');
-  if (!activeEl) {
-    // 无 active 项：隐藏指示器
-    animate(indicator, { opacity: 0, duration: 200, ease: ANIME_SPRINGS.sensitive });
-    return;
-  }
-  const navRect = root.getBoundingClientRect();
-  const itemRect = activeEl.getBoundingClientRect();
-  const x = itemRect.left - navRect.left;
-  const w = itemRect.width;
-  animate(indicator, {
-    translateX: x,
-    width: w,
-    opacity: 1,
-    duration: 420,
-    ease: ANIME_SPRINGS.bouncy,
-  });
-}
-
-// 路由切换 → FLIP 指示器滑动
 watch(() => route.path, () => {
   nextTick(updateIndicator);
 });
 </script>
-
 <template>
-  <div ref="root" class="app-bottom-nav" :class="{ 'with-player': hasCurrentTrack }">
-    <LiquidGlass
-      :corner-radius="999"
-      :elasticity="0.35"
-      padding="0 16px"
-      extra-class="nav-glass"
-    >
-      <div ref="indicator" class="nav-indicator"></div>
-      <router-link v-for="item in navItems" :key="item.path" :to="item.path" class="bottom-nav-item"
-        :class="{ active: isActive(item.path) }">
+  <div
+    ref="root"
+    class="app-bottom-nav"
+    :class="{ 'with-player': hasCurrentTrack }"
+    @pointerdown="onPointerDown"
+    @pointermove="onPointerMove"
+    @pointerup="onPointerUp"
+    @pointercancel="onPointerCancel"
+    @click.capture="onRootClickCapture"
+  >
+    <LiquidGlass :corner-radius="999" :elasticity="0.35" padding="0 16px" extra-class="nav-glass">
+      <div ref="indicator" class="nav-indicator" :style="indicatorGlassStyle">
+        <LiquidGlassFilter v-bind="indicatorFilterProps" />
+      </div>
+      <router-link
+        v-for="item in navItems"
+        :key="item.path"
+        :to="item.path"
+        class="bottom-nav-item"
+        :class="{ active: isActive(item.path) }"
+      >
         <i :class="item.icon" class="bottom-nav-icon"></i>
         <span class="bottom-nav-text">{{ item.name }}</span>
       </router-link>
     </LiquidGlass>
   </div>
 </template>
-
 <style scoped>
 .app-bottom-nav {
   position: fixed;
   bottom: 1.5rem;
-  /* 桌面端：居左浮动胶囊 */
   left: 1.5rem;
   z-index: 100;
+  touch-action: pan-y;
   transition: bottom var(--transition-slow);
 }
 
-/* 玻璃容器：由 LiquidGlass 提供背景、边框、阴影、圆角、模糊与折射 */
 .nav-glass {
   height: var(--bottom-nav-height);
   display: flex;
@@ -142,24 +399,32 @@ watch(() => route.path, () => {
   width: fit-content;
   max-width: calc(100vw - 3rem);
   padding-bottom: var(--safe-area-bottom);
-  overflow: hidden;
   isolation: isolate;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
-/* active 指示器（绝对定位背景胶囊，由 anime.js animate translateX/width 滑动） */
 .nav-indicator {
   position: absolute;
   left: 0;
+  top: calc(var(--bottom-nav-height) * 0.14);
   height: calc(var(--bottom-nav-height) * 0.72);
   width: 0;
-  background: var(--primary-light);
-  border-radius: var(--radius-md);
   opacity: 0;
   z-index: 0;
   pointer-events: none;
-  will-change: transform, width;
+  will-change: transform, width, backdrop-filter;
+  background: color-mix(in srgb, var(--primary-color) 22%, transparent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--primary-color) 12%, transparent);
+  transition: background 220ms ease, box-shadow 220ms ease;
 }
 
+.nav-indicator.moving {
+  background: color-mix(in srgb, var(--primary-color) 34%, transparent);
+  box-shadow:
+    0 4px 16px color-mix(in srgb, var(--primary-color) 28%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
 .bottom-nav-item {
   display: flex;
   flex-direction: column;
@@ -200,7 +465,6 @@ watch(() => route.path, () => {
 
 @media (max-width: 767px) {
   .app-bottom-nav {
-    /* 移动端：占满宽度减去边距，向上避让播放器控制栏 */
     right: 1rem;
     left: 1rem;
     transform: none;
@@ -215,6 +479,14 @@ watch(() => route.path, () => {
 @media (prefers-color-scheme: dark) {
   .bottom-nav-item.active {
     color: var(--primary-color);
+  }
+
+  .nav-indicator {
+    background: color-mix(in srgb, var(--primary-color) 30%, transparent);
+  }
+
+  .nav-indicator.moving {
+    background: color-mix(in srgb, var(--primary-color) 42%, transparent);
   }
 }
 </style>

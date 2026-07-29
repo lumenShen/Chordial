@@ -207,6 +207,11 @@ watch(
   display: block !important;
   width: 100% !important;
   height: 100% !important;
+  /* 项目全局 .glass 工具类会叠加 --bg-glass 背景与 backdrop-filter，
+     导致液态玻璃层异常泛灰/重复模糊，在此重置 */
+  background: transparent !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
 }
 
 .chordial-liquid-glass__react .glass__warp {

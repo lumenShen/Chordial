@@ -61,6 +61,7 @@ import { PlayerStore } from '@/stores/player.js'
 import { usePerf } from '@/utils/performanceMonitor.js'
 import { useAnime } from '@/composables/useAnime.js'
 import LiquidGlass from '@/components/ui/LiquidGlass.vue'
+import { formatDuration as formatTime } from '@/utils/format.js'
 
 const { log } = usePerf('PlayerControlBar')
 
@@ -178,13 +179,6 @@ const onVolumeChange = (e) => {
   emit('volume-change', parseFloat(e.target.value))
 }
 
-// 格式化时间
-const formatTime = (seconds) => {
-  if (!seconds || isNaN(seconds)) return '0:00'
-  const mins = Math.floor(seconds / 60)
-  const secs = Math.floor(seconds % 60)
-  return `${mins}:${secs.toString().padStart(2, '0')}`
-}
 </script>
 
 <style scoped>
@@ -203,7 +197,6 @@ const formatTime = (seconds) => {
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
   isolation: isolate;
   position: relative;
 }
