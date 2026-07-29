@@ -24,6 +24,8 @@ use crate::module::storage::persistent::PersistentStore;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -56,6 +58,16 @@ pub struct LocalMusicSource {
     /// 封面图内存缓存：entity_id（路径）→ 图片字节
     /// 避免每次 chordial://image 请求都触发 extract_cover_art（5-50ms/次）
     cover_cache: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+    /// 封面图磁盘缓存目录：`<data_dir>/cover_cache/<hash>.bin`
+    ///
+    /// 三级缓存策略（album_picture_get）：
+    /// 1. 内存缓存命中 → ~0.01ms
+    /// 2. 磁盘缓存命中 → ~1-5ms（文件读取）
+    /// 3. symphonia 提取 → 117-296ms（写入磁盘 + 内存）
+    ///
+    /// 扫描阶段（batch_index_files）通过 probe_file_with_cover 一次解析
+    /// 同时提取元数据与封面，写入磁盘缓存预热，浏览阶段直接命中。
+    cover_disk_cache_dir: PathBuf,
 }
 
 impl LocalMusicSource {
@@ -64,11 +76,22 @@ impl LocalMusicSource {
     /// # 参数
     /// - `folder_manager`: 文件夹管理器（持久化 + 运行时文件夹集合）
     /// - `library`: 音乐库引用
+    /// - `mtime_store`: 文件 mtime 持久化存储
+    /// - `cover_disk_cache_dir`: 封面磁盘缓存目录（不存在时自动创建）
     pub fn new(
         folder_manager: Arc<FolderManager>,
         library: Arc<MusicLibrary>,
         mtime_store: PersistentStore,
+        cover_disk_cache_dir: PathBuf,
     ) -> Self {
+        // 确保封面缓存目录存在（首次启动自动创建）
+        if let Err(e) = std::fs::create_dir_all(&cover_disk_cache_dir) {
+            eprintln!(
+                "[local_source] 创建封面缓存目录失败 '{}': {}",
+                cover_disk_cache_dir.display(),
+                e
+            );
+        }
         Self {
             name: LOCAL_SOURCE_NAME.to_string(),
             folder_manager,
@@ -78,10 +101,72 @@ impl LocalMusicSource {
             file_mtimes: RwLock::new(HashMap::new()),
             mtime_store,
             cover_cache: Mutex::new(HashMap::new()),
+            cover_disk_cache_dir,
         }
     }
 
     // ── 内部辅助方法 ─────────────────────────────────
+
+    // ── 封面磁盘缓存 ─────────────────────────────────
+
+    /// 计算 entity_id 的稳定缓存键（16 位十六进制）。
+    ///
+    /// 使用 `DefaultHasher`（固定种子，跨运行稳定），不引入额外依赖。
+    /// entity_id 通常是音频文件规范路径，不同文件 → 不同键。
+    fn cover_cache_key(entity_id: &str) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        entity_id.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    /// 返回 entity_id 对应的磁盘缓存文件路径。
+    fn cover_disk_path(&self, entity_id: &str) -> PathBuf {
+        self.cover_disk_cache_dir
+            .join(format!("{}.bin", Self::cover_cache_key(entity_id)))
+    }
+
+    /// 从磁盘缓存加载封面（命中时 ~1-5ms，远快于 symphonia 提取的 117-296ms）。
+    fn load_cover_from_disk(&self, entity_id: &str) -> Option<Vec<u8>> {
+        let path = self.cover_disk_path(entity_id);
+        std::fs::read(&path).ok()
+    }
+
+    /// 将封面字节写入磁盘缓存（best-effort，失败仅日志不中断）。
+    pub fn save_cover_to_disk(&self, entity_id: &str, data: &[u8]) {
+        let path = self.cover_disk_path(entity_id);
+        if let Err(e) = std::fs::write(&path, data) {
+            eprintln!(
+                "[local_source] 保存封面到磁盘缓存失败 '{}': {}",
+                path.display(),
+                e
+            );
+        }
+    }
+
+    /// 清空封面磁盘缓存（维护工具调用）。
+    pub fn clear_cover_disk_cache(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.cover_disk_cache_dir) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// 写入内存缓存（含 FIFO 半量淘汰）。
+    ///
+    /// 提取公共逻辑，供 `album_picture_get` 的磁盘命中回填和提取后写入复用。
+    fn insert_cover_cache(&self, entity_id: &str, data: Vec<u8>) {
+        let mut cache = self.cover_cache.lock();
+        if cache.len() >= COVER_CACHE_CAP {
+            // 简单 FIFO 半量淘汰（避免单条 LRU 链维护开销）
+            let drop_count = COVER_CACHE_CAP / 2;
+            let keys: Vec<String> = cache.keys().take(drop_count).cloned().collect();
+            for k in keys {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(entity_id.to_string(), Arc::new(data));
+    }
 
     /// 扫描单个音频文件并添加到音乐库（或合并到已有条目）。
     ///
@@ -105,8 +190,15 @@ impl LocalMusicSource {
             return Ok(true);
         }
 
-        // 探测元数据
-        let meta = scanner::probe_file(&canonical)?;
+        // 探测元数据 + 提取嵌入封面（一次 symphonia probe）
+        let probed = scanner::probe_file_with_cover(&canonical)?;
+        let meta = &probed.audio;
+
+        // 预热封面磁盘缓存：扫描阶段写入，浏览阶段直接命中（~1-5ms vs 117-296ms）
+        if let Some(cover) = &probed.cover {
+            let entity_id = platform::path_to_string(&canonical);
+            self.save_cover_to_disk(&entity_id, cover);
+        }
 
         // 读取同目录歌词文件（.lrc 优先，.txt 兜底）；
         // 找不到时回退到音频文件嵌入的歌词（ID3 USLT/SYLT、Vorbis LYRICS、MP4 ©lyr）
@@ -116,7 +208,7 @@ impl LocalMusicSource {
         }
 
         // 构建 Song（lyric_id 占位 UUID 仅在确实有歌词时保留）
-        let mut song = self.build_song(&canonical, &meta);
+        let mut song = self.build_song(&canonical, meta);
         if lyric_text.is_none() {
             song.lyric_id = None;
         }
@@ -247,9 +339,11 @@ impl LocalMusicSource {
             .max(1);
         let chunk_size = (probe_count + num_threads - 1) / num_threads;
 
-        // 每个探测结果携带 (path, Result<(meta, lyric_text), error_msg>)
-        let mut probe_results: Vec<(PlatformPath, Result<(AudioMeta, Option<String>), String>)> =
-            Vec::with_capacity(probe_count);
+        // 每个探测结果携带 (path, Result<(probed, lyric_text), error_msg>)
+        let mut probe_results: Vec<(
+            PlatformPath,
+            Result<(scanner::ProbedMeta, Option<String>), String>,
+        )> = Vec::with_capacity(probe_count);
 
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(num_threads);
@@ -259,16 +353,15 @@ impl LocalMusicSource {
                 handles.push(s.spawn(move || {
                     let mut chunk_results = Vec::with_capacity(chunk.len());
                     for path in &chunk {
-                        // probe + read_lyric 在同一线程内串行，
+                        // probe + cover + read_lyric 在同一线程内串行，
                         // 避免再次起线程的开销；线程间仍是并行的
-                        let result = scanner::probe_file(path).and_then(|meta| {
+                        let result = scanner::probe_file_with_cover(path).and_then(|probed| {
                             // 外部 .lrc/.txt 优先；找不到时回退到嵌入歌词
-                            // （ID3 USLT/SYLT、Vorbis LYRICS、MP4 ©lyr）
                             let mut lyric = scanner::read_lyric_file(path);
                             if lyric.is_none() {
-                                lyric = meta.lyrics.clone();
+                                lyric = probed.audio.lyrics.clone();
                             }
-                            Ok((meta, lyric))
+                            Ok((probed, lyric))
                         });
                         chunk_results.push((path.clone(), result));
                     }
@@ -283,7 +376,7 @@ impl LocalMusicSource {
             }
         });
 
-        // 3. 构建 Song 列表，收集错误
+        // 3. 构建 Song 列表，收集错误；同时预热封面磁盘缓存
         // 容量上限 = 探测成功的条目数
         let success_count = probe_results
             .iter()
@@ -295,8 +388,13 @@ impl LocalMusicSource {
 
         for (path, result) in probe_results {
             match result {
-                Ok((meta, lyric_text)) => {
-                    let mut song = self.build_song(&path, &meta);
+                Ok((probed, lyric_text)) => {
+                    // 预热封面磁盘缓存：扫描阶段写入，浏览阶段直接命中
+                    if let Some(cover) = &probed.cover {
+                        let entity_id = platform::path_to_string(&path);
+                        self.save_cover_to_disk(&entity_id, cover);
+                    }
+                    let mut song = self.build_song(&path, &probed.audio);
                     if lyric_text.is_none() {
                         song.lyric_id = None;
                     }
@@ -414,6 +512,8 @@ impl LocalMusicSource {
         self.id_to_path.write().clear();
         self.file_mtimes.write().clear();
         self.cover_cache.lock().clear();
+        // 清空封面磁盘缓存
+        self.clear_cover_disk_cache();
         // mtime_store 持久化清空
         self.mtime_store.clear();
         self.mtime_store.save()
@@ -817,9 +917,10 @@ impl MusicSource for LocalMusicSource {
     }
 
     fn album_picture_get(&self, entity_id: &str) -> Result<Vec<u8>, String> {
-        // 1. 命中内存缓存直接返回（典型命中：浏览/播放同一专辑时多次请求封面）
-        //    extract_cover_art 平均 5-50ms（symphonia 全文件解析），缓存命中 ~0.01ms
-        //    外层 resource::get_album_picture 已有 perf::scope 计时，命中时显示 ~0ms
+        // 三级缓存策略，将浏览阶段的 117-296ms 提取降至 ~0.01ms（内存）/ ~1-5ms（磁盘）
+
+        // 1. 内存缓存命中（~0.01ms）
+        //    典型命中：浏览/播放同一专辑时多次请求封面
         {
             let cache = self.cover_cache.lock();
             if let Some(hit) = cache.get(entity_id) {
@@ -827,20 +928,22 @@ impl MusicSource for LocalMusicSource {
             }
         }
 
+        // 2. 磁盘缓存命中（~1-5ms）
+        //    典型命中：重启后首次浏览；扫描阶段已通过 probe_file_with_cover 预热
+        if let Some(data) = self.load_cover_from_disk(entity_id) {
+            // 回填内存缓存，后续请求直接命中内存
+            self.insert_cover_cache(entity_id, data.clone());
+            return Ok(data);
+        }
+
+        // 3. 从文件提取（慢路径，117-296ms symphonia 解析）
+        //    典型场景：扫描未覆盖的文件（如外部 cover.jpg 回退路径）
         let path = PlatformPath::from(entity_id);
         let data = self.extract_album_picture(&path)?;
 
-        // 2. 写入缓存（容量上限简单淘汰策略：超出 cap 时清空一半）
-        let mut cache = self.cover_cache.lock();
-        if cache.len() >= COVER_CACHE_CAP {
-            // 简单 FIFO 半量淘汰（避免单条 LRU 链维护开销）
-            let drop_count = COVER_CACHE_CAP / 2;
-            let keys: Vec<String> = cache.keys().take(drop_count).cloned().collect();
-            for k in keys {
-                cache.remove(&k);
-            }
-        }
-        cache.insert(entity_id.to_string(), Arc::new(data.clone()));
+        // 写入磁盘 + 内存缓存（后续请求不再触发提取）
+        self.save_cover_to_disk(entity_id, &data);
+        self.insert_cover_cache(entity_id, data.clone());
 
         Ok(data)
     }

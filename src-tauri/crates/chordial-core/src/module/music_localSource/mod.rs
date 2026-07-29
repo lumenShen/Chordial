@@ -79,18 +79,22 @@ pub fn init_local_source(
     eprintln!("[local_source] ⏱ 2. 系统音乐目录检查: {:?}", t2 - t1);
 
     // 3. 创建本地来源（使用独立的 mtime 存储，与 library 分离）
-    let mtime_store_path = library
+    let data_dir = library
         .store_path()
         .parent()
-        .map(|p| p.join("local_source_file_mtimes.json"))
-        .unwrap_or_else(|| std::path::PathBuf::from("local_source_file_mtimes.json"));
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mtime_store_path = data_dir.join("local_source_file_mtimes.json");
     let mtime_store = PersistentStore::new(mtime_store_path);
     // 迁移：清理 library 中遗留的旧 mtime 数据（现使用独立文件存储）
     library.remove_store_key("local_source_file_mtimes");
+    // 封面磁盘缓存目录：扫描阶段预热，浏览阶段直接命中（~1-5ms vs 117-296ms 提取）
+    let cover_disk_cache_dir = data_dir.join("cover_cache");
     let local_source = Arc::new(LocalMusicSource::new(
         folder_manager.clone(),
         library.clone(),
         mtime_store,
+        cover_disk_cache_dir,
     ));
     let t3 = Instant::now();
     eprintln!("[local_source] ⏱ 3. LocalMusicSource 创建: {:?}", t3 - t2);
@@ -209,7 +213,7 @@ pub fn init_local_source(
             .min(needs_probe.len());
         let chunk_size = (needs_probe.len() + num_threads - 1) / num_threads;
 
-        let mut results: Vec<(PlatformPath, Result<scanner::AudioMeta, String>)> =
+        let mut results: Vec<(PlatformPath, Result<scanner::ProbedMeta, String>)> =
             Vec::with_capacity(needs_probe.len());
 
         let _t_probe = Instant::now();
@@ -221,7 +225,8 @@ pub fn init_local_source(
                 handles.push(s.spawn(move || {
                     let mut chunk_results = Vec::with_capacity(chunk.len());
                     for path in &chunk {
-                        let result = scanner::probe_file(path);
+                        // 合并 probe + cover 提取，一次 symphonia 解析
+                        let result = scanner::probe_file_with_cover(path);
                         chunk_results.push((path.clone(), result));
                     }
                     chunk_results
@@ -254,9 +259,14 @@ pub fn init_local_source(
                 let _t_lyric = Instant::now();
                 let mut results_with_lyrics: Vec<(&PlatformPath, Song, Option<String>)> =
                     Vec::with_capacity(results.len());
-                for (path, meta_result) in results.iter() {
-                    let Ok(meta) = meta_result else { continue };
-                    let mut song = local_source.build_song(path, meta);
+                for (path, probe_result) in results.iter() {
+                    let Ok(probed) = probe_result else { continue };
+                    // 预热封面磁盘缓存：扫描阶段写入，浏览阶段直接命中
+                    if let Some(cover) = &probed.cover {
+                        let entity_id = crate::module::platform::path_to_string(path);
+                        local_source.save_cover_to_disk(&entity_id, cover);
+                    }
+                    let mut song = local_source.build_song(path, &probed.audio);
                     let lyric_text = scanner::read_lyric_file(path);
                     if lyric_text.is_none() {
                         song.lyric_id = None;

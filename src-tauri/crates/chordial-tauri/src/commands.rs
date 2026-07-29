@@ -1069,13 +1069,15 @@ pub fn maintenance_repair_references(
     }))
 }
 
-/// 清空内存缓存 + Blob 磁盘缓存（不影响音乐库 / 配置 / 存储）。
+/// 清空内存缓存 + Blob 磁盘缓存 + 封面磁盘缓存（不影响音乐库 / 配置 / 存储）。
 #[tauri::command]
 pub fn maintenance_clear_cache(ctx: State<'_, Arc<AppContext>>) -> Result<serde_json::Value, String> {
     let mem_keys = ctx.cache.keys().len();
     let blob_keys = ctx.cache.blob_keys().len();
     ctx.cache.clear();
     ctx.cache.clear_blobs();
+    // 清空封面磁盘缓存（扫描阶段预热的封面图）
+    ctx.local_source.clear_cover_disk_cache();
     Ok(serde_json::json!({
         "cleared": true,
         "memory_items": mem_keys,

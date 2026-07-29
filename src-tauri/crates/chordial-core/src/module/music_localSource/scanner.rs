@@ -202,6 +202,186 @@ pub fn probe_file(path: &PlatformPath) -> Result<AudioMeta, String> {
     Ok(meta)
 }
 
+/// 探测结果（含封面）— 合并 probe_file + extract_cover_art 的一次解析。
+///
+/// 在扫描阶段调用，一次 symphonia probe 同时提取元数据与嵌入封面，
+/// 避免后续 `album_picture_get` 再次打开并解析同一文件（117-296ms/次）。
+/// 封面字节写入磁盘缓存后，浏览阶段直接命中缓存（~1-5ms）。
+pub struct ProbedMeta {
+    /// 音频元数据
+    pub audio: AudioMeta,
+    /// 嵌入式封面（FrontCover 优先，其次任意图片）；无嵌入封面时为 None
+    pub cover: Option<Vec<u8>>,
+}
+
+/// 探测音频文件并同时提取嵌入封面（一次 symphonia probe）。
+///
+/// 合并 [`probe_file`] + [`extract_cover_art`] 的逻辑，避免对同一文件
+/// 执行两次 symphonia 解析。扫描阶段调用此函数，封面写入磁盘缓存，
+/// 后续 `album_picture_get` 直接读缓存。
+pub fn probe_file_with_cover(path: &PlatformPath) -> Result<ProbedMeta, String> {
+    let _token = perf::start("scanner.probe_file_with_cover");
+    let src = platform::open_file(path)?;
+
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = platform::path_extension(path) {
+        hint.with_extension(&ext);
+    }
+
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("无法识别音频格式 '{}': {}", platform::path_to_string(path), e))?;
+
+    let mut meta = AudioMeta::default();
+
+    let fi = format.format_info();
+    meta.format_name = Some(fi.short_name.to_string());
+
+    if let Some(track) = format.default_track(TrackType::Audio) {
+        if let Some(params) = &track.codec_params {
+            if let Some(audio_params) = params.audio() {
+                meta.sample_rate = audio_params.sample_rate;
+                meta.channels = audio_params.channels.as_ref().map(|c| c.count() as u8);
+            }
+        }
+    }
+
+    // 消费所有旧版本，只留最新
+    loop {
+        let is_latest = format.metadata().is_latest();
+        if is_latest {
+            break;
+        }
+        format.metadata().pop();
+    }
+
+    let mut cover: Option<Vec<u8>> = None;
+    let mut first_image: Option<Vec<u8>> = None;
+
+    if let Some(revision) = format.metadata().current() {
+        // ── 标签读取（与 probe_file 相同）──
+        for tag in &revision.media.tags {
+            match &tag.std {
+                Some(StandardTag::TrackTitle(title)) => {
+                    meta.title = Some(title.to_string());
+                }
+                Some(StandardTag::Artist(artist)) => {
+                    meta.artist = Some(artist.to_string());
+                }
+                Some(StandardTag::Album(album)) => {
+                    meta.album = Some(album.to_string());
+                }
+                _ => {}
+            }
+
+            if meta.year.is_none() {
+                let key_lower = tag.raw.key.to_lowercase();
+                let is_year_key = matches!(
+                    key_lower.as_str(),
+                    "year"
+                        | "date"
+                        | "tdrc"
+                        | "tdrl"
+                        | "tory"
+                        | "tyer"
+                        | "release_date"
+                        | "releasedate"
+                        | "originaldate"
+                        | "©day"
+                );
+                if is_year_key {
+                    if let Some(y) = parse_year_from_value(&tag.raw.value) {
+                        meta.year = Some(y);
+                    }
+                }
+            }
+
+            if meta.lyrics.is_none() {
+                let key_lower = tag.raw.key.to_lowercase();
+                let key_main = key_lower.split(':').next().unwrap_or(&key_lower);
+                let is_lyrics_key = matches!(
+                    key_main,
+                    "lyrics" | "lyric"
+                        | "uslt" | "sylt"
+                        | "ult" | "slt"
+                        | "unsyncedlyrics" | "syncedlyrics"
+                        | "unsynchronized lyrics" | "synchronized lyrics"
+                        | "unsynced lyrics" | "synced lyrics"
+                        | "©lyr"
+                );
+                if is_lyrics_key {
+                    match &tag.raw.value {
+                        symphonia::core::meta::RawValue::String(s) => {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                meta.lyrics = Some(trimmed.to_string());
+                            }
+                        }
+                        symphonia::core::meta::RawValue::Binary(b) => {
+                            if let Some(text) = decode_uslt_binary(b) {
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() {
+                                    meta.lyrics = Some(trimmed.to_string());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // ── 封面读取（与 extract_cover_art 相同）──
+        for visual in &revision.media.visuals {
+            let media_type = match &visual.media_type {
+                Some(t) => t,
+                None => continue,
+            };
+            if !media_type.starts_with("image/") {
+                continue;
+            }
+            let data = visual.data.to_vec();
+            if let Some(ref usage) = visual.usage {
+                if usage == &symphonia::core::meta::StandardVisualKey::FrontCover {
+                    cover = Some(data);
+                    break;
+                }
+            }
+            if first_image.is_none() {
+                first_image = Some(data);
+            }
+        }
+    }
+
+    if cover.is_none() {
+        cover = first_image;
+    }
+
+    if meta.title.is_none() {
+        meta.title = platform::path_file_stem(path);
+    }
+
+    let meta_str = if perf::enabled() {
+        Some(format!(
+            "path={} cover={}",
+            platform::path_to_string(path),
+            cover.as_ref().map_or(0, |c| c.len())
+        ))
+    } else {
+        None
+    };
+    perf::end(&_token, meta_str.as_deref());
+
+    Ok(ProbedMeta { audio: meta, cover })
+}
+
 /// 从音频文件中提取嵌入封面图片。
 ///
 /// 使用 symphonia 读取 FLAC/Vorbis comments 或 ID3v2 中的封面数据。
