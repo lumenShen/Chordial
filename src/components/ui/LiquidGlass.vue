@@ -1,51 +1,30 @@
-<script lang="ts">
-/**
- * 用户预设参数（与 useLiquidGlass 时代的 LIQUID_GLASS_PRESETS.user 保持一致）
- */
-export const LIQUID_GLASS_PRESETS = {
-  user: {
-    displacementScale: 150,
-    blurAmount: 0.1,
-    saturation: 130,
-    aberrationIntensity: 2,
-    elasticity: 0.35,
-    mode: "standard" as const,
-  },
-} as const;
-</script>
-
 <script setup lang="ts">
 /**
  * LiquidGlass - 项目统一的液态玻璃包装组件
  *
- * 基于 @wxperia/liquid-glass-vue 的 <LiquidGlass> 组件封装：
- * - 内置用户预设参数（折射模式=标准, 位移量表=150, 模糊量=0.1, 饱和度=130%,
- *   像差强度=2, 弹性=0.35）
- * - 注入项目主题色背景（浅色/深色模式自动适配）
- * - 透传所有库组件 props 和 onClick 回调
+ * 基于 liquid-glass-react（https://github.com/rdev/liquid-glass-react）算法，
+ * 采用 Vue 封装 React 库的方式实现：
+ * - React 渲染的液态玻璃层仅作为 background，position: absolute，z-index: 0
+ * - Vue slot 内容平铺在 z-index: 1 的内容层，不会 Teleport 到 React 子容器中
+ * - 保留与原组件一致的 props 接口（displacementScale、blurAmount、saturation、
+ *   aberrationIntensity、elasticity、cornerRadius、mode、padding 等）
  *
- * 库组件内部管理：
- * - SVG filter 定义和生命周期（挂载/卸载自动清理）
- * - elasticity 鼠标跟随（默认响应玻璃自身范围；如需响应外部容器，
- *   通过 mouseContainer 传入 HTMLElement，注意容器必须能接收 mousemove）
- * - hover/click 交互效果
- *
- * 注意：
- * - 库组件不 emit `click` 事件，而是通过 `onClick` prop 回调处理点击。
- *   本包装组件接收 `onClick` prop 并透传，父组件用 `@click="handler"` 即可
- *   （无 emits 声明时，Vue 会自动把 `@click` 解释为 `onClick` prop）。
- * - 不要把 `pointer-events:none` 的元素作为 mouseContainer，它无法触发
- *   mousemove 事件，且会触发库组件内部 watchEffect 的递归更新。
- *
- * 用法：
- * ```vue
- * <LiquidGlass :corner-radius="32" padding="0 16px" :elasticity="0.2">
- *   <nav>...</nav>
- * </LiquidGlass>
- * ```
+ * 结构示例：
+ * <div class="chordial-liquid-glass">
+ *   <div class="chordial-liquid-glass__react">  <!-- React 背景层 --></div>
+ *   <div class="chordial-liquid-glass__content"><slot /></div>
+ * </div>
  */
-import { computed } from "vue";
-import { LiquidGlass as LibLiquidGlass } from "@wxperia/liquid-glass-vue";
+import {
+  computed,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
+import { createElement } from "react";
+import { createRoot } from "react-dom/client";
+import LiquidGlassReact from "@/lib/liquid-glass-react/index.tsx";
 
 const props = withDefaults(
   defineProps<{
@@ -63,86 +42,229 @@ const props = withDefaults(
     cornerRadius?: number;
     /** 折射模式 */
     mode?: "standard" | "polar" | "prominent" | "shader";
-    /** 着色器效果类型（仅 mode='shader' 时有效） */
-    effect?: "flowingLiquid" | "liquidGlass" | "transparentIce" | "unevenGlass" | "mosaicGlass";
     /** 是否在浅色背景上 */
     overLight?: boolean;
     /** CSS 内边距 */
     padding?: string;
-    /**
-     * 鼠标容器 HTMLElement（用于父容器响应鼠标）
-     * 注意：必须是能接收 mousemove 事件的元素，不能是 pointer-events:none
-     */
-    mouseContainer?: HTMLElement | null;
-    /** 全局鼠标位置（手动控制） */
-    globalMousePos?: { x: number; y: number };
-    /** 鼠标位置偏移 */
-    mouseOffset?: { x: number; y: number };
-    /** 点击回调（库组件通过 onClick prop 处理点击，非 emit click 事件） */
+    /** 点击回调 */
     onClick?: () => void;
-    /** 额外 CSS 类（避免与 Vue 保留的 class 属性冲突） */
+    /** 额外 CSS 类 */
     extraClass?: string;
     /** 额外内联样式 */
     style?: Record<string, string>;
   }>(),
   {
-    ...LIQUID_GLASS_PRESETS.user,
+    displacementScale: 150,
+    blurAmount: 0.1,
+    saturation: 130,
+    aberrationIntensity: 2,
+    elasticity: 0.35,
     cornerRadius: 999,
+    mode: "standard",
+    overLight: false,
     padding: "0px",
   },
 );
 
-// 合并用户 style 与项目主题色背景
-const mergedStyle = computed<Record<string, string>>(() => ({
-  // 项目主题：半透明乳白磨砂玻璃底色
-  // 库组件本身不提供背景色，需通过 style 注入
-  background: "rgba(255, 255, 255, 0.22)",
-  border: "1px solid rgba(255, 255, 255, 0.35)",
-  boxShadow:
-    "0 8px 24px rgba(0, 0, 0, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.5)",
+const emit = defineEmits<{
+  click: [];
+}>();
+
+const wrapperRef = ref<HTMLElement | null>(null);
+const reactHostRef = ref<HTMLDivElement | null>(null);
+let root: ReturnType<typeof createRoot> | null = null;
+
+// React 期望的 ref 对象，指向鼠标容器（wrapper 根节点）
+const mouseContainerReactRef = { current: null as HTMLElement | null };
+
+const wrapperStyle = computed(() => ({
+  position: "relative" as const,
   ...props.style,
 }));
 
-// 合并用户 extraClass 与项目默认 class
-const mergedClass = computed(() =>
-  ["chordial-liquid-glass", props.extraClass].filter(Boolean).join(" "),
+const contentStyle = computed(() => ({
+  padding: props.padding,
+}));
+
+function handleClick() {
+  props.onClick?.();
+  emit("click");
+}
+
+function renderReact() {
+  if (!root) return;
+
+  mouseContainerReactRef.current = wrapperRef.value;
+
+  const reactStyle = {
+    position: "absolute" as const,
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    top: 0,
+    left: 0,
+    transform: "none",
+  };
+
+  root.render(
+    createElement(
+      LiquidGlassReact,
+      {
+        displacementScale: props.displacementScale,
+        blurAmount: props.blurAmount,
+        saturation: props.saturation,
+        aberrationIntensity: props.aberrationIntensity,
+        elasticity: props.elasticity,
+        cornerRadius: props.cornerRadius,
+        padding: "0",
+        overLight: props.overLight,
+        mode: props.mode,
+        style: reactStyle,
+        mouseContainer: mouseContainerReactRef,
+      },
+      // React 子节点仅作为尺寸占位，真正的 Vue slot 内容在内容层渲染
+      createElement("div", { style: { width: "100%", height: "100%" } }),
+    ),
+  );
+}
+
+onMounted(() => {
+  if (reactHostRef.value) {
+    root = createRoot(reactHostRef.value);
+    renderReact();
+  }
+});
+
+onBeforeUnmount(() => {
+  root?.unmount();
+  root = null;
+});
+
+watch(
+  () => [
+    props.displacementScale,
+    props.blurAmount,
+    props.saturation,
+    props.aberrationIntensity,
+    props.elasticity,
+    props.cornerRadius,
+    props.mode,
+    props.overLight,
+    props.padding,
+    props.extraClass,
+    props.style,
+    wrapperRef.value,
+  ],
+  renderReact,
+  { deep: true },
 );
 </script>
 
 <template>
-  <LibLiquidGlass
-    :displacement-scale="displacementScale"
-    :blur-amount="blurAmount"
-    :saturation="saturation"
-    :aberration-intensity="aberrationIntensity"
-    :elasticity="elasticity"
-    :corner-radius="cornerRadius"
-    :mode="mode"
-    :effect="effect"
-    :over-light="overLight"
-    :padding="padding"
-    :mouse-container="mouseContainer"
-    :global-mouse-pos="globalMousePos"
-    :mouse-offset="mouseOffset"
-    :on-click="onClick"
-    :class="mergedClass"
-    :style="mergedStyle"
+  <div
+    ref="wrapperRef"
+    class="chordial-liquid-glass"
+    :class="extraClass"
+    :style="wrapperStyle"
   >
-    <slot />
-  </LibLiquidGlass>
+    <div ref="reactHostRef" class="chordial-liquid-glass__react" />
+    <div
+      class="chordial-liquid-glass__content"
+      :style="contentStyle"
+      @click="handleClick"
+    >
+      <slot />
+    </div>
+  </div>
 </template>
 
 <style>
-/* 项目主题样式：深色模式适配
-   注意：库组件返回 Fragment（多根节点），scoped 样式无法自动应用，
-   因此使用非 scoped 全局样式 + .chordial-liquid-glass 精确选择器 */
+/* 项目主题：半透明乳白磨砂玻璃底色 */
 .chordial-liquid-glass {
-  @media (prefers-color-scheme: dark) {
-    background: rgba(40, 40, 45, 0.5) !important;
-    border-color: rgba(255, 255, 255, 0.15) !important;
-    box-shadow:
-      0 8px 24px rgba(0, 0, 0, 0.35),
-      inset 0 1px 0 rgba(255, 255, 255, 0.1) !important;
+  position: relative;
+  isolation: isolate;
+}
+
+.chordial-liquid-glass__react {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.chordial-liquid-glass__content {
+  position: relative;
+  z-index: 1;
+}
+
+/* React 库内部 .glass 默认 inline-flex 且随内容缩放；
+   背景层需要充满容器，因此强制 block + 100% 宽高 */
+.chordial-liquid-glass__react .glass {
+  display: block !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.chordial-liquid-glass__react .glass__warp {
+  border-radius: inherit !important;
+}
+
+/* liquid-glass-react 内部使用 Tailwind 工具类，
+   项目未引入 Tailwind，因此提供最小等价定义以保证视觉效果 */
+.chordial-liquid-glass__react .relative {
+  position: relative;
+}
+
+.chordial-liquid-glass__react .transition-all {
+  transition-property: all;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 150ms;
+}
+
+.chordial-liquid-glass__react .duration-150 {
+  transition-duration: 150ms;
+}
+
+.chordial-liquid-glass__react .ease-in-out {
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.chordial-liquid-glass__react .text-white {
+  color: #ffffff;
+}
+
+.chordial-liquid-glass__react .pointer-events-none {
+  pointer-events: none;
+}
+
+.chordial-liquid-glass__react .bg-black {
+  background-color: #000000;
+}
+
+.chordial-liquid-glass__react .mix-blend-overlay {
+  mix-blend-mode: overlay;
+}
+
+.chordial-liquid-glass__react .opacity-0 {
+  opacity: 0;
+}
+
+.chordial-liquid-glass__react .opacity-20 {
+  opacity: 0.2;
+}
+
+.chordial-liquid-glass__react .opacity-100 {
+  opacity: 1;
+}
+
+.chordial-liquid-glass__react .cursor-pointer {
+  cursor: pointer;
+}
+
+@media (prefers-color-scheme: dark) {
+  .chordial-liquid-glass {
+    /* 深色模式下由 React 层自行处理 overLight/shadow，
+       内容层不需要额外背景覆盖 */
   }
 }
 </style>
