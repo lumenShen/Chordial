@@ -38,6 +38,21 @@ let boundAudioEl = null
 // 默认 80-120Hz（AMLL 文档推荐，对应低音鼓点）
 let lowFreqRange = [80, 120]
 
+// ── 缓存与复用：避免 60fps 每帧分配 ──────────────────────────────
+//
+// `fftDataAtom` 期望 number[]，Jotai 用 Object.is 比较引用判断是否触发订阅者。
+// 因此不能复用同一个数组（引用不变 → Jotai 不通知）。
+// 采用双缓冲 ping-pong：仅分配 2 个数组，每帧交替返回，引用会变化但无 GC 压力。
+const fftBufferA = new Array(BIN_COUNT)
+const fftBufferB = new Array(BIN_COUNT)
+let fftBufferFlip = false
+
+// lowFreqVolume 的频段索引缓存：sampleRate / freqData.length / lowFreqRange
+// 在一次播放会话内都不变，每帧重算 Math.floor/ceil 是纯浪费。
+let cachedLowBin = -1
+let cachedHighBin = -1
+let lowFreqCacheKey = ''
+
 /**
  * 取得或创建 AudioContext + AnalyserNode 单例。
  * 之所以惰性创建：浏览器要求 AudioContext 必须由用户手势触发 resume，
@@ -91,16 +106,22 @@ function bindAudioElement(audioEl) {
  */
 function computeLowFreqVolume(freqData) {
 	if (!audioCtx || !analyser) return 0
-	const nyquist = audioCtx.sampleRate / 2
-	const binHz = nyquist / freqData.length
+	const len = freqData.length
 	const [lowHz, highHz] = lowFreqRange
-	const lowBin = Math.max(1, Math.floor(lowHz / binHz))
-	const highBin = Math.min(freqData.length - 1, Math.ceil(highHz / binHz))
-	if (highBin < lowBin) return 0
+	// 频段索引在一次会话内不变，缓存避免每帧 Math.floor/ceil
+	const key = `${audioCtx.sampleRate}:${len}:${lowHz}:${highHz}`
+	if (key !== lowFreqCacheKey) {
+		const nyquist = audioCtx.sampleRate / 2
+		const binHz = nyquist / len
+		cachedLowBin = Math.max(1, Math.floor(lowHz / binHz))
+		cachedHighBin = Math.min(len - 1, Math.ceil(highHz / binHz))
+		lowFreqCacheKey = key
+	}
+	if (cachedHighBin < cachedLowBin) return 0
 
 	let sum = 0
 	let count = 0
-	for (let i = lowBin; i <= highBin; i++) {
+	for (let i = cachedLowBin; i <= cachedHighBin; i++) {
 		sum += freqData[i]
 		count++
 	}
@@ -112,10 +133,15 @@ function computeLowFreqVolume(freqData) {
 /**
  * 抽取 fftData：取前 BIN_COUNT 个频段，归一化到 0-1。
  * AMLL 的 fftDataAtom 期望 number[]，长度无严格要求（一般 32-64）。
+ *
+ * 使用双缓冲 ping-pong：Jotai 用 Object.is 比较引用判断是否通知订阅者，
+ * 复用同一数组会导致不触发更新；每帧 new Array 又造成 60fps GC 压力。
+ * 双缓冲仅分配 2 次，每帧交替返回，引用变化且零分配。
  */
 function computeFftData(freqData) {
 	// 取前 32 个频段（低中频，对背景可视化最有信息量）
-	const out = new Array(BIN_COUNT)
+	const out = fftBufferFlip ? fftBufferA : fftBufferB
+	fftBufferFlip = !fftBufferFlip
 	for (let i = 0; i < BIN_COUNT; i++) {
 		out[i] = freqData[i] / 255
 	}

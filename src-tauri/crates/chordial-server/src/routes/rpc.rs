@@ -8,7 +8,6 @@
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use chordial_core::module::music_localSource;
@@ -33,11 +32,16 @@ pub fn router() -> Router<AppState> {
 async fn handle_rpc(
     State(state): State<AppState>,
     Json(req): Json<RpcRequest>,
-) -> impl IntoResponse {
-    match dispatch(&state, &req.name, &req.args) {
-        Ok(value) => Ok(Json(value)),
-        Err(msg) => Err((StatusCode::BAD_REQUEST, msg)),
-    }
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // `dispatch` 内部调用同步阻塞的 `reqwest::blocking`（在线源资源获取、
+    // 文件扫描等），必须用 `spawn_blocking` 包裹，否则阻塞 tokio runtime。
+    let state = state.clone();
+    let inner = tokio::task::spawn_blocking(move || dispatch(&state, &req.name, &req.args))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("阻塞任务失败: {}", e)))?;
+    inner
+        .map(Json)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))
 }
 
 fn dispatch(state: &AppState, name: &str, args: &Value) -> Result<Value, String> {

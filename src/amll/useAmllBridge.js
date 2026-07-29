@@ -66,6 +66,10 @@ import { startAudioAnalyser, stopAudioAnalyser, setLowFreqRange } from '@/amll/u
 //   所以实际就是垂直同步。
 const VSYNC_FPS = 240
 
+// track watcher 封面加载取消令牌：快速切歌时旧 watcher 的 acquireCoverResource
+// await resolve 后通过 token 失效放弃 store.set(musicCoverAtom)，避免旧封面覆盖新封面。
+let coverLoadToken = 0
+
 // 收集所有配置 atoms，供 AmllSettingsStore.apply / .bind 使用
 // （放在模块顶层避免每次调用 useAmllBridge 重建对象）
 const CONFIG_ATOMS = {
@@ -335,10 +339,15 @@ export function useAmllBridge() {
 			store.set(musicAlbumNameAtom, track.albumTitle || '')
 
 			// 异步加载封面（acquireCoverResource 返回 chordial:// URL）
+			// 用 token 取消：快速切歌时旧 watcher 的 await resolve 后放弃写入，
+			// 避免旧曲目封面覆盖新曲目封面导致 UI 闪烁。
+			const myCoverToken = ++coverLoadToken
 			try {
 				const { url } = await track.acquireCoverResource('large')
+				if (myCoverToken !== coverLoadToken) return
 				store.set(musicCoverAtom, url)
 			} catch {
+				if (myCoverToken !== coverLoadToken) return
 				store.set(musicCoverAtom, '')
 			}
 		},

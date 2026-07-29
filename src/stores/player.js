@@ -11,6 +11,7 @@
 
 import { reactive, readonly, computed, markRaw } from 'vue';
 import { perf } from '@/utils/performanceMonitor.js';
+import { formatDuration as formatTime } from '@/utils/format.js';
 
 // 播放模式枚举
 export const PlayMode = {
@@ -30,6 +31,10 @@ const createAudioElement = () => {
   audio.crossOrigin = 'anonymous';
   return audio;
 };
+
+// play() 取消令牌：快速切歌时旧 play() 通过 token 失效放弃副作用，
+// 避免旧 await resolve 后覆盖新曲目的 audioElement.src / isPlaying / 歌词。
+let currentPlayToken = 0;
 
 // PlayerStore 状态
 const state = reactive({
@@ -138,15 +143,6 @@ const getters = {
   isTrackMenuOpen: computed(() => state.ui.isTrackMenuOpen),
   isPlayQueueOpen: computed(() => state.ui.isPlayQueueOpen),
 };
-
-// 格式化时间
-function formatTime(seconds) {
-  if (!seconds || isNaN(seconds)) return '0:00';
-
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
-}
 
 // 初始化音频元素
 function initAudioElement() {
@@ -326,6 +322,10 @@ const actions = {
       return;
     }
 
+    // 取消令牌：快速切歌时旧 play() 的 await resolve 后通过 token 失效放弃副作用，
+    // 避免旧曲目覆盖新曲目的 audioElement.src / isPlaying / 歌词加载。
+    const myToken = ++currentPlayToken;
+
     try {
       state.isLoading = true;
       state.error = null;
@@ -339,6 +339,7 @@ const actions = {
       if (state.currentTrack?.id === track.id) {
         if (state.audioElement?.paused) {
           await state.audioElement.play();
+          if (myToken !== currentPlayToken) return;
           state.isPlaying = true;
         }
         state.isLoading = false;
@@ -364,6 +365,8 @@ const actions = {
 
       // 获取音频 URL
       const audioUrl = await track.getAudioBlobUrl();
+      // 切歌检查：若期间用户又切了别的歌，放弃本次 play 副作用
+      if (myToken !== currentPlayToken) return;
       if (!audioUrl) {
         throw new Error('无法获取音频文件');
       }
@@ -378,6 +381,7 @@ const actions = {
 
       // 播放（先启动播放，歌词后台加载，不阻塞）
       await state.audioElement.play();
+      if (myToken !== currentPlayToken) return;
       state.isPlaying = true;
 
       // 后台加载歌词，不阻塞播放启动
@@ -385,10 +389,15 @@ const actions = {
 
     } catch (error) {
       console.error('播放失败:', error);
+      // 已切歌则不污染新曲目的状态
+      if (myToken !== currentPlayToken) return;
       state.error = error.message || '播放失败';
       state.isPlaying = false;
     } finally {
-      state.isLoading = false;
+      // 仅当仍是当前 token 时才重置 loading，避免旧 play() 提前清掉新 play() 的 loading
+      if (myToken === currentPlayToken) {
+        state.isLoading = false;
+      }
     }
     })());
   },
@@ -676,14 +685,11 @@ const actions = {
         state.lyricsData.hasPlainLyrics !== lyricsInfo.hasPlainLyrics;
 
       if (hasChanged) {
-        console.log('[PlayerStore] lyricsData changed, updating');
         // 逐个更新字段，而不是替换整个对象
         state.lyricsData.plainLyrics = lyricsInfo.plainLyrics;
         state.lyricsData.syncedLyrics = lyricsInfo.syncedLyrics;
         state.lyricsData.hasSyncedLyrics = lyricsInfo.hasSyncedLyrics;
         state.lyricsData.hasPlainLyrics = lyricsInfo.hasPlainLyrics;
-      } else {
-        console.log('[PlayerStore] lyricsData unchanged, skipping update');
       }
     } catch (error) {
       console.warn('加载歌词失败:', error);

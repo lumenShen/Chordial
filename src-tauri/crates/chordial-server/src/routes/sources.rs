@@ -132,24 +132,36 @@ async fn local_rescan(State(state): State<AppState>) -> Result<Json<serde_json::
 }
 
 // ── Resource ────────────────────────────────────────
+//
+// `MusicSource` trait 是同步阻塞接口（底层 `reqwest::blocking`），必须用
+// `spawn_blocking` 包裹，否则会阻塞 tokio 工作线程导致整个 server 冻结。
 
 async fn get_song_file(
     State(state): State<AppState>,
     Json(source_id): Json<SourceId>,
 ) -> Result<Vec<u8>, String> {
-    resource::get_song_file(&state.ctx.registrar, &source_id)
+    let registrar = state.ctx.registrar.clone();
+    tokio::task::spawn_blocking(move || resource::get_song_file(&registrar, &source_id))
+        .await
+        .map_err(|e| format!("阻塞任务失败: {}", e))?
 }
 
 async fn get_album_picture(
     State(state): State<AppState>,
     Json(source_id): Json<SourceId>,
 ) -> Result<Vec<u8>, String> {
-    resource::get_album_picture(&state.ctx.registrar, &source_id)
+    let registrar = state.ctx.registrar.clone();
+    tokio::task::spawn_blocking(move || resource::get_album_picture(&registrar, &source_id))
+        .await
+        .map_err(|e| format!("阻塞任务失败: {}", e))?
 }
 
 async fn get_lyric_text(
     State(state): State<AppState>,
     Json(source_id): Json<SourceId>,
 ) -> Result<String, String> {
-    resource::get_lyric_text(&state.ctx.registrar, &source_id)
+    let registrar = state.ctx.registrar.clone();
+    tokio::task::spawn_blocking(move || resource::get_lyric_text(&registrar, &source_id))
+        .await
+        .map_err(|e| format!("阻塞任务失败: {}", e))?
 }

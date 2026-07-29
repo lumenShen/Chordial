@@ -172,6 +172,9 @@ export function useCoverImages(itemsRef, size = 'medium') {
   const coverUrls = ref(new Map());
   const isLoading = ref(false);
   const releaseFns = new Map();
+  // 组件卸载标志：阻止卸载后仍在 loadQueue 中等待的请求继续执行
+  // （acquireLoadPermit 可能排队等待，卸载后应跳过资源获取与状态写入）
+  let disposed = false;
 
   const loadCovers = async () => {
     if (!itemsRef.value || itemsRef.value.length === 0) return;
@@ -189,8 +192,15 @@ export function useCoverImages(itemsRef, size = 'medium') {
       await acquireLoadPermit();
 
       try {
+        // 卸载检查：若组件已卸载，跳过资源获取（permit 在 finally 释放）
+        if (disposed) return;
         // 使用统一的资源获取函数
         const resource = await acquireCoverResource(item, size);
+        // 再次检查：await 期间可能已卸载，避免写入已卸载组件的 Map
+        if (disposed) {
+          resource?.release?.();
+          return;
+        }
         if (resource && resource.url) {
           newCoverUrls.set(item.id, resource.url);
           newReleaseFns.set(item.id, resource.release);
@@ -204,6 +214,12 @@ export function useCoverImages(itemsRef, size = 'medium') {
     });
 
     await Promise.all(promises);
+
+    // 卸载检查：避免卸载后写入响应式状态触发无意义更新
+    if (disposed) {
+      newReleaseFns.forEach((fn) => fn?.());
+      return;
+    }
 
     // 释放旧的资源
     releaseFns.forEach((release) => release());
@@ -239,8 +255,9 @@ export function useCoverImages(itemsRef, size = 'medium') {
     loadCovers();
   });
 
-  // 组件卸载时释放所有资源
+  // 组件卸载时释放所有资源，并阻止队列中等待的请求继续执行
   onUnmounted(() => {
+    disposed = true;
     releaseAll();
   });
 

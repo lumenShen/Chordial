@@ -10,7 +10,7 @@ use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 
@@ -50,15 +50,29 @@ fn to_core_request(method: &Method, headers: &HeaderMap) -> http::Request<Vec<u8
 }
 
 /// `GET/HEAD /audio/{sn}/{eid}` — 音频流（支持 Range）。
+///
+/// `media::handle` 内部调用同步阻塞的 `reqwest::blocking`（在线源拉取音频/封面/歌词），
+/// 必须用 `spawn_blocking` 包裹，否则阻塞 tokio runtime 导致 server 冻结。
 async fn audio(
     State(state): State<AppState>,
     Path((sn, eid)): Path<(String, String)>,
     method: Method,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     let path = format!("/audio/{}/{}", sn, eid);
     let req = to_core_request(&method, &headers);
-    let resp = chordial_core::media::handle(&state.ctx.registrar, &path, &req);
+    let registrar = state.ctx.registrar.clone();
+    let resp = match tokio::task::spawn_blocking(move || chordial_core::media::handle(&registrar, &path, &req))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("阻塞任务失败: {}", e)))
+                .unwrap();
+        }
+    };
     convert_response(resp)
 }
 
@@ -66,14 +80,24 @@ async fn audio(
 async fn image(
     State(state): State<AppState>,
     Path((sn, eid)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> Response {
     let path = format!("/image/{}/{}", sn, eid);
-    // 用 GET 方法构建简单请求
     let req = http::Request::builder()
         .method("GET")
         .body(Vec::new())
         .unwrap();
-    let resp = chordial_core::media::handle(&state.ctx.registrar, &path, &req);
+    let registrar = state.ctx.registrar.clone();
+    let resp = match tokio::task::spawn_blocking(move || chordial_core::media::handle(&registrar, &path, &req))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("阻塞任务失败: {}", e)))
+                .unwrap();
+        }
+    };
     convert_response(resp)
 }
 
@@ -81,12 +105,23 @@ async fn image(
 async fn lyric(
     State(state): State<AppState>,
     Path((sn, eid)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> Response {
     let path = format!("/lyric/{}/{}", sn, eid);
     let req = http::Request::builder()
         .method("GET")
         .body(Vec::new())
         .unwrap();
-    let resp = chordial_core::media::handle(&state.ctx.registrar, &path, &req);
+    let registrar = state.ctx.registrar.clone();
+    let resp = match tokio::task::spawn_blocking(move || chordial_core::media::handle(&registrar, &path, &req))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("阻塞任务失败: {}", e)))
+                .unwrap();
+        }
+    };
     convert_response(resp)
 }

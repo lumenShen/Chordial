@@ -29,19 +29,36 @@
  */
 
 // ── 是否启用 ──────────────────────────────────────────────────────────────────
+//
+// `isEnabled()` 在每次 IPC/缓存调用时都会被读取（start/end/measureAsync 各调一次），
+// 直接读 localStorage 在 Tauri WebView 中是同步阻塞 IPC，高频场景下累积明显开销。
+// 因此缓存结果：首次调用读一次 localStorage，后续 O(1) 返回。
+// 跨文档变更（如 DevTools 改 localStorage）通过 storage 事件失效缓存。
+
+let _enabledCache = null; // null = 未初始化，true/false = 缓存值
 
 function isEnabled() {
+  if (_enabledCache !== null) return _enabledCache;
   const stored = localStorage.getItem('chordial_perf_monitor');
   if (stored !== null) {
-    return stored === '1';
+    _enabledCache = stored === '1';
+  } else {
+    // 开发环境默认开启
+    try {
+      _enabledCache = import.meta.env.DEV ? true : false;
+    } catch {
+      // import.meta 不可用时静默
+      _enabledCache = false;
+    }
   }
-  // 开发环境默认开启
-  try {
-    if (import.meta.env.DEV) return true;
-  } catch {
-    // import.meta 不可用时静默
-  }
-  return false;
+  return _enabledCache;
+}
+
+// 跨文档同步：其他标签页/窗口修改 localStorage 时失效缓存
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'chordial_perf_monitor') _enabledCache = null;
+  });
 }
 
 // ── 检查 Performance API 可用性 ───────────────────────────────────────────────
