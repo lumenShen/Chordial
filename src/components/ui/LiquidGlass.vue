@@ -98,11 +98,12 @@ function renderReact() {
 
   const reactStyle = {
     position: "absolute" as const,
-    inset: 0,
     width: "100%",
     height: "100%",
-    top: 0,
-    left: 0,
+    top: "0px",
+    left: "0px",
+    right: "0px",
+    bottom: "0px",
     transform: "none",
   };
 
@@ -195,6 +196,9 @@ watch(
 .chordial-liquid-glass__content {
   position: relative;
   z-index: 1;
+  display: flex;
+  align-items: center;
+  width: 100%;
 }
 
 /* React 库内部 .glass 默认 inline-flex 且随内容缩放；
