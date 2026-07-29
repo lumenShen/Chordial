@@ -14,7 +14,6 @@ import { ref, shallowRef, onMounted, watch, nextTick, useTemplateRef } from 'vue
 import { usePerf } from '@/utils/performanceMonitor.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { useLibraryEvents } from '@/composables/useLibraryEvents.js';
-import GradualBlur from '@/components/ui/GradualBlur.vue';
 
 const props = defineProps({
   /** 页头标题，如 "歌手" */
@@ -143,25 +142,10 @@ watch(
 
 <template>
   <div class="entity-list-page page-container" ref="root">
-    <!-- 顶部/底部渐进模糊：贴在 header 下方与底栏上方，消除内容被 .content-wrapper overflow 硬切割的观感 -->
-    <GradualBlur
-      target="page"
-      position="top"
-      height="5rem"
-      :z-index="-50"
-      :strength="2"
-      :div-count="4"
-      :style="{ top: 'calc(var(--header-height) + var(--safe-area-top))' }"
-    />
-    <GradualBlur
-      target="page"
-      position="bottom"
-      height="5rem"
-      :z-index="-50"
-      :strength="2"
-      :div-count="4"
-      :style="{ bottom: 'calc(var(--bottom-nav-height) + var(--player-bar-height) + var(--safe-area-bottom))' }"
-    />
+    <!-- 顶部/底部 sticky 渐变遮罩：内容滚动到 .content-wrapper 边缘时渐隐，
+         消除 overflow 硬切割子元素的观感；高度仅 2rem，不覆盖标题。 -->
+    <div class="edge-fade edge-fade-top" aria-hidden="true"></div>
+    <div class="edge-fade edge-fade-bottom" aria-hidden="true"></div>
 
     <div class="page-header">
       <h1 class="page-title">{{ title }}</h1>
@@ -210,5 +194,42 @@ watch(
   display: inline-block;
   margin-right: 8px;
   vertical-align: middle;
+}
+
+/* 顶部/底部 sticky 渐变遮罩：内容滚动到 .content-wrapper 边缘时渐隐，
+   消除 overflow 硬切割子元素的观感。高度仅 2rem，不会覆盖标题。 */
+.entity-list-page {
+  position: relative;
+}
+
+.edge-fade {
+  position: sticky;
+  left: 0;
+  right: 0;
+  height: 2rem;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.edge-fade-top {
+  top: 0;
+  margin-bottom: -2rem;
+  background: linear-gradient(
+    to bottom,
+    var(--bg-primary) 0%,
+    color-mix(in srgb, var(--bg-primary) 60%, transparent) 40%,
+    transparent 100%
+  );
+}
+
+.edge-fade-bottom {
+  bottom: 0;
+  margin-top: -2rem;
+  background: linear-gradient(
+    to top,
+    var(--bg-primary) 0%,
+    color-mix(in srgb, var(--bg-primary) 60%, transparent) 40%,
+    transparent 100%
+  );
 }
 </style>
