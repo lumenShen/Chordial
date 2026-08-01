@@ -1,92 +1,97 @@
 <script setup>
-import { ref, shallowRef, onMounted, watch, useTemplateRef } from 'vue';
+/**
+ * ArtistDetail — 歌手详情页主视图
+ *
+ * 架构（减少上帝文件）：
+ *   useArtistDetail  数据加载（取消令牌 + 路由 param 响应）
+ *   ArtistHero       顶部封面 + 信息 + 操作按钮
+ *   ArtistAlbums     专辑列表 section
+ *   ArtistTracks     热门歌曲 section
+ *   本视图仅做三态编排（loading / error / content）与动画管线
+ *
+ * 动画全流程管线：
+ *  - 进入：routeEnter（路由层）→ loading spinner（ANIME_LOOP.spin）
+ *  - loading→content：spinner 淡出 + content 区 fadeInUp
+ *  - 切换歌手（路由 param 变化）：useArtistDetail 取消令牌防抖 +
+ *    :key="artist.id" 重建 content 区 → ArtistHero/Albums/Tracks 各自重播入场
+ *  - error：content 淡出 → empty-state scaleIn
+ */
+import { ref, computed, useTemplateRef, watch, nextTick, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import AlbumList from '../components/common/AlbumList.vue';
-import TrackList from '../components/common/TrackList.vue';
 import GradualBlur from '@/components/ui/GradualBlur.vue';
-import { getArtist } from '../api/artist';
-import { getAlbumsByIds } from '../api/album';
-import { getSongsByIds } from '../api/musicSource/musicResource';
-import { useCoverImage } from '@/composables/useCoverImage';
-import { usePerf } from '@/utils/performanceMonitor.js';
+import ArtistHero from '@/components/artist/ArtistHero.vue';
+import ArtistAlbums from '@/components/artist/ArtistAlbums.vue';
+import ArtistTracks from '@/components/artist/ArtistTracks.vue';
+import { useArtistDetail } from '@/composables/useArtistDetail.js';
 import { useAnime } from '@/composables/useAnime.js';
-
-const { start, end, log } = usePerf('ArtistDetail');
+import PlayerStore from '@/stores/player.js';
 
 const route = useRoute();
 const router = useRouter();
 
+// 路由 param 作为响应式源，watch 触发重新加载（支持同组件复用切换歌手）
+const artistIdRef = computed(() => route.params.artistId);
+const { artist, albums, tracks, isLoading, error, reload } = useArtistDetail(artistIdRef);
+
 const rootRef = useTemplateRef('root');
 const { run } = useAnime(() => rootRef.value);
 
-// shallowRef：业务类实例避免深代理开销
-const artist = shallowRef(null);
-const isLoading = ref(true);
+// 收藏状态（TODO: 接入收藏 store，当前仅 UI 状态）
+const isFavorite = ref(false);
 
-// 使用 composable 加载封面
-const { coverUrl, reload: reloadCover } = useCoverImage(artist, 'large');
-
-onMounted(async () => {
-  const artistId = route.params.artistId;
-  if (!artistId) {
-    router.push('/artists');
-    return;
-  }
-
-  // 启动 loading spinner 旋转动画
+// --- 动画 ---
+// loading spinner 旋转：用 ANIME_LOOP.spin 替代 CSS @keyframes
+function playLoadingSpinner() {
   run(({ animate, loopPresets }) => {
-    animate('.spinner', { ...loopPresets.spin });
+    animate('.loading-state .spinner', { ...loopPresets.spin });
   });
+}
 
-  try {
-    start('loadArtist');
-    artist.value = await getArtist(artistId);
-
-    // 加载歌手的专辑和歌曲详情
-    if (artist.value) {
-      start('loadArtistDetails');
-      const [albums, tracks] = await Promise.all([
-        artist.value.albumIds?.length > 0 ? getAlbumsByIds(artist.value.albumIds) : Promise.resolve([]),
-        artist.value.trackIds?.length > 0 ? getSongsByIds(artist.value.trackIds) : Promise.resolve([])
-      ]);
-      artist.value.albums = albums;
-      artist.value.tracks = tracks;
-      end('loadArtistDetails', { albumCount: albums.length, trackCount: tracks.length });
+// 三态切换时编排：
+//  - 进入 loading：启动 spinner
+//  - 进入 content：content 区整体 fadeInUp（子组件内部各自播 cover/title 动画）
+//  - 进入 empty：scaleIn
+watch(
+  isLoading,
+  (val) => {
+    if (val) {
+      nextTick(playLoadingSpinner);
     }
-    end('loadArtist', { albumIds: artist.value?.albumIds?.length ?? 0, trackIds: artist.value?.trackIds?.length ?? 0 });
-  } catch (error) {
-    console.error('Failed to load artist:', error);
-    end('loadArtist', { error: error.message });
-  } finally {
-    isLoading.value = false;
+  },
+  { flush: 'post' },
+);
+
+// 初始挂载若处于 loading，启动 spinner
+onMounted(() => {
+  if (isLoading.value) {
+    nextTick(playLoadingSpinner);
   }
 });
 
-// 监听歌手变化，重新加载封面
-watch(() => artist.value?.id, (newId) => {
-  if (newId) {
-    reloadCover();
-  }
-});
+// 播放全部：将歌手全部歌曲注入播放列表并播放第一首
+function handlePlayAll() {
+  if (!tracks.value?.length) return;
+  PlayerStore.play(tracks.value[0], tracks.value);
+}
 
-const getCoverUrl = () => {
-  // 优先使用从 ResourceManager 加载的封面
-  return coverUrl.value || '';
-};
+function handleToggleFavorite() {
+  isFavorite.value = !isFavorite.value;
+  // TODO: 接入收藏 store 持久化
+}
 
-const handleTrackSelect = (track) => {
+// 歌曲点击 → 跳转歌曲详情
+function handleTrackSelect(track) {
   router.push(`/track/${track.id}`);
-};
+}
 
-const handleTrackPlay = (track) => {
-  // TODO: 接入播放逻辑
-};
+// 无歌手数据且非加载中 → 显示空状态
+const showEmpty = computed(() => !artist.value && !isLoading.value && !error.value);
+const showError = computed(() => !!error.value && !isLoading.value);
 </script>
 
 <template>
-  <div class="artist-detail-page page-container">
-    <!-- 顶部渐进模糊：内容从 header 下方渐显，消除滚动时 overflow 硬切割子元素的观感 -->
-    <!-- target=page 用 fixed 定位贴视口；top 偏移到 header 下方；zIndex -50 → 实际 50，位于内容之上、header(100)之下 -->
+  <div ref="root" class="artist-detail-page page-container">
+    <!-- 顶部渐进模糊：内容从 header 下方渐显，消除滚动时 overflow 硬切割 -->
     <GradualBlur
       target="page"
       position="top"
@@ -96,7 +101,7 @@ const handleTrackPlay = (track) => {
       :div-count="4"
       :style="{ top: 'calc(var(--header-height) + var(--safe-area-top))' }"
     />
-    <!-- 底部渐进模糊：内容渐隐到底栏上方，消除底部硬切割 -->
+    <!-- 底部渐进模糊：内容渐隐到底栏上方 -->
     <GradualBlur
       target="page"
       position="bottom"
@@ -107,84 +112,54 @@ const handleTrackPlay = (track) => {
       :style="{ bottom: 'calc(var(--bottom-nav-height) + var(--player-bar-height) + var(--safe-area-bottom))' }"
     />
 
+    <!-- loading 态 -->
     <div v-if="isLoading" class="loading-state">
       <div class="spinner"></div>
     </div>
 
-    <template v-else-if="artist">
-      <div class="artist-hero">
-        <div class="artist-cover-wrapper">
-          <img
-            v-if="getCoverUrl()"
-            :src="getCoverUrl()"
-            class="artist-cover"
-            :alt="artist.name"
-          />
-          <div v-else class="artist-cover-placeholder">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-              <circle cx="12" cy="7" r="4"/>
-            </svg>
-          </div>
-        </div>
-
-        <div class="artist-info">
-          <span class="artist-label">歌手</span>
-          <h1 class="artist-name">{{ artist.name }}</h1>
-          <div class="artist-meta">
-            <span>{{ artist.trackIds?.length || 0 }} 首歌曲</span>
-            <span class="separator">·</span>
-            <span>{{ artist.albumIds?.length || 0 }} 张专辑</span>
-          </div>
-          <p v-if="artist.bio" class="artist-bio">{{ artist.bio }}</p>
-
-          <div class="artist-actions">
-            <button class="btn btn-primary btn-play">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M8 5v14l11-7z"/>
-              </svg>
-              播放全部
-            </button>
-            <button class="btn btn-secondary">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"/>
-              </svg>
-              收藏
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <!-- 专辑列表 -->
-      <section class="section" v-if="artist.albums && artist.albums.length > 0">
-        <div class="section-header">
-          <h2 class="section-title">专辑</h2>
-        </div>
-        <AlbumList :albums="artist.albums" />
-      </section>
-
-      <!-- 歌曲列表 -->
-      <section class="section" v-if="artist.tracks && artist.tracks.length > 0">
-        <div class="section-header">
-          <h2 class="section-title">热门歌曲</h2>
-        </div>
-        <!-- mode=page 使用外层 .content-wrapper 滚动，避免自带 max-height 滚动容器造成多层滚动条 -->
-        <!-- :virtual-scroll=false 仅 10 首歌无需虚拟列表，避免独立滚动容器 -->
-        <TrackList
-          :tracks="artist.tracks.slice(0, 10)"
-          mode="page"
-          :virtual-scroll="false"
-          @select="handleTrackSelect"
-          @play="handleTrackPlay"
-        />
-      </section>
-    </template>
-
-    <div v-else class="empty-state">
+    <!-- 错误态 -->
+    <div v-else-if="showError" class="empty-state">
       <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <circle cx="12" cy="12" r="10"/>
-        <line x1="12" y1="8" x2="12" y2="12"/>
-        <line x1="12" y1="16" x2="12.01" y2="16"/>
+        <circle cx="12" cy="12" r="10" />
+        <line x1="12" y1="8" x2="12" y2="12" />
+        <line x1="12" y1="16" x2="12.01" y2="16" />
+      </svg>
+      <h3 class="empty-state-title">加载失败</h3>
+      <p class="empty-state-desc">{{ error.message || '无法获取该歌手的信息' }}</p>
+      <button class="btn btn-primary" style="margin-top: 16px;" @click="reload(artistIdRef.value)">
+        重试
+      </button>
+    </div>
+
+    <!-- 内容态：key=artist.id 切换歌手时重建，触发子组件入场动画 -->
+    <div
+      v-else-if="artist"
+      :key="artist.id"
+      class="artist-content"
+    >
+      <ArtistHero
+        :artist="artist"
+        :is-favorite="isFavorite"
+        @play-all="handlePlayAll"
+        @toggle-favorite="handleToggleFavorite"
+      />
+
+      <ArtistAlbums v-if="albums.length > 0" :albums="albums" />
+
+      <ArtistTracks
+        v-if="tracks.length > 0"
+        :tracks="tracks"
+        :limit="10"
+        @select="handleTrackSelect"
+      />
+    </div>
+
+    <!-- 空状态 -->
+    <div v-else-if="showEmpty" class="empty-state">
+      <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="12" cy="12" r="10" />
+        <line x1="12" y1="8" x2="12" y2="12" />
+        <line x1="12" y1="16" x2="12.01" y2="16" />
       </svg>
       <h3 class="empty-state-title">歌手不存在</h3>
       <p class="empty-state-desc">找不到该歌手的信息</p>
@@ -197,103 +172,11 @@ const handleTrackPlay = (track) => {
 
 <style scoped>
 .artist-detail-page {
-  /* max-width 和 margin 由 .page-container 提供 */
+  position: relative;
 }
 
-.artist-hero {
-  display: flex;
-  gap: 28px;
-  margin-bottom: 28px;
-}
-
-.artist-cover-wrapper {
-  flex-shrink: 0;
-  width: 200px;
-  height: 200px;
-  border-radius: 50%;
-  overflow: hidden;
-  box-shadow: var(--shadow-md, 0 4px 6px rgba(0, 0, 0, 0.1));
-}
-
-.artist-cover {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.artist-cover-placeholder {
-  width: 100%;
-  height: 100%;
-  background: var(--bg-tertiary, #e8e8ed);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.artist-cover-placeholder svg {
-  width: 80px;
-  height: 80px;
-  color: var(--text-tertiary, #999);
-}
-
-.artist-info {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-}
-
-.artist-label {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  color: var(--text-secondary, #666);
-  margin-bottom: 8px;
-}
-
-.artist-name {
-  font-size: 32px;
-  font-weight: 700;
-  color: var(--text-primary, #333);
-  margin: 0 0 16px 0;
-  line-height: 1.2;
-}
-
-.artist-meta {
-  font-size: 14px;
-  color: var(--text-secondary, #666);
-  margin-bottom: 16px;
-}
-
-.artist-meta .separator {
-  margin: 0 8px;
-}
-
-.artist-bio {
-  font-size: 14px;
-  color: var(--text-secondary, #666);
-  line-height: 1.6;
-  margin-bottom: 24px;
-  max-width: 600px;
-}
-
-.artist-actions {
-  display: flex;
-  gap: 12px;
-}
-
-.btn-play {
-  padding: 12px 32px;
-}
-
-.btn-play svg {
-  width: 20px;
-  height: 20px;
-}
-
-.section {
-  margin-bottom: 28px;
+.artist-content {
+  /* 内容区入场由子组件各自处理，此处仅做容器 */
 }
 
 /* 覆盖全局 .spinner 的 CSS 旋转，改由 anime.js 驱动 */
@@ -301,52 +184,7 @@ const handleTrackPlay = (track) => {
   animation: none;
 }
 
-.section-header {
-  margin-bottom: 20px;
-}
-
-.section-title {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--text-primary, #333);
-  margin: 0;
-}
-
-@media (max-width: 767px) {
-  .artist-hero {
-    flex-direction: column;
-    align-items: center;
-    text-align: center;
-    gap: 20px;
-    margin-bottom: 24px;
-  }
-
-  .artist-cover-wrapper {
-    width: 160px;
-    height: 160px;
-  }
-
-  .artist-name {
-    font-size: 24px;
-  }
-
-  .artist-actions {
-    justify-content: center;
-  }
-
-  .section-title {
-    font-size: 18px;
-  }
-
-  .section {
-    margin-bottom: 24px;
-  }
-}
-
 @media (prefers-color-scheme: dark) {
-  .artist-name,
-  .section-title {
-    color: var(--text-primary, #f6f6f6);
-  }
+  /* 暗色模式由 tokens.css 变量自动切换 */
 }
 </style>

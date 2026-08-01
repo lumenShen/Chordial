@@ -58,6 +58,13 @@ const itemHeight = computed(() => {
 // 虚拟列表（网格模式）
 // mode=page 使用外层 .content-wrapper 滚动，不再自带 max-height 滚动容器，
 // 避免歌手圆形封面下半圆被容器底部截断，同时消除双层滚动条。
+//
+// ⚠️ useVirtualList 内部 columns/itemHeight 为闭包常量（非响应式），
+// resize 后不会重算。用 layoutKey 强制重建虚拟列表容器以更新布局参数。
+// 重建代价：CoverImage 重新挂载，但 ResourceManager 有缓存，不会重复网络请求。
+// 滚动位置会丢失，但 resize 是低频操作（窗口拖动/设备旋转），可接受。
+const layoutKey = computed(() => `${columns.value}_${itemHeight.value}`);
+
 const {
   visibleItems,
   totalHeight,
