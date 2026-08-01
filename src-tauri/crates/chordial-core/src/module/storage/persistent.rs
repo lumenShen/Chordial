@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 持久化键值存储。
 ///
@@ -50,8 +51,8 @@ pub struct PersistentStore {
     backend: FileBackend,
     /// 内存缓存，避免每次读取都访问磁盘
     cache: RwLock<HashMap<String, Value>>,
-    /// 是否有未落盘的修改
-    dirty: RwLock<bool>,
+    /// 是否有未落盘的修改（原子操作，无锁）
+    dirty: AtomicBool,
     /// Blob 文件存储目录
     blob_dir: PathBuf,
     /// 内存中的 Blob key 集合（避免每次扫描目录）
@@ -86,7 +87,7 @@ impl PersistentStore {
         Self {
             backend,
             cache: RwLock::new(cache),
-            dirty: RwLock::new(false),
+            dirty: AtomicBool::new(false),
             blob_dir,
             blob_keys_cache: RwLock::new(blob_keys_cache),
         }
@@ -186,7 +187,7 @@ impl PersistentStore {
             .and_then(|v| v.as_object_mut())
             .map_or(false, |obj| obj.remove(id).is_some());
         if removed {
-            *self.dirty.write() = true;
+            self.dirty.store(true, Ordering::Release);
         }
         removed
     }
@@ -211,7 +212,7 @@ impl PersistentStore {
         if let Some(obj) = entry.as_object_mut() {
             obj.insert(id.to_string(), json);
             drop(guard);
-            *self.dirty.write() = true;
+            self.dirty.store(true, Ordering::Release);
             Ok(())
         } else {
             Err(format!("键 '{}' 的值不是 JSON Object", key))
@@ -409,14 +410,14 @@ impl PersistentStore {
         let json = serde_json::to_value(value)
             .map_err(|e| format!("序列化失败: {}", e))?;
         self.cache.write().insert(key.to_string(), json);
-        *self.dirty.write() = true;
+        self.dirty.store(true, Ordering::Release);
         Ok(())
     }
 
     /// 写入原始 JSON 值，仅修改内存缓存。
     pub fn set_raw(&self, key: &str, value: Value) {
         self.cache.write().insert(key.to_string(), value);
-        *self.dirty.write() = true;
+        self.dirty.store(true, Ordering::Release);
     }
 
     // ── 删除 / 检查 ──────────────────────────────────
@@ -425,7 +426,7 @@ impl PersistentStore {
     pub fn remove(&self, key: &str) -> bool {
         let existed = self.cache.write().remove(key).is_some();
         if existed {
-            *self.dirty.write() = true;
+            self.dirty.store(true, Ordering::Release);
         }
         existed
     }
@@ -443,7 +444,7 @@ impl PersistentStore {
     /// 清空所有数据（仅修改内存缓存）。
     pub fn clear(&self) {
         self.cache.write().clear();
-        *self.dirty.write() = true;
+        self.dirty.store(true, Ordering::Release);
     }
 
     // ── 持久化 ───────────────────────────────────────
@@ -461,7 +462,7 @@ impl PersistentStore {
             serde_json::to_string(&*guard).map_err(|e| format!("序列化失败: {}", e))?
         };
         self.backend.write_str(&content)?;
-        *self.dirty.write() = false;
+        self.dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -470,7 +471,7 @@ impl PersistentStore {
     /// 适合在退出时调用，避免不必要的磁盘 I/O。
     pub fn save_if_dirty(&self) -> Result<(), String> {
         let _scope = perf::scope("persistent.save");
-        if *self.dirty.read() {
+        if self.dirty.load(Ordering::Acquire) {
             self.save()
         } else {
             Ok(())
@@ -483,7 +484,7 @@ impl PersistentStore {
     pub fn reload(&self) {
         if let Ok(data) = self.backend.read() {
             *self.cache.write() = data;
-            *self.dirty.write() = false;
+            self.dirty.store(false, Ordering::Release);
         }
     }
 

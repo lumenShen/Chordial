@@ -18,6 +18,7 @@
 //! 3. **资源获取**：前端通过 `get_song_file` / `get_album_picture` / `get_lyric_text`
 //!    请求资源时，`LocalMusicSource` 直接从文件系统读取并返回。
 
+pub mod artists;
 pub mod folder;
 pub mod scanner;
 pub mod source;

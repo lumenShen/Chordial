@@ -69,10 +69,16 @@ impl WebHttpClient {
             .build()
             .map_err(|e| format!("构建 HTTP 客户端失败: {}", e))?;
 
+        // 统一去掉结尾 `/`，与 set_base_url 保持一致，避免 `/api//search` 双斜杠
+        let mut normalized_base = base_url;
+        while normalized_base.ends_with('/') {
+            normalized_base.pop();
+        }
+
         Ok(Self {
             client,
             cookie: RwLock::new(cookie),
-            base_url: RwLock::new(base_url),
+            base_url: RwLock::new(normalized_base),
             timeout_secs,
         })
     }
@@ -110,39 +116,40 @@ impl WebHttpClient {
     /// 构建 GET 请求 URL（base_url + path），自动添加查询参数。
     ///
     /// `path` 不以 `/` 开头时自动补。
+    /// 在读锁内直接 format，避免 clone 整个 base_url String。
     fn build_url(&self, path: &str) -> String {
-        let base = self.base_url.read().clone();
-        let path = if path.starts_with('/') {
-            path.to_string()
+        let base = self.base_url.read();
+        if path.starts_with('/') {
+            format!("{}{}", *base, path)
         } else {
-            format!("/{}", path)
-        };
-        format!("{}{}", base, path)
+            format!("{}/{}", *base, path)
+        }
     }
 
     /// 构建 `RequestBuilder`，自动附加 cookie。
+    ///
+    /// 在读锁内直接通过 `&str` 构造 `HeaderValue`，避免 clone 整个 cookie String。
     fn attach_cookie(&self, mut rb: RequestBuilder) -> RequestBuilder {
-        let cookie = self.cookie.read().clone();
-        if !cookie.is_empty() {
-            // 用 HeaderName 自动校验，避免无效字符触发 panic
-            match HeaderValue::from_str(&cookie) {
-                Ok(value) => {
-                    rb = rb.header(reqwest::header::COOKIE, value);
+        {
+            let cookie = self.cookie.read();
+            if !cookie.is_empty() {
+                match HeaderValue::from_str(&*cookie) {
+                    Ok(value) => {
+                        rb = rb.header(reqwest::header::COOKIE, value);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[web_http] cookie 含非法字符无法附加到 header：{}（cookie 长度={}）",
+                            e,
+                            cookie.len()
+                        );
+                    }
                 }
-                Err(e) => {
-                    // cookie 字符串含非法字符，跳过附加并打日志
-                    eprintln!(
-                        "[web_http] cookie 含非法字符无法附加到 header：{}（cookie 长度={}）",
-                        e,
-                        cookie.len()
-                    );
-                }
+            } else {
+                eprintln!("[web_http] cookie 为空，请求未携带登录态");
             }
-        } else {
-            eprintln!("[web_http] cookie 为空，请求未携带登录态");
         }
         // 禁用任何中间层缓存（代理/CDN/reqwest 连接池的响应复用）
-        // 对于登录态轮询等场景至关重要
         rb = rb
             .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
             .header(reqwest::header::PRAGMA, "no-cache");

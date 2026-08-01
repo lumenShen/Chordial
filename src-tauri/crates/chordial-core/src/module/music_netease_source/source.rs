@@ -250,9 +250,10 @@ impl NeteaseCloudMusicApiSource {
 
     /// 写入封面字节缓存（带 FIFO 半量淘汰）。
     ///
-    /// 持锁期间仅做 `Arc::new(data)`（move，无深拷贝）与键驱逐，
-    /// 不在锁内深拷贝 `Vec<u8>`。
+    /// 在锁外预分配 key 字符串和 `Arc` 包装，临界区内仅做 HashMap 查删与插入。
     fn insert_cover_cache(&self, entity_id: &str, data: Vec<u8>) {
+        let key = entity_id.to_string();
+        let arc = Arc::new(data);
         let mut cache = self.cover_cache.lock();
         if cache.len() >= NETEASE_COVER_CACHE_CAP {
             let drop_count = NETEASE_COVER_CACHE_CAP / 2;
@@ -261,11 +262,12 @@ impl NeteaseCloudMusicApiSource {
                 cache.remove(&k);
             }
         }
-        cache.insert(entity_id.to_string(), Arc::new(data));
+        cache.insert(key, arc);
     }
 
     /// 写入 picUrl 缓存（带 FIFO 半量淘汰）。
     fn insert_pic_url_cache(&self, entity_id: &str, pic_url: String) {
+        let key = entity_id.to_string();
         let mut cache = self.pic_url_cache.lock();
         if cache.len() >= NETEASE_PIC_URL_CACHE_CAP {
             let drop_count = NETEASE_PIC_URL_CACHE_CAP / 2;
@@ -274,7 +276,7 @@ impl NeteaseCloudMusicApiSource {
                 cache.remove(&k);
             }
         }
-        cache.insert(entity_id.to_string(), pic_url);
+        cache.insert(key, pic_url);
     }
 }
 

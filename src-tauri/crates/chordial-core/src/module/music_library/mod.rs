@@ -28,6 +28,8 @@ pub mod albums;
 pub mod artists;
 pub mod library;
 pub mod lyrics;
+pub mod maintenance;
+pub mod merge;
 pub mod models;
 pub mod relations;
 pub mod search;

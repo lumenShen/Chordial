@@ -344,21 +344,21 @@ impl AudioQuality {
 /// 而非简单显示数字 rank。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioQualityDescriptor {
-    /// 归一化等级 rank（0-5，对应 [`AudioQuality`] 的 `as u8`）
-    #[serde(default)]
-    pub rank: u8,
     /// 码率（kbps）。无损格式时此值为 0（实际由采样率×位深决定）。
     #[serde(default)]
     pub bitrate_kbps: u32,
-    /// 编码格式
-    #[serde(default)]
-    pub codec: AudioCodec,
     /// 采样率（Hz）。仅无损 / Hi-Res 时有意义。
     #[serde(default)]
     pub sample_rate_hz: Option<u32>,
     /// 位深。仅无损 / Hi-Res 时有意义。
     #[serde(default)]
     pub bit_depth: Option<u8>,
+    /// 归一化等级 rank（0-5，对应 [`AudioQuality`] 的 `as u8`）
+    #[serde(default)]
+    pub rank: u8,
+    /// 编码格式
+    #[serde(default)]
+    pub codec: AudioCodec,
 }
 
 impl Default for AudioQualityDescriptor {
