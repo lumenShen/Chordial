@@ -7,7 +7,8 @@ use crate::module::music_source::traits::MusicSource;
 use crate::module::music_source::types::{EntityType, SourceId, SourceType};
 use crate::module::music_web_source::{WebHttpClient, WebSourceConfig};
 use crate::module::storage::persistent::PersistentStore;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 网易云音乐来源的固定名称。
@@ -15,6 +16,11 @@ pub const NETEASE_SOURCE_NAME: &str = "netease";
 
 /// 网易云 entity_id 中各部分的分隔符。
 const ENTITY_ID_SEP: &str = ":";
+
+/// 封面字节缓存容量上限（典型 50-500KB/张，128 条 ≈ 6-64MB）。
+const NETEASE_COVER_CACHE_CAP: usize = 128;
+/// picUrl 缓存容量上限（picUrl 是短字符串，可容纳更多）。
+const NETEASE_PIC_URL_CACHE_CAP: usize = 512;
 
 /// 网易云 entity_id 的种类前缀。
 #[allow(non_camel_case_types)]
@@ -69,7 +75,7 @@ fn parse_remote_id(entity_id: &str) -> Option<i64> {
 /// 将网易云的 publishTime（毫秒级 Unix 时间戳）转换为年份。
 ///
 /// 返回 None 表示时间戳无效（<=0）。
-fn publish_time_to_year(ms: i64) -> Option<u32> {
+pub(crate) fn publish_time_to_year(ms: i64) -> Option<u32> {
     if ms <= 0 {
         return None;
     }
@@ -87,7 +93,7 @@ fn publish_time_to_year(ms: i64) -> Option<u32> {
     Some(year)
 }
 
-fn is_leap_year(year: u32) -> bool {
+pub(crate) fn is_leap_year(year: u32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
@@ -105,6 +111,12 @@ pub struct NeteaseCloudMusicApiSource {
     store: Arc<PersistentStore>,
     /// 配置在 PersistentStore 中的 key
     config_key: String,
+    /// 封面缓存：entity_id → 图片字节
+    /// 避免重复下载（典型 50-500KB/张，限制 128 条 ≈ 6-64MB）
+    cover_cache: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+    /// picUrl 缓存：entity_id → picUrl 字符串
+    /// 避免重复调 /song/detail 或 /album 接口拿 picUrl
+    pic_url_cache: Mutex<HashMap<String, String>>,
 }
 
 impl NeteaseCloudMusicApiSource {
@@ -143,6 +155,8 @@ impl NeteaseCloudMusicApiSource {
             config: RwLock::new(config),
             store,
             config_key,
+            cover_cache: Mutex::new(HashMap::new()),
+            pic_url_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -230,6 +244,37 @@ impl NeteaseCloudMusicApiSource {
             // 避免song id 被当成 album id 调 /album 接口导致 404/405 限流
             cover_url: detail.al.as_ref().and_then(|a| a.picUrl.clone()),
         }
+    }
+
+    // ── 封面 / picUrl 双层缓存辅助 ─────────────────────────────────────────
+
+    /// 写入封面字节缓存（带 FIFO 半量淘汰）。
+    ///
+    /// 持锁期间仅做 `Arc::new(data)`（move，无深拷贝）与键驱逐，
+    /// 不在锁内深拷贝 `Vec<u8>`。
+    fn insert_cover_cache(&self, entity_id: &str, data: Vec<u8>) {
+        let mut cache = self.cover_cache.lock();
+        if cache.len() >= NETEASE_COVER_CACHE_CAP {
+            let drop_count = NETEASE_COVER_CACHE_CAP / 2;
+            let keys: Vec<String> = cache.keys().take(drop_count).cloned().collect();
+            for k in keys {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(entity_id.to_string(), Arc::new(data));
+    }
+
+    /// 写入 picUrl 缓存（带 FIFO 半量淘汰）。
+    fn insert_pic_url_cache(&self, entity_id: &str, pic_url: String) {
+        let mut cache = self.pic_url_cache.lock();
+        if cache.len() >= NETEASE_PIC_URL_CACHE_CAP {
+            let drop_count = NETEASE_PIC_URL_CACHE_CAP / 2;
+            let keys: Vec<String> = cache.keys().take(drop_count).cloned().collect();
+            for k in keys {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(entity_id.to_string(), pic_url);
     }
 }
 
@@ -440,61 +485,95 @@ impl MusicSource for NeteaseCloudMusicApiSource {
         if !self.is_enabled() {
             return Err("网易云来源未启用".to_string());
         }
-        // entity_id 可能是 album:<id> / song:<id>，也可能直接是图片 URL
-        // 若是 URL，直接下载
+
+        // 1. 先查字节缓存：命中则直接返回
+        //    持锁期间只 clone Arc（廉价），锁外再 clone Vec<u8>，避免持锁深拷贝
+        {
+            let cache = self.cover_cache.lock();
+            if let Some(hit) = cache.get(entity_id) {
+                let arc = Arc::clone(hit);
+                drop(cache); // 显式释放锁
+                return Ok((*arc).clone()); // 锁外深拷贝
+            }
+        }
+
+        // 2. entity_id 可能是 album:<id> / song:<id>，也可能直接是图片 URL
+        //    若是 URL，直接下载并以 URL 本身作为缓存 key
         if entity_id.starts_with("http://") || entity_id.starts_with("https://") {
-            return self.client.get_bytes(entity_id);
+            let bytes = self.client.get_bytes(entity_id)?;
+            self.insert_cover_cache(entity_id, bytes.clone());
+            return Ok(bytes);
         }
 
         let Some(remote_id) = parse_remote_id(entity_id) else {
             return Err(format!("无效的 entity_id: {}", entity_id));
         };
 
-        // 根据 entity_id 前缀选择 API：
-        // - album:<id> → /album?id=<id> 拿 album.picUrl
-        // - song:<id>  → /song/detail?ids=<id> 拿 songs[0].al.picUrl
-        //   （旧实现统一调 /album，把 song id 当 album id 导致 404）
-        let pic_url = if entity_id.starts_with("song:") {
-            #[derive(serde::Deserialize)]
-            struct SongDetailResp {
-                #[serde(default)]
-                code: i32,
-                #[serde(default)]
-                songs: Vec<super::types::NeteaseSongDetail>,
-            }
-            let resp: SongDetailResp = self.client.get_json(
-                "/song/detail",
-                &[("ids", &remote_id.to_string())],
-            )?;
-            if resp.code != 200 {
-                return Err(format!("获取歌曲详情失败 code={}", resp.code));
-            }
-            resp.songs
-                .into_iter()
-                .next()
-                .and_then(|s| s.al.and_then(|a| a.picUrl))
-                .ok_or_else(|| "歌曲无封面 URL".to_string())?
-        } else {
-            // album:<id> 或裸 id → /album 接口
-            #[derive(serde::Deserialize)]
-            struct AlbumResp {
-                #[serde(default)]
-                code: i32,
-                #[serde(default)]
-                album: Option<super::types::NeteaseAlbumBrief>,
-            }
-            let resp: AlbumResp = self
-                .client
-                .get_json("/album", &[("id", &remote_id.to_string())])?;
-            if resp.code != 200 {
-                return Err(format!("获取专辑失败 code={}", resp.code));
-            }
-            resp.album
-                .and_then(|a| a.picUrl)
-                .ok_or_else(|| "专辑无封面 URL".to_string())?
+        // 3. 查 picUrl 缓存：命中则跳过 /song/detail 或 /album 接口
+        let pic_url_cached: Option<String> = {
+            let cache = self.pic_url_cache.lock();
+            cache.get(entity_id).cloned()
         };
 
-        self.client.get_bytes(&pic_url)
+        // 4. picUrl 未命中 → 走原有 /song/detail 或 /album 逻辑拿 picUrl
+        let pic_url = match pic_url_cached {
+            Some(cached) => cached,
+            None => {
+                // 根据 entity_id 前缀选择 API：
+                // - album:<id> → /album?id=<id> 拿 album.picUrl
+                // - song:<id>  → /song/detail?ids=<id> 拿 songs[0].al.picUrl
+                //   （旧实现统一调 /album，把 song id 当 album id 导致 404）
+                let fetched = if entity_id.starts_with("song:") {
+                    #[derive(serde::Deserialize)]
+                    struct SongDetailResp {
+                        #[serde(default)]
+                        code: i32,
+                        #[serde(default)]
+                        songs: Vec<super::types::NeteaseSongDetail>,
+                    }
+                    let resp: SongDetailResp = self.client.get_json(
+                        "/song/detail",
+                        &[("ids", &remote_id.to_string())],
+                    )?;
+                    if resp.code != 200 {
+                        return Err(format!("获取歌曲详情失败 code={}", resp.code));
+                    }
+                    resp.songs
+                        .into_iter()
+                        .next()
+                        .and_then(|s| s.al.and_then(|a| a.picUrl))
+                        .ok_or_else(|| "歌曲无封面 URL".to_string())?
+                } else {
+                    // album:<id> 或裸 id → /album 接口
+                    #[derive(serde::Deserialize)]
+                    struct AlbumResp {
+                        #[serde(default)]
+                        code: i32,
+                        #[serde(default)]
+                        album: Option<super::types::NeteaseAlbumBrief>,
+                    }
+                    let resp: AlbumResp = self
+                        .client
+                        .get_json("/album", &[("id", &remote_id.to_string())])?;
+                    if resp.code != 200 {
+                        return Err(format!("获取专辑失败 code={}", resp.code));
+                    }
+                    resp.album
+                        .and_then(|a| a.picUrl)
+                        .ok_or_else(|| "专辑无封面 URL".to_string())?
+                };
+                // picUrl 获取成功才写缓存，避免空字符串污染缓存
+                if !fetched.is_empty() {
+                    self.insert_pic_url_cache(entity_id, fetched.clone());
+                }
+                fetched
+            }
+        };
+
+        // 5. 用 picUrl 调 get_bytes，写入 cover_cache，返回字节
+        let bytes = self.client.get_bytes(&pic_url)?;
+        self.insert_cover_cache(entity_id, bytes.clone());
+        Ok(bytes)
     }
 
     fn lyric_text_get(&self, song_id: &str) -> Result<String, String> {

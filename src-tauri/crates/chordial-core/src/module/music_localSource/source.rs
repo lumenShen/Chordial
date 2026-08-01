@@ -156,6 +156,8 @@ impl LocalMusicSource {
     ///
     /// 提取公共逻辑，供 `album_picture_get` 的磁盘命中回填和提取后写入复用。
     fn insert_cover_cache(&self, entity_id: &str, data: Vec<u8>) {
+        // 在锁外完成 key 的 String 分配，减少临界区内堆分配
+        let key = entity_id.to_string();
         let mut cache = self.cover_cache.lock();
         if cache.len() >= COVER_CACHE_CAP {
             // 简单 FIFO 半量淘汰（避免单条 LRU 链维护开销）
@@ -165,7 +167,7 @@ impl LocalMusicSource {
                 cache.remove(&k);
             }
         }
-        cache.insert(entity_id.to_string(), Arc::new(data));
+        cache.insert(key, Arc::new(data));
     }
 
     /// 扫描单个音频文件并添加到音乐库（或合并到已有条目）。
@@ -921,11 +923,15 @@ impl MusicSource for LocalMusicSource {
 
         // 1. 内存缓存命中（~0.01ms）
         //    典型命中：浏览/播放同一专辑时多次请求封面
-        {
+        //    临界区仅做 HashMap lookup + Arc::clone（引用计数拷贝，无堆分配），
+        //    深拷贝 Vec<u8> 放到锁外执行，避免高并发下多线程排队等锁。
+        let arc_hit = {
             let cache = self.cover_cache.lock();
-            if let Some(hit) = cache.get(entity_id) {
-                return Ok(hit.as_ref().clone());
-            }
+            cache.get(entity_id).map(Arc::clone)
+        };
+        if let Some(arc) = arc_hit {
+            // 锁外深拷贝（典型 50-500KB），不阻塞其他线程访问缓存
+            return Ok((*arc).clone());
         }
 
         // 2. 磁盘缓存命中（~1-5ms）

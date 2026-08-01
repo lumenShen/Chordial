@@ -2,46 +2,14 @@
  * 封面图片加载 Composable
  * 使用 ResourceManager 按需加载封面图片
  *
- * # 性能优化
- * - 实现并发控制，限制同时加载的图片数量
- * - 优化 watch 监听，避免深度监听大对象
- * - 自动管理资源生命周期，组件卸载时释放资源
+ * # 性能说明
+ * - acquireCoverResource 仅同步构造 chordial:// URL（真正的图片下载由
+ *   浏览器 <img> 发起，浏览器自身管理并发连接），因此批量加载不做
+ *   JS 层并发限制——人为限流反而会把同步操作串行化，造成排队延迟。
+ * - 优化 watch 监听，避免深度监听大对象。
+ * - 自动管理资源生命周期，组件卸载时释放资源并跳过排队中的请求。
  */
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue';
-
-// 全局并发控制 - 限制同时加载的封面数量
-const MAX_CONCURRENT_LOADS = 5;
-let currentLoadCount = 0;
-const loadQueue = [];
-
-/**
- * 获取加载许可（并发控制）
- * @returns {Promise<void>}
- */
-async function acquireLoadPermit() {
-  if (currentLoadCount < MAX_CONCURRENT_LOADS) {
-    currentLoadCount++;
-    return;
-  }
-
-  // 等待队列
-  return new Promise((resolve) => {
-    loadQueue.push(resolve);
-  });
-}
-
-/**
- * 释放加载许可
- */
-function releaseLoadPermit() {
-  currentLoadCount--;
-  // 唤醒队列中的下一个
-  if (loadQueue.length > 0) {
-    const next = loadQueue.shift();
-    currentLoadCount++;
-    next();
-  }
-}
 
 /**
  * 从对象获取封面资源
@@ -172,8 +140,8 @@ export function useCoverImages(itemsRef, size = 'medium') {
   const coverUrls = ref(new Map());
   const isLoading = ref(false);
   const releaseFns = new Map();
-  // 组件卸载标志：阻止卸载后仍在 loadQueue 中等待的请求继续执行
-  // （acquireLoadPermit 可能排队等待，卸载后应跳过资源获取与状态写入）
+  // 组件卸载标志：阻止卸载后仍在进行的资源获取继续写入状态
+  // （acquireCoverResource 含 await，卸载后应跳过资源获取与状态写入）
   let disposed = false;
 
   const loadCovers = async () => {
@@ -181,20 +149,19 @@ export function useCoverImages(itemsRef, size = 'medium') {
 
     isLoading.value = true;
 
-    // 加载新的封面（带并发控制），先收集到临时 Map，最后一次性替换（避免 N+1 次重渲染）
+    // 批量构造封面 URL（acquireCoverResource 仅同步构造 chordial:// URL，
+    // 真正的图片下载并发由浏览器管理），先收集到临时 Map，最后一次性替换
+    // （避免 N+1 次重渲染）。
     const newCoverUrls = new Map();
     const newReleaseFns = new Map();
 
     const promises = itemsRef.value.map(async (item) => {
       if (!item) return;
 
-      // 获取加载许可（并发控制）
-      await acquireLoadPermit();
-
       try {
-        // 卸载检查：若组件已卸载，跳过资源获取（permit 在 finally 释放）
+        // 卸载检查：若组件已卸载，跳过资源获取
         if (disposed) return;
-        // 使用统一的资源获取函数
+        // 使用统一的资源获取函数（构造 chordial:// URL）
         const resource = await acquireCoverResource(item, size);
         // 再次检查：await 期间可能已卸载，避免写入已卸载组件的 Map
         if (disposed) {
@@ -207,9 +174,6 @@ export function useCoverImages(itemsRef, size = 'medium') {
         }
       } catch (err) {
         console.warn(`Failed to load cover for ${item.id}:`, err);
-      } finally {
-        // 释放加载许可
-        releaseLoadPermit();
       }
     });
 

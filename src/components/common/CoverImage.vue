@@ -26,6 +26,16 @@ const props = defineProps({
   size: {
     type: String,
     default: 'medium' // 'small' | 'medium' | 'large'
+  },
+  /**
+   * 是否作为首屏优先图片加载。
+   * - true：立即加载（loading="eager"）并提升优先级（fetchpriority="high"），
+   *   用于首屏可见的封面，避免 lazy 等待视口观察器触发的一帧延迟。
+   * - false（默认）：lazy 加载，适用于长列表中可能位于视口外的图片。
+   */
+  priority: {
+    type: Boolean,
+    default: false
   }
 });
 
@@ -126,7 +136,8 @@ const handleError = () => {
       :alt="alt"
       class="cover-image"
       :class="{ 'cover-hidden': hasImgError || (isLoading && displaySrc) }"
-      loading="lazy"
+      :loading="priority ? 'eager' : 'lazy'"
+      :fetchpriority="priority ? 'high' : 'auto'"
       decoding="async"
       @load="handleLoad"
       @error="handleError"
