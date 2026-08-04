@@ -60,6 +60,10 @@ pub struct DeployableSourceSpec {
     pub display_name: String,
     /// GitHub 仓库地址（`https://...git`）。
     pub git_url: String,
+    /// 镜像 URL（国内网络环境备用，如 `https://ghproxy.com/...`）。
+    /// 当 `git_url` 克隆失败时自动回退到此 URL 重试。
+    /// `None` 表示不启用镜像回退。
+    pub mirror_url: Option<String>,
     /// 启动命令（通常为 `"npm"`）。
     pub start_command: String,
     /// 启动参数（如 `["start"]`）。
@@ -138,4 +142,36 @@ pub struct ToolchainCheck {
     pub node_version: String,
     /// npm 版本字符串（如 `"10.2.3"`）。
     pub npm_version: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_round_trip() {
+        for s in [
+            DeployStatus::NotDeployed,
+            DeployStatus::Cloned,
+            DeployStatus::Installed,
+            DeployStatus::Running,
+            DeployStatus::Stopped,
+            DeployStatus::Error,
+        ] {
+            assert_eq!(DeployStatus::from_str(s.as_str()), s);
+        }
+        // 未知字符串降级为 NotDeployed
+        assert_eq!(DeployStatus::from_str("unknown"), DeployStatus::NotDeployed);
+        assert_eq!(DeployStatus::from_str(""), DeployStatus::NotDeployed);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let cfg = DeployConfig::default();
+        assert!(!cfg.enabled);
+        assert!(!cfg.auto_start);
+        assert!(!cfg.auto_configure_base_url);
+        assert_eq!(cfg.port, 0);
+        assert!(cfg.last_status.is_empty());
+    }
 }

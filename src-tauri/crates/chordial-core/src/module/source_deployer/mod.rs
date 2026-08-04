@@ -9,7 +9,13 @@
 //! | 子模块 | 职责 |
 //! |--------|------|
 //! | [`types`] | 数据模型（`DeployableSourceSpec` / `DeployConfig` / `SourceDeployInfo` / ...） |
-//! | [`manager`] | [`SourceDeployer`] 主体（进程管理 / git 操作 / 配置持久化） |
+//! | [`spec`] | 可部署来源的固定规格（`list_deployable_sources` / `find_spec`） |
+//! | [`manager`] | [`SourceDeployer`] 主体结构（构造 / 目录辅助） |
+//! | [`config`] | 部署配置读写与持久化 |
+//! | [`status`] | 运行时状态查询（列表 / 详情 / 日志） |
+//! | [`deploy`] | git 克隆 / 拉取 / npm 安装 |
+//! | [`process`] | 后台进程管理（启动 / 停止 / 退出清理） |
+//! | [`toolchain`] | git / node / npm 工具链检测 |
 //!
 //! # 使用示例
 //!
@@ -29,10 +35,17 @@
 //! deployer.stop_source("netease")?;
 //! ```
 
+pub mod config;
+pub mod deploy;
 pub mod manager;
+pub mod process;
+pub mod spec;
+pub mod status;
+pub mod toolchain;
 pub mod types;
 
-pub use manager::{find_spec, list_deployable_sources, SourceDeployer};
+pub use manager::SourceDeployer;
+pub use spec::{find_spec, list_deployable_sources};
 pub use types::{
     DeployConfig, DeployRuntimeInfo, DeployStatus, DeployableSourceSpec, SourceDeployInfo,
     ToolchainCheck,
