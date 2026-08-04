@@ -12,27 +12,13 @@
       </div>
 
       <div class="controls-section">
-        <!-- 专辑封面（真共享 DOM：动态 Teleport 到 PlayerView portal） -->
-        <div class="album-cover-slot">
-          <Teleport :to="coverPortalTarget" :disabled="!coverPortalTarget">
-            <div class="album-cover-thumb" ref="coverThumb" v-if="albumCoverUrl" @click="openPlayerView" data-shared="cover">
-              <img :src="albumCoverUrl" alt="专辑封面" />
-            </div>
-            <div class="album-cover-thumb placeholder" ref="coverThumb" v-else @click="openPlayerView" data-shared="cover">
-              <HugeiconsIcon :icon="MusicNote01Icon" :size="20" />
-            </div>
-          </Teleport>
-        </div>
-
-        <!-- 歌曲信息（真共享 DOM：动态 Teleport 到 PlayerView portal） -->
-        <div class="track-info-slot">
-          <Teleport :to="metaPortalTarget" :disabled="!metaPortalTarget">
-            <div class="track-info" v-if="trackTitle" data-shared="meta">
-              <span class="track-title">{{ trackTitle }}</span>
-              <span class="track-meta">{{ trackMeta }}</span>
-            </div>
-          </Teleport>
-        </div>
+        <!-- 专辑封面 + 歌曲信息（真共享 DOM：动态 Teleport 到 PlayerView portal） -->
+        <PlayerNowPlaying
+          variant="compact"
+          :cover-url="albumCoverUrl"
+          :title="trackTitle"
+          :meta="trackMeta"
+        />
 
         <button class="control-btn play-btn" @click="togglePlay">
           <HugeiconsIcon :icon="isPlaying ? PauseIcon : PlayIcon" :size="26" />
@@ -48,13 +34,13 @@
 
 <script setup>
 /**
- * PlayerControlBar - 播放器控制栏
+ * PlayerControlBar - 播放器控制栏（移动端悬浮控制条）
  *
  * 提供播放控制、歌曲信息展示、封面模糊背景等功能。
  * 从 PlayerStore 读取当前播放状态和歌曲元数据。
  *
- * 液态玻璃：使用 LiquidGlass 组件为悬浮控制条提供
- * 边缘折射 + 磨砂模糊效果，与 AppHeader / AppBottomNav 统一风格。
+ * 封面 + 元信息使用 PlayerNowPlaying 共享组件（真共享 DOM Teleport），
+ * 与桌面端 AppBottomBar 保持一致，避免重复。
  */
 import { computed, onMounted, useTemplateRef } from 'vue'
 import { HugeiconsIcon } from '@hugeicons/vue'
@@ -62,22 +48,16 @@ import {
   PlayIcon,
   PauseIcon,
   FastForwardIcon,
-  MusicNote01Icon,
 } from '@hugeicons/core-free-icons'
 import { PlayerStore } from '@/stores/player/index.js'
 import { usePerf } from '@/utils/performanceMonitor.js'
 import { useAnime } from '@/composables/useAnime.js'
 import LiquidGlass from '@/components/ui/LiquidGlass.vue'
-import { formatDuration as formatTime } from '@/utils/format.js'
+import PlayerNowPlaying from './PlayerNowPlaying.vue'
 const { log } = usePerf('PlayerControlBar')
 
 const rootRef = useTemplateRef('root')
-const coverThumbRef = useTemplateRef('coverThumb')
 const { run } = useAnime(() => rootRef.value)
-
-// 真共享 DOM：动态 Teleport 目标（PlayerView 打开时设为 portal 容器）
-const coverPortalTarget = computed(() => PlayerStore.coverPortalTarget.value)
-const metaPortalTarget = computed(() => PlayerStore.metaPortalTarget.value)
 
 // 入场动画：控制栏向上淡入
 onMounted(() => {
@@ -87,27 +67,7 @@ onMounted(() => {
 })
 
 const props = defineProps({
-  currentTime: {
-    type: Number,
-    default: 0
-  },
-  duration: {
-    type: Number,
-    default: 0
-  },
   isPlaying: {
-    type: Boolean,
-    default: false
-  },
-  volume: {
-    type: Number,
-    default: 0.8
-  },
-  playMode: {
-    type: String,
-    default: 'sequence'
-  },
-  muted: {
     type: Boolean,
     default: false
   },
@@ -117,16 +77,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits([
-  'play',
-  'pause',
-  'seek',
-  'volume-change',
-  'toggle-play-mode',
-  'previous',
-  'next',
-  'toggle-mute'
-])
+const emit = defineEmits(['play', 'pause', 'next'])
 
 const trackTitle = computed(() => PlayerStore.state.currentTrack?.title ?? '')
 const trackArtist = computed(() => PlayerStore.state.currentTrack?.artist ?? '')
@@ -136,14 +87,6 @@ const trackMeta = computed(() => {
   const parts = [trackArtist.value, trackAlbum.value].filter(Boolean)
   return parts.join(' · ')
 })
-
-
-// 点击封面打开 PlayerView 模态（传递封面 DOM 元素用于 FLIP 共享元素动画）
-
-// 点击封面打开 PlayerView 模态（传递封面 DOM 元素用于 FLIP 共享元素动画）
-const openPlayerView = () => {
-  PlayerStore.openPlayerView(coverThumbRef.value)
-}
 
 // 切换播放/暂停
 const togglePlay = () => {
@@ -155,17 +98,6 @@ const togglePlay = () => {
     emit('play')
   }
 }
-
-// 跳转
-const onSeek = (e) => {
-  emit('seek', parseFloat(e.target.value))
-}
-
-// 音量变化
-const onVolumeChange = (e) => {
-  emit('volume-change', parseFloat(e.target.value))
-}
-
 </script>
 
 <style scoped>
@@ -229,16 +161,9 @@ const onVolumeChange = (e) => {
   z-index: 1;
 }
 
-/* 真共享 DOM：teleport 后占位容器保持原尺寸，避免布局塌陷 */
-.album-cover-slot {
-  width: 2.5rem;
-  height: 2.5rem;
-  flex-shrink: 0;
-}
-.track-info-slot {
-  min-width: 0;
-  max-width: 12rem;
-  flex: 1;
+/* 有封面背景时切换为白色文字 */
+.bar-bg ~ .controls-section .control-btn {
+  color: rgba(255, 255, 255, 0.92);
 }
 
 .control-btn {
@@ -253,11 +178,6 @@ const onVolumeChange = (e) => {
   color: var(--text-primary);
 }
 
-/* 有封面背景时切换为白色文字 */
-.bar-bg ~ .controls-section .control-btn {
-  color: rgba(255, 255, 255, 0.92);
-}
-
 .control-btn:hover {
   opacity: 1;
 }
@@ -266,99 +186,14 @@ const onVolumeChange = (e) => {
   font-size: 1.75rem;
 }
 
-/* 专辑封面缩略图 */
-.album-cover-thumb {
-  width: 2.5rem;
-  border: 1px solid var(--border-light);
-  height: 2.5rem;
-  border-radius: 0.5rem;
-  overflow: hidden;
-  flex-shrink: 0;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
-  cursor: pointer;
-  transition: transform 0.2s ease;
-}
-
-.album-cover-thumb:hover {
-  transform: scale(1.08);
-}
-
-.album-cover-thumb:active {
-  transform: scale(0.95);
-}
-
-.album-cover-thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.album-cover-thumb.placeholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--bg-glass);
-  border: 1px solid var(--border-light);
-  box-shadow: none;
-}
-
-.album-cover-thumb.placeholder i {
-  font-size: 1.25rem;
-  opacity: 0.5;
-}
-
-/* 歌曲信息 */
-.track-info {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  max-width: 12rem;
-  line-height: 1.25;
-}
-
-.track-title {
-  font-size: 0.8125rem;
-  font-weight: 600;
-  color: var(--text-primary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.bar-bg ~ .controls-section .track-title {
-  color: rgba(255, 255, 255, 0.95);
-}
-
-.track-meta {
-  font-size: 0.6875rem;
-  color: var(--text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-top: 1px;
-}
-
-.bar-bg ~ .controls-section .track-meta {
-  color: rgba(255, 255, 255, 0.6);
-}
-
 @media (max-width: 767px) {
   .player-control-bar {
     right: 1rem;
     left: 1rem;
-    /* bottom: calc(var(--bottom-nav-height) + 0.5rem); */
-    /* border-radius: 1rem; */
-    /* padding: 0.4rem 0.75rem; */
   }
 
   .controls-section {
     gap: 0.5rem;
-  }
-
-  .track-info {
-    flex: 1;
-    max-width: none;
   }
 }
 

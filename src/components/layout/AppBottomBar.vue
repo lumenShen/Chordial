@@ -24,12 +24,12 @@ import {
   RepeatOffIcon,
   VolumeUpIcon,
   VolumeMute01Icon,
-  MusicNote01Icon,
   HeartIcon,
   Queue01Icon,
   CaptionsIcon,
 } from '@hugeicons/core-free-icons';
 import PlayerStore from '@/stores/player/index.js';
+import PlayerNowPlaying from '@/components/player/PlayerNowPlaying.vue';
 import { useCoverImage } from '@/composables/useCoverImage.js';
 import { useFavorites } from '@/composables/useFavorites.js';
 import { formatDuration } from '@/utils/format.js';
@@ -56,10 +56,6 @@ const progressPct = computed(() => {
   return Math.min(100, (currentTime.value / duration.value) * 100);
 });
 
-const coverPortalTarget = computed(() => PlayerStore.coverPortalTarget.value);
-const metaPortalTarget = computed(() => PlayerStore.metaPortalTarget.value);
-
-const openPlayerView = () => PlayerStore.openPlayerView();
 const togglePlay = () => PlayerStore.togglePlay();
 
 // ── 播放模式（四种状态图标区分）────────────────────────
@@ -196,31 +192,12 @@ const volumePct = computed(() => Math.round((muted.value ? 0 : volume.value) * 1
     <!-- 主体三栏 -->
     <div class="bar-inner">
       <!-- 左区：封面 + 元信息（共享 DOM 槽位，勿动 Teleport 结构） -->
-      <div class="bar-left">
-        <div class="cover-slot">
-          <Teleport :to="coverPortalTarget" :disabled="!coverPortalTarget">
-            <button
-              class="cover-thumb"
-              :class="{ placeholder: !albumCoverUrl }"
-              data-shared="cover"
-              @click="openPlayerView"
-              :title="trackTitle"
-            >
-              <img v-if="albumCoverUrl" :src="albumCoverUrl" alt="专辑封面" />
-              <HugeiconsIcon v-else :icon="MusicNote01Icon" :size="18" class="cover-ph-icon" />
-            </button>
-          </Teleport>
-        </div>
-
-        <div class="meta-slot">
-          <Teleport :to="metaPortalTarget" :disabled="!metaPortalTarget">
-            <div class="track-meta" data-shared="meta">
-              <span class="track-title" :title="trackTitle">{{ trackTitle }}</span>
-              <span class="track-artist" :title="trackMeta">{{ trackMeta }}</span>
-            </div>
-          </Teleport>
-        </div>
-      </div>
+      <PlayerNowPlaying
+        class="bar-left"
+        :cover-url="albumCoverUrl"
+        :title="trackTitle"
+        :meta="trackMeta"
+      />
 
       <!-- 中区：播放控制（绝对居中） -->
       <div class="controls">
@@ -430,75 +407,6 @@ const volumePct = computed(() => Math.round((muted.value ? 0 : volume.value) * 1
   gap: 2px;
 }
 
-/* 封面 */
-.cover-slot {
-  width: 44px;
-  height: 44px;
-  flex-shrink: 0;
-}
-
-.cover-thumb {
-  width: 44px;
-  height: 44px;
-  border: none;
-  border-radius: 6px;
-  overflow: hidden;
-  padding: 0;
-  cursor: pointer;
-  background: var(--bg-tertiary);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: var(--shadow-sm);
-  transition: transform var(--transition-fast);
-}
-
-.cover-thumb:hover {
-  transform: scale(1.04);
-}
-
-.cover-thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.cover-ph-icon {
-  color: var(--text-tertiary);
-}
-
-/* 元信息 */
-.meta-slot {
-  min-width: 0;
-  flex: 1;
-  max-width: 340px;
-}
-
-.track-meta {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  line-height: 1.35;
-}
-
-.track-title {
-  font-size: var(--font-size-md);
-  font-weight: 600;
-  color: var(--text-primary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.track-artist {
-  font-size: var(--font-size-sm);
-  color: var(--text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* 控制按钮 */
 .ctrl-btn {
   width: 34px;
@@ -617,9 +525,6 @@ const volumePct = computed(() => Math.round((muted.value ? 0 : volume.value) * 1
 
 /* ── 窄屏适配：逐级隐藏次要按钮，避免挤压 ───────── */
 @media (max-width: 1100px) {
-  .meta-slot {
-    max-width: 240px;
-  }
   .lyrics-btn {
     display: none;
   }
