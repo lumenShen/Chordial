@@ -31,10 +31,14 @@
 pub mod api;
 pub mod cache;
 pub mod cookie;
+pub mod detail;
+pub mod download;
 pub mod entity_id;
 pub mod login;
+pub mod lyric;
 pub mod mapper;
 pub mod playlist;
+pub mod search;
 pub mod source;
 pub mod time;
 pub mod types;
