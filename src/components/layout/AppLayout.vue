@@ -12,6 +12,7 @@ import BatchDownloadManager from '@/components/common/BatchDownloadManager.vue';
 import { PlayerControlBar } from '@/components/player';
 import PlayerView from '@/views/PlayerView.vue';
 import { PlayerStore } from '@/stores/player/index.js'
+import LayoutStore from '@/stores/layout.js';
 import { useCoverImage } from '@/composables/useCoverImage';
 import { useBreakpoint } from '@/composables/useBreakpoint';
 
@@ -28,6 +29,17 @@ provide('appScrollContainer', contentWrapperRef);
 // 设备检测：useBreakpoint 统一监听视口，同步到 PlayerStore.ui.currentDevice
 const { width: viewportWidth, isDesktop, isMobile } = useBreakpoint();
 watch(viewportWidth, (w) => PlayerStore.detectDevice(w), { immediate: true });
+
+// 侧栏展开占用宽度（px）。侧栏改为绝对定位 overlay 后，main 内容始终全宽，
+// 仅通过 content-wrapper 的 padding-left 让出侧栏宽度，避免折叠时 flex 布局重排。
+// 数值与 tokens.css 中的 --side-nav-width / --playlist-sidebar-width 保持一致。
+const SIDE_NAV_WIDTH = 64;
+const PLAYLIST_SIDEBAR_WIDTH = 264;
+const contentOffset = computed(() => {
+  const nav = LayoutStore.sideNavCollapsed.value ? 0 : SIDE_NAV_WIDTH;
+  const playlist = LayoutStore.playlistSidebarCollapsed.value ? 0 : PLAYLIST_SIDEBAR_WIDTH;
+  return nav + playlist;
+});
 
 // 路由切换动画：前页缩小淡出 + 后页放大淡入，同步进行，总时长 300ms
 function onRouteEnter(el, done) {
@@ -74,7 +86,7 @@ function onRouteLeave(el, done) {
       <SideNav v-if="!isMobile" />
       <PlaylistSidebar v-if="!isMobile" />
       <main class="main-content">
-        <div class="content-wrapper" ref="contentWrapper">
+        <div class="content-wrapper" ref="contentWrapper" :style="{ '--sidebar-offset': (isMobile ? '0px' : contentOffset + 'px') }">
           <router-view v-slot="{ Component }">
             <transition :css="false" @enter="onRouteEnter" @leave="onRouteLeave">
               <component :is="Component" />
@@ -124,6 +136,7 @@ function onRouteLeave(el, done) {
   display: flex;
   overflow: hidden;
   min-height: 0;
+  position: relative;
 }
 
 .main-content {
@@ -136,6 +149,9 @@ function onRouteLeave(el, done) {
 
 .content-wrapper {
   padding: 24px 28px calc(var(--bottom-bar-height) + 28px);
+  /* 侧栏为 overlay，用 padding-left 让出宽度（含基础 28px 内边距），仅触发当前页横向重排，不触发 flex/虚拟列表重排 */
+  padding-left: calc(28px + var(--sidebar-offset, 0px));
+  transition: padding-left var(--transition-normal);
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
