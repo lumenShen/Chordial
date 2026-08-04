@@ -1,18 +1,29 @@
 <template>
   <div class="chord-music-info">
-    <div v-if="showMusicName" class="mi-title" :title="title">{{ title }}</div>
-    <div v-if="showMusicArtists" class="mi-artists" :title="artistsText">
-      <!-- 每位歌手独立链接，点击跳转歌手页（对齐 AMLL onArtistClicked） -->
-      <template v-for="(artist, i) in artistList" :key="i">
-        <a
-          class="mi-artist"
-          :href="artistHref(artist)"
-          @click.prevent="onArtistClick(artist)"
-        >{{ artist.name }}</a>
-        <span v-if="i < artistList.length - 1" class="mi-artist-sep">{{ artistSeparator(i) }}</span>
-      </template>
+    <div v-if="showMusicName" class="mi-row" v-marquee>
+      <div class="mi-row-inner" data-marquee-inner>
+        <div class="mi-title" :title="title">{{ title }}</div>
+      </div>
     </div>
-    <div v-if="showMusicAlbum && album" class="mi-album">{{ album }}</div>
+    <div v-if="showMusicArtists" class="mi-row" v-marquee>
+      <div class="mi-row-inner" data-marquee-inner>
+        <div class="mi-artists" :title="artistsText">
+          <!-- 每位歌手独立链接，点击跳转歌手页（对齐 AMLL MusicInfo 的艺人 <a> 结构） -->
+          <template v-for="(artist, i) in artistList" :key="i">
+            <a
+              class="mi-artist"
+              :href="artistHref(artist)"
+              @click.prevent="onArtistClick(artist)"
+            >{{ artist.name }}</a>
+          </template>
+        </div>
+      </div>
+    </div>
+    <div v-if="showMusicAlbum && album" class="mi-row" v-marquee>
+      <div class="mi-row-inner" data-marquee-inner>
+        <div class="mi-album" :title="album">{{ album }}</div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -20,7 +31,9 @@
 /**
  * ChordMusicInfo — 歌曲信息（标题/艺人/专辑）。
  * 显示项由设置切换（showMusicName / showMusicArtists / showMusicAlbum）。
- * 艺人以独立链接渲染，点击跳转歌手详情页（对齐 AMLL MusicInfo 的 onArtistClicked）。
+ * 艺人以独立 <a> 渲染，点击跳转歌手详情页（自研超集，AMLL 仅渲染样式化 <a>）。
+ * 标题/艺人/专辑使用 hover 跑马灯（对齐 AMLL TextMarquee：文本溢出时滚动显示）。
+ * 艺人分隔符使用 CSS 变量 --applemusic-like-lyrics-music-artists-separator（与 AMLL 一致）。
  */
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
@@ -44,13 +57,48 @@ function artistHref(artist) {
   return artist?.id ? `/artists/${artist.id}` : '#'
 }
 
-function artistSeparator(i) {
-  // 对齐 AMLL：倒数第二个用 " & "，其余用 ", "
-  return i === props.artistList.length - 2 ? ' & ' : ', '
-}
-
 function onArtistClick(artist) {
   if (artist?.id) router.push(`/artists/${artist.id}`)
+}
+
+/**
+ * 对齐 AMLL TextMarquee 的 hover 跑马灯：文本溢出时左右往返滚动。
+ * 结构要求：指令元素为外层（overflow hidden + mask），内含 [data-marquee-inner]。
+ */
+const vMarquee = {
+  mounted(el) {
+    const inner = el.querySelector('[data-marquee-inner]')
+    if (!inner) return
+    let anim = null
+    const enter = () => {
+      anim?.cancel()
+      const outerW = el.clientWidth
+      const innerW = inner.scrollWidth
+      if (innerW <= outerW * 0.95) return
+      el.classList.add('is-marquee-animating')
+      const distance = innerW - outerW * 0.95
+      anim = inner.animate(
+        [
+          { transform: 'translateX(0px)' },
+          { transform: `translateX(${-distance}px)` },
+        ],
+        { iterations: 2, direction: 'alternate', easing: 'linear', duration: Math.max(0, (distance * 2 / 64) * 1000) }
+      )
+      anim.finished.then(() => el.classList.remove('is-marquee-animating'))
+    }
+    const leave = () => {
+      anim?.cancel()
+      el.classList.remove('is-marquee-animating')
+    }
+    el._marqueeEnter = enter
+    el._marqueeLeave = leave
+    el.addEventListener('mouseenter', enter)
+    el.addEventListener('mouseleave', leave)
+  },
+  unmounted(el) {
+    el.removeEventListener('mouseenter', el._marqueeEnter)
+    el.removeEventListener('mouseleave', el._marqueeLeave)
+  },
 }
 </script>
 
@@ -63,46 +111,75 @@ function onArtistClick(artist) {
   text-align: left;
 }
 
+/* 对齐 AMLL TextMarquee：外层裁剪 + 右侧渐隐 mask */
+.mi-row {
+  min-width: 0;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to right, #000 95%, #0000);
+}
+
+.mi-row.is-marquee-animating {
+  -webkit-mask-image: linear-gradient(to left, #0000, #000 5% 95%, #0000);
+}
+
+.mi-row-inner {
+  width: fit-content;
+}
+
 .mi-title {
   font-size: 15px;
-  font-weight: 600;
+  font-weight: 500;
+  letter-spacing: 0.4px;
   color: #fff;
+  opacity: 0.9;
+  cursor: text;
+  user-select: text;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .mi-artists {
   font-size: 12px;
-  color: rgba(255, 255, 255, 0.75);
+  font-weight: 400;
+  letter-spacing: 0.4px;
+  color: rgba(255, 255, 255, 0.45);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   margin-top: 1px;
 }
 
 .mi-artist {
-  color: rgba(255, 255, 255, 0.75);
+  color: inherit;
   text-decoration: none;
   cursor: pointer;
-  transition: opacity 0.2s;
+  transition: color 0.2s;
 }
 
 .mi-artist:hover {
-  opacity: 0.75;
-  text-decoration: underline;
+  color: rgba(255, 255, 255, 0.75);
 }
 
-.mi-artist-sep {
-  opacity: 0.6;
+.mi-artist:active {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+/* 艺人分隔符：对齐 AMLL 的 :after 方案，倒数第二个用 " & "，其余用 CSS 变量 */
+.mi-artist:after {
+  content: var(--applemusic-like-lyrics-music-artists-separator, ', ');
+}
+
+.mi-artist:nth-last-child(2):after {
+  content: ' & ';
+}
+
+.mi-artist:last-child:after {
+  content: '';
 }
 
 .mi-album {
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.55);
+  font-weight: 400;
+  letter-spacing: 0.4px;
+  color: rgba(255, 255, 255, 0.45);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   margin-top: 1px;
 }
 </style>

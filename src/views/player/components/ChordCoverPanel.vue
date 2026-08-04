@@ -3,7 +3,11 @@
     <div class="cover-bg" v-if="coverUrl">
       <img :src="coverUrl" alt="" />
     </div>
-    <div class="cover-main" :class="{ paused: musicPaused }">
+    <div
+      class="cover-main"
+      :class="{ paused: musicPaused }"
+      :style="{ '--scale-level': pauseShrinkAspect }"
+    >
       <img v-if="coverUrl" :src="coverUrl" alt="专辑封面" class="cover-img" />
       <div v-else class="cover-placeholder">
         <HugeiconsIcon :icon="MusicNote01Icon" :size="56" />
@@ -16,7 +20,8 @@
 /**
  * ChordCoverPanel — 竖屏布局的封面面板。
  * 封面 + 模糊背景，用于隐藏歌词时的沉浸式封面展示。
- * 暂停时封面轻微缩小（对齐 AMLL Cover 的 pauseShrink 动画）。
+ * 暂停时封面缩小（对齐 AMLL Cover 的 pauseShrink 动画）。
+ * 缩小比例由 pauseShrinkAspect 控制（默认 0.75，与 AMLL 一致）。
  */
 import { HugeiconsIcon } from '@hugeicons/vue'
 import { MusicNote01Icon } from '@hugeicons/core-free-icons'
@@ -24,6 +29,7 @@ import { MusicNote01Icon } from '@hugeicons/core-free-icons'
 defineProps({
   coverUrl: { type: String, default: '' },
   musicPaused: { type: Boolean, default: false },
+  pauseShrinkAspect: { type: Number, default: 0.75 },
 })
 </script>
 
@@ -59,12 +65,15 @@ defineProps({
   border-radius: 16px;
   overflow: hidden;
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
-  transition: transform 0.6s cubic-bezier(0.3, 0.2, 0.2, 1.4);
+  /* 播放中：缩小比例 1，缓动 match AMLL 播放态 */
+  transition: transform 0.5s cubic-bezier(0.3, 0.2, 0.2, 1.4);
 }
 
-/* 暂停时封面轻微缩小（对齐 AMLL pauseShrink） */
+/* 暂停时封面缩小（对齐 AMLL pauseShrink：--scale-level 默认 0.75） */
 .cover-main.paused {
-  transform: scale(0.92);
+  transform: scale(var(--scale-level, 0.75));
+  /* 暂停态缓动 match AMLL：0.6s cubic-bezier(.4,.2,.1,1) */
+  transition: transform 0.6s cubic-bezier(0.4, 0.2, 0.1, 1);
 }
 
 .cover-img {

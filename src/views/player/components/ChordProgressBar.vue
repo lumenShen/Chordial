@@ -16,7 +16,8 @@
 <script setup>
 /**
  * ChordProgressBar — 可拖拽进度条。
- * 指针按下/拖动即 seek，显示填充与缓冲。
+ * 指针按下/拖动时本地实时预览，松手才 commit seek（对齐 AMLL BouncingSlider 的
+ * changeOnDrag=false 行为），显示填充与缓冲。
  *
  * # 性能：进度经 inject 高频驱动
  * 播放进度 by 帧更新，为避免父组件链每帧重渲染，进度 ref 由
@@ -100,6 +101,9 @@ onBeforeUnmount(() => {
   border-radius: 2px;
   background: rgba(255, 255, 255, 0.18);
   overflow: visible;
+  /* 对齐 AMLL BouncingSlider：hover/拖动时加粗（expand），结束收缩（collapse）。
+     仅作用于轨道高度，不触碰 60fps 热更新的 fill/buffer 宽度，性能安全。 */
+  transition: height 0.18s ease;
 }
 
 .bar-buffer {
@@ -130,15 +134,19 @@ onBeforeUnmount(() => {
   transform: translate(-50%, -50%);
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
   opacity: 0;
-  transition: opacity 0.2s;
+  transition: opacity 0.2s, width 0.18s ease, height 0.18s ease;
+}
+
+/* hover/拖动时轨道加粗、缩略图放大（对齐 AMLL expand 交互） */
+.chord-progress-bar:hover .bar-track,
+.chord-progress-bar.dragging .bar-track {
+  height: 6px;
 }
 
 .chord-progress-bar:hover .bar-thumb,
 .chord-progress-bar.dragging .bar-thumb {
   opacity: 1;
-}
-
-.chord-progress-bar.dragging .bar-track {
-  height: 6px;
+  width: 14px;
+  height: 14px;
 }
 </style>

@@ -82,6 +82,7 @@
         @toggle-mute="toggleMute"
         @volume="setVolume"
         @open-queue="openPlayQueue"
+        @toggle-remaining="onToggleRemaining"
       />
       </template>
     </div>
@@ -158,6 +159,11 @@ const qualityLabel = computed(() => '')
 // 沉浸模式：点击空白处切换
 function toggleImmersive() {
   isImmersive.value = !isImmersive.value
+}
+
+// 剩余时间标签点击：在 剩余时间 / 总时长 间切换（对齐 AMLL）
+function onToggleRemaining() {
+  settings.showRemainingTime = !settings.showRemainingTime
 }
 </script>
 

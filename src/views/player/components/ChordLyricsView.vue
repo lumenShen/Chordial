@@ -12,6 +12,7 @@
         :is-active="i === activeLineIndex"
         :is-before="i < activeLineIndex"
         :is-after="i > activeLineIndex"
+        :distance-from-active="i - activeLineIndex"
         :show-translation="showTranslation"
         :font-size-px="fontSizePx"
         :font-weight="fontWeight"
@@ -83,8 +84,9 @@ function scrollToActive(immediate = false) {
   if (scrollAnim) scrollAnim.cancel?.()
   scrollAnim = animate(container, {
     scrollTop: clamped,
-    duration: immediate ? 0 : 320,
-    ease: 'spring({ bounce: 0.2, duration: 320 })',
+    duration: immediate || !props.enableSpring ? 0 : 320,
+    // 对齐 AMLL posYSpringParams：mass .9 / stiffness 90 / damping 15
+    ease: 'spring({ mass: 0.9, stiffness: 90, damping: 15, duration: 320 })',
   })
 }
 

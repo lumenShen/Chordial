@@ -23,9 +23,17 @@
     </div>
 
     <div class="ct-right">
-      <div v-if="showQuality" class="ct-quality" title="当前音质">
-        {{ qualityLabel }}
-      </div>
+      <Transition name="quality">
+        <div
+          v-if="showQuality"
+          class="ct-quality"
+          :class="{ clickable: hasQualityClick }"
+          :title="qualityLabel"
+          @click="onQualityClick"
+        >
+          {{ qualityLabel }}
+        </div>
+      </Transition>
       <button class="ct-btn" title="打开菜单" @click="onOpenMenu">
         <HugeiconsIcon :icon="MoreHorizontalIcon" :size="20" />
       </button>
@@ -37,6 +45,7 @@
 /**
  * ChordControlThumb — 顶部控制横条（横屏布局）。
  * 关闭按钮 + 歌曲信息 + 音质标签 + 菜单按钮。
+ * 音质标签对齐 AMLL AudioQualityTag：进入/离开动画 + hover/active 缩放 + 可点击。
  */
 import { computed } from 'vue'
 import { HugeiconsIcon } from '@hugeicons/vue'
@@ -55,12 +64,14 @@ const props = defineProps({
   isImmersive: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['close', 'open-menu'])
+const emit = defineEmits(['close', 'open-menu', 'quality-click'])
 
 const showQuality = computed(() => !!props.qualityLabel)
+const hasQualityClick = computed(() => !!props.qualityLabel)
 
 function onClose() { emit('close') }
 function onOpenMenu() { emit('open-menu') }
+function onQualityClick() { emit('quality-click') }
 </script>
 
 <style scoped>
@@ -116,12 +127,44 @@ function onOpenMenu() { emit('open-menu') }
   -webkit-app-region: no-drag;
 }
 
+/* 音质标签：对齐 AMLL AudioQualityTag 的胶囊样式（白字、细描边、hover/active 缩放） */
 .ct-quality {
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.7);
+  font-weight: 500;
+  letter-spacing: 0.018em;
+  color: #fff;
   background: rgba(255, 255, 255, 0.12);
-  padding: 3px 8px;
-  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  padding: 2px 10px;
+  border-radius: 999px;
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  user-select: none;
+  transition: transform 0.2s ease, background 0.2s ease;
+}
+
+.ct-quality.clickable {
+  cursor: pointer;
+}
+
+.ct-quality.clickable:hover {
+  transform: scale(0.95);
+}
+
+.ct-quality.clickable:active {
+  transform: scale(0.9);
+}
+
+/* 进入/离开动画：对齐 AMLL AudioQualityTag 的 show/hide（淡入 + 缩放） */
+.quality-enter-active,
+.quality-leave-active {
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+
+.quality-enter-from,
+.quality-leave-to {
+  opacity: 0;
+  transform: scale(0.8);
 }
 </style>

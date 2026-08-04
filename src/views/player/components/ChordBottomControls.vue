@@ -8,7 +8,11 @@
         :buffer-ms="bufferMs"
         @seek="onSeek"
       />
-      <span class="bc-time bc-remaining">
+      <span
+        class="bc-time bc-remaining"
+        title="点击切换 剩余时间 / 总时长"
+        @click="onToggleRemaining"
+      >
         {{ showRemainingTime ? formattedRemaining : formattedDuration }}
       </span>
     </div>
@@ -114,6 +118,7 @@ const props = defineProps({
 const emit = defineEmits([
   'seek', 'toggle-play', 'prev', 'next',
   'toggle-shuffle', 'cycle-repeat', 'toggle-mute', 'volume', 'open-queue',
+  'toggle-remaining',
 ])
 
 const repeatIcon = computed(() => {
@@ -137,6 +142,7 @@ function onCycleRepeat() { emit('cycle-repeat') }
 function onToggleMute() { emit('toggle-mute') }
 function onVolumeInput(e) { emit('volume', parseFloat(e.target.value)) }
 function onOpenQueue() { emit('open-queue') }
+function onToggleRemaining() { emit('toggle-remaining') }
 </script>
 
 <style scoped>
@@ -171,6 +177,12 @@ function onOpenQueue() { emit('open-queue') }
 
 .bc-remaining {
   text-align: right;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+.bc-remaining:hover {
+  color: #fff;
 }
 
 .bc-buttons {
