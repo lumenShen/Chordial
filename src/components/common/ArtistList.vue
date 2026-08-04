@@ -1,8 +1,9 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted, watch, nextTick, useTemplateRef, inject } from 'vue';
+import { computed, ref, onMounted, watch, nextTick, useTemplateRef, inject } from 'vue';
 import { useRouter } from 'vue-router';
 import { useCoverImages } from '@/composables/useCoverImage';
 import { useVirtualList } from '@/composables/useVirtualList';
+import { useResponsiveGrid } from '@/composables/useResponsiveGrid';
 import { useAnime } from '@/composables/useAnime.js';
 import CoverImage from './CoverImage.vue';
 
@@ -33,26 +34,13 @@ const { run } = useAnime(() => rootRef.value);
 const artistsRef = computed(() => props.artists);
 const { coverUrls } = useCoverImages(artistsRef, 'small');
 
-// 根据容器宽度动态计算列数
-const containerWidth = ref(window.innerWidth);
-const columns = computed(() => {
-  const w = containerWidth.value;
-  if (w <= 480) return 2;   // 小屏幕 2 列
-  if (w <= 767) return 3;   // 平板竖屏 3 列
-  if (w <= 900) return 3;   // 平板横屏 3 列
-  if (w <= 1200) return 4;  // 中等屏幕 4 列
-  return 5;                 // 大屏幕 5 列
-});
-
-// 动态计算行高：卡片内容宽度 = 封面正方形高度 + 间距 + 文字区域 + 行间距
-const itemHeight = computed(() => {
-  const w = containerWidth.value;
-  const cols = columns.value;
-  // 卡片像素宽度 → 减去左右 padding (8px*2) → 封面正方形边长
-  // + margin-bottom (14px) + 文字区域 (~42px) + 行间距 (20px)
-  const cardWidth = w / cols;
-  const coverSize = cardWidth - 16; // padding: 0 8px
-  return coverSize + 14 + 42 + 20;
+// 容器感知的响应式网格：以实际容器宽度（ResizeObserver）计算列数与行高，
+// 而非 window.innerWidth —— 桌面端带动侧栏时列数与真实渲染区一致。
+// 列数公式与 CSS `repeat(auto-fill, minmax(160px, 1fr))` 保持一致。
+const { columns, itemHeight, layoutKey } = useResponsiveGrid(rootRef, {
+  cardMinWidth: 160,
+  gap: 24,
+  extraHeight: 76, // 卡片内：封面下 margin(14) + 文字区(~42) + 行距(20)
 });
 
 // 虚拟列表（网格模式）
@@ -60,11 +48,9 @@ const itemHeight = computed(() => {
 // 避免歌手圆形封面下半圆被容器底部截断，同时消除双层滚动条。
 //
 // ⚠️ useVirtualList 内部 columns/itemHeight 为闭包常量（非响应式），
-// resize 后不会重算。用 layoutKey 强制重建虚拟列表容器以更新布局参数。
+// resize 后不会重算。用 layoutKey 作为 :key 强制重建虚拟列表容器以更新布局参数。
 // 重建代价：CoverImage 重新挂载，但 ResourceManager 有缓存，不会重复网络请求。
 // 滚动位置会丢失，但 resize 是低频操作（窗口拖动/设备旋转），可接受。
-const layoutKey = computed(() => `${columns.value}_${itemHeight.value}`);
-
 const {
   visibleItems,
   totalHeight,
@@ -79,15 +65,6 @@ const {
   mode: 'page',
   scrollContainer: appScrollContainer,
 });
-
-// 监听容器宽度变化
-let resizeTimer = null;
-const handleResize = () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    containerWidth.value = window.innerWidth;
-  }, 100);
-};
 
 // --- 动画（anime.js v4）---
 // 列表项错峰入场：listItemEnter + stagger。
@@ -113,17 +90,11 @@ function playEnter() {
 }
 
 onMounted(() => {
-  window.addEventListener('resize', handleResize);
   playEnter();
 });
 
 // 数据异步到达后触发入场动画
 watch(() => props.artists, () => nextTick(playEnter), { flush: 'post' });
-
-onUnmounted(() => {
-  window.removeEventListener('resize', handleResize);
-  if (resizeTimer) clearTimeout(resizeTimer);
-});
 
 const handleArtistClick = (artist) => {
   router.push(`/artists/${artist.id}`);
@@ -160,8 +131,10 @@ const getAlbumCount = (artist) => {
 <template>
   <div ref="root" class="artist-list-wrapper">
     <!-- 虚拟列表容器（page 模式：使用外层 .content-wrapper 滚动，自身无滚动条） -->
+    <!-- layoutKey: 列数变化时强制重建，让 useVirtualList 拿到新的 columns/itemHeight 闭包常量 -->
     <div
       v-if="virtualScroll && artists.length > 30"
+      :key="layoutKey"
       ref="containerRef"
       class="artist-list virtual-scroll mode-page"
     >
