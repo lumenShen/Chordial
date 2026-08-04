@@ -14,6 +14,7 @@
       <ChordMusicInfo
         :title="title"
         :artists="artists"
+        :artist-list="artistList"
         :album="album"
         :show-music-name="showMusicName"
         :show-music-artists="showMusicArtists"
@@ -45,6 +46,7 @@ import ChordMusicInfo from './ChordMusicInfo.vue'
 const props = defineProps({
   title: { type: String, default: '未知歌曲' },
   artists: { type: String, default: '未知歌手' },
+  artistList: { type: Array, default: () => [] },
   album: { type: String, default: '' },
   qualityLabel: { type: String, default: '' },
   showMusicName: { type: Boolean, default: true },

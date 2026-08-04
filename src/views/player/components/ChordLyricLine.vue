@@ -11,6 +11,9 @@
     :style="lineStyle"
     @click="onClick"
   >
+    <!-- 活动行背景光晕（对齐 AMLL bgWrapper 观感） -->
+    <div class="lyric-line-glow" aria-hidden="true" />
+
     <!-- 主歌词：整行逐字同步填充（对齐 AMLL 逐字高亮） -->
     <div class="lyric-main">
       <template v-for="(word, wi) in line.words" :key="wi">

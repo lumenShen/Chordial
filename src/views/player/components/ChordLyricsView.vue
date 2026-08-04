@@ -132,6 +132,8 @@ onMounted(() => {
   -ms-overflow-style: none;
   padding: 0 24px;
   box-sizing: border-box;
+  /* 对齐 AMLL：限制绘制边界，避免滚动时触发全局重排 */
+  contain: paint;
   -webkit-mask-image: linear-gradient(
     to bottom,
     transparent 0%,

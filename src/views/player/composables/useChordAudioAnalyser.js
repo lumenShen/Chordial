@@ -11,7 +11,8 @@
  * - lowFreqVolume 取 80-120Hz 频段均值，归一化到 0-1（驱动鼓点跳动）。
  * - fftData 使用双缓冲 ping-pong，避免每帧分配数组造成 GC 压力。
  */
-import { ref, provide, onScopeDispose } from 'vue'
+import { ref, provide, watch, onScopeDispose } from 'vue'
+import { PlayerStore } from '@/stores/player/index.js'
 import { ensureAudioReady, createAnalyserTap } from '@/amll/audioAnalyserHub.js'
 import { CHORD_LOW_FREQ, CHORD_FFT_DATA } from './injectionKeys.js'
 
@@ -76,11 +77,16 @@ export function useChordAudioAnalyser() {
   const fftData = ref([])
   let rafId = 0
   let running = false
+  let retryTimer = null
 
   function start() {
     if (running) return
-    // 确保共享 source 就绪
-    if (!ensureAudioReady()) return
+    // 确保共享 source 就绪；音频元素未就绪则稍后重试，避免分析器永远无法启动
+    if (!ensureAudioReady()) {
+      retryTimer = setTimeout(start, 500)
+      return
+    }
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null }
     // 防御：若上次 tap 未断开则先断开，避免 source→analyser 连接累积
     tap?.disconnect()
     // 从共享 source 分叉出本分析器节点
@@ -104,12 +110,23 @@ export function useChordAudioAnalyser() {
 
   function stop() {
     running = false
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null }
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0 }
     // 整段断开，把 destination 路由让给下一个分析器
     tap?.disconnect()
     tap = null
     analyserNode = null
   }
+
+  // 暂停时停止 rAF 采样（低配设备省电），恢复时继续
+  const stopPauseWatch = watch(
+    () => PlayerStore.state.isPlaying,
+    (playing) => {
+      if (playing) start()
+      else stop()
+    },
+    { immediate: true },
+  )
 
   // 挂载即启动
   start()
@@ -119,7 +136,10 @@ export function useChordAudioAnalyser() {
   provide(CHORD_LOW_FREQ, lowFreqVolume)
   provide(CHORD_FFT_DATA, fftData)
 
-  onScopeDispose(stop)
+  onScopeDispose(() => {
+    stopPauseWatch()
+    stop()
+  })
 
   return { lowFreqVolume, fftData }
 }

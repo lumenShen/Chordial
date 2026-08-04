@@ -115,6 +115,11 @@ export function useChordPlayer() {
 
   const title = computed(() => track.value?.title || '未知歌曲')
   const artists = computed(() => (track.value?.artistNames || []).join(' / ') || '未知歌手')
+  // 歌手列表（含 id，供点击跳转，对齐 AMLL onArtistClicked）
+  const artistList = computed(() => (track.value?.artistNames || []).map((name, i) => ({
+    name: name || '未知歌手',
+    id: track.value?.artistIds?.[i] || name || '',
+  })))
   const album = computed(() => track.value?.albumTitle || '')
   const hasLyrics = computed(() => lyricLines.value.length > 0)
 
@@ -126,11 +131,12 @@ export function useChordPlayer() {
 
   // 格式化的当前时间 / 总时长 / 剩余时间
   const formatTime = (ms) => {
-    if (!Number.isFinite(ms) || ms < 0) ms = 0
-    const total = Math.floor(ms / 1000)
+    if (!Number.isFinite(ms)) ms = 0
+    const isRemain = ms < 0
+    const total = Math.abs(Math.floor(ms / 1000))
     const m = Math.floor(total / 60)
     const s = total % 60
-    return `${m}:${s.toString().padStart(2, '0')}`
+    return `${isRemain ? '-' : ''}${m}:${String(s).padStart(2, '0')}`
   }
   const formattedCurrentTime = computed(() => formatTime(currentTimeMs.value))
   const formattedDuration = computed(() => formatTime(durationMs.value))
@@ -200,6 +206,20 @@ export function useChordPlayer() {
     rafId = requestAnimationFrame(tick)
   }
 
+  function startTick() {
+    if (!rafId) rafId = requestAnimationFrame(tick)
+  }
+  function stopTick() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0 }
+  }
+
+  // 暂停时停止 rAF（低配设备省电）；恢复时继续
+  const stopTickPauseWatch = watch(
+    () => PlayerStore.state.isPlaying,
+    (playing) => { if (playing) startTick(); else stopTick() },
+    { immediate: true },
+  )
+
   // ── 状态订阅（PlayerStore 变化 → 同步自研状态）──────────────
   const stopTrackWatch = watch(
     () => PlayerStore.state.currentTrack,
@@ -231,18 +251,16 @@ export function useChordPlayer() {
     if (line && Number.isFinite(line.startTime)) seek(line.startTime)
   }
 
-  // 启动 rAF 循环
-  rafId = requestAnimationFrame(tick)
-
   // 高频播放进度通过 provide 下发，仅进度条与活动歌词行订阅，
   // 避免经 props 下发导致整棵播放器树每帧重渲染。
   provide(CHORD_NOW_MS, currentTimeMs)
 
   // 清理
   onScopeDispose(() => {
-    if (rafId) cancelAnimationFrame(rafId)
+    stopTick()
     stopTrackWatch()
     stopLyricsWatch()
+    stopTickPauseWatch()
   })
 
   return {
@@ -266,6 +284,7 @@ export function useChordPlayer() {
     isRepeatOne,
     title,
     artists,
+    artistList,
     album,
     hasLyrics,
     progressPercent,

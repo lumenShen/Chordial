@@ -3,7 +3,7 @@
     <div class="cover-bg" v-if="coverUrl">
       <img :src="coverUrl" alt="" />
     </div>
-    <div class="cover-main">
+    <div class="cover-main" :class="{ paused: musicPaused }">
       <img v-if="coverUrl" :src="coverUrl" alt="专辑封面" class="cover-img" />
       <div v-else class="cover-placeholder">
         <HugeiconsIcon :icon="MusicNote01Icon" :size="56" />
@@ -16,12 +16,14 @@
 /**
  * ChordCoverPanel — 竖屏布局的封面面板。
  * 封面 + 模糊背景，用于隐藏歌词时的沉浸式封面展示。
+ * 暂停时封面轻微缩小（对齐 AMLL Cover 的 pauseShrink 动画）。
  */
 import { HugeiconsIcon } from '@hugeicons/vue'
 import { MusicNote01Icon } from '@hugeicons/core-free-icons'
 
 defineProps({
   coverUrl: { type: String, default: '' },
+  musicPaused: { type: Boolean, default: false },
 })
 </script>
 
@@ -57,6 +59,12 @@ defineProps({
   border-radius: 16px;
   overflow: hidden;
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  transition: transform 0.6s cubic-bezier(0.3, 0.2, 0.2, 1.4);
+}
+
+/* 暂停时封面轻微缩小（对齐 AMLL pauseShrink） */
+.cover-main.paused {
+  transform: scale(0.92);
 }
 
 .cover-img {

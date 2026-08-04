@@ -4,6 +4,9 @@
     <ChordFluidBackground
       :cover-url="coverUrl"
       :static-mode="settings.lyricBackgroundStaticMode"
+      :fps="settings.lyricBackgroundFPS"
+      :vsync="settings.lyricBackgroundVSync"
+      :render-scale="settings.lyricBackgroundRenderScale"
     />
 
     <!-- 内容层 -->
@@ -13,6 +16,7 @@
         v-if="!isVerticalLayout"
         :title="title"
         :artists="artists"
+        :artist-list="artistList"
         :album="album"
         :quality-label="qualityLabel"
         :show-music-name="settings.showMusicName"
@@ -26,7 +30,7 @@
       <!-- 主体：歌词 或 封面（竖屏/隐藏歌词） -->
       <div class="chord-main">
         <template v-if="isVerticalLayout">
-          <ChordCoverPanel :cover-url="coverUrl" />
+          <ChordCoverPanel :cover-url="coverUrl" :music-paused="!isPlaying" />
         </template>
         <template v-else>
           <ChordLyricsView
@@ -36,6 +40,7 @@
             :font-size-px="fontSizePx"
             :font-weight="settings.lyricFontWeight"
             :letter-spacing="settings.lyricLetterSpacing"
+            :font-family="settings.lyricFontFamily"
             :enable-blur="settings.enableLyricLineBlurEffect"
             :enable-scale="settings.enableLyricLineScaleEffect"
             :enable-spring="settings.enableLyricLineSpringAnimation"
@@ -46,6 +51,7 @@
       </div>
 
       <!-- 底部：FFT 可视化 或 控制条 -->
+      <template v-if="showBottomControls">
       <ChordFftControls
         v-if="controlsType === 'fft'"
         :is-immersive="isImmersive"
@@ -77,6 +83,7 @@
         @volume="setVolume"
         @open-queue="openPlayQueue"
       />
+      </template>
     </div>
 
     <!-- 沉浸模式提示（点击空白处退出） -->
@@ -116,7 +123,7 @@ useChordAudioAnalyser()
 
 const {
   state, settings, activeLineIndex, lyricLines, coverUrl, bufferMs,
-  isImmersive, title, artists, album, isPlaying, isLoading, durationMs,
+  isImmersive, title, artists, artistList, album, isPlaying, isLoading, durationMs,
   volume, muted, isShuffle, isRepeatAll, isRepeatOne,
   formattedCurrentTime, formattedDuration, formattedRemaining,
   togglePlay, playPrevious, playNext, seek, setVolume, toggleMute,
@@ -129,6 +136,9 @@ const isVerticalLayout = computed(() => !!settings.hideLyricView)
 
 // 底部控件类型
 const controlsType = computed(() => settings.playerControlsType)
+
+// 底部控件是否显示（AMLL showBottomControl + 非 none 类型）
+const showBottomControls = computed(() => settings.showBottomControl && controlsType.value !== 'none')
 
 // 字号档位 → px
 const SIZE_PRESET_PX = {
