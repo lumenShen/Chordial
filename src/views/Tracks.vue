@@ -1,72 +1,25 @@
 <script setup>
-import { ref, shallowRef, onMounted, watch, nextTick, useTemplateRef } from 'vue';
+import { onMounted, watch, nextTick, useTemplateRef } from 'vue';
 import { useRouter } from 'vue-router';
 import TrackList from '../components/common/TrackList.vue';
-import { library } from '../api/musicSource';
-import { usePerf } from '@/utils/performanceMonitor.js';
+import TracksEmptyState from '../components/common/TracksEmptyState.vue';
 import { useAnime } from '@/composables/useAnime.js';
-
-const { start, end } = usePerf('Tracks');
+import { useTracksPagination } from '@/composables/useTracksPagination.js';
 
 const router = useRouter();
-
-const PAGE_SIZE = 100;
-// shallowRef：列表数据为业务类实例，避免深代理开销
-const tracks = shallowRef([]);
-const totalCount = ref(0);
-const isLoading = ref(true);
-const isLoadingMore = ref(false);
-const hasMore = ref(true);
 
 const rootRef = useTemplateRef('root');
 const { run } = useAnime(() => rootRef.value);
 
-const loadTracks = async () => {
-  isLoading.value = true;
-  start('loadTracks');
-  try {
-    const data = await library.getSongsPage(0, PAGE_SIZE);
-    if (data) {
-      tracks.value = data.songs;
-      totalCount.value = data.total;
-      hasMore.value = data.songs.length < data.total;
-    }
-    end('loadTracks', { count: tracks.value.length, total: totalCount.value });
-  } catch (error) {
-    console.error('Failed to load tracks:', error);
-    end('loadTracks', { error: error.message });
-  } finally {
-    isLoading.value = false;
-  }
-};
-
-const loadMore = async () => {
-  if (isLoadingMore.value || !hasMore.value) return false;
-  isLoadingMore.value = true;
-  try {
-    const data = await library.getSongsPage(tracks.value.length, PAGE_SIZE);
-    if (data) {
-      tracks.value = [...tracks.value, ...data.songs];
-      hasMore.value = tracks.value.length < data.total;
-      // 返回 false 表示已无更多数据；返回 true 表示可能还有更多
-      return hasMore.value;
-    }
-    return false;
-  } catch (error) {
-    console.error('Failed to load more tracks:', error);
-    return false;
-  } finally {
-    isLoadingMore.value = false;
-  }
-};
-
-// --- 动画（anime.js v4） ---
-// loading spinner：用 ANIME_LOOP.spin 替代 CSS @keyframes spin
-function playLoadingSpinner() {
-  run(({ animate, loopPresets }) => {
-    animate('.loading-state .spinner', { ...loopPresets.spin });
-  });
-}
+const {
+  tracks,
+  totalCount,
+  isLoading,
+  hasMore,
+  loadTracks,
+  loadMore,
+  playLoadingSpinner,
+} = useTracksPagination({ run });
 
 // 页面挂载时获取数据（已加载则跳过）
 onMounted(() => {
@@ -96,15 +49,17 @@ const handleTrackSelect = (track) => {
 };
 
 const handleTrackPlay = (track) => {
-  console.log('Play track:', track);
+  // TODO: 接入播放逻辑
 };
 </script>
 
 <template>
-  <div class="tracks-page" ref="root">
+  <div class="tracks-page page-container" ref="root">
     <div class="page-header">
-      <!-- <h1 class="page-title">歌曲</h1> -->
-      <p class="page-subtitle">共 {{ totalCount || tracks.length }} 首歌曲</p>
+      <div>
+        <h1 class="page-title">歌曲</h1>
+        <p class="page-subtitle">共 {{ totalCount || tracks.length }} 首歌曲</p>
+      </div>
     </div>
 
     <div v-if="isLoading" class="loading-state">
@@ -124,28 +79,12 @@ const handleTrackPlay = (track) => {
         @play="handleTrackPlay"
       />
 
-      <div v-else-if="tracks.length === 0" class="empty-state">
-        <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M9 18V5l12-2v13"/>
-          <circle cx="6" cy="18" r="3"/>
-          <circle cx="18" cy="16" r="3"/>
-        </svg>
-        <h3 class="empty-state-title">暂无歌曲</h3>
-        <p class="empty-state-desc">添加音乐源开始扫描歌曲</p>
-        <router-link to="/music-sources" class="btn btn-primary" style="margin-top: 16px;">
-          添加音乐源
-        </router-link>
-      </div>
+      <TracksEmptyState v-else-if="tracks.length === 0" />
     </template>
   </div>
 </template>
 
 <style scoped>
-.tracks-page {
-  max-width: 1200px;
-  margin: 0 auto;
-}
-
 /* 禁用全局 .spinner 的 CSS spin 动画，改由 anime.js ANIME_LOOP.spin 驱动 */
 .loading-state .spinner {
   animation: none;
