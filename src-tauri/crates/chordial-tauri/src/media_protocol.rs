@@ -47,18 +47,28 @@ fn to_tauri_response(response: Response<Vec<u8>>) -> tauri::http::Response<Vec<u
 
 /// 处理 chordial 协议请求。
 ///
-/// 被 Tauri 的 `register_asynchronous_uri_scheme_protocol` 调用，
-/// 在独立线程中执行，可以安全地进行阻塞 I/O。
+/// 被 Tauri 的 `register_asynchronous_uri_scheme_protocol` 调用。
+///
+/// **必须在独立线程中执行实际工作**：`register_asynchronous_uri_scheme_protocol`
+/// 的回调运行在 webview 的协议线程上（Windows WebView2 为 UI 线程）。
+/// `media::handle` 涉及磁盘 I/O、symphonia 封面提取（117-296ms/次）等阻塞操作，
+/// 若同步执行会阻塞协议线程，导致后续 `chordial://` 请求排队甚至 UI 冻结。
+///
+/// 通过 `std::thread::spawn` 将阻塞工作移至后台线程，协议线程立即返回。
+/// 浏览器对同一 host 的并发连接数有上限（Chrome 为 6），因此线程数天然受限。
+/// `UriSchemeResponder` 内部通过 channel 通信，是 `Send` 的，可安全跨线程使用。
 pub fn handle_protocol(request: Request<Vec<u8>>, responder: UriSchemeResponder) {
-    let path = request.uri().path().to_string();
+    std::thread::spawn(move || {
+        let path = request.uri().path().to_string();
 
-    let response = match REGISTRAR.get() {
-        Some(registrar) => media::handle(registrar, &path, &request),
-        None => media::error_response(
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            "音乐来源系统未初始化",
-        ),
-    };
+        let response = match REGISTRAR.get() {
+            Some(registrar) => media::handle(registrar, &path, &request),
+            None => media::error_response(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "音乐来源系统未初始化",
+            ),
+        };
 
-    responder.respond(to_tauri_response(response));
+        responder.respond(to_tauri_response(response));
+    });
 }

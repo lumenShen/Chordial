@@ -58,10 +58,48 @@ pub fn run() {
                 );
                 for source_id in auto_start_ids {
                     let d = deployer.clone();
+                    let netease = ctx.netease_source.clone();
+                    let kugou = ctx.kugou_source.clone();
                     tauri::async_runtime::spawn(async move {
                         match d.start_source(&source_id).await {
                             Ok(()) => {
                                 eprintln!("[chordial] auto-started: {}", source_id);
+
+                                // 启动后自动配置 base_url（此前只在前端手动
+                                // 部署/启动时执行，应用启动的自动拉起漏掉了这一步）
+                                let auto_configure = d
+                                    .get_config(&source_id)
+                                    .map(|c| c.auto_configure_base_url)
+                                    .unwrap_or(false);
+                                if auto_configure {
+                                    if let Some(base_url) = d.get_base_url(&source_id) {
+                                        let result = match source_id.as_str() {
+                                            "netease" => {
+                                                let mut cfg = netease.config();
+                                                cfg.base_url = base_url.clone();
+                                                cfg.enabled = true;
+                                                netease.update_config(cfg)
+                                            }
+                                            "kugou" => {
+                                                let mut cfg = kugou.config();
+                                                cfg.base_url = base_url.clone();
+                                                cfg.enabled = true;
+                                                kugou.update_config(cfg)
+                                            }
+                                            _ => Ok(()),
+                                        };
+                                        match result {
+                                            Ok(()) => eprintln!(
+                                                "[chordial] auto-configured base_url for {}: {}",
+                                                source_id, base_url
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "[chordial] auto-configure base_url failed for {}: {}",
+                                                source_id, e
+                                            ),
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 eprintln!(
