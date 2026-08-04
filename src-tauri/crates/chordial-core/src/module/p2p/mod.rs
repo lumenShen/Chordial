@@ -23,14 +23,25 @@
 //! |------|------|
 //! | [`protocol`] | 帧定义 / serde / 长度前缀读写 |
 //! | [`source`] | `P2pSource` — `MusicSource` 实现 |
-//! | [`manager`] | `P2pManager` — 服务器 / 客户端 / 握手 / 对端生命周期 |
+//! | [`types`] | 数据模型 / 常量 / 状态容器 |
+//! | [`manager`] | `P2pManager` — 生命周期 / 启停 / 广播 / 状态 |
+//! | [`handshake`] | 入站 / 出站握手 |
+//! | [`peer_io`] | 对端查询循环与处理 |
+//! | [`trusted`] | 可信设备管理 |
+//! | [`auto`] | 匹配码轮换 + 可信自动连接 |
 //! | [`broadcast`] | UDP 信标发送 + 接收 |
 
+pub mod auto;
 pub mod broadcast;
+pub mod handshake;
 pub mod manager;
+pub mod peer_io;
 pub mod protocol;
 pub mod source;
+pub mod trusted;
+pub mod types;
 
-pub use manager::{P2pEvent, P2pManager, P2pStatus, PeerInfo, TrustedDevice};
+pub use manager::P2pManager;
 pub use protocol::Permission;
 pub use source::P2pSource;
+pub use types::{P2pEvent, P2pStatus, PeerInfo, TrustedDevice};
