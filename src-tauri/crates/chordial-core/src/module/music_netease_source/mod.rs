@@ -29,6 +29,7 @@
 //! - `GET /playlist/track/all`：分页获取歌单曲目
 
 pub mod api;
+pub mod cookie;
 pub mod source;
 pub mod types;
 

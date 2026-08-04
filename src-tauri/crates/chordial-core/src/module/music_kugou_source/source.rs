@@ -1,10 +1,12 @@
 //! [`KugouMusicApiSource`] — 酷狗音乐来源的 [`MusicSource`] 实现。
 
 use super::api;
+use super::entity_id::{build_entity_id, build_lyric_entity_id, parse_remote_id, EntityKind};
+use super::quality::default_quality;
 use super::types::KugouSongBrief;
 use crate::module::music_library::models::{Album, Artist, Lyric, Song};
 use crate::module::music_source::traits::MusicSource;
-use crate::module::music_source::types::{AudioQuality, EntityType, SourceId, SourceType};
+use crate::module::music_source::types::{EntityType, SourceId, SourceType};
 use crate::module::music_web_source::{WebHttpClient, WebSourceConfig};
 use crate::module::storage::persistent::PersistentStore;
 use parking_lot::RwLock;
@@ -12,94 +14,6 @@ use std::sync::Arc;
 
 /// 酷狗音乐来源的固定名称。
 pub const KUGOU_SOURCE_NAME: &str = "kugou";
-
-/// entity_id 中各部分的分隔符。
-const ENTITY_ID_SEP: &str = ":";
-
-/// entity_id 的种类前缀。
-#[allow(non_camel_case_types)]
-enum EntityKind {
-    song,
-    artist,
-    album,
-    lyric,
-}
-
-impl EntityKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::song => "song",
-            Self::artist => "artist",
-            Self::album => "album",
-            Self::lyric => "lyric",
-        }
-    }
-}
-
-/// 构建酷狗 entity_id。
-fn build_entity_id(kind: EntityKind, id: &str) -> String {
-    format!("{}{}{}", kind.as_str(), ENTITY_ID_SEP, id)
-}
-
-/// 构建歌词的 entity_id（携带 id + accesskey 复合键）。
-fn build_lyric_entity_id(lyric_id: &str, accesskey: &str) -> String {
-    format!(
-        "{}{}{}{}{}",
-        EntityKind::lyric.as_str(),
-        ENTITY_ID_SEP,
-        lyric_id,
-        ENTITY_ID_SEP,
-        accesskey
-    )
-}
-
-/// 解析 entity_id 中的远程 ID（去掉 `kind:` 前缀后的部分）。
-/// 对于 `lyric:<id>:<accesskey>` 格式，仅返回第一段。
-fn parse_remote_id(entity_id: &str) -> Option<String> {
-    let parts: Vec<&str> = entity_id.splitn(3, ENTITY_ID_SEP).collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    Some(parts[1].to_string())
-}
-
-/// 默认音质字符串（酷狗 API 的 quality 参数）。
-///
-/// "320" 对应 [`AudioQuality::Exhigh`]，约 320 kbps MP3。
-fn default_quality() -> &'static str {
-    "320"
-}
-
-/// 酷狗音质字符串 → 内部 [`AudioQuality`] 枚举。
-///
-/// 酷狗 API 的 `quality` 参数取值：
-/// - `"128"` → [`AudioQuality::Standard`]（≈128 kbps MP3）
-/// - `"320"` → [`AudioQuality::Exhigh`]（≈320 kbps MP3）
-/// - `"flac"` / `"high"` → [`AudioQuality::Lossless`]（FLAC 16bit/44.1kHz）
-/// - `"super"` → [`AudioQuality::Hires`]（Hi-Res FLAC 24bit/96kHz+）
-pub fn quality_from_kugou_str(s: &str) -> AudioQuality {
-    match s.to_lowercase().as_str() {
-        "128" => AudioQuality::Standard,
-        "320" => AudioQuality::Exhigh,
-        "flac" | "high" => AudioQuality::Lossless,
-        "super" => AudioQuality::Hires,
-        _ => AudioQuality::Unknown,
-    }
-}
-
-/// 内部 [`AudioQuality`] → 酷狗音质字符串。
-///
-/// 反向映射，用于将用户偏好（如"无损"）转换为酷狗 API 的 `quality` 参数。
-pub fn quality_to_kugou_str(q: AudioQuality) -> &'static str {
-    match q {
-        AudioQuality::Standard => "128",
-        AudioQuality::Higher => "320", // 酷狗无 192 kbps，退化为 320
-        AudioQuality::Exhigh => "320",
-        AudioQuality::Lossless => "flac",
-        AudioQuality::Hires => "super",
-        AudioQuality::Unknown => "320",
-    }
-}
 
 /// 从日期字符串中解析年份。
 ///
@@ -129,9 +43,9 @@ pub struct KugouMusicApiSource {
     /// 来源名称（固定为 `"kugou"`）
     name: String,
     /// HTTP 客户端（线程安全，连接池复用）
-    client: WebHttpClient,
+    pub(super) client: WebHttpClient,
     /// 配置（运行时可通过 `update_config` 更新）
-    config: RwLock<WebSourceConfig>,
+    pub(super) config: RwLock<WebSourceConfig>,
     /// 配置持久化存储
     store: Arc<PersistentStore>,
     /// 配置在 PersistentStore 中的 key
@@ -738,99 +652,15 @@ impl KugouMusicApiSource {
     pub fn build_song_from_brief(&self, brief: &KugouSongBrief) -> Song {
         self.build_song(brief)
     }
-
-    // ── 扫码登录 ───────────────────────────────────────────────────────
-
-    /// 第 1 步：获取扫码登录的 key。
-    pub fn login_qr_key(&self) -> Result<String, String> {
-        api::login_qr_key(&self.client)
-    }
-
-    /// 第 2 步：用 key 生成二维码。
-    pub fn login_qr_create(
-        &self,
-        key: &str,
-        qrimg: bool,
-    ) -> Result<super::types::KugouQrCreateData, String> {
-        api::login_qr_create(&self.client, key, qrimg)
-    }
-
-    /// 第 3 步：轮询扫码状态。
-    ///
-    /// **副作用**：当 `data.status == 4`（授权成功）时，自动将 token + userid
-    /// 组装为 cookie 写回配置（持久化）并更新 WebHttpClient，调用方无需再手动保存。
-    pub fn login_qr_check(
-        &self,
-        key: &str,
-    ) -> Result<super::types::KugouQrCheckResponse, String> {
-        let resp = api::login_qr_check(&self.client, key)?;
-        let status = super::types::KugouQrCheckStatus::from(resp.data.status);
-        if status == super::types::KugouQrCheckStatus::Authorized {
-            let token = resp.data.token.clone();
-            let userid = resp.data.userid;
-            if !token.is_empty() {
-                // 组装 cookie：token=xxx; userid=yyy
-                // 保留已有 cookie 中的其他字段（如 dfid/mid），追加/更新 token 和 userid
-                let mut cookie_parts: Vec<String> = Vec::new();
-                let existing = self.config.read().cookie.clone();
-                if !existing.is_empty() {
-                    // 保留非 token/userid 的已有 cookie 字段
-                    for part in existing.split(';') {
-                        let trimmed = part.trim();
-                        if trimmed.is_empty() { continue; }
-                        let key = trimmed.split('=').next().unwrap_or("").trim();
-                        if key != "token" && key != "userid" {
-                            cookie_parts.push(trimmed.to_string());
-                        }
-                    }
-                }
-                cookie_parts.push(format!("token={}", token));
-                cookie_parts.push(format!("userid={}", userid));
-                let cookie = cookie_parts.join("; ");
-
-                eprintln!(
-                    "[kugou] 扫码登录成功，userid={}，cookie 长度={}",
-                    userid, cookie.len()
-                );
-                // 写入运行时 client
-                self.client.set_cookie(cookie.clone());
-                // 持久化到 config
-                let mut cfg = self.config.write().clone();
-                cfg.cookie = cookie;
-                if let Err(e) = self.update_config(cfg) {
-                    eprintln!("[kugou] 扫码登录 cookie 持久化失败: {}", e);
-                }
-            }
-        }
-        Ok(resp)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_quality_from_kugou_str() {
-        assert_eq!(quality_from_kugou_str("128"), AudioQuality::Standard);
-        assert_eq!(quality_from_kugou_str("320"), AudioQuality::Exhigh);
-        assert_eq!(quality_from_kugou_str("flac"), AudioQuality::Lossless);
-        assert_eq!(quality_from_kugou_str("high"), AudioQuality::Lossless);
-        assert_eq!(quality_from_kugou_str("super"), AudioQuality::Hires);
-        assert_eq!(quality_from_kugou_str("FLAC"), AudioQuality::Lossless);
-        assert_eq!(quality_from_kugou_str("unknown"), AudioQuality::Unknown);
-        assert_eq!(quality_from_kugou_str(""), AudioQuality::Unknown);
-    }
-
-    #[test]
-    fn test_quality_to_kugou_str() {
-        assert_eq!(quality_to_kugou_str(AudioQuality::Standard), "128");
-        assert_eq!(quality_to_kugou_str(AudioQuality::Exhigh), "320");
-        assert_eq!(quality_to_kugou_str(AudioQuality::Lossless), "flac");
-        assert_eq!(quality_to_kugou_str(AudioQuality::Hires), "super");
-        // Higher 酷狗无 192，退化为 320
-        assert_eq!(quality_to_kugou_str(AudioQuality::Higher), "320");
-    }
+    use crate::module::music_netease_source::source::{
+        is_leap_year,
+        publish_time_to_year as year_from_millis,
+    };
 
     #[test]
     fn test_parse_year_from_date() {
@@ -863,38 +693,5 @@ mod tests {
         assert!(is_leap_year(2024)); // 能被 4 整除但不被 100
         assert!(!is_leap_year(1900)); // 能被 100 整除但不被 400
         assert!(!is_leap_year(2023));
-    }
-
-    #[test]
-    fn test_build_entity_id() {
-        assert_eq!(build_entity_id(EntityKind::song, "abc123"), "song:abc123");
-        assert_eq!(
-            build_entity_id(EntityKind::artist, "4625"),
-            "artist:4625"
-        );
-        assert_eq!(build_entity_id(EntityKind::album, "12345"), "album:12345");
-    }
-
-    #[test]
-    fn test_parse_remote_id() {
-        assert_eq!(parse_remote_id("song:abc123"), Some("abc123".to_string()));
-        assert_eq!(parse_remote_id("artist:4625"), Some("4625".to_string()));
-        assert_eq!(parse_remote_id("album:12345"), Some("12345".to_string()));
-        // lyric:<id>:<accesskey> 仅返回第一段
-        assert_eq!(
-            parse_remote_id("lyric:abc:xyz"),
-            Some("abc".to_string())
-        );
-        // 无前缀
-        assert_eq!(parse_remote_id("no_prefix"), None);
-        assert_eq!(parse_remote_id(""), None);
-    }
-
-    #[test]
-    fn test_build_lyric_entity_id() {
-        assert_eq!(
-            build_lyric_entity_id("lyric123", "access456"),
-            "lyric:lyric123:access456"
-        );
     }
 }
