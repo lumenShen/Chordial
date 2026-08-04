@@ -2,7 +2,9 @@
 
 use super::api;
 use super::cookie::{needs_cookie_normalization, parse_set_cookie_to_header};
-use super::types::{AudioQuality, NeteasePlaylistBrief, NeteaseSongDetail};
+use super::entity_id::{build_entity_id, build_lyric_entity_id, parse_remote_id, EntityKind};
+use super::time::publish_time_to_year;
+use super::types::AudioQuality;
 use crate::module::music_library::models::{Album, Artist, Lyric, Song};
 use crate::module::music_source::traits::MusicSource;
 use crate::module::music_source::types::{EntityType, SourceId, SourceType};
@@ -15,109 +17,26 @@ use std::sync::Arc;
 /// 网易云音乐来源的固定名称。
 pub const NETEASE_SOURCE_NAME: &str = "netease";
 
-/// 网易云 entity_id 中各部分的分隔符。
-const ENTITY_ID_SEP: &str = ":";
-
-/// 封面字节缓存容量上限（典型 50-500KB/张，128 条 ≈ 6-64MB）。
-const NETEASE_COVER_CACHE_CAP: usize = 128;
-/// picUrl 缓存容量上限（picUrl 是短字符串，可容纳更多）。
-const NETEASE_PIC_URL_CACHE_CAP: usize = 512;
-
-/// 网易云 entity_id 的种类前缀。
-#[allow(non_camel_case_types)]
-enum EntityKind {
-    song,
-    artist,
-    album,
-    lyric,
-    /// 保留：未来可能将歌单作为库内实体追踪
-    #[allow(dead_code)]
-    playlist,
-}
-
-impl EntityKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::song => "song",
-            Self::artist => "artist",
-            Self::album => "album",
-            Self::lyric => "lyric",
-            Self::playlist => "playlist",
-        }
-    }
-}
-
-/// 构建网易云 entity_id。
-fn build_entity_id(kind: EntityKind, id: i64) -> String {
-    format!("{}{}{}", kind.as_str(), ENTITY_ID_SEP, id)
-}
-
-/// 构建歌词的 entity_id（携带格式以区分 YRC/LRC）。
-fn build_lyric_entity_id(song_id: i64, format: &str) -> String {
-    format!(
-        "{}{}{}{}{}",
-        EntityKind::lyric.as_str(),
-        ENTITY_ID_SEP,
-        song_id,
-        ENTITY_ID_SEP,
-        format
-    )
-}
-
-/// 解析 entity_id 中的网易云 ID（去掉 `kind:` 前缀后的部分）。
-fn parse_remote_id(entity_id: &str) -> Option<i64> {
-    let parts: Vec<&str> = entity_id.splitn(3, ENTITY_ID_SEP).collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    parts[1].parse::<i64>().ok()
-}
-
-/// 将网易云的 publishTime（毫秒级 Unix 时间戳）转换为年份。
-///
-/// 返回 None 表示时间戳无效（<=0）。
-pub(crate) fn publish_time_to_year(ms: i64) -> Option<u32> {
-    if ms <= 0 {
-        return None;
-    }
-    let secs = (ms / 1000) as u64;
-    let mut days = secs / 86400;
-    let mut year = 1970u32;
-    loop {
-        let days_in_year: u64 = if is_leap_year(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
-    }
-    Some(year)
-}
-
-pub(crate) fn is_leap_year(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
 /// 网易云音乐来源。
 ///
 /// 持有一个 [`WebHttpClient`] 实例（连接池复用），配置通过 [`WebSourceConfig`] 持久化。
 pub struct NeteaseCloudMusicApiSource {
     /// 来源名称（固定为 `"netease"`）
-    name: String,
+    pub(super) name: String,
     /// HTTP 客户端（线程安全，连接池复用）
-    client: WebHttpClient,
+    pub(super) client: WebHttpClient,
     /// 配置（运行时可通过 `update_config` 更新）
-    config: RwLock<WebSourceConfig>,
+    pub(super) config: RwLock<WebSourceConfig>,
     /// 配置持久化存储
     store: Arc<PersistentStore>,
     /// 配置在 PersistentStore 中的 key
     config_key: String,
     /// 封面缓存：entity_id → 图片字节
     /// 避免重复下载（典型 50-500KB/张，限制 128 条 ≈ 6-64MB）
-    cover_cache: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+    pub(super) cover_cache: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     /// picUrl 缓存：entity_id → picUrl 字符串
     /// 避免重复调 /song/detail 或 /album 接口拿 picUrl
-    pic_url_cache: Mutex<HashMap<String, String>>,
+    pub(super) pic_url_cache: Mutex<HashMap<String, String>>,
 }
 
 impl NeteaseCloudMusicApiSource {
@@ -194,90 +113,6 @@ impl NeteaseCloudMusicApiSource {
     /// 获取下载目录（从配置或默认值）。
     pub fn download_dir(&self) -> String {
         self.config.read().download_dir.clone()
-    }
-
-    /// 从 [`NeteaseSongDetail`] 构建 [`Song`] 模型（公开版本，供 Tauri 命令使用）。
-    pub fn build_song_from_detail(&self, detail: &NeteaseSongDetail) -> Song {
-        self.build_song(detail)
-    }
-
-    /// 从 [`NeteaseSongDetail`] 构建 [`Song`] 模型。
-    fn build_song(&self, detail: &NeteaseSongDetail) -> Song {
-        let entity_id = build_entity_id(EntityKind::song, detail.id);
-        let song_id = format!("netease_song_{}", detail.id);
-        let artist_names: Vec<String> = if detail.ar.is_empty() {
-            vec!["未知艺术家".to_string()]
-        } else {
-            detail.ar.iter().map(|a| a.name.clone()).collect()
-        };
-        let artist_ids: Vec<String> = if detail.ar.is_empty() {
-            vec!["netease_artist_unknown".to_string()]
-        } else {
-            detail.ar.iter().map(|a| format!("netease_artist_{}", a.id)).collect()
-        };
-        let album_title = detail.al.as_ref().map(|a| a.name.clone());
-        let album_id = detail.al.as_ref().map(|a| format!("netease_album_{}", a.id));
-        let lyric_id = Some(format!("netease_lyric_{}", detail.id));
-
-        let source_id = SourceId {
-            source_name: self.name.clone(),
-            source_type: SourceType::Web(NETEASE_SOURCE_NAME.to_string()),
-            entity_type: EntityType::Song,
-            entity_id: entity_id.clone(),
-        };
-
-        Song {
-            id: song_id,
-            title: detail.name.clone(),
-            artist_names,
-            album_title,
-            duration: if detail.dt > 0 {
-                Some((detail.dt / 1000) as u64)
-            } else {
-                None
-            },
-            artist_ids,
-            album_id,
-            lyric_id,
-            source_ids: vec![source_id],
-            year: None,
-            // 网易云 al.picUrl 直接作为封面 URL，前端无需通过 chordial:// 协议二次拉取
-            // 避免song id 被当成 album id 调 /album 接口导致 404/405 限流
-            cover_url: detail.al.as_ref().and_then(|a| a.picUrl.clone()),
-        }
-    }
-
-    // ── 封面 / picUrl 双层缓存辅助 ─────────────────────────────────────────
-
-    /// 写入封面字节缓存（带 FIFO 半量淘汰）。
-    ///
-    /// 在锁外预分配 key 字符串和 `Arc` 包装，临界区内仅做 HashMap 查删与插入。
-    fn insert_cover_cache(&self, entity_id: &str, data: Vec<u8>) {
-        let key = entity_id.to_string();
-        let arc = Arc::new(data);
-        let mut cache = self.cover_cache.lock();
-        if cache.len() >= NETEASE_COVER_CACHE_CAP {
-            let drop_count = NETEASE_COVER_CACHE_CAP / 2;
-            let keys: Vec<String> = cache.keys().take(drop_count).cloned().collect();
-            for k in keys {
-                cache.remove(&k);
-            }
-        }
-        cache.insert(key, arc);
-    }
-
-    /// 写入 picUrl 缓存（带 FIFO 半量淘汰）。
-    fn insert_pic_url_cache(&self, entity_id: &str, pic_url: String) {
-        let key = entity_id.to_string();
-        let mut cache = self.pic_url_cache.lock();
-        if cache.len() >= NETEASE_PIC_URL_CACHE_CAP {
-            let drop_count = NETEASE_PIC_URL_CACHE_CAP / 2;
-            let keys: Vec<String> = cache.keys().take(drop_count).cloned().collect();
-            for k in keys {
-                cache.remove(&k);
-            }
-        }
-        cache.insert(key, pic_url);
     }
 }
 
@@ -588,22 +423,9 @@ impl MusicSource for NeteaseCloudMusicApiSource {
     }
 }
 
-// ── 歌单相关方法（非 trait 方法，由专门的 Tauri 命令调用）──────────────────
+// ── 搜索映射（非 trait 方法，由专门的 Tauri 命令调用）────────────────────
 
 impl NeteaseCloudMusicApiSource {
-    /// 搜索网易云歌单。
-    pub fn search_playlists(
-        &self,
-        query: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<NeteasePlaylistBrief>, String> {
-        if !self.is_enabled() {
-            return Err("网易云来源未启用".to_string());
-        }
-        api::search_playlists(&self.client, query, limit, offset)
-    }
-
     /// 搜索网易云歌手，返回库内 Artist 模型（附带 netease SourceId）。
     pub fn search_artists(
         &self,
@@ -665,168 +487,5 @@ impl NeteaseCloudMusicApiSource {
             })
             .collect();
         Ok(albums)
-    }
-
-    /// 获取歌单详情（元信息 + 全部曲目）。
-    ///
-    /// 返回 `(playlist_meta, songs)`。
-    pub fn get_playlist_full(
-        &self,
-        playlist_id: i64,
-    ) -> Result<(super::types::NeteasePlaylistDetail, Vec<NeteaseSongDetail>), String> {
-        if !self.is_enabled() {
-            return Err("网易云来源未启用".to_string());
-        }
-        let detail = api::get_playlist_detail(&self.client, playlist_id)?;
-        let total = detail.trackCount.max(0) as usize;
-
-        // 分页获取全部曲目（NeteaseCloudMusicApi /playlist/track/all 单次最多 1000）
-        // 即使 detail.trackCount=0 也至少请求一次（部分接口不返回 trackCount）
-        let page_size = 1000u32;
-        let mut all_tracks = Vec::with_capacity(total);
-        let mut offset = 0u32;
-        // 最大页数保护（100 页 = 10 万首），避免 API 异常导致死循环
-        let max_pages = 100usize;
-        let mut pages = 0usize;
-
-        loop {
-            pages += 1;
-            if pages > max_pages {
-                eprintln!(
-                    "[netease] get_playlist_full 超过最大页数 {}，停止分页（已获取 {} 首）",
-                    max_pages, all_tracks.len()
-                );
-                break;
-            }
-
-            let page = api::get_playlist_tracks(&self.client, playlist_id, page_size, offset)?;
-            let page_len = page.len();
-            all_tracks.extend(page);
-
-            // 终止条件（任一满足即停）：
-            // 1. 本次返回 0 首（API 无更多数据）
-            // 2. 本次返回 < page_size（最后一页不足一页）
-            // 3. 已知 total 且累计 >= total
-            if page_len == 0 || page_len < page_size as usize {
-                break;
-            }
-            if total > 0 && all_tracks.len() >= total {
-                break;
-            }
-            offset += page_size;
-        }
-
-        // 去重保护：若 API 异常返回重复 song，按 id 去重
-        if all_tracks.len() > 1 {
-            let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::with_capacity(all_tracks.len());
-            let before = all_tracks.len();
-            all_tracks.retain(|s| seen.insert(s.id));
-            let deduped = before - all_tracks.len();
-            if deduped > 0 {
-                eprintln!(
-                    "[netease] get_playlist_full 去重 {} 首重复曲目（{} -> {}）",
-                    deduped, before, all_tracks.len()
-                );
-            }
-        }
-
-        eprintln!(
-            "[netease] get_playlist_full playlist={} trackCount={} 实际获取={} 页数={}",
-            playlist_id, total, all_tracks.len(), pages
-        );
-
-        Ok((detail, all_tracks))
-    }
-
-    // ── 扫码登录 ───────────────────────────────────────────────────────────
-
-    /// 第 1 步：获取扫码登录的 unikey。
-    pub fn login_qr_key(&self) -> Result<String, String> {
-        api::login_qr_key(&self.client)
-    }
-
-    /// 第 2 步：用 unikey 生成二维码。
-    pub fn login_qr_create(
-        &self,
-        key: &str,
-        qrimg: bool,
-    ) -> Result<super::types::NeteaseQrCreateData, String> {
-        api::login_qr_create(&self.client, key, qrimg)
-    }
-
-    /// 第 3 步：轮询扫码状态。
-    ///
-    /// **副作用**：当返回 `code == 803`（授权成功）时，自动将响应中的 cookie
-    /// 写回当前配置（持久化）并更新 `WebHttpClient` 的 cookie，调用方无需再手动保存。
-    pub fn login_qr_check(
-        &self,
-        key: &str,
-    ) -> Result<super::types::NeteaseQrCheckResponse, String> {
-        let resp = api::login_qr_check(&self.client, key)?;
-        if resp.status() == super::types::QrCheckStatus::Authorized {
-            if let Some(raw_cookie) = resp.cookie.clone() {
-                if !raw_cookie.is_empty() {
-                    // ncmapi 返回的 cookie 字段是多个 Set-Cookie 用 ", " 连接的字符串
-                    // 每条格式：NAME=VALUE; Path=/; HttpOnly; Expires=Day, DD Mon YYYY HH:MM:SS GMT
-                    // 直接当作 Cookie 请求头发送时，ncmapi 会把 Path/Expires/Max-Age 等属性名
-                    // 当成 cookie 名解析，真正的 `MUSIC_U` 被属性淹没，导致登录态丢失（profile=null）
-                    // 此处解析出 NAME=VALUE 对，用 "; " 连接成标准 Cookie 头格式
-                    let cookie = parse_set_cookie_to_header(&raw_cookie);
-                    eprintln!(
-                        "[netease] 扫码登录成功，原始 cookie 长度={}，解析后长度={}，含 MUSIC_U={}",
-                        raw_cookie.len(),
-                        cookie.len(),
-                        cookie.contains("MUSIC_U=")
-                    );
-                    // 写入运行时 client（立即生效）
-                    self.client.set_cookie(cookie.clone());
-                    // 持久化到 config
-                    let mut cfg = self.config.write().clone();
-                    cfg.cookie = cookie;
-                    // update_config 会落盘并刷新 client
-                    if let Err(e) = self.update_config(cfg) {
-                        // 持久化失败不影响返回 cookie，仅 stderr 记录
-                        eprintln!("[netease] 扫码登录 cookie 持久化失败: {}", e);
-                    }
-                }
-            }
-        }
-        Ok(resp)
-    }
-
-    // ── 用户账户与"我的资源" ────────────────────────────────────────────────
-
-    /// 获取当前登录账号信息（依赖 cookie）。
-    pub fn get_user_account(
-        &self,
-    ) -> Result<super::types::NeteaseUserAccountResponse, String> {
-        api::get_user_account(&self.client)
-    }
-
-    /// 获取指定用户的全部歌单（创建 + 收藏）。
-    pub fn get_user_playlists(
-        &self,
-        uid: i64,
-    ) -> Result<Vec<super::types::NeteasePlaylistBrief>, String> {
-        api::get_user_playlists(&self.client, uid)
-    }
-
-    /// 获取当前用户收藏的专辑（依赖 cookie，分页）。
-    ///
-    /// 返回 `(albums, total_count)`。
-    pub fn get_user_albums(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<super::types::NeteaseSubAlbum>, i64), String> {
-        api::get_user_albums(&self.client, limit, offset)
-    }
-
-    /// 获取专辑详情（含全部曲目）。
-    pub fn get_album_detail(
-        &self,
-        album_id: i64,
-    ) -> Result<(super::types::NeteaseAlbumDetail, Vec<NeteaseSongDetail>), String> {
-        api::get_album_detail(&self.client, album_id)
     }
 }

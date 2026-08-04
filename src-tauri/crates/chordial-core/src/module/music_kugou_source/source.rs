@@ -657,7 +657,7 @@ impl KugouMusicApiSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::music_netease_source::source::{
+    use crate::module::music_netease_source::time::{
         is_leap_year,
         publish_time_to_year as year_from_millis,
     };

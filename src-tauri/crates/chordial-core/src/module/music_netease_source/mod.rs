@@ -29,9 +29,16 @@
 //! - `GET /playlist/track/all`：分页获取歌单曲目
 
 pub mod api;
+pub mod cache;
 pub mod cookie;
+pub mod entity_id;
+pub mod login;
+pub mod mapper;
+pub mod playlist;
 pub mod source;
+pub mod time;
 pub mod types;
+pub mod user;
 
 pub use source::{NeteaseCloudMusicApiSource, NETEASE_SOURCE_NAME};
 pub use types::{

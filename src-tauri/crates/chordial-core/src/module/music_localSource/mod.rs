@@ -19,7 +19,9 @@
 //!    请求资源时，`LocalMusicSource` 直接从文件系统读取并返回。
 
 pub mod artists;
+pub mod cover;
 pub mod folder;
+pub mod index;
 pub mod scanner;
 pub mod source;
 #[cfg(not(target_os = "android"))]
