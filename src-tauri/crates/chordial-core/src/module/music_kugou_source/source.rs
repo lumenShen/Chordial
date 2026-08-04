@@ -1,8 +1,13 @@
 //! [`KugouMusicApiSource`] — 酷狗音乐来源的 [`MusicSource`] 实现。
+//!
+//! 本文件仅保留来源的**核心**：结构体定义、构造、配置访问、资源模型映射。
+//! 搜索 / 详情 / 歌词 / 下载等职责拆分到独立子模块：
+//! - [`search`]：歌曲/歌手/专辑搜索
+//! - [`detail`]：单曲/歌手/专辑详情
+//! - [`lyric`]：歌词搜索与下载
+//! - [`download`]：音频字节与封面图片获取
 
-use super::api;
-use super::entity_id::{build_entity_id, build_lyric_entity_id, parse_remote_id, EntityKind};
-use super::quality::default_quality;
+use super::entity_id::{build_entity_id, EntityKind};
 use super::types::KugouSongBrief;
 use crate::module::music_library::models::{Album, Artist, Lyric, Song};
 use crate::module::music_source::traits::MusicSource;
@@ -19,7 +24,7 @@ pub const KUGOU_SOURCE_NAME: &str = "kugou";
 ///
 /// 支持格式：`"2024"` / `"2024-01-01"` / `"2024/01/01"` / `"2024.01.01"`。
 /// 不支持 Unix 时间戳（酷狗 `publish_date` 一般为字符串格式）。
-fn parse_year_from_date(s: &str) -> Option<u32> {
+pub(super) fn parse_year_from_date(s: &str) -> Option<u32> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -41,7 +46,7 @@ fn parse_year_from_date(s: &str) -> Option<u32> {
 /// 持有一个 [`WebHttpClient`] 实例（连接池复用），配置通过 [`WebSourceConfig`] 持久化。
 pub struct KugouMusicApiSource {
     /// 来源名称（固定为 `"kugou"`）
-    name: String,
+    pub(super) name: String,
     /// HTTP 客户端（线程安全，连接池复用）
     pub(super) client: WebHttpClient,
     /// 配置（运行时可通过 `update_config` 更新）
@@ -107,7 +112,7 @@ impl KugouMusicApiSource {
     ///
     /// 使用确定性 ID（基于 `hash` / `singer_id` / `album_id`）替代随机 UUID，
     /// 这样同一首酷狗歌曲重复导入时不会产生重复条目，便于库内去重与跨实体引用。
-    fn build_song(&self, brief: &KugouSongBrief) -> Song {
+    pub(super) fn build_song(&self, brief: &KugouSongBrief) -> Song {
         let hash = brief.file_hash_lower();
         let entity_id = build_entity_id(EntityKind::song, &hash);
         // 库内 ID：使用确定性前缀 + hash，确保同一首酷狗歌曲 ID 稳定
@@ -175,6 +180,11 @@ impl KugouMusicApiSource {
             cover_url: None,
         }
     }
+
+    /// 从 [`KugouSongBrief`] 构建 [`Song`]（公开版本，供 Tauri 命令使用）。
+    pub fn build_song_from_brief(&self, brief: &KugouSongBrief) -> Song {
+        self.build_song(brief)
+    }
 }
 
 impl MusicSource for KugouMusicApiSource {
@@ -187,325 +197,27 @@ impl MusicSource for KugouMusicApiSource {
     }
 
     fn search_songs(&self, query: &str) -> Result<Vec<Song>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        let briefs = api::search_songs(&self.client, query, 1, 30)?;
-        Ok(briefs.iter().map(|b| self.build_song(b)).collect())
+        super::search::search_songs(self, query)
     }
 
     fn get_song(&self, id: &str) -> Result<Option<Song>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        // id 是 song:<hash>
-        let hash = parse_remote_id(id).unwrap_or_default();
-        if hash.is_empty() {
-            return Ok(None);
-        }
-        let song_id = format!("kugou_song_{}", hash);
-        let source_id = SourceId {
-            source_name: self.name.clone(),
-            source_type: SourceType::Web(KUGOU_SOURCE_NAME.to_string()),
-            entity_type: EntityType::Song,
-            entity_id: id.to_string(),
-        };
-
-        // 优先通过 /search/lyric 获取歌曲元信息（歌曲名 + 歌手 + 时长）
-        // 这个接口仅需 hash，返回的 KugouLyricCandidate 含 song/singer/duration 字段
-        let candidates = api::search_lyric(&self.client, &hash, 0).unwrap_or_default();
-        if let Some(candidate) = candidates.into_iter().next() {
-            let artist_names: Vec<String> = if candidate.singer.is_empty() {
-                vec!["未知艺术家".to_string()]
-            } else {
-                candidate
-                    .singer
-                    .split('/')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
-            // candidate.duration 是毫秒，转换为秒
-            let duration = if candidate.duration > 0 {
-                Some((candidate.duration / 1000) as u64)
-            } else {
-                None
-            };
-            return Ok(Some(Song {
-                id: song_id,
-                title: if candidate.song.is_empty() {
-                    hash.clone()
-                } else {
-                    candidate.song
-                },
-                artist_names,
-                album_title: None,
-                duration,
-                artist_ids: Vec::new(), // search/lyric 不返回 SingerId
-                album_id: None,
-                lyric_id: None,
-                source_ids: vec![source_id],
-                year: None,
-                cover_url: None,
-            }));
-        }
-
-        // 退化为 /song/url 验证 hash 有效性并从 URL 数据提取 name/duration
-        match api::get_song_url(&self.client, &hash, default_quality(), None) {
-            Ok(url_data) => {
-                let Some(url_entry) = url_data.url.first() else {
-                    return Ok(None);
-                };
-                let duration = if url_entry.duration > 0 {
-                    Some(url_entry.duration as u64)
-                } else {
-                    None
-                };
-                Ok(Some(Song {
-                    id: song_id,
-                    title: url_entry.name.clone(),
-                    artist_names: vec!["未知艺术家".to_string()],
-                    album_title: None,
-                    duration,
-                    artist_ids: Vec::new(),
-                    album_id: None,
-                    lyric_id: None,
-                    source_ids: vec![source_id],
-                    year: None,
-                    cover_url: None,
-                }))
-            }
-            Err(_) => Ok(None),
-        }
+        super::detail::get_song(self, id)
     }
 
     fn get_artist(&self, id: &str) -> Result<Option<Artist>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        let singer_id = parse_remote_id(id)
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-        if singer_id == 0 {
-            return Ok(None);
-        }
-
-        // 调用 /artist/detail 获取歌手详情（含简介 brief/intro、头像 img、粉丝数等）
-        let detail = api::get_artist_detail(&self.client, singer_id)?;
-        let name = detail.name();
-        let bio = {
-            let intro = detail.intro();
-            if intro.is_empty() {
-                None
-            } else {
-                Some(intro.to_string())
-            }
-        };
-
-        Ok(Some(Artist {
-            id: format!("kugou_artist_{}", singer_id),
-            name: if name.is_empty() {
-                format!("singer_{}", singer_id)
-            } else {
-                name.to_string()
-            },
-            bio,
-            source_ids: vec![SourceId {
-                source_name: self.name.clone(),
-                source_type: SourceType::Web(KUGOU_SOURCE_NAME.to_string()),
-                entity_type: EntityType::Artist,
-                entity_id: build_entity_id(EntityKind::artist, &singer_id.to_string()),
-            }],
-        }))
+        super::detail::get_artist(self, id)
     }
 
     fn get_album(&self, id: &str) -> Result<Option<Album>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        let album_id = parse_remote_id(id).unwrap_or_default();
-        if album_id.is_empty() || album_id == "0" {
-            return Ok(None);
-        }
-
-        // 1. 获取专辑基础信息（含封面 URL、author_name、publish_date）
-        let info = api::get_album_info(&self.client, &album_id)?;
-
-        // 2. 尝试获取专辑详情（含 singer_id 数值，便于填充 Album.artist_id）
-        //    /album/detail 是较新的接口，部分自建 ncmapi 风格服务端可能未实现，
-        //    失败时降级为仅使用 /album 信息（artist_id 留空）
-        let (artist_id, year_from_detail) = match api::get_album_detail(&self.client, &album_id) {
-            Ok(detail) => {
-                let artist_id = if detail.singer_id > 0 {
-                    format!("kugou_artist_{}", detail.singer_id)
-                } else {
-                    String::new()
-                };
-                let year = parse_year_from_date(&detail.publish_date);
-                (artist_id, year)
-            }
-            Err(e) => {
-                eprintln!(
-                    "[kugou] get_album: /album/detail 失败 album_id={}，降级使用 /album 信息: {}",
-                    album_id, e
-                );
-                (String::new(), None)
-            }
-        };
-
-        // 3. 获取专辑歌曲列表（用于填充 song_ids）
-        //    默认拉取前 1000 首（pagesize=500, 最多 2 页）
-        let mut song_ids: Vec<String> = Vec::new();
-        let pagesize: u32 = 500;
-        let max_pages: u32 = 4; // 最多 2000 首
-        let mut page = 1u32;
-        let mut total: i64 = -1;
-        loop {
-            match api::get_album_songs(&self.client, &album_id, page, pagesize) {
-                Ok((list, t)) => {
-                    if total < 0 {
-                        total = t;
-                    }
-                    for song in &list {
-                        let hash = song.file_hash_lower();
-                        if !hash.is_empty() {
-                            song_ids.push(format!("kugou_song_{}", hash));
-                        }
-                    }
-                    let len = list.len() as u32;
-                    if len < pagesize
-                        || (total > 0 && song_ids.len() as i64 >= total)
-                        || page >= max_pages
-                    {
-                        break;
-                    }
-                    page += 1;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[kugou] get_album: /album/songs 失败 album_id={} page={}：{}",
-                        album_id, page, e
-                    );
-                    // 失败不致命，继续返回专辑基本信息（song_ids 可能部分为空）
-                    break;
-                }
-            }
-        }
-
-        // 4. 年份：优先 /album/detail 的 publish_date，回退到 /album 的 publish_date
-        let year = year_from_detail.or_else(|| parse_year_from_date(&info.publish_date));
-
-        // 5. 封面 URL：优先 sizable_cover（可调整尺寸），回退到 cover
-        let cover_url = if !info.sizable_cover.is_empty() {
-            Some(info.sizable_cover)
-        } else if !info.cover.is_empty() {
-            Some(info.cover)
-        } else {
-            None
-        };
-
-        Ok(Some(Album {
-            id: format!("kugou_album_{}", album_id),
-            title: info.album_name,
-            artist_id,
-            cover_url,
-            song_ids,
-            source_ids: vec![SourceId {
-                source_name: self.name.clone(),
-                source_type: SourceType::Web(KUGOU_SOURCE_NAME.to_string()),
-                entity_type: EntityType::Album,
-                entity_id: build_entity_id(EntityKind::album, &album_id),
-            }],
-            year,
-        }))
+        super::detail::get_album(self, id)
     }
 
     fn get_lyric(&self, song_id: &str) -> Result<Option<Lyric>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        // song_id 可能是 entity_id (song:<hash>) 或纯 hash
-        let hash = if song_id.starts_with("song:") {
-            parse_remote_id(song_id).unwrap_or_default()
-        } else {
-            song_id.to_string()
-        };
-        if hash.is_empty() {
-            return Ok(None);
-        }
-
-        // 第一步：搜索歌词候选
-        // duration=0 表示不指定时长过滤；若 candidate.duration > 0，下次可优化为传入真实时长
-        let candidates = api::search_lyric(&self.client, &hash, 0)?;
-        let candidate = candidates
-            .into_iter()
-            .next()
-            .ok_or_else(|| "未找到歌词候选".to_string())?;
-
-        // 第二步：下载歌词
-        let lyric_resp = api::get_lyric(&self.client, &candidate.id, &candidate.accesskey)?;
-
-        // 优先使用已解码的 decodeContent；若为空则尝试 base64 解码 content 字段
-        let lyric_text = if !lyric_resp.decodeContent.is_empty() {
-            lyric_resp.decodeContent
-        } else if !lyric_resp.content.is_empty() {
-            // 兜底：base64 解码 content 字段
-            use base64::Engine;
-            match base64::engine::general_purpose::STANDARD.decode(&lyric_resp.content) {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!(
-                            "[kugou] 歌词 base64 解码后 UTF-8 转换失败 hash={} id={}: {}",
-                            hash, candidate.id, e
-                        );
-                        return Ok(None);
-                    }
-                },
-                Err(e) => {
-                    eprintln!(
-                        "[kugou] 歌词 base64 解码失败 hash={} id={}: {}",
-                        hash, candidate.id, e
-                    );
-                    return Ok(None);
-                }
-            }
-        } else {
-            return Ok(None);
-        };
-
-        if lyric_text.is_empty() {
-            return Ok(None);
-        }
-
-        // 歌词库内 ID：基于 candidate id 确定性，便于去重
-        let entity_id = build_lyric_entity_id(&candidate.id, &candidate.accesskey);
-        Ok(Some(Lyric {
-            id: format!("kugou_lyric_{}", candidate.id),
-            song_id: song_id.to_string(),
-            text: lyric_text,
-            source_id: SourceId {
-                source_name: self.name.clone(),
-                source_type: SourceType::Web(KUGOU_SOURCE_NAME.to_string()),
-                entity_type: EntityType::Lyric,
-                entity_id,
-            },
-        }))
+        super::lyric::get_lyric(self, song_id)
     }
 
     fn song_file_get(&self, entity_id: &str) -> Result<Vec<u8>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        let hash = parse_remote_id(entity_id).unwrap_or_default();
-        if hash.is_empty() {
-            return Err(format!("无效的 entity_id: {}", entity_id));
-        }
-        // 默认 320 kbps MP3（Exhigh）
-        // trait 方法签名不接受音质参数，因此使用默认值；
-        // 前端需要指定音质时通过专门的 Tauri 命令（source_download_song）调用
-        let (bytes, _url_data) = api::download_song(&self.client, &hash, default_quality(), None)?;
-        Ok(bytes)
+        super::download::song_file_get(self, entity_id)
     }
 
     fn song_file_path(&self, _entity_id: &str) -> Option<String> {
@@ -513,53 +225,13 @@ impl MusicSource for KugouMusicApiSource {
     }
 
     fn album_picture_get(&self, entity_id: &str) -> Result<Vec<u8>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        // entity_id 可能是 http(s):// URL，直接下载
-        if entity_id.starts_with("http://") || entity_id.starts_with("https://") {
-            return self.client.get_bytes(entity_id);
-        }
-
-        // 支持 album:<id> 和 song:<hash>
-        // song:<hash> 时先通过 /search/lyric 获取歌曲信息，但该接口不返回 AlbumID，
-        // 因此 song:<hash> 路径会失败，建议前端直接用 song.cover_url 或调 album:<id>
-        let album_id = if entity_id.starts_with("album:") {
-            parse_remote_id(entity_id).unwrap_or_default()
-        } else {
-            // song:<hash> 无法直接获取专辑封面（需先查 AlbumID，搜索接口未返回）
-            return Err(format!(
-                "酷狗 album_picture_get 仅支持 album:<id> 或 http(s):// URL，收到: {}；\
-                 建议前端使用歌曲详情中已缓存的 cover_url",
-                entity_id
-            ));
-        };
-
-        if album_id.is_empty() || album_id == "0" {
-            return Err(format!("无效的专辑 ID: {}", entity_id));
-        }
-
-        let info = api::get_album_info(&self.client, &album_id)?;
-        let cover_url = if !info.sizable_cover.is_empty() {
-            info.sizable_cover
-        } else if !info.cover.is_empty() {
-            info.cover
-        } else {
-            return Err("专辑无封面 URL".to_string());
-        };
-
-        self.client.get_bytes(&cover_url)
+        super::download::album_picture_get(self, entity_id)
     }
 
     fn lyric_text_get(&self, song_id: &str) -> Result<String, String> {
-        let lyric = self
-            .get_lyric(song_id)?
-            .ok_or_else(|| "未找到歌词".to_string())?;
-        Ok(lyric.text)
+        super::lyric::lyric_text_get(self, song_id)
     }
 }
-
-// ── 非 trait 方法（供 Tauri 命令使用）────────────────────
 
 impl KugouMusicApiSource {
     /// 搜索酷狗歌手，返回库内 Artist 模型。
@@ -569,34 +241,7 @@ impl KugouMusicApiSource {
         page: u32,
         pagesize: u32,
     ) -> Result<Vec<Artist>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        let briefs = api::search_artists(&self.client, query, page, pagesize)?;
-        Ok(briefs
-            .into_iter()
-            .map(|b| {
-                let singer_id = b.singer_id();
-                Artist {
-                    id: if singer_id > 0 {
-                        format!("kugou_artist_{}", singer_id)
-                    } else {
-                        String::new()
-                    },
-                    name: b.singer_name().to_string(),
-                    bio: None,
-                    source_ids: vec![SourceId {
-                        source_name: self.name.clone(),
-                        source_type: SourceType::Web(KUGOU_SOURCE_NAME.to_string()),
-                        entity_type: EntityType::Artist,
-                        entity_id: build_entity_id(
-                            EntityKind::artist,
-                            &singer_id.to_string(),
-                        ),
-                    }],
-                }
-            })
-            .collect())
+        super::search::search_artists(self, query, page, pagesize)
     }
 
     /// 搜索酷狗专辑，返回库内 Album 模型。
@@ -606,51 +251,7 @@ impl KugouMusicApiSource {
         page: u32,
         pagesize: u32,
     ) -> Result<Vec<Album>, String> {
-        if !self.is_enabled() {
-            return Err("酷狗来源未启用".to_string());
-        }
-        let briefs = api::search_albums(&self.client, query, page, pagesize)?;
-        Ok(briefs
-            .into_iter()
-            .map(|b| {
-                let album_id_str = b.album_id().to_string();
-                let singer_id = b.SingerId;
-                Album {
-                    id: if !album_id_str.is_empty() && album_id_str != "0" {
-                        format!("kugou_album_{}", album_id_str)
-                    } else {
-                        String::new()
-                    },
-                    title: b.album_name().to_string(),
-                    artist_id: if singer_id > 0 {
-                        format!("kugou_artist_{}", singer_id)
-                    } else {
-                        String::new()
-                    },
-                    cover_url: {
-                        let img = b.image_url();
-                        if img.is_empty() {
-                            None
-                        } else {
-                            Some(img.to_string())
-                        }
-                    },
-                    song_ids: Vec::new(),
-                    source_ids: vec![SourceId {
-                        source_name: self.name.clone(),
-                        source_type: SourceType::Web(KUGOU_SOURCE_NAME.to_string()),
-                        entity_type: EntityType::Album,
-                        entity_id: build_entity_id(EntityKind::album, &album_id_str),
-                    }],
-                    year: None,
-                }
-            })
-            .collect())
-    }
-
-    /// 从 [`KugouSongBrief`] 构建 [`Song`]（公开版本，供 Tauri 命令使用）。
-    pub fn build_song_from_brief(&self, brief: &KugouSongBrief) -> Song {
-        self.build_song(brief)
+        super::search::search_albums(self, query, page, pagesize)
     }
 }
 

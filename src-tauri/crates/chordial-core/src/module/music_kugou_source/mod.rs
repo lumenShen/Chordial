@@ -25,9 +25,13 @@
 //! - `POST /album?album_id=<id>`：获取专辑信息（含 `sizable_cover` 封面 URL）
 
 pub mod api;
+pub mod detail;
+pub mod download;
 pub mod entity_id;
 pub mod login;
+pub mod lyric;
 pub mod quality;
+pub mod search;
 pub mod source;
 pub mod types;
 
