@@ -24,7 +24,7 @@ import ArtistAlbums from '@/components/artist/ArtistAlbums.vue';
 import ArtistTracks from '@/components/artist/ArtistTracks.vue';
 import { useArtistDetail } from '@/composables/useArtistDetail.js';
 import { useAnime } from '@/composables/useAnime.js';
-import PlayerStore from '@/stores/player.js';
+import PlayerStore from '@/stores/player/index.js';
 
 const route = useRoute();
 const router = useRouter();

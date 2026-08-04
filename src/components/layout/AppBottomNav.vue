@@ -1,13 +1,21 @@
 <script setup>
 import { useRoute, useRouter } from 'vue-router';
 import { computed, onMounted, useTemplateRef, watch, nextTick } from 'vue';
-import PlayerStore from '@/stores/player.js';
+import { HugeiconsIcon } from '@hugeicons/vue';
+import {
+  Home01Icon,
+  HeartIcon,
+  MusicNote01Icon,
+  UserGroupIcon,
+  DiscIcon,
+  Playlist01Icon,
+} from '@hugeicons/core-free-icons';
+import PlayerStore from '@/stores/player/index.js';
 import { useAnime } from '@/composables/useAnime.js';
 import { ANIME_SPRINGS } from '@/utils/animePresets.js';
 import LiquidGlass from '@/components/ui/LiquidGlass.vue';
 import LiquidGlassFilter from '@/components/ui/LiquidGlassFilter.vue';
 import { useLiquidGlass } from '@/composables/useLiquidGlass.js';
-
 const route = useRoute();
 const router = useRouter();
 
@@ -31,18 +39,19 @@ const {
 }));
 
 const navItems = [
-  { path: '/', name: '首页', icon: 'bi-house' },
-  { path: '/tracks', name: '歌曲', icon: 'bi-music-note-beamed' },
-  { path: '/artists', name: '歌手', icon: 'bi-people' },
-  { path: '/albums', name: '专辑', icon: 'bi-disc' },
-  { path: '/playlists', name: '歌单', icon: 'bi-music-note-list' },
-  { path: '/music-sources', name: '音乐源', icon: 'bi-folder' },
+  { path: '/', name: '首页', icon: Home01Icon },
+  { path: '/favorites', name: '偏好库', icon: HeartIcon },
+  { path: '/tracks', name: '歌曲', icon: MusicNote01Icon },
+  { path: '/artists', name: '歌手', icon: UserGroupIcon },
+  { path: '/albums', name: '专辑', icon: DiscIcon },
+  { path: '/playlists', name: '歌单', icon: Playlist01Icon },
 ];
 
 const isActive = (path) => {
   if (path === '/') return route.path === '/';
   return route.path.startsWith(path);
 };
+
 
 const getCurrentIndexFromRoute = () => {
   const idx = navItems.findIndex((item) => isActive(item.path));
@@ -368,16 +377,16 @@ watch(() => route.path, () => {
       <div ref="indicator" class="nav-indicator" :style="indicatorGlassStyle">
         <LiquidGlassFilter v-bind="indicatorFilterProps" />
       </div>
-      <router-link
-        v-for="item in navItems"
-        :key="item.path"
-        :to="item.path"
-        class="bottom-nav-item"
-        :class="{ active: isActive(item.path) }"
-      >
-        <i :class="item.icon" class="bottom-nav-icon"></i>
-        <span class="bottom-nav-text">{{ item.name }}</span>
-      </router-link>
+        <router-link
+          v-for="item in navItems"
+          :key="item.path"
+          :to="item.path"
+          class="bottom-nav-item"
+          :class="{ active: isActive(item.path) }"
+        >
+          <HugeiconsIcon :icon="item.icon" :size="20" class="bottom-nav-icon" />
+          <span class="bottom-nav-text">{{ item.name }}</span>
+        </router-link>
     </LiquidGlass>
   </div>
 </template>
@@ -399,6 +408,7 @@ watch(() => route.path, () => {
   width: fit-content;
   max-width: calc(100vw - 3rem);
   padding-bottom: var(--safe-area-bottom);
+  overflow: hidden;
   isolation: isolate;
   user-select: none;
   -webkit-user-select: none;

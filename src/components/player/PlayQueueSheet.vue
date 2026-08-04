@@ -17,9 +17,10 @@
  */
 import { ref, computed, watch, nextTick, shallowRef, onUnmounted } from 'vue';
 import BottomSheet from '@/components/ui/BottomSheet.vue';
-import { PlayerStore } from '@/stores/player.js';
+import { PlayerStore } from '@/stores/player/index.js';
 import { useCoverImages } from '@/composables/useCoverImage';
 import { useVirtualList } from '@/composables/useVirtualList';
+import { formatDuration as formatDurationBase } from '@/utils/format.js';
 
 // ── Sheet 可见性 ────────────────────────────────────────────
 const visible = computed({
@@ -56,11 +57,10 @@ function getCoverUrl(track) {
 }
 
 // ── 时长格式化 ──────────────────────────────────────────────
+// 与 utils/format.js 的 formatDuration 一致，但无数据时显示占位符 '--:--'
 function formatDuration(sec) {
   if (!sec || isNaN(sec)) return '--:--';
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
+  return formatDurationBase(sec);
 }
 
 // ── 交互 ────────────────────────────────────────────────────
@@ -143,7 +143,7 @@ function onClose() {
     @close="onClose"
   >
     <div v-if="playlist.length === 0" class="pqs-empty">
-      <i class="bi bi-music-note-list" />
+        <HIcon name="music-note-list" />
       <span>播放队列为空</span>
     </div>
 
@@ -194,7 +194,7 @@ function onClose() {
                 :alt="track.title"
                 loading="lazy"
               />
-              <i v-else class="bi bi-music-note-beamed pqs-cover-placeholder" />
+                <HIcon v-else name="music-note-beamed" class="pqs-cover-placeholder" />
             </div>
 
             <!-- 标题 + 艺术家 -->
@@ -434,7 +434,7 @@ function onClose() {
 }
 
 /* ── 移动端适配 ────────────────────────────────────────────── */
-@media (max-width: 768px) {
+@media (max-width: 767px) {
   .pqs-item {
     grid-template-columns: 32px 40px 1fr 48px;
     gap: var(--space-2, 8px);

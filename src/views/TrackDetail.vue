@@ -1,13 +1,13 @@
 <script setup>
-import { ref, shallowRef, onMounted, watch, nextTick, useTemplateRef } from 'vue';
+import { ref, shallowRef, onMounted, watch, useTemplateRef } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { Track } from '../class';
 import { getSong } from '../api/musicSource/library';
 import TrackList from '../components/common/TrackList.vue';
 import { useCoverImage } from '@/composables/useCoverImage';
-import PlayerStore from '@/stores/player.js';
+import PlayerStore from '@/stores/player/index.js';
 import { usePerf } from '@/utils/performanceMonitor.js';
 import { useAnime } from '@/composables/useAnime.js';
+import { formatDuration } from '@/utils/format.js';
 
 const { start, end, log } = usePerf('TrackDetail');
 
@@ -57,18 +57,6 @@ watch(() => track.value?.id, (newId) => {
   }
 });
 
-// 数据加载完成后触入场动画
-watch(isLoading, (loading) => {
-  if (!loading && track.value) {
-    nextTick(() => {
-      run(({ animate, presets, staggerPresets }) => {
-        animate('.track-hero', { ...presets.fadeInUp });
-        animate('.track-details', { ...presets.listItemEnter, delay: staggerPresets.normal() });
-      });
-    });
-  }
-});
-
 const handlePlay = () => {
   if (track.value) {
     log('handlePlay', { trackId: track.value.id, title: track.value.title });
@@ -81,16 +69,10 @@ const getCoverUrl = () => {
   return coverUrl.value || '';
 };
 
-const formatDuration = (seconds) => {
-  if (!seconds) return '0:00';
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
-};
 </script>
 
 <template>
-  <div ref="root" class="track-detail-page">
+  <div ref="root" class="track-detail-page page-container">
     <div v-if="isLoading" class="loading-state">
       <div class="spinner"></div>
     </div>
@@ -203,8 +185,7 @@ const formatDuration = (seconds) => {
 
 <style scoped>
 .track-detail-page {
-  max-width: 1200px;
-  margin: 0 auto;
+  /* max-width 和 margin 由 .page-container 提供 */
 }
 
 .track-hero {
@@ -279,7 +260,7 @@ const formatDuration = (seconds) => {
 
 .artist-link,
 .album-link {
-  color: var(--primary-color, #0078d7);
+  color: var(--primary-color);
   font-weight: 500;
 }
 

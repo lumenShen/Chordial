@@ -9,14 +9,14 @@
  *  - 删除歌单
  *  - 移除单曲、调整顺序
  */
-import { ref, shallowRef, computed, onMounted, useTemplateRef } from 'vue';
+import { ref, shallowRef, computed, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { useAnime } from '@/composables/useAnime.js';
 import * as playlistApi from '@/api/musicSource/playlists.js';
 import TrackList from '@/components/common/TrackList.vue';
 import BatchDownloadDialog from '@/components/common/BatchDownloadDialog.vue';
-import PlayerStore from '@/stores/player.js';
+import PlayerStore from '@/stores/player/index.js';
 import { useDownloadManager } from '@/stores/downloadManager.js';
+import { formatDuration } from '@/utils/format.js';
 
 const { startBatch: startBatchDownload } = useDownloadManager();
 
@@ -56,9 +56,6 @@ function showToast(msg, type = 'info', duration = 2500) {
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { toast.value = null; }, duration);
 }
-
-const rootRef = useTemplateRef('root');
-const { run } = useAnime(() => rootRef.value);
 
 // ── 加载 ──────────────────────────────────────────────
 async function loadPlaylist() {
@@ -287,13 +284,6 @@ function formatTime(ts) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-function formatDuration(seconds) {
-  if (!seconds) return '0:00';
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
 const sourceLabel = computed(() => {
   if (!playlist.value) return '';
   return playlist.value.source === 'netease' ? '网易云' : '本地';
@@ -301,18 +291,14 @@ const sourceLabel = computed(() => {
 
 onMounted(async () => {
   await loadPlaylist();
-  run(({ animate, presets }) => {
-    animate('.playlist-header', { ...presets.fadeIn });
-    animate('.tracks-section', { ...presets.fadeInUp });
-  });
 });
 </script>
 
 <template>
-  <div class="playlist-detail" ref="root">
+  <div class="playlist-detail page-container">
     <!-- 返回 -->
     <button class="back-btn" @click="router.push('/playlists')">
-      <i class="bi bi-arrow-left"></i> 返回歌单
+      <HIcon name="arrow-left" /> 返回歌单
     </button>
 
     <!-- 加载 -->
@@ -322,7 +308,7 @@ onMounted(async () => {
 
     <!-- 错误 -->
     <div v-else-if="errorMsg" class="error-state">
-      <i class="bi bi-exclamation-triangle"></i>
+      <HIcon name="exclamation-triangle" />
       <p>{{ errorMsg }}</p>
       <button class="btn btn-primary" @click="router.push('/playlists')">返回歌单列表</button>
     </div>
@@ -357,13 +343,13 @@ onMounted(async () => {
             </div>
             <div class="header-stats">
               <span v-if="playlist.creator">
-                <i class="bi bi-person"></i> {{ playlist.creator }}
+                <HIcon name="person" /> {{ playlist.creator }}
               </span>
               <span>
-                <i class="bi bi-music-note-beamed"></i> {{ songs.length }} 首
+                <HIcon name="music-note-beamed" /> {{ songs.length }} 首
               </span>
               <span v-if="playlist.created_at">
-                <i class="bi bi-calendar"></i> {{ formatTime(playlist.created_at) }}
+                <HIcon name="calendar" /> {{ formatTime(playlist.created_at) }}
               </span>
             </div>
           </template>
@@ -414,7 +400,7 @@ onMounted(async () => {
               :disabled="songs.length === 0"
               @click="playAll"
             >
-              <i class="bi bi-play-fill"></i> 播放全部
+              <HIcon name="play-fill" /> 播放全部
             </button>
             <button
               class="btn btn-secondary"
@@ -422,10 +408,10 @@ onMounted(async () => {
               @click="openBatchDialog"
               title="将网易云曲目批量下载到本地（后台静默执行）"
             >
-              <i class="bi bi-cloud-arrow-down"></i> 批量下载
+              <HIcon name="cloud-arrow-down" /> 批量下载
             </button>
             <button class="btn btn-secondary" @click="startEdit">
-              <i class="bi bi-pencil"></i> 编辑
+              <HIcon name="pencil" /> 编辑
             </button>
             <button
               class="btn btn-danger"
@@ -452,7 +438,7 @@ onMounted(async () => {
         </div>
 
         <div v-if="songs.length === 0" class="empty-tracks">
-          <i class="bi bi-music-note empty-icon"></i>
+          <HIcon name="music-note" class="empty-icon" />
           <p>歌单为空</p>
         </div>
 
@@ -474,7 +460,7 @@ onMounted(async () => {
             @dragend="dragIndex = null; dragOverIndex = null"
           >
             <div class="row-handle" title="拖拽调整顺序">
-              <i class="bi bi-grip-vertical"></i>
+              <HIcon name="grip-vertical" />
             </div>
             <span class="row-idx">{{ idx + 1 }}</span>
             <div class="row-info">
@@ -483,16 +469,18 @@ onMounted(async () => {
             </div>
             <span class="row-dur">{{ formatDuration(song.duration) }}</span>
             <button class="row-remove" @click="removeSong(song.id)" title="从歌单移除">
-              <i class="bi bi-x-lg"></i>
+              <HIcon name="x-lg" />
             </button>
           </div>
         </div>
 
         <!-- 只读模式：使用 TrackList -->
+        <!-- mode="page"：复用外层 .content-wrapper 滚动，避免双层嵌套滚动 -->
         <TrackList
           v-else
           :tracks="songs"
           :virtual-scroll="true"
+          mode="page"
           :show-match-count="true"
           @select="openTrack"
           @play="playSong"
@@ -524,9 +512,7 @@ onMounted(async () => {
 
 <style scoped>
 .playlist-detail {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding-bottom: 80px;
+  /* max-width 和 margin 由 .page-container 提供 */
 }
 
 .back-btn {
@@ -545,8 +531,8 @@ onMounted(async () => {
 }
 
 .back-btn:hover {
-  border-color: var(--primary-color, #0078d7);
-  color: var(--primary-color, #0078d7);
+  border-color: var(--primary-color);
+  color: var(--primary-color);
 }
 
 .loading-state,
@@ -566,7 +552,7 @@ onMounted(async () => {
   width: 32px;
   height: 32px;
   border: 3px solid var(--border-light, #e8e8e8);
-  border-top-color: var(--primary-color, #0078d7);
+  border-top-color: var(--primary-color);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
@@ -669,8 +655,8 @@ onMounted(async () => {
   font-size: 11px;
   padding: 3px 10px;
   border-radius: 12px;
-  background: var(--primary-light, rgba(0, 120, 215, 0.1));
-  color: var(--primary-color, #0078d7);
+  background: var(--primary-light);
+  color: var(--primary-color);
 }
 
 .tag.removable {
@@ -730,8 +716,8 @@ onMounted(async () => {
 }
 
 .btn:hover:not(:disabled) {
-  border-color: var(--primary-color, #0078d7);
-  color: var(--primary-color, #0078d7);
+  border-color: var(--primary-color);
+  color: var(--primary-color);
 }
 
 .btn:disabled {
@@ -740,13 +726,13 @@ onMounted(async () => {
 }
 
 .btn-primary {
-  background: var(--primary-color, #0078d7);
-  border-color: var(--primary-color, #0078d7);
+  background: var(--primary-color);
+  border-color: var(--primary-color);
   color: #fff;
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: var(--primary-color-dark, #0066bf);
+  background: var(--primary-hover);
   color: #fff;
 }
 
@@ -798,7 +784,7 @@ onMounted(async () => {
 
 .edit-input:focus,
 .edit-textarea:focus {
-  border-color: var(--primary-color, #0078d7);
+  border-color: var(--primary-color);
 }
 
 .tag-editor {
@@ -887,8 +873,8 @@ onMounted(async () => {
 }
 
 .editable-row.drag-over {
-  background: var(--primary-light, rgba(0, 120, 215, 0.05));
-  border-top: 2px solid var(--primary-color, #0078d7);
+  background: var(--primary-light);
+  border-top: 2px solid var(--primary-color);
 }
 
 .editable-row:last-child {
@@ -987,7 +973,7 @@ onMounted(async () => {
 }
 
 .toast.info {
-  color: var(--primary-color, #0078d7);
+  color: var(--primary-color);
 }
 
 .fade-enter-active,
@@ -1000,7 +986,7 @@ onMounted(async () => {
   opacity: 0;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 767px) {
   .playlist-header {
     grid-template-columns: 1fr;
     gap: 16px;

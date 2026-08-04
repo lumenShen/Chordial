@@ -1,16 +1,21 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted, watch, nextTick, useTemplateRef } from 'vue';
+import { computed, ref, onMounted, onUnmounted, watch, nextTick, useTemplateRef, inject } from 'vue';
 import { useRouter } from 'vue-router';
 import { useCoverImages } from '@/composables/useCoverImage';
 import { useVirtualList } from '@/composables/useVirtualList';
 import { useAnime } from '@/composables/useAnime.js';
 import CoverImage from './CoverImage.vue';
-import PlayerStore from '@/stores/player.js';
+import PlayerStore from '@/stores/player/index.js';
 import { usePerf } from '@/utils/performanceMonitor.js';
 import * as playlistApi from '@/api/musicSource/playlists.js';
 import * as neteaseApi from '@/api/musicSource/netease.js';
 import * as sourceApi from '@/api/musicSource/sources.js';
 import * as prefApi from '@/api/musicSource/lyricPreference.js';
+import { formatDuration } from '@/utils/format.js';
+
+// 注入外层滚动容器（由 AppLayout 通过 provide 暴露的 .content-wrapper ref）
+// 仅在 page 模式下生效：避免双层滚动嵌套；为 null 时回退到 window（向后兼容）
+const appScrollContainer = inject('appScrollContainer', null);
 
 const { start, end, log } = usePerf('TrackList');
 
@@ -114,6 +119,7 @@ const virtualListApi = useVirtualList(tracksRef, {
   mode: props.mode,
   infiniteScroll: props.infiniteScroll && typeof props.onLoadMore === 'function',
   onLoadMore: handleLoadMore,
+  scrollContainer: appScrollContainer,
 });
 
 // 解构出来用于模板
@@ -172,13 +178,6 @@ const handleTrackDoubleClick = (track) => {
   // 双击播放
   log('playTrack', { trackId: track.id, source: 'dblclick' });
   PlayerStore.play(track, props.tracks);
-};
-
-const formatDuration = (seconds) => {
-  if (!seconds) return '0:00';
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
 };
 
 const getCoverUrl = (track) => {
@@ -818,15 +817,15 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
         @contextmenu.prevent
       >
         <div class="ctx-item" @click="ctxPlay">
-          <i class="bi bi-play-fill"></i> 播放
+          <HIcon name="play-fill" /> 播放
         </div>
         <div class="ctx-item" @click="ctxViewDetail">
-          <i class="bi bi-info-circle"></i> 查看详情
+          <HIcon name="info-circle" /> 查看详情
         </div>
         <div class="ctx-separator"></div>
         <div class="ctx-item has-sub" @click="ctxTogglePlaylistSub" @mouseenter="ctxMenu.showPlaylistSub = true">
-          <i class="bi bi-music-note-list"></i> 添加到歌单
-          <i class="bi bi-chevron-right ctx-arrow"></i>
+          <HIcon name="music-note-list" /> 添加到歌单
+          <HIcon name="chevron-right" class="ctx-arrow" />
           <!-- 子菜单 -->
           <div
             v-if="ctxMenu.showPlaylistSub"
@@ -849,15 +848,15 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
             </div>
             <div class="ctx-separator"></div>
             <div class="ctx-sub-item" @click="ctxCreatePlaylistAndAdd">
-              <i class="bi bi-plus-lg"></i> 新建歌单…
+              <HIcon name="plus-lg" /> 新建歌单…
             </div>
           </div>
         </div>
         <div class="ctx-item" @click="ctxDownloadFromCloud">
-          <i class="bi bi-cloud-download"></i> 从云端下载…
+          <HIcon name="cloud-download" /> 从云端下载…
         </div>
         <div class="ctx-item" @click="ctxViewLyricSource">
-          <i class="bi bi-card-text"></i> 查看歌词来源…
+          <HIcon name="card-text" /> 查看歌词来源…
         </div>
       </div>
 
@@ -866,11 +865,11 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
         <div class="ctx-dialog">
           <div class="ctx-dialog-header">
             <h3 class="ctx-dialog-title">
-              <i class="bi bi-cloud-download"></i>
+              <HIcon name="cloud-download" />
               从云端下载
             </h3>
             <button class="ctx-close-btn" @click="closeDownloadDialog">
-              <i class="bi bi-x-lg"></i>
+              <HIcon name="x-lg" />
             </button>
           </div>
           <div class="ctx-dialog-body">
@@ -903,11 +902,11 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
             </div>
 
             <div v-else-if="downloadDialog.error" class="ctx-error">
-              <i class="bi bi-exclamation-triangle"></i> {{ downloadDialog.error }}
+              <HIcon name="exclamation-triangle" /> {{ downloadDialog.error }}
             </div>
 
             <div v-else-if="downloadDialog.result" class="ctx-success">
-              <i class="bi bi-check-circle-fill"></i>
+              <HIcon name="check-circle-fill" />
               <div>
                 <div>下载完成</div>
                 <code class="ctx-path">{{ downloadDialog.result }}</code>
@@ -938,7 +937,7 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
                   </div>
                 </div>
                 <p class="ctx-hint">
-                  <i class="bi bi-info-circle"></i>
+                  <HIcon name="info-circle" />
                   本地音质已较高时，无需重复下载
                 </p>
               </div>
@@ -989,11 +988,11 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
         <div class="ctx-dialog">
           <div class="ctx-dialog-header">
             <h3 class="ctx-dialog-title">
-              <i class="bi bi-card-text"></i>
+              <HIcon name="card-text" />
               歌词来源
             </h3>
             <button class="ctx-close-btn" @click="closeLyricDialog">
-              <i class="bi bi-x-lg"></i>
+              <HIcon name="x-lg" />
             </button>
           </div>
           <div class="ctx-dialog-body">
@@ -1007,7 +1006,7 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
             </div>
 
             <div v-else-if="lyricDialog.error" class="ctx-error">
-              <i class="bi bi-exclamation-triangle"></i> {{ lyricDialog.error }}
+              <HIcon name="exclamation-triangle" /> {{ lyricDialog.error }}
             </div>
 
             <div v-else-if="lyricDialog.data" class="ctx-lyric-info">
@@ -1029,13 +1028,13 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
                 <span class="ctx-info-value">{{ lyricDialog.data.candidates_count }}</span>
               </div>
               <p class="ctx-hint">
-                <i class="bi bi-info-circle"></i>
+                <HIcon name="info-circle" />
                 在「设置 → 网易云音乐来源 → 歌词优先级」可调整来源与格式偏好
               </p>
             </div>
 
             <div v-else class="ctx-hint">
-              <i class="bi bi-emoji-frown"></i> 暂无歌词
+              <HIcon name="emoji-frown" /> 暂无歌词
             </div>
           </div>
           <div class="ctx-dialog-actions">
@@ -1245,7 +1244,7 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   width: 14px;
   height: 14px;
   border: 2px solid var(--border-light, #e8e8e8);
-  border-top-color: var(--primary-color, #0078d7);
+  border-top-color: var(--primary-color);
   border-radius: 50%;
   animation: vl-spin 0.8s linear infinite;
   display: inline-block;
@@ -1580,7 +1579,7 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   width: 14px;
   height: 14px;
   border: 2px solid var(--border-light, #e8e8e8);
-  border-top-color: var(--primary-color, #0078d7);
+  border-top-color: var(--primary-color);
   border-radius: 50%;
   animation: ctx-spin 0.8s linear infinite;
   display: inline-block;
@@ -1753,8 +1752,8 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   font-size: 10px;
   padding: 1px 6px;
   border-radius: 8px;
-  background: var(--primary-light, rgba(0, 120, 215, 0.1));
-  color: var(--primary-color, #0078d7);
+  background: var(--primary-light);
+  color: var(--primary-color);
   font-weight: 600;
 }
 
@@ -1786,18 +1785,18 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
 }
 
 .ctx-btn-secondary:hover:not(:disabled) {
-  border-color: var(--primary-color, #0078d7);
-  color: var(--primary-color, #0078d7);
+  border-color: var(--primary-color);
+  color: var(--primary-color);
 }
 
 .ctx-btn-primary {
-  background: var(--primary-color, #0078d7);
-  border-color: var(--primary-color, #0078d7);
+  background: var(--primary-color);
+  border-color: var(--primary-color);
   color: #fff;
 }
 
 .ctx-btn-primary:hover:not(:disabled) {
-  background: var(--primary-color-dark, #0066bf);
+  background: var(--primary-hover);
 }
 
 /* Toast */
@@ -1830,7 +1829,7 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
 }
 
 .ctx-toast.info {
-  color: var(--primary-color, #0078d7);
+  color: var(--primary-color);
 }
 
 .ctx-fade-enter-active,
@@ -1843,7 +1842,7 @@ watch(() => props.tracks, () => nextTick(playEnter), { flush: 'post' });
   opacity: 0;
 }
 
-@media (max-width: 600px) {
+@media (max-width: 480px) {
   .track-ctx-menu {
     min-width: 180px;
   }

@@ -17,7 +17,7 @@
 import { ref, computed, watch, shallowRef } from 'vue';
 import { useRouter } from 'vue-router';
 import BottomSheet from '@/components/ui/BottomSheet.vue';
-import { PlayerStore } from '@/stores/player.js';
+import { PlayerStore } from '@/stores/player/index.js';
 import { useCoverImage } from '@/composables/useCoverImage';
 import * as playlistApi from '@/api/musicSource/playlists.js';
 import * as neteaseApi from '@/api/musicSource/netease.js';
@@ -394,7 +394,7 @@ function onClose() {
       <header class="tms-hero">
         <div class="tms-cover">
           <img v-if="coverUrl" :src="coverUrl" :alt="track.title" />
-          <i v-else class="bi bi-music-note-beamed tms-cover-placeholder" />
+            <HIcon v-else name="music-note-beamed" class="tms-cover-placeholder" />
         </div>
         <div class="tms-meta">
           <div class="tms-title" :title="track.title">{{ track.title || '未知歌曲' }}</div>
@@ -402,7 +402,7 @@ function onClose() {
             {{ track.artist || '未知歌手' }}
           </div>
           <div v-if="track.albumTitle" class="tms-album">
-            <i class="bi bi-disc" />
+              <HIcon name="disc" />
             <span :title="track.albumTitle">{{ track.albumTitle }}</span>
           </div>
         </div>
@@ -413,11 +413,11 @@ function onClose() {
         <h4 class="tms-section-title">歌曲操作</h4>
         <div class="tms-actions">
           <button class="tms-action-btn" @click="togglePlaylistPicker">
-            <i class="bi bi-plus-square" />
+              <HIcon name="plus-square" />
             <span>添加到歌单</span>
           </button>
           <button class="tms-action-btn" @click="viewTrackDetail">
-            <i class="bi bi-info-circle" />
+              <HIcon name="info-circle" />
             <span>查看详情</span>
           </button>
         </div>
@@ -433,12 +433,12 @@ function onClose() {
             class="tms-sublist-item"
             @click="addToPlaylist(pl.id)"
           >
-            <i class="bi bi-music-note-list" />
+              <HIcon name="music-note-list" />
             <span class="tms-sublist-name">{{ pl.name }}</span>
             <span class="tms-sublist-count">{{ pl.song_ids?.length || 0 }} 首</span>
           </button>
           <button class="tms-sublist-item tms-sublist-create" @click="createPlaylistAndAdd">
-            <i class="bi bi-plus-circle" />
+              <HIcon name="plus-circle" />
             <span>创建新歌单</span>
           </button>
         </div>
@@ -453,7 +453,7 @@ function onClose() {
             :disabled="!track.artistIds?.length"
             @click="gotoArtist"
           >
-            <i class="bi bi-person" />
+              <HIcon name="person" />
             <span>查看艺术家</span>
           </button>
           <button
@@ -461,7 +461,7 @@ function onClose() {
             :disabled="!track.albumId"
             @click="gotoAlbum"
           >
-            <i class="bi bi-disc3" />
+              <HIcon name="disc3" />
             <span>查看专辑</span>
           </button>
         </div>
@@ -476,13 +476,13 @@ function onClose() {
             :disabled="onlineSearching"
             @click="searchOnlineMatches"
           >
-            <i class="bi bi-arrow-repeat" :class="{ 'tms-spin': onlineSearching }" />
+              <HIcon name="arrow-repeat" :class="{ 'tms-spin': onlineSearching }" />
             {{ onlineSearchDone ? '重新搜索' : '搜索网易云' }}
           </button>
         </div>
 
         <div v-if="onlineSearching" class="tms-loading">
-          <i class="bi bi-arrow-repeat tms-spin" /> 搜索中...
+            <HIcon name="arrow-repeat" class="tms-spin" /> 搜索中...
         </div>
 
         <div v-else-if="onlineSearchDone && onlineMatches.length === 0" class="tms-empty-inline">
@@ -503,7 +503,7 @@ function onClose() {
                 <span v-if="m.albumTitle"> · {{ m.albumTitle }}</span>
               </div>
             </div>
-            <i class="bi bi-play-circle tms-match-play" />
+              <HIcon name="play-circle" class="tms-match-play" />
           </button>
         </div>
 
@@ -544,7 +544,7 @@ function onClose() {
                 </div>
               </div>
             </div>
-            <i v-if="idx === 0" class="bi bi-check-circle-fill tms-source-check" />
+              <HIcon v-if="idx === 0" name="check-circle-fill" class="tms-source-check" />
           </button>
         </div>
       </section>
@@ -587,7 +587,7 @@ function onClose() {
             :disabled="!canRevealInFolder"
             @click="revealInFolder"
           >
-            <i class="bi bi-folder2-open" />
+              <HIcon name="folder2-open" />
             <span>在文件管理器中显示</span>
           </button>
           <button
@@ -595,7 +595,7 @@ function onClose() {
             :disabled="!canOpenOnline"
             @click="openOnlinePage"
           >
-            <i class="bi bi-box-arrow-up-right" />
+              <HIcon name="box-arrow-up-right" />
             <span>打开在线页面</span>
           </button>
         </div>
@@ -963,8 +963,8 @@ function onClose() {
 }
 
 .tms-source-active {
-  border-color: var(--accent-primary, #0078d7);
-  background: var(--bg-active, rgba(0, 120, 215, 0.08));
+  border-color: var(--primary-color);
+  background: var(--bg-active);
 }
 
 .tms-source-main {
@@ -1005,7 +1005,7 @@ function onClose() {
 }
 
 .tms-source-check {
-  color: var(--accent-primary, #0078d7);
+  color: var(--primary-color);
   font-size: 16px;
   flex-shrink: 0;
 }
@@ -1060,7 +1060,7 @@ function onClose() {
 
 .tms-toast--success { background: rgba(40, 167, 69, 0.92); }
 .tms-toast--error { background: rgba(220, 53, 69, 0.92); }
-.tms-toast--info { background: rgba(0, 120, 215, 0.92); }
+.tms-toast--info { background: rgba(0, 122, 255, 0.92); }
 
 .tms-toast-enter-active,
 .tms-toast-leave-active {

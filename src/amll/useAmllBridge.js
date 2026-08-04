@@ -54,7 +54,7 @@ import {
 	// 枚举
 	RepeatMode,
 } from '@applemusic-like-lyrics/react-full'
-import { PlayerStore, PlayMode } from '@/stores/player.js'
+import { PlayerStore, PlayMode } from '@/stores/player/index.js'
 import { parseLyrics } from '@/utils/lyricConverter.js'
 import { AmllSettingsStore } from '@/stores/amllSettings.js'
 import { startAudioAnalyser, stopAudioAnalyser, setLowFreqRange } from '@/amll/useAudioAnalyser.js'

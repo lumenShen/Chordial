@@ -19,7 +19,7 @@
               <img :src="albumCoverUrl" alt="专辑封面" />
             </div>
             <div class="album-cover-thumb placeholder" ref="coverThumb" v-else @click="openPlayerView" data-shared="cover">
-              <i class="bi bi-disc-fill"></i>
+              <HugeiconsIcon :icon="MusicNote01Icon" :size="20" />
             </div>
           </Teleport>
         </div>
@@ -35,11 +35,11 @@
         </div>
 
         <button class="control-btn play-btn" @click="togglePlay">
-          <i :class="isPlaying ? 'bi bi-pause-fill' : 'bi bi-play-fill'"></i>
+          <HugeiconsIcon :icon="isPlaying ? PauseIcon : PlayIcon" :size="26" />
         </button>
 
         <button class="control-btn" @click="$emit('next')">
-          <i class="bi bi-skip-end-fill"></i>
+          <HugeiconsIcon :icon="FastForwardIcon" :size="20" />
         </button>
       </div>
     </LiquidGlass>
@@ -57,12 +57,18 @@
  * 边缘折射 + 磨砂模糊效果，与 AppHeader / AppBottomNav 统一风格。
  */
 import { computed, onMounted, useTemplateRef } from 'vue'
-import { PlayerStore } from '@/stores/player.js'
+import { HugeiconsIcon } from '@hugeicons/vue'
+import {
+  PlayIcon,
+  PauseIcon,
+  FastForwardIcon,
+  MusicNote01Icon,
+} from '@hugeicons/core-free-icons'
+import { PlayerStore } from '@/stores/player/index.js'
 import { usePerf } from '@/utils/performanceMonitor.js'
 import { useAnime } from '@/composables/useAnime.js'
 import LiquidGlass from '@/components/ui/LiquidGlass.vue'
 import { formatDuration as formatTime } from '@/utils/format.js'
-
 const { log } = usePerf('PlayerControlBar')
 
 const rootRef = useTemplateRef('root')
@@ -131,27 +137,8 @@ const trackMeta = computed(() => {
   return parts.join(' · ')
 })
 
-// 播放模式图标
-const playModeIcon = computed(() => {
-  switch (props.playMode) {
-    case 'random':
-      return 'bi bi-shuffle'
-    case 'loop':
-      return 'bi bi-repeat'
-    case 'loop_one':
-      return 'bi bi-repeat-1'
-    default:
-      return 'bi bi-arrow-right'
-  }
-})
 
-// 音量图标
-const volumeIcon = computed(() => {
-  if (props.muted || props.volume === 0) return 'bi bi-volume-mute-fill'
-  if (props.volume < 0.3) return 'bi bi-volume-off-fill'
-  if (props.volume < 0.7) return 'bi bi-volume-down-fill'
-  return 'bi bi-volume-up-fill'
-})
+// 点击封面打开 PlayerView 模态（传递封面 DOM 元素用于 FLIP 共享元素动画）
 
 // 点击封面打开 PlayerView 模态（传递封面 DOM 元素用于 FLIP 共享元素动画）
 const openPlayerView = () => {
@@ -197,6 +184,7 @@ const onVolumeChange = (e) => {
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
   isolation: isolate;
   position: relative;
 }

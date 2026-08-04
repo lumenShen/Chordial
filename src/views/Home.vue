@@ -6,7 +6,7 @@ import ArtistList from '../components/common/ArtistList.vue';
 import CoverImage from '../components/common/CoverImage.vue';
 import AlbumCollageBackground from '../components/common/AlbumCollageBackground.vue';
 import { library } from '../api/musicSource';
-import PlayerStore from '@/stores/player.js';
+import PlayerStore from '@/stores/player/index.js';
 import { usePerf } from '@/utils/performanceMonitor.js';
 import { useAnime } from '@/composables/useAnime.js';
 
@@ -88,50 +88,13 @@ const startSpinner = () => {
   });
 };
 
-// 入场动画：hero 区 + 区块标题 + 卡片列表 + 空状态
-const playEntrance = () => {
-  run(({ animate, stagger, presets, staggerPresets }) => {
-    // Hero 徽章自上而下淡入
-    animate('.hero-badge', { ...presets.fadeInDown });
-    // Hero 其余内容向上淡入并错峰
-    animate('.hero-title, .hero-subtitle, .hero-actions, .hero-stats', {
-      ...presets.fadeInUp,
-      delay: stagger(80, { start: 80 }),
-    });
-
-    // 各区块标题淡入
-    animate('.section-header', { ...presets.fadeIn, delay: stagger(60) });
-
-    // 为你推荐 - 横向卡片顺序错峰入场
-    animate('.track-card', {
-      ...presets.listItemEnter,
-      delay: staggerPresets.fast(),
-    });
-
-    // 热门专辑 - 网格卡片从中心扩散入场
-    animate('.album-card', {
-      ...presets.listItemEnter,
-      delay: staggerPresets.grid(4),
-    });
-
-    // 空状态
-    animate('.empty-icon', { ...presets.scaleIn });
-    animate('.empty-title, .empty-desc, .empty-action', {
-      ...presets.fadeInUp,
-      delay: stagger(60, { start: 80 }),
-    });
-  });
-};
-
-// 监听加载状态：加载中旋转 spinner，加载完成触发入场动画
+// 监听加载状态：加载中旋转 spinner
 // immediate 保证首次进入（isLoading 初始为 true）也能启动 spinner
 watch(
   isLoading,
   (loading) => {
     if (loading) {
       nextTick(startSpinner);
-    } else {
-      nextTick(playEntrance);
     }
   },
   { immediate: true }
@@ -165,7 +128,7 @@ const shufflePlay = () => {
 </script>
 
 <template>
-  <div class="home-page" ref="root">
+  <div class="home-page page-container" ref="root">
     <!-- Hero Banner -->
     <section class="hero-banner" v-if="todayPicks.length > 0">
       <!-- 多专辑封面拼接背景 -->
@@ -177,18 +140,18 @@ const shufflePlay = () => {
       />
       <div class="hero-content">
         <div class="hero-badge">
-          <i class="bi bi-stars"></i>
+          <HIcon name="stars" />
           <span>今日推荐</span>
         </div>
         <h1 class="hero-title">{{ greeting }}，音乐爱好者</h1>
         <p class="hero-subtitle">探索你的音乐世界，发现无限可能</p>
         <div class="hero-actions">
           <button class="hero-btn primary" @click="playAllTracks">
-            <i class="bi bi-play-fill"></i>
+            <HIcon name="play-fill" />
             <span>播放全部</span>
           </button>
           <button class="hero-btn secondary" @click="shufflePlay">
-            <i class="bi bi-shuffle"></i>
+            <HIcon name="shuffle" />
             <span>随机播放</span>
           </button>
         </div>
@@ -223,7 +186,7 @@ const shufflePlay = () => {
           <h2 class="section-title">为你推荐</h2>
           <router-link to="/tracks" class="section-link">
             查看全部
-            <i class="bi bi-arrow-right"></i>
+            <HIcon name="arrow-right" />
           </router-link>
         </div>
         <div class="horizontal-scroll">
@@ -238,9 +201,10 @@ const shufflePlay = () => {
                 :item="track"
                 :alt="track.title"
                 type="track"
+                priority
               />
               <button class="track-card-play" @click.stop="handleTrackPlay(track)">
-                <i class="bi bi-play-fill"></i>
+                <HIcon name="play-fill" />
               </button>
             </div>
             <div class="track-card-info">
@@ -257,7 +221,7 @@ const shufflePlay = () => {
           <h2 class="section-title">热门专辑</h2>
           <router-link to="/albums" class="section-link">
             查看全部
-            <i class="bi bi-arrow-right"></i>
+            <HIcon name="arrow-right" />
           </router-link>
         </div>
         <div class="albums-grid">
@@ -272,10 +236,11 @@ const shufflePlay = () => {
                 :item="album"
                 :alt="album.title"
                 type="album"
+                priority
               />
               <div class="album-overlay">
                 <button class="album-play-btn">
-                  <i class="bi bi-play-fill"></i>
+                  <HIcon name="play-fill" />
                 </button>
               </div>
             </div>
@@ -293,7 +258,7 @@ const shufflePlay = () => {
           <h2 class="section-title">最近添加</h2>
           <router-link to="/tracks" class="section-link">
             查看全部
-            <i class="bi bi-arrow-right"></i>
+            <HIcon name="arrow-right" />
           </router-link>
         </div>
         <TrackList 
@@ -309,7 +274,7 @@ const shufflePlay = () => {
           <h2 class="section-title">推荐歌手</h2>
           <router-link to="/artists" class="section-link">
             查看全部
-            <i class="bi bi-arrow-right"></i>
+            <HIcon name="arrow-right" />
           </router-link>
         </div>
         <ArtistList :artists="featuredArtists.slice(0, 5)" />
@@ -318,12 +283,12 @@ const shufflePlay = () => {
       <!-- 空状态 -->
       <div v-if="recentTracks.length === 0 && featuredArtists.length === 0 && recentAlbums.length === 0" class="empty-state">
         <div class="empty-icon">
-          <i class="bi bi-music-note-beamed"></i>
+          <HIcon name="music-note-beamed" />
         </div>
         <h3 class="empty-title">开始你的音乐之旅</h3>
         <p class="empty-desc">添加音乐源，发现属于你的音乐世界</p>
         <router-link to="/music-sources" class="empty-action">
-          <i class="bi bi-plus-lg"></i>
+          <HIcon name="plus-lg" />
           添加音乐源
         </router-link>
       </div>
@@ -333,22 +298,22 @@ const shufflePlay = () => {
 
 <style scoped>
 .home-page {
-  max-width: 1200px;
-  margin: 0 auto;
+  /* max-width 和 margin 由 .page-container 提供 */
 }
 
-/* Hero Banner - 沉浸式大背景 */
+/* Hero Banner - 白/灰/黑三色调沉浸式头部 */
 .hero-banner {
   position: relative;
-  margin-bottom: 48px;
-  padding: 48px;
+  margin-bottom: 40px;
+  padding: 40px 44px;
   border-radius: var(--radius-xl);
   overflow: hidden;
-  min-height: 320px;
+  min-height: 300px;
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
-  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f0f23 100%);
+  background: linear-gradient(135deg, #ffffff 0%, #f4f4f5 55%, #ececef 100%);
+  border: 1px solid var(--border-light);
 }
 
 /* 多专辑封面背景 */
@@ -356,48 +321,48 @@ const shufflePlay = () => {
   position: absolute;
   inset: 0;
   z-index: 0;
+  opacity: 0.28;
 }
 
 .hero-content {
   position: relative;
   z-index: 1;
-  max-width: 500px;
+  max-width: 520px;
 }
 
 .hero-badge {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 12px;
-  background: rgba(255, 255, 255, 0.15);
-  backdrop-filter: blur(10px);
+  padding: 5px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  backdrop-filter: blur(8px);
   border-radius: 20px;
-  color: white;
-  font-size: 13px;
+  color: var(--text-primary);
+  font-size: 12px;
   font-weight: 600;
   margin-bottom: 16px;
-  /* GPU: badge backdrop 独立合成 */
   will-change: backdrop-filter;
   contain: paint;
 }
 
 .hero-badge i {
-  color: #ffd700;
+  color: var(--text-primary);
 }
 
 .hero-title {
-  font-size: 42px;
+  font-size: 38px;
   font-weight: 800;
-  color: white;
+  color: var(--text-primary);
   margin: 0 0 12px 0;
   letter-spacing: -1px;
   line-height: 1.1;
-  text-shadow: 0 2px 20px rgba(0, 0, 0, 0.3);
 }
 
 .hero-subtitle {
-  font-size: 16px;
-  color: rgba(255, 255, 255, 0.8);
+  font-size: 15px;
+  color: var(--text-secondary);
   margin: 0 0 24px 0;
   font-weight: 400;
 }
@@ -411,9 +376,9 @@ const shufflePlay = () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 14px 28px;
+  padding: 12px 24px;
   border-radius: 100px;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
   cursor: pointer;
   transition: all var(--transition-fast);
@@ -421,31 +386,28 @@ const shufflePlay = () => {
 }
 
 .hero-btn.primary {
-  background: white;
-  color: var(--text-primary);
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+  background: var(--primary-color);
+  color: var(--primary-contrast);
+  box-shadow: var(--shadow-primary);
 }
 
 .hero-btn.primary:hover {
-  transform: scale(1.05);
-  box-shadow: 0 6px 30px rgba(0, 0, 0, 0.3);
+  transform: scale(1.04);
+  box-shadow: var(--shadow-md);
 }
 
 .hero-btn.secondary {
-  background: rgba(255, 255, 255, 0.15);
-  backdrop-filter: blur(10px);
-  color: white;
-  /* GPU: hero 按钮通常静态，hints 提示合成器 */
-  will-change: backdrop-filter;
-  contain: paint;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
 }
 
 .hero-btn.secondary:hover {
-  background: rgba(255, 255, 255, 0.25);
+  background: var(--bg-hover);
 }
 
 .hero-btn i {
-  font-size: 18px;
+  font-size: 16px;
 }
 
 .hero-stats {
@@ -454,12 +416,12 @@ const shufflePlay = () => {
   display: flex;
   align-items: center;
   gap: 20px;
-  padding: 20px 24px;
-  background: rgba(255, 255, 255, 0.1);
-  backdrop-filter: blur(16px);
+  padding: 18px 22px;
+  background: var(--bg-secondary);
+  backdrop-filter: blur(12px);
   border-radius: var(--radius-lg);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  /* GPU: stats 区 backdrop 高开销，降模糊+合成层 */
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-sm);
   will-change: backdrop-filter;
   contain: layout paint;
 }
@@ -472,23 +434,23 @@ const shufflePlay = () => {
 }
 
 .hero-stat-value {
-  font-size: 28px;
+  font-size: 26px;
   font-weight: 800;
-  color: white;
+  color: var(--text-primary);
   line-height: 1;
   letter-spacing: -1px;
 }
 
 .hero-stat-label {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.7);
+  font-size: 11px;
+  color: var(--text-secondary);
   font-weight: 500;
 }
 
 .hero-stat-divider {
   width: 1px;
-  height: 40px;
-  background: rgba(255, 255, 255, 0.2);
+  height: 36px;
+  background: var(--border-color);
 }
 
 /* 区块样式 */
@@ -872,8 +834,8 @@ const shufflePlay = () => {
   }
 
   .track-card-play {
-    width: 36px;
-    height: 36px;
+    width: 44px;
+    height: 44px;
     opacity: 1;
     transform: scale(1);
     bottom: 8px;
@@ -920,16 +882,21 @@ const shufflePlay = () => {
 }
 
 @media (prefers-color-scheme: dark) {
+  .hero-banner {
+    background: linear-gradient(135deg, #1b1b1d 0%, #161618 55%, #111113 100%);
+    border-color: var(--border-light);
+  }
+
   .hero-badge {
-    background: rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.08);
   }
 
   .hero-btn.secondary {
-    background: rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.08);
   }
 
   .hero-stats {
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.05);
   }
 }
 </style>

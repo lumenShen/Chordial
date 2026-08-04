@@ -16,7 +16,7 @@
  * 的 audio 元素会被 Tauri WebView 拒绝读取频谱数据（ImageData tainted）。
  * 媒体协议层已在 to_tauri_response 注入 Access-Control-Allow-Origin: *。
  */
-import { PlayerStore } from '@/stores/player.js'
+import { PlayerStore } from '@/stores/player/index.js'
 
 // ── 常量 ──────────────────────────────────────────────────────
 const FFT_SIZE = 256              // AnalyserNode.fftSize（必须是 2 的幂）
