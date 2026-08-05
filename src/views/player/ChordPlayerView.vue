@@ -1,93 +1,127 @@
 <template>
-  <div class="chord-player-view" :class="{ 'is-immersive': isImmersive }">
-    <!-- 流体背景层 -->
-    <ChordFluidBackground
-      :cover-url="coverUrl"
-      :static-mode="settings.lyricBackgroundStaticMode"
-      :fps="settings.lyricBackgroundFPS"
-      :vsync="settings.lyricBackgroundVSync"
-      :render-scale="settings.lyricBackgroundRenderScale"
-    />
-
-    <!-- 内容层 -->
-    <div class="chord-content">
-      <!-- 顶部控制横条（横屏布局） -->
-      <ChordControlThumb
-        v-if="!isVerticalLayout"
-        :title="title"
-        :artists="artists"
-        :artist-list="artistList"
-        :album="album"
-        :quality-label="qualityLabel"
-        :show-music-name="settings.showMusicName"
-        :show-music-artists="settings.showMusicArtists"
-        :show-music-album="settings.showMusicAlbum"
-        :is-immersive="isImmersive"
-        @close="closePlayerView"
-        @open-menu="openTrackMenu"
+  <div ref="rootEl" class="chord-player-view" :class="{ 'is-immersive': isImmersive }">
+    <!-- 流体背景层（铺满） -->
+    <div class="chord-background">
+      <ChordFluidBackground
+        :cover-url="coverUrl"
+        :static-mode="settings.lyricBackgroundStaticMode"
+        :fps="settings.lyricBackgroundFPS"
+        :vsync="settings.lyricBackgroundVSync"
+        :render-scale="settings.lyricBackgroundRenderScale"
       />
-
-      <!-- 主体：歌词 或 封面（竖屏/隐藏歌词） -->
-      <div class="chord-main">
-        <template v-if="isVerticalLayout">
-          <ChordCoverPanel :cover-url="coverUrl" :music-paused="!isPlaying" />
-        </template>
-        <template v-else>
-          <ChordLyricsView
-            :lyric-lines="lyricLines"
-            :active-line-index="activeLineIndex"
-            :show-translation="settings.enableLyricTranslationLine"
-            :font-size-px="fontSizePx"
-            :font-weight="settings.lyricFontWeight"
-            :letter-spacing="settings.lyricLetterSpacing"
-            :font-family="settings.lyricFontFamily"
-            :enable-blur="settings.enableLyricLineBlurEffect"
-            :enable-scale="settings.enableLyricLineScaleEffect"
-            :enable-spring="settings.enableLyricLineSpringAnimation"
-            @line-click="onLyricLineClick"
-            @background-click="toggleImmersive"
-          />
-        </template>
-      </div>
-
-      <!-- 底部：FFT 可视化 或 控制条 -->
-      <template v-if="showBottomControls">
-      <ChordFftControls
-        v-if="controlsType === 'fft'"
-        :is-immersive="isImmersive"
-      />
-      <ChordBottomControls
-        v-else-if="controlsType === 'controls'"
-        :duration-ms="durationMs"
-        :buffer-ms="bufferMs"
-        :formatted-current-time="formattedCurrentTime"
-        :formatted-duration="formattedDuration"
-        :formatted-remaining="formattedRemaining"
-        :is-playing="isPlaying"
-        :is-loading="isLoading"
-        :is-shuffle="isShuffle"
-        :is-repeat-all="isRepeatAll"
-        :is-repeat-one="isRepeatOne"
-        :volume="volume"
-        :muted="muted"
-        :show-volume-control="settings.showVolumeControl"
-        :show-remaining-time="settings.showRemainingTime"
-        :is-immersive="isImmersive"
-        @seek="seek"
-        @toggle-play="togglePlay"
-        @prev="playPrevious"
-        @next="playNext"
-        @toggle-shuffle="toggleShuffleMode"
-        @cycle-repeat="cycleRepeat"
-        @toggle-mute="toggleMute"
-        @volume="setVolume"
-        @open-queue="openPlayQueue"
-        @toggle-remaining="onToggleRemaining"
-      />
-      </template>
     </div>
 
-    <!-- 沉浸模式提示（点击空白处退出） -->
+    <!-- 自动布局：横屏 / 竖屏 -->
+    <ChordHorizontalLayout
+      v-if="!isVertical"
+      :title="title"
+      :artists="artists"
+      :artist-list="artistList"
+      :album="album"
+      :quality-label="qualityLabel"
+      :cover-url="coverUrl"
+      :show-music-name="settings.showMusicName"
+      :show-music-artists="settings.showMusicArtists"
+      :show-music-album="settings.showMusicAlbum"
+      :lyric-lines="lyricLines"
+      :active-line-index="activeLineIndex"
+      :show-translation="settings.enableLyricTranslationLine"
+      :font-size-px="fontSizePx"
+      :font-weight="settings.lyricFontWeight"
+      :letter-spacing="settings.lyricLetterSpacing"
+      :font-family="settings.lyricFontFamily"
+      :enable-blur="settings.enableLyricLineBlurEffect"
+      :enable-scale="settings.enableLyricLineScaleEffect"
+      :enable-spring="settings.enableLyricLineSpringAnimation"
+      :duration-ms="durationMs"
+      :buffer-ms="bufferMs"
+      :formatted-current-time="formattedCurrentTime"
+      :formatted-duration="formattedDuration"
+      :formatted-remaining="formattedRemaining"
+      :is-playing="isPlaying"
+      :is-loading="isLoading"
+      :is-shuffle="isShuffle"
+      :is-repeat-all="isRepeatAll"
+      :is-repeat-one="isRepeatOne"
+      :volume="volume"
+      :muted="muted"
+      :show-volume-control="settings.showVolumeControl"
+      :show-remaining-time="settings.showRemainingTime"
+      :show-bottom-controls="showBottomControls"
+      :is-immersive="isImmersive"
+      :hide-lyric="hideLyric"
+      @close="closePlayerView"
+      @open-menu="openTrackMenu"
+      @seek="seek"
+      @toggle-play="togglePlay"
+      @prev="playPrevious"
+      @next="playNext"
+      @toggle-shuffle="toggleShuffleMode"
+      @cycle-repeat="cycleRepeat"
+      @toggle-mute="toggleMute"
+      @volume="setVolume"
+      @toggle-remaining="onToggleRemaining"
+      @line-click="onLyricLineClick"
+      @background-click="toggleImmersive"
+      @open-queue="openPlayQueue"
+      @toggle-lyric="toggleHideLyric"
+      @airplay="onAirplay"
+    />
+
+    <ChordVerticalLayout
+      v-else
+      :title="title"
+      :artists="artists"
+      :artist-list="artistList"
+      :album="album"
+      :quality-label="qualityLabel"
+      :cover-url="coverUrl"
+      :show-music-name="settings.showMusicName"
+      :show-music-artists="settings.showMusicArtists"
+      :show-music-album="settings.showMusicAlbum"
+      :lyric-lines="lyricLines"
+      :active-line-index="activeLineIndex"
+      :show-translation="settings.enableLyricTranslationLine"
+      :font-size-px="fontSizePx"
+      :font-weight="settings.lyricFontWeight"
+      :letter-spacing="settings.lyricLetterSpacing"
+      :font-family="settings.lyricFontFamily"
+      :enable-blur="settings.enableLyricLineBlurEffect"
+      :enable-scale="settings.enableLyricLineScaleEffect"
+      :enable-spring="settings.enableLyricLineSpringAnimation"
+      :duration-ms="durationMs"
+      :buffer-ms="bufferMs"
+      :formatted-current-time="formattedCurrentTime"
+      :formatted-duration="formattedDuration"
+      :formatted-remaining="formattedRemaining"
+      :is-playing="isPlaying"
+      :is-loading="isLoading"
+      :is-shuffle="isShuffle"
+      :is-repeat-all="isRepeatAll"
+      :is-repeat-one="isRepeatOne"
+      :volume="volume"
+      :muted="muted"
+      :show-volume-control="settings.showVolumeControl"
+      :show-remaining-time="settings.showRemainingTime"
+      :is-immersive="isImmersive"
+      :hide-lyric="hideLyric"
+      :immerse-cover="verticalImmerseCover"
+      @close="closePlayerView"
+      @open-menu="openTrackMenu"
+      @seek="seek"
+      @toggle-play="togglePlay"
+      @prev="playPrevious"
+      @next="playNext"
+      @toggle-shuffle="toggleShuffleMode"
+      @cycle-repeat="cycleRepeat"
+      @toggle-mute="toggleMute"
+      @volume="setVolume"
+      @toggle-remaining="onToggleRemaining"
+      @line-click="onLyricLineClick"
+      @background-click="toggleImmersive"
+    />
+
+    <!-- 沉浸模式提示 -->
     <div v-if="isImmersive" class="chord-immersive-hint" @click="toggleImmersive">
       <HugeiconsIcon :icon="ExpandIcon" :size="20" />
     </div>
@@ -96,27 +130,22 @@
 
 <script setup>
 /**
- * ChordPlayerView — 自研 Vue 播放器根容器。
- *
- * 组装：流体背景 + 顶部控制横条 + 歌词/封面 + 底部控件，
- * 由 useChordPlayer 提供状态与 actions，由 useChordAudioAnalyser 提供音频分析数据。
+ * ChordPlayerView — 自研 Vue 播放器根容器（对齐 AMLL AutoLyricLayout）。
  *
  * # 布局
- * - 横屏（默认）：顶部控制条 + 歌词 + 底部控件。
- * - 竖屏（hideLyricView）：顶部控制条 + 封面面板 + 底部控件。
- * - playerControlsType：controls（控制条）/ fft（频谱可视化）/ none（不显示）。
+ * - AutoLyricLayout：用 ResizeObserver 检测宽 < 高 → 竖屏(VerticalLayout)，否则 → 横屏(HorizontalLayout)。
+ * - 横屏：两列网格，左列 封面+信息+控件，右列 歌词，底部 切换按钮。
+ * - 竖屏：顶部控制条 + 歌词（小封面左上），隐藏歌词 → 大封面居中 + 大控件（封面 FLIP 动画）。
+ * - hideLyric（settings.hideLyricView）：独立于横/竖屏的用户开关。
  */
-import { computed, ref } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { HugeiconsIcon } from '@hugeicons/vue'
 import { ExpandIcon } from '@hugeicons/core-free-icons'
 import { useChordPlayer } from '@/composables/useChordPlayer.js'
 import { useChordAudioAnalyser } from './composables/useChordAudioAnalyser.js'
 import ChordFluidBackground from './components/ChordFluidBackground.vue'
-import ChordControlThumb from './components/ChordControlThumb.vue'
-import ChordLyricsView from './components/ChordLyricsView.vue'
-import ChordCoverPanel from './components/ChordCoverPanel.vue'
-import ChordBottomControls from './components/ChordBottomControls.vue'
-import ChordFftControls from './components/ChordFftControls.vue'
+import ChordHorizontalLayout from './components/ChordHorizontalLayout.vue'
+import ChordVerticalLayout from './components/ChordVerticalLayout.vue'
 
 const p = useChordPlayer()
 // 启动音频分析器并 provide 高频数据（低频音量/频谱由子组件注入）
@@ -132,14 +161,23 @@ const {
   openPlayQueue, onLyricLineClick,
 } = p
 
-// 竖屏布局：隐藏歌词时显示封面
-const isVerticalLayout = computed(() => !!settings.hideLyricView)
+// 竖屏布局：宽 < 高（对齐 AMLL AutoLyricLayout 的 clientWidth < clientHeight）
+const rootEl = ref(null)
+const isVertical = ref(false)
 
-// 底部控件类型
-const controlsType = computed(() => settings.playerControlsType)
+// 隐藏歌词（用户开关，独立于横/竖屏）
+const hideLyric = computed(() => !!settings.hideLyricView)
+
+// 竖屏沉浸封面（对齐 AMLL verticalCoverLayout："force-immersive" 时强制大封面沉浸）
+const verticalImmerseCover = computed(
+  () => hideLyric.value && settings.verticalCoverLayout === 'force-immersive',
+)
 
 // 底部控件是否显示（AMLL showBottomControl + 非 none 类型）
-const showBottomControls = computed(() => settings.showBottomControl && controlsType.value !== 'none')
+const showBottomControls = computed(() => settings.showBottomControl)
+
+// 音质标签（当前无数据源，留空）
+const qualityLabel = computed(() => '')
 
 // 字号档位 → px
 const SIZE_PRESET_PX = {
@@ -153,9 +191,6 @@ const SIZE_PRESET_PX = {
 }
 const fontSizePx = computed(() => SIZE_PRESET_PX[settings.lyricSizePreset] || 30)
 
-// 音质标签（当前无数据源，留空）
-const qualityLabel = computed(() => '')
-
 // 沉浸模式：点击空白处切换
 function toggleImmersive() {
   isImmersive.value = !isImmersive.value
@@ -165,6 +200,29 @@ function toggleImmersive() {
 function onToggleRemaining() {
   settings.showRemainingTime = !settings.showRemainingTime
 }
+
+// 隐藏/显示歌词
+function toggleHideLyric() {
+  settings.hideLyricView = !settings.hideLyricView
+}
+
+// 投放（暂无可投设备，留空实现）
+function onAirplay() {}
+
+let io = null
+
+onMounted(() => {
+  const el = rootEl.value
+  if (!el) return
+  isVertical.value = el.clientWidth < el.clientHeight
+  io = new ResizeObserver(() => {
+    const b = el.getBoundingClientRect()
+    isVertical.value = b.width < b.height
+  })
+  io.observe(el)
+})
+
+onBeforeUnmount(() => io?.disconnect())
 </script>
 
 <style scoped>
@@ -178,20 +236,10 @@ function onToggleRemaining() {
   font-family: var(--font-sans, system-ui, sans-serif);
 }
 
-.chord-content {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  width: 100%;
-}
-
-.chord-main {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
+.chord-background {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
 }
 
 /* 沉浸模式提示 */

@@ -54,6 +54,9 @@ const props = defineProps({
   enableBlur: { type: Boolean, default: true },
   enableScale: { type: Boolean, default: true },
   enableSpring: { type: Boolean, default: true },
+  // 活动行对齐位置（占容器高度的比例）。默认 0.5（垂直居中）。
+  // 横屏布局对齐到封面中心，竖屏布局对齐到顶部（0.1），对齐 AMLL alignAnchor/alignPosition。
+  alignPosition: { type: Number, default: 0.5 },
 })
 
 const emit = defineEmits(['line-click', 'background-click'])
@@ -78,7 +81,7 @@ function scrollToActive(immediate = false) {
   const lineEl = lineEls.value[idx]
   if (!lineEl) return
 
-  const target = lineEl.offsetTop - container.clientHeight / 2 + lineEl.offsetHeight / 2
+  const target = lineEl.offsetTop - container.clientHeight * props.alignPosition + lineEl.offsetHeight / 2
   const clamped = Math.max(0, Math.min(target, container.scrollHeight - container.clientHeight))
 
   if (scrollAnim) scrollAnim.cancel?.()
