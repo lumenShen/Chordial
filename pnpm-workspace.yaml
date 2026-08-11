@@ -1,4 +1,0 @@
-packages:
-  - '.'
-onlyBuiltDependencies:
-  - '@applemusic-like-lyrics/vue'

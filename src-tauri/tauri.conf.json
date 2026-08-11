@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "chordial",
+  "productName": "Chordial",
   "version": "0.1.0",
-  "identifier": "com.gozaoo.chordial",
+  "identifier": "com.chordial.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,11 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "chordial",
+        "title": "Chordial",
         "width": 800,
-        "height": 600,
-        "decorations": false,
-        "transparent": true
+        "height": 600
       }
     ],
     "security": {

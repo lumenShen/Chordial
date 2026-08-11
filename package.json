@@ -5,48 +5,20 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "android:build": "tauri android build",
+    "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
-    "@applemusic-like-lyrics/core": "0.5.2",
-    "@applemusic-like-lyrics/lyric": "1.0.2",
-    "@applemusic-like-lyrics/react": "0.5.2",
-    "@applemusic-like-lyrics/react-full": "0.4.2",
-    "@applemusic-like-lyrics/vue": "0.5.2",
-    "@pixi/app": "^7.4.3",
-    "@pixi/core": "^7.4.3",
-    "@pixi/display": "^7.4.3",
-    "@pixi/filter-blur": "^7.4.3",
-    "@pixi/filter-bulge-pinch": "^5.1.1",
-    "@pixi/filter-color-matrix": "^7.4.3",
-    "@pixi/sprite": "^7.4.3",
-    "@tauri-apps/api": "~2.10.1",
-    "@tauri-apps/plugin-dialog": "^2.7.2",
-    "@tauri-apps/plugin-notification": "^2.3.3",
-    "@tauri-apps/plugin-opener": "^2.5.4",
-    "@tauri-apps/plugin-window-state": "^2.4.1",
-    "@vueuse/core": "^14.3.0",
-    "@wxperia/liquid-glass-vue": "^1.0.9",
-    "animejs": "^4.5.0",
-    "bootstrap-icons": "^1.13.1",
-    "framer-motion": "^12.42.2",
-    "jotai": "^2.20.2",
-    "jsqr": "^1.4.0",
-    "jss": "^10.10.0",
-    "jss-preset-default": "^10.10.0",
-    "qrcode": "^1.5.4",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-    "vue": "^3.5.40",
-    "vue-router": "^4.6.4"
+    "vue": "^3.5.13",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.4",
-    "@vitejs/plugin-react": "^4.7.0",
-    "@vitejs/plugin-vue": "^5.2.4",
-    "vite": "^6.4.3"
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3",
+    "vue-tsc": "^2.1.10",
+    "@tauri-apps/cli": "^2"
   }
 }
