@@ -39,6 +39,9 @@ encoding_rs = "0.8"
 rustc-hash = "2.1"
 dirs = "6.0"
 
+# 下载落盘时写回标签/封面/歌词（ID3v2、Vorbis Comments、MP4 ilst 统一接口）。
+lofty = { version = "0.25", default-features = false, features = ["id3v2_compression_support"] }
+
 # 解码（纯 Rust，无系统依赖）。元数据读取与音频解码共用一套 codec 集合。
 symphonia = { version = "0.5", default-features = false, features = [
     "mp3", "flac", "ogg", "wav", "aac", "isomp4", "pcm",

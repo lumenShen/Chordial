@@ -7,12 +7,20 @@
 
 mod actions;
 mod app;
+mod autoeq;
 mod config;
 mod downloads;
+mod eq;
+mod eq_page;
 mod icons;
 mod input;
+mod layout_morph;
 mod lyrics;
 mod main_state;
+mod player_page;
+mod responsive;
+mod settings;
+mod sheet_drag;
 mod theme;
 mod widgets;
 
@@ -173,7 +181,11 @@ fn main() {
                 appears_transparent: true,
                 ..Default::default()
             }),
-            window_min_size: Some(size(px(980.0), px(640.0))),
+            // 允许收缩到手机竖屏：主面板在 <720 时切换为单列手机壳。
+            window_min_size: Some(size(
+                px(responsive::MIN_WINDOW_W),
+                px(responsive::MIN_WINDOW_H),
+            )),
             ..Default::default()
         };
 

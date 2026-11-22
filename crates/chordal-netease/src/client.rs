@@ -6,8 +6,9 @@
 //! - 鉴权走 `Cookie` 头（api-enhanced 支持从环境变量或请求参数注入，
 //!   适配器统一用请求头，避免把 Cookie 写进 URL 日志）。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chordal_core::error::{CoreError, CoreResult};
 use chordal_core::perf::PerfScope;
@@ -44,14 +45,14 @@ impl NeteaseClient {
         Self {
             base_url,
             http,
-            cookie: RwLock::new(cookie.map(str::to_string)),
+            cookie: RwLock::new(normalize_cookie_opt(cookie)),
             service,
         }
     }
 
     pub fn set_cookie(&self, cookie: Option<String>) {
         if let Ok(mut current) = self.cookie.write() {
-            *current = cookie.filter(|c| !c.trim().is_empty());
+            *current = normalize_cookie_opt(cookie.as_deref());
         }
     }
 
@@ -80,6 +81,14 @@ impl NeteaseClient {
         }
         let scope = PerfScope::enter("netease.request");
         let url = format!("{}{}", self.base_url.get(), path);
+        // api-enhanced 的 apicache 以 `host + path?query` 为键缓存 200 响应
+        // 2 分钟，且键里不含 Cookie/请求头。登录轮询、`/user/account` 这类
+        // 随登录态变化的响应一旦复用缓存就会一直读到“未登录”结果，因此每个
+        // 请求都附带唯一 timestamp 强制换键（纯数字，兼容按数值解析的服务端）。
+        let timestamp = cache_bust();
+        let mut query: Vec<(&str, &str)> = Vec::with_capacity(params.len() + 1);
+        query.extend_from_slice(params);
+        query.push(("timestamp", timestamp.as_str()));
 
         let mut last_err: Option<String> = None;
         for attempt in 0..2u8 {
@@ -87,7 +96,7 @@ impl NeteaseClient {
                 // 退避重试（运行在共享 tokio runtime 上，sleep 合法）。
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
-            let mut request = self.http.get(&url).query(params);
+            let mut request = self.http.get(&url).query(&query);
             if let Some(cookie) = self.cookie()
                 && let Ok(value) = reqwest::header::HeaderValue::from_str(&cookie)
             {
@@ -153,5 +162,98 @@ impl NeteaseClient {
             .send()
             .await
             .is_ok()
+    }
+}
+
+/// 单调递增的毫秒时间戳，作为 GET 请求的缓存键扰动值。
+fn cache_bust() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // 毫秒 + 进程内序号：同一毫秒内的并发请求也不会撞键。
+    format!(
+        "{}{:04}",
+        millis,
+        SEQ.fetch_add(1, Ordering::Relaxed) % 10_000
+    )
+}
+
+fn normalize_cookie_opt(raw: Option<&str>) -> Option<String> {
+    let normalized = normalize_cookie(raw?);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+/// 把 api-enhanced 返回的 `Set-Cookie` 拼接串规范化为可放进 `Cookie` 请求头
+/// 的 `name=value; ...`：丢弃 `Max-Age`/`Expires`/`Path` 等属性，同名 Cookie
+/// 保留最后一个值。
+///
+/// 直接把带属性的串回传会被网易云解析成匿名会话（`anonimousUser: true`），
+/// 表现为“扫码登录成功但歌单/我喜欢为空”。
+fn normalize_cookie(raw: &str) -> String {
+    const ATTRIBUTES: &[&str] = &[
+        "max-age",
+        "expires",
+        "path",
+        "domain",
+        "httponly",
+        "secure",
+        "samesite",
+        "priority",
+        "partitioned",
+    ];
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    for part in raw.split(';') {
+        let part = part.trim();
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let lowered = name.to_ascii_lowercase();
+        if name.is_empty() || ATTRIBUTES.contains(&lowered.as_str()) {
+            continue;
+        }
+        let value = value.trim();
+        let mut replaced = false;
+        for pair in &mut pairs {
+            if pair.0 == name {
+                pair.1 = value;
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            pairs.push((name, value));
+        }
+    }
+    pairs
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_normalization_strips_set_cookie_attributes() {
+        let raw = "MUSIC_R_T=1513381609303; Max-Age=2147483647; \
+                   Expires=Fri, 10 Dec 2094 12:46:16 GMT; Path=/openapi/clientlog;;\
+                   MUSIC_A_T=1; Path=/; MUSIC_U=abc==; Max-Age=1296010; \
+                   __csrf=xyz; MUSIC_A_T=2";
+        assert_eq!(
+            normalize_cookie(raw),
+            "MUSIC_R_T=1513381609303; MUSIC_A_T=2; MUSIC_U=abc==; __csrf=xyz"
+        );
+    }
+
+    #[test]
+    fn cookie_without_pairs_normalizes_to_none() {
+        assert_eq!(normalize_cookie(" ; Path=/ "), "");
+        assert!(normalize_cookie_opt(Some("Max-Age=1")).is_none());
+        assert!(normalize_cookie_opt(None).is_none());
     }
 }

@@ -18,6 +18,7 @@ chordal-netease = { workspace = true }
 chordal-player = { workspace = true }
 chordial-amll-gpui = { workspace = true }
 reqwest = { workspace = true }
+lofty = { workspace = true }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 gpui = { workspace = true }

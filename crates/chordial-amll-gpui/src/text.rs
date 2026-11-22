@@ -57,7 +57,10 @@ const FALLBACK_VIEWPORT_HEIGHT: f32 = 720.0;
 const WRAP_EPSILON: f32 = 0.01;
 
 /// 歌词文本样式（全部单位：逻辑像素或比例）。
-#[derive(Clone, Debug)]
+///
+/// `PartialEq` 用于视图层样式去重：沉浸层每帧都会重算样式，但只有真正
+/// 变化（字号/字重/行高等）时才允许丢弃整形缓存。
+#[derive(Clone, Debug, PartialEq)]
 pub struct LyricTextStyle {
     /// 字体族名（gpui 的 `Font::family`）。
     pub font_family: SharedString,
@@ -79,11 +82,12 @@ pub struct LyricTextStyle {
     /// 布局宽度本身按视口宽度计算，此字段供渲染层/配置保持一致）。
     /// 背景行字号相对主字号的倍数。
     pub bg_line_scale: f32,
-    /// 逐词渐变半宽（单位：主字号）。AMLL 默认 0.5。
+    /// 整行扫光渐变带宽度（单位：主字号 em）。
     ///
-    /// 这是渲染层用的附加字段：文本模块本身不读它，但放在样式里可以避免渲染层
-    /// 再从别的对象取同一份配置。
-    pub word_fade_width: f32,
+    /// 动态歌词的亮暗由**一条覆盖整行**的 mask 前沿推进：所有字形共用同一
+    /// 组边界，渐变带会压在相邻的字/词之间。这个值决定软边能横跨多少相邻
+    /// 字形 —— 1.5 约等于 1–2 个 CJK 字、3 个左右拉丁字符。
+    pub sweep_fade_em: f32,
     /// 容器顶部渐隐比例（AMLL 歌词容器 CSS mask 的 `transparent → black 10%`）。
     pub edge_fade_top: f32,
     /// 容器底部渐隐比例（横向布局 mask 是 `black 90% → transparent`；
@@ -103,7 +107,7 @@ impl Default for LyricTextStyle {
             padding_x_em: 1.0,
             padding_y_ratio: 0.02,
             bg_line_scale: 0.7,
-            word_fade_width: 0.5,
+            sweep_fade_em: 1.5,
             edge_fade_top: 0.1,
             edge_fade_bottom: 0.1,
         }

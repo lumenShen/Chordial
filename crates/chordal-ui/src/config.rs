@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use chordal_netease::{NeteaseConfig, SongQualityLevel};
 
+use crate::eq::SavedEqPreset;
 use crate::theme::Appearance;
 
 /// 本地/在线同曲的播放来源偏好。
@@ -61,12 +62,25 @@ pub struct AppConfig {
     /// 本地/在线同曲偏好。
     #[serde(default)]
     pub source_preference: SourcePreference,
+    /// 平滑滚动（滚轮/触控板）。默认关闭，保留系统原生手感。
+    #[serde(default)]
+    pub smooth_scroll: bool,
     /// 背景鼓点监听频段下限（Hz）。
     #[serde(default = "default_beat_band_low_hz")]
     pub beat_band_low_hz: f32,
     /// 背景鼓点监听频段上限（Hz）。
     #[serde(default = "default_beat_band_high_hz")]
     pub beat_band_high_hz: f32,
+    /// 背景鼓点视觉效果倍率：0 = 关闭，1.0 = 原始幅度，上限 1.5。
+    /// 默认 0.5，保持可感知但不过分剧烈。
+    #[serde(default = "default_beat_strength")]
+    pub beat_strength: f32,
+    /// 参数均衡器（最后一次编辑的配置）。
+    #[serde(default)]
+    pub equalizer: chordal_player::EqSettings,
+    /// 「另存为」得到的个人均衡器配置。
+    #[serde(default)]
+    pub eq_saved_presets: Vec<SavedEqPreset>,
 }
 
 pub fn default_cache_dir() -> PathBuf {
@@ -91,6 +105,13 @@ fn default_beat_band_high_hz() -> f32 {
     chordal_player::DEFAULT_BEAT_BAND.1
 }
 
+/// 背景鼓点视觉效果默认倍率（0..=1.5）。
+pub const DEFAULT_BEAT_STRENGTH: f32 = 0.5;
+
+fn default_beat_strength() -> f32 {
+    DEFAULT_BEAT_STRENGTH
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         let music = dirs::audio_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -104,13 +125,25 @@ impl Default for AppConfig {
             cache_limit_bytes: default_cache_limit(),
             download_dir: default_download_dir(),
             source_preference: SourcePreference::Auto,
+            smooth_scroll: false,
             beat_band_low_hz: chordal_player::DEFAULT_BEAT_BAND.0,
             beat_band_high_hz: chordal_player::DEFAULT_BEAT_BAND.1,
+            beat_strength: DEFAULT_BEAT_STRENGTH,
+            equalizer: chordal_player::EqSettings::default(),
+            eq_saved_presets: Vec::new(),
         }
     }
 }
 
 pub fn config_path() -> PathBuf {
+    // 便携/测试覆盖：`CHORDIAL_CONFIG` 指向完整文件，`CHORDIAL_CONFIG_DIR`
+    // 指向目录（其下 config.json）。不设置时使用系统配置目录。
+    if let Some(path) = std::env::var_os("CHORDIAL_CONFIG") {
+        return PathBuf::from(path);
+    }
+    if let Some(dir) = std::env::var_os("CHORDIAL_CONFIG_DIR") {
+        return PathBuf::from(dir).join("config.json");
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("chordial")
@@ -121,7 +154,11 @@ pub fn load_or_default() -> AppConfig {
     let path = config_path();
     if let Ok(raw) = std::fs::read_to_string(&path) {
         match serde_json::from_str::<AppConfig>(&raw) {
-            Ok(cfg) => return cfg,
+            Ok(mut cfg) => {
+                // 手改配置时也保证倍率落在可渲染范围。
+                cfg.beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
+                return cfg;
+            }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "config parse failed; using defaults");
             }
@@ -146,4 +183,39 @@ pub fn save(cfg: &AppConfig) {
 #[allow(dead_code)]
 fn _level_roundtrip() {
     let _ = serde_json::to_string(&SongQualityLevel::default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smooth_scroll_defaults_off() {
+        assert!(!AppConfig::default().smooth_scroll);
+    }
+
+    #[test]
+    fn smooth_scroll_roundtrips() {
+        let mut cfg = AppConfig::default();
+        cfg.smooth_scroll = true;
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.smooth_scroll);
+    }
+
+    #[test]
+    fn old_config_without_smooth_scroll_defaults_off() {
+        let json = r#"{
+            "local_roots": [],
+            "netease": {
+                "base_url": "http://127.0.0.1:3000",
+                "cookie": null,
+                "level": null
+            },
+            "player_device": null,
+            "search_timeout_ms": 6000
+        }"#;
+        let parsed: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.smooth_scroll);
+    }
 }

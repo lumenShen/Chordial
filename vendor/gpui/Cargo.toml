@@ -747,3 +747,7 @@ priority = -1
 [lints.rust.unexpected_cfgs]
 level = "allow"
 priority = 0
+
+# 独立工作区根：vendored 包需要能单独跑 `cargo test`，同时仍可作为
+# 主工作区的 path 依赖（`[patch.crates-io]`）。
+[workspace]

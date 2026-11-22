@@ -72,6 +72,9 @@ pub struct UniformList {
 pub struct UniformListFrameState {
     items: SmallVec<[AnyElement; 32]>,
     decorations: SmallVec<[AnyElement; 2]>,
+    /// 请求布局阶段测得的第一项尺寸；prepaint 直接复用，避免同一帧
+    /// 把同一行元素渲染/布局两次。
+    measured_item_size: Option<Size<Pixels>>,
 }
 
 /// A handle for controlling the scroll position of a uniform list.
@@ -303,6 +306,7 @@ impl Element for UniformList {
             UniformListFrameState {
                 items: SmallVec::new(),
                 decorations: SmallVec::new(),
+                measured_item_size: Some(item_size),
             },
         )
     }
@@ -335,7 +339,9 @@ impl Element for UniformList {
             ListHorizontalSizingBehavior::Unconstrained
         );
 
-        let longest_item_size = self.measure_item(None, window, cx);
+        let longest_item_size = frame_state
+            .measured_item_size
+            .unwrap_or_else(|| self.measure_item(None, window, cx));
         let content_width = if can_scroll_horizontally {
             padded_bounds.size.width.max(longest_item_size.width)
         } else {
@@ -675,6 +681,12 @@ impl UniformList {
     pub fn track_scroll(mut self, handle: UniformListScrollHandle) -> Self {
         self.interactivity.tracked_scroll_handle = Some(handle.0.borrow().base_handle.clone());
         self.scroll_handle = Some(handle);
+        self
+    }
+
+    /// Use frame-rate-independent smooth wheel/touchpad scrolling.
+    pub fn smooth_scroll(mut self) -> Self {
+        self.interactivity.smooth_scroll = true;
         self
     }
 

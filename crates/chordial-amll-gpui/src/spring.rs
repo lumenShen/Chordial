@@ -337,4 +337,23 @@ mod tests {
         b.update(2.0);
         assert!((a.get_current_position() - b.get_current_position()).abs() < 1e-6);
     }
+
+    #[test]
+    fn frame_rate_independent_at_300hz() {
+        // 300Hz 显示下每帧 3.33ms；解析弹簧轨迹必须与一次性求值一致。
+        let mut a = Spring::new(0.0);
+        a.set_target_position(10.0, 0.0);
+        let mut b = Spring::new(0.0);
+        b.set_target_position(10.0, 0.0);
+        for _ in 0..300 {
+            a.update(1.0 / 300.0);
+        }
+        b.update(1.0);
+        assert!(
+            (a.get_current_position() - b.get_current_position()).abs() < 1e-6,
+            "300Hz={} 1s={}",
+            a.get_current_position(),
+            b.get_current_position()
+        );
+    }
 }

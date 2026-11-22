@@ -68,6 +68,11 @@ pub trait MusicSource: Send + Sync {
     /// 应用退出时停止后台服务 / 子进程；不清理缓存、不注销账号。
     async fn stop_services(&self) {}
 
+    /// 预热：启动外部服务/托管 sidecar，可在 UI 加载源后后台调用。
+    async fn warm_up(&self) -> CoreResult<()> {
+        Ok(())
+    }
+
     /// 可选：目录浏览能力（专辑/歌单/歌手）。
     fn catalog(&self) -> Option<&dyn CatalogSource> {
         None

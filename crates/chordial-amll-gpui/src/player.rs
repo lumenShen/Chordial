@@ -26,7 +26,7 @@ pub enum AlignAnchor {
     Bottom,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LyricPlayerConfig {
     pub align_anchor: AlignAnchor,
     /// 对齐位置占视口高度的比例（0..=1）。
@@ -62,6 +62,8 @@ pub struct LayoutMetrics {
     pub width: f32,
     pub height: f32,
     pub base_font_size: f32,
+    /// 歌词文本的左右内边距（`--lyric-line-padding-x`），间奏点与歌词左/右对齐用。
+    pub padding_x: f32,
     pub line_heights: Vec<f32>,
 }
 
@@ -93,13 +95,16 @@ pub struct LineFrameState {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InterludeDotsFrame {
+    /// 点组内容（不含 padding）左侧在播放器坐标中的 x。
     pub x: f32,
     pub y: f32,
     pub scale: f32,
     pub dot_opacity: [f32; 3],
+    /// 点组内容宽度（3 个点 + 2 个 gap，不含左右 padding）。
     pub width: f32,
     pub height: f32,
     pub dot_size: f32,
+    pub gap: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -241,8 +246,12 @@ impl LyricPlayer {
         &self.config
     }
 
-    /// 运行时修改配置。会重新布局，O(n) 一次。
+    /// 运行时修改配置。仅在配置真正变化时重新布局（O(n) 一次）。
+    /// 每帧重复设置同一份配置必须是 O(1) —— 渲染路径依赖这一点。
     pub fn set_config(&mut self, config: LyricPlayerConfig) {
+        if self.config == config {
+            return;
+        }
         let playing_changed = self.is_playing;
         self.config = config;
         if playing_changed {
@@ -656,8 +665,11 @@ impl LyricPlayer {
             .max(font_size * 0.5);
         let dots_padding_y = self.metrics.width * 0.025;
         let dots_height = dot_size + dots_padding_y * 2.0;
-        let dots_width =
-            dot_size * 3.0 + font_size * 0.25 * 2.0 + 3.0 * 4.0 + font_size * 0.75 * 2.0;
+        // AMLL `.interludeDots { gap: 0.18em; padding: 0.4em var(--lyric-line-padding-x) }`。
+        // 这里只建模点组内容，左右 padding 由下面的 x 锚点承担。
+        let dots_gap = dot_size * 0.25 + 4.0;
+        let dots_width = dot_size * 3.0 + dots_gap * 2.0;
+        let dots_padding_x = self.metrics.padding_x.max(0.0);
         let total_interlude_height = dots_height + dot_margin * 2.0;
 
         let target_align_index = self.scroll_to_index.min(self.doc.lines.len());
@@ -713,9 +725,12 @@ impl LyricPlayer {
             let should_show_dots = interlude.is_some_and(|it| i as i64 == it.index + 1);
 
             if dots.is_none() && should_show_dots {
-                let mut x = 0.0;
+                // AMLL 的 `.interludeDots` 用 `left: 0` + padding-left = 1em，
+                // 所以普通行第一颗点与歌词文本左边缘对齐；对唱行整体右对齐，
+                // 最后一颗点与文本右边缘对齐。
+                let mut x = dots_padding_x;
                 if interlude.is_some_and(|it| it.next_duet) {
-                    x = (self.metrics.width - dots_width).max(0.0);
+                    x = (self.metrics.width - dots_padding_x - dots_width).max(dots_padding_x);
                 }
                 cur_pos += dot_margin;
                 let y = cur_pos;
@@ -727,6 +742,7 @@ impl LyricPlayer {
                     width: dots_width,
                     height: dots_height,
                     dot_size,
+                    gap: dots_gap,
                     ..Default::default()
                 });
             }
@@ -1061,6 +1077,7 @@ mod tests {
             width: 1000.0,
             height: 600.0,
             base_font_size: 24.0,
+            padding_x: 24.0,
             line_heights: vec![80.0; n],
         }
     }
@@ -1144,9 +1161,54 @@ mod tests {
             width: 1000.0,
             height: 600.0,
             base_font_size: 24.0,
+            padding_x: 24.0,
             line_heights: vec![80.0; 3],
         });
         p.set_time(5_000, false);
         assert!(p.frame().interlude.is_some());
+    }
+
+    #[test]
+    fn interlude_dots_follow_lyric_padding_and_duet_alignment() {
+        let build = |duet: bool| {
+            let mut p = LyricPlayer::new(LyricPlayerConfig::default());
+            let lines = vec![
+                LyricLine {
+                    words: vec![LyricWord::new("a", 0, 2_000)],
+                    start_time: 0,
+                    end_time: 2_000,
+                    ..Default::default()
+                },
+                LyricLine {
+                    words: vec![LyricWord::new("b", 10_000, 12_000)],
+                    start_time: 10_000,
+                    end_time: 12_000,
+                    is_duet: duet,
+                    ..Default::default()
+                },
+            ];
+            p.set_lyrics(lines, 0);
+            p.set_metrics(LayoutMetrics {
+                width: 1_000.0,
+                height: 600.0,
+                base_font_size: 24.0,
+                padding_x: 24.0,
+                line_heights: vec![80.0; 2],
+            });
+            p.set_time(5_000, false);
+            p
+        };
+        // 普通行：点组内容左边缘 = 歌词文本左边缘（padding_x）。
+        let normal = build(false);
+        let dots = normal.frame().interlude.expect("interlude").dots;
+        assert!((dots.x - 24.0).abs() < 1e-4, "x = {}", dots.x);
+        // 对唱行：点组内容右边缘 = 歌词文本右边缘（width - padding_x）。
+        let duet = build(true);
+        let dots = duet.frame().interlude.expect("interlude").dots;
+        assert!(
+            (dots.x + dots.width - (1_000.0 - 24.0)).abs() < 1e-4,
+            "right = {}",
+            dots.x + dots.width
+        );
     }
 }

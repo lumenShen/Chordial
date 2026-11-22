@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -35,12 +36,12 @@ use chordal_core::error::{CoreError, CoreResult};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NeteaseMode {
-    /// 有随包/本地 api-enhanced 就托管，否则回退外部服务。
+    /// 优先本地资产/外部服务；都没有时在 auto_install 下自动下载。
     #[default]
     Auto,
     /// 只连接用户已经运行的服务。
     External,
-    /// 由 Chordial 启动 Node 进程。
+    /// 由 Chordial 启动/自动安装 api-enhanced。
     Managed,
 }
 
@@ -134,17 +135,33 @@ impl Endpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ServiceState {
     Stopped,
-    Ready { base_url: String, pid: u32 },
+    /// 正在下载/安装或启动，其他请求应等待 Notify。
+    Installing,
+    /// Auto 模式探测到用户已有的外部服务。
+    ExternalReady {
+        base_url: String,
+    },
+    Ready {
+        base_url: String,
+        pid: u32,
+    },
+    Failed(String),
 }
 
 /// 托管服务管理器。线程安全，可被多个请求并发 `ensure_ready`。
 pub struct NeteaseService {
+    mode: NeteaseMode,
+    /// Auto 模式回退的外部服务地址。
+    external_base_url: String,
     config: ManagedConfig,
     endpoint: Arc<Endpoint>,
     state: Mutex<ServiceState>,
     child: tokio::sync::Mutex<Option<Child>>,
     start_lock: tokio::sync::Mutex<()>,
+    notify: tokio::sync::Notify,
     logs: Arc<Mutex<VecDeque<String>>>,
+    /// 每次 stop 自增，用于安装/启动完成后判断是否已被取消。
+    generation: AtomicU64,
 }
 
 impl std::fmt::Debug for NeteaseService {
@@ -167,38 +184,80 @@ impl Drop for NeteaseService {
 }
 
 impl NeteaseService {
-    /// 根据配置构造。`External` 返回 None（不管理进程）；`Auto` 只有找到
-    /// api-enhanced 入口时才进入 Managed。
+    /// 根据配置构造。`External` 返回 None（不管理进程）；`Auto`/`Managed`
+    /// 返回管理器，首次需要时下载或启动 api-enhanced。
     pub fn from_config(
         mode: NeteaseMode,
         managed: &ManagedConfig,
         endpoint: Arc<Endpoint>,
     ) -> Option<Arc<Self>> {
-        let use_managed = match mode {
-            NeteaseMode::External => false,
-            NeteaseMode::Managed => true,
-            NeteaseMode::Auto => resolve_app_dir(managed).is_some(),
-        };
-        if !use_managed {
+        if mode == NeteaseMode::External {
             return None;
         }
         Some(Arc::new(Self {
+            mode,
+            external_base_url: endpoint.get(),
             config: managed.clone(),
             endpoint,
             state: Mutex::new(ServiceState::Stopped),
             child: tokio::sync::Mutex::new(None),
             start_lock: tokio::sync::Mutex::new(()),
+            notify: tokio::sync::Notify::new(),
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(200))),
+            generation: AtomicU64::new(0),
         }))
     }
 
-    /// 确保服务可用，返回当前 base_url。这是每个 HTTP 请求前的钩子。
-    pub async fn ensure_ready(&self) -> CoreResult<String> {
-        let _guard = self.start_lock.lock().await;
+    /// 确保服务可用，返回当前 base_url。安装/启动在后台任务中执行，
+    /// 调用方超时被 drop 也不会中断下载。
+    pub async fn ensure_ready(self: &Arc<Self>) -> CoreResult<String> {
+        let guard = self.start_lock.lock().await;
         if let Some(base) = self.current_ready().await? {
             return Ok(base);
         }
-        self.start_managed(&self.config).await
+        match self.state_snapshot() {
+            ServiceState::Installing => {
+                let notified = self.notify.notified();
+                drop(guard);
+                notified.await;
+                return self.wait_result().await;
+            }
+            ServiceState::Failed(e) => {
+                return Err(CoreError::source_err("netease", e));
+            }
+            _ => {}
+        }
+
+        // Auto 且没有本地可管理资产：优先复用用户已运行的外部服务。
+        if self.mode == NeteaseMode::Auto && !self.has_local_managed() {
+            let external = self.external_base_url.clone();
+            if probe(&external).await {
+                self.endpoint.set(external.clone());
+                self.set_state(ServiceState::ExternalReady {
+                    base_url: external.clone(),
+                });
+                return Ok(external);
+            }
+        }
+
+        self.set_state(ServiceState::Installing);
+        let notified = self.notify.notified();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let result = this.prepare_and_start().await;
+            if let Err(e) = &result {
+                tracing::error!(target: "chordial::netease", error = %e, "api-enhanced prepare failed");
+                // 卸载/停止可能已经发生，不要把状态改回 Failed 之外的运行态。
+                if matches!(this.state_snapshot(), ServiceState::Installing) {
+                    this.set_state(ServiceState::Failed(e.to_string()));
+                }
+            }
+            // 成功时 prepare_and_start 已经写入 Ready/child。
+            this.notify.notify_waiters();
+        });
+        drop(guard);
+        notified.await;
+        self.wait_result().await
     }
 
     /// 源卸载时调用；`keep_warm` 为 true 时保留进程。
@@ -211,13 +270,15 @@ impl NeteaseService {
 
     /// 主动停止 Node 进程。
     pub async fn stop(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut state) = self.state.lock() {
+            *state = ServiceState::Stopped;
+        }
+        self.notify.notify_waiters();
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            *state = ServiceState::Stopped;
         }
     }
 
@@ -230,19 +291,23 @@ impl NeteaseService {
 
     async fn current_ready(&self) -> CoreResult<Option<String>> {
         let mut child_guard = self.child.lock().await;
-        let ready = {
+        let (ready, external) = {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| CoreError::source_err("netease", "service state poisoned"))?;
             match &*state {
-                ServiceState::Ready { base_url, .. } => Some(base_url.clone()),
-                ServiceState::Stopped => None,
+                ServiceState::Ready { base_url, .. } => (Some(base_url.clone()), false),
+                ServiceState::ExternalReady { base_url } => (Some(base_url.clone()), true),
+                _ => (None, false),
             }
         };
         let Some(base_url) = ready else {
             return Ok(None);
         };
+        if external {
+            return Ok(Some(base_url));
+        }
         match child_guard.as_mut() {
             Some(child) => match child.try_wait() {
                 Ok(None) => Ok(Some(base_url)),
@@ -276,41 +341,75 @@ impl NeteaseService {
         }
     }
 
-    async fn start_managed(&self, config: &ManagedConfig) -> CoreResult<String> {
-        let app_dir = resolve_app_dir(config).ok_or_else(|| {
-            CoreError::source_err(
-                "netease",
-                format!(
-                    "未找到 api-enhanced 目录（app.js/server.js/index.js）。查找过：{}",
-                    candidate_app_dirs(config)
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("、")
-                ),
-            )
-        })?;
-        let entry = resolve_entry(&app_dir).ok_or_else(|| {
-            CoreError::source_err(
-                "netease",
-                format!("{} 中没有 app.js / server.js / index.js", app_dir.display()),
-            )
-        })?;
-        let node = resolve_node(config, &app_dir);
-        let port = pick_port(config.port)?;
+    fn state_snapshot(&self) -> ServiceState {
+        self.state
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or(ServiceState::Stopped)
+    }
+
+    fn set_state(&self, state: ServiceState) {
+        if let Ok(mut current) = self.state.lock() {
+            *current = state;
+        }
+    }
+
+    async fn wait_result(&self) -> CoreResult<String> {
+        loop {
+            match self.state_snapshot() {
+                ServiceState::Ready { base_url, .. } => {
+                    if self.current_ready().await?.is_some() {
+                        return Ok(base_url);
+                    }
+                }
+                ServiceState::ExternalReady { base_url } => return Ok(base_url),
+                ServiceState::Failed(e) => return Err(CoreError::source_err("netease", e)),
+                ServiceState::Installing => {
+                    self.notify.notified().await;
+                }
+                ServiceState::Stopped => {
+                    return Err(CoreError::source_err("netease", "api-enhanced 服务已停止"));
+                }
+            }
+        }
+    }
+
+    fn has_local_managed(&self) -> bool {
+        if self
+            .config
+            .binary_path
+            .as_ref()
+            .is_some_and(|path| path.is_file())
+        {
+            return true;
+        }
+        if resolve_app_dir(&self.config).is_some() {
+            return true;
+        }
+        installed_binary(&self.config).is_some()
+    }
+
+    async fn prepare_and_start(&self) -> CoreResult<String> {
+        let target = self.resolve_launch_target().await?;
+        let epoch = self.generation.load(Ordering::Acquire);
+        let port = pick_port(self.config.port)?;
         let base_url = format!("http://127.0.0.1:{port}");
 
-        let mut command = Command::new(&node);
+        let mut command = Command::new(&target.program);
+        for arg in &target.args {
+            command.arg(arg);
+        }
         command
-            .arg(&entry)
-            .current_dir(&app_dir)
+            .current_dir(&target.cwd)
             .env("HOST", "127.0.0.1")
             .env("PORT", port.to_string())
             .env("NODE_ENV", "production")
-            .env("NODE_OPTIONS", "--max-old-space-size=256")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if target.node {
+            command.env("NODE_OPTIONS", "--max-old-space-size=256");
+        }
         #[cfg(windows)]
         {
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
@@ -318,15 +417,18 @@ impl NeteaseService {
 
         tracing::info!(
             target: "chordial::netease",
-            node = %node.display(),
-            entry = %entry.display(),
+            program = %target.program.display(),
+            label = %target.label,
             port,
             "spawning managed api-enhanced"
         );
         let mut child = command.spawn().map_err(|e| {
             CoreError::source_err(
                 "netease",
-                format!("启动 Node 失败（{}）：{e}", node.display()),
+                format!(
+                    "启动 api-enhanced 失败（{}）：{e}",
+                    target.program.display()
+                ),
             )
         })?;
         let pid = child.id().unwrap_or(0);
@@ -337,7 +439,7 @@ impl NeteaseService {
             spawn_log_reader(stderr, self.logs.clone());
         }
 
-        let timeout = Duration::from_millis(config.startup_timeout_ms.max(1_000));
+        let timeout = Duration::from_millis(self.config.startup_timeout_ms.max(1_000));
         if let Err(e) = wait_ready(&mut child, &base_url, timeout, &self.logs).await {
             let _ = child.kill().await;
             let tail = self.logs_tail(12).join("\n");
@@ -347,14 +449,33 @@ impl NeteaseService {
             ));
         }
 
-        self.endpoint.set(base_url.clone());
-        if let Ok(mut state) = self.state.lock() {
-            *state = ServiceState::Ready {
-                base_url: base_url.clone(),
-                pid,
-            };
+        // stop() 可能在下载/启动期间发生：此时丢弃刚启动的进程，不写 Ready。
+        if epoch != self.generation.load(Ordering::Acquire)
+            || !matches!(self.state_snapshot(), ServiceState::Installing)
+        {
+            let _ = child.kill().await;
+            return Err(CoreError::source_err(
+                "netease",
+                "api-enhanced 启动被取消（源已停止）",
+            ));
         }
+        self.endpoint.set(base_url.clone());
+        self.set_state(ServiceState::Ready {
+            base_url: base_url.clone(),
+            pid,
+        });
         *self.child.lock().await = Some(child);
+        // 检查 set_state 与 child 写入之间的 stop 竞态。
+        if epoch != self.generation.load(Ordering::Acquire) {
+            if let Some(mut child) = self.child.lock().await.take() {
+                let _ = child.kill().await;
+            }
+            self.set_state(ServiceState::Stopped);
+            return Err(CoreError::source_err(
+                "netease",
+                "api-enhanced 启动被取消（源已停止）",
+            ));
+        }
         tracing::info!(
             target: "chordial::netease",
             pid,
@@ -362,6 +483,377 @@ impl NeteaseService {
             "managed api-enhanced ready"
         );
         Ok(base_url)
+    }
+
+    async fn resolve_launch_target(&self) -> CoreResult<LaunchTarget> {
+        if let Some(binary) = &self.config.binary_path {
+            if !binary.is_file() {
+                return Err(CoreError::source_err(
+                    "netease",
+                    format!("managed.binary_path 不存在：{}", binary.display()),
+                ));
+            }
+            return Ok(LaunchTarget::binary(binary.clone()));
+        }
+        if let Some(dir) = &self.config.app_dir {
+            return node_target(dir, &self.config).ok_or_else(|| {
+                CoreError::source_err(
+                    "netease",
+                    format!("{} 中没有 app.js / server.js / index.js", dir.display()),
+                )
+            });
+        }
+        if let Some(binary) = installed_binary(&self.config) {
+            return Ok(LaunchTarget::binary(binary));
+        }
+        if let Some(dir) = resolve_app_dir(&self.config) {
+            let node = resolve_node(&self.config, &dir);
+            let node_usable = node.is_file()
+                || std::process::Command::new(&node)
+                    .arg("--version")
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false);
+            if node_usable && let Some(target) = node_target(&dir, &self.config) {
+                return Ok(target);
+            }
+        }
+        if self.config.auto_install {
+            let binary = install_binary(&self.config, &self.logs).await?;
+            return Ok(LaunchTarget::binary(binary));
+        }
+        Err(CoreError::source_err(
+            "netease",
+            format!(
+                "未找到 api-enhanced 且 auto_install=false。查找过：{}",
+                candidate_app_dirs(&self.config)
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
+        ))
+    }
+}
+
+struct LaunchTarget {
+    program: PathBuf,
+    args: Vec<PathBuf>,
+    cwd: PathBuf,
+    node: bool,
+    label: String,
+}
+
+impl LaunchTarget {
+    fn binary(path: PathBuf) -> Self {
+        let cwd = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            label: format!("binary {}", path.display()),
+            program: path,
+            args: Vec::new(),
+            cwd,
+            node: false,
+        }
+    }
+
+    fn node(program: PathBuf, entry: PathBuf, app_dir: PathBuf) -> Self {
+        Self {
+            label: format!("node {} {}", program.display(), entry.display()),
+            program,
+            args: vec![entry],
+            cwd: app_dir,
+            node: true,
+        }
+    }
+}
+
+fn node_target(dir: &Path, config: &ManagedConfig) -> Option<LaunchTarget> {
+    let entry = resolve_entry(dir)?;
+    let node = resolve_node(config, dir);
+    Some(LaunchTarget::node(node, entry, dir.to_path_buf()))
+}
+
+fn install_root(config: &ManagedConfig) -> PathBuf {
+    config.install_dir.clone().unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| std::env::temp_dir())
+            .join("chordial")
+            .join("netease-api")
+    })
+}
+
+fn binary_filename() -> &'static str {
+    if cfg!(windows) {
+        "api-enhanced.exe"
+    } else {
+        "api-enhanced"
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct InstalledMeta {
+    version: String,
+    asset: String,
+    sha256: String,
+}
+
+fn installed_binary(config: &ManagedConfig) -> Option<PathBuf> {
+    let binary = install_root(config).join(binary_filename());
+    if !binary.is_file() {
+        return None;
+    }
+    let meta: Option<InstalledMeta> =
+        std::fs::read_to_string(binary.with_file_name("installed.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+    if let Some(requested) = config
+        .api_version
+        .as_deref()
+        .filter(|v| !v.is_empty() && *v != "latest")
+    {
+        match &meta {
+            Some(meta) if meta.version == requested => {}
+            _ => return None,
+        }
+    }
+    if let Some(expected) = config.api_sha256.as_deref() {
+        match &meta {
+            Some(meta) if meta.sha256 == normalize_sha256(expected) => {}
+            _ => return None,
+        }
+    }
+    Some(binary)
+}
+
+fn release_asset_name() -> CoreResult<&'static str> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Ok("ncm-api-win-x64.exe");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Ok("ncm-api-linux-x64");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return Ok("ncm-api-macos-x64");
+    }
+    #[allow(unreachable_code)]
+    Err(CoreError::source_err(
+        "netease",
+        format!(
+            "api-enhanced 暂无当前平台预编译包（{}/{}）",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+    ))
+}
+
+fn normalize_sha256(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("sha256:")
+        .trim_start_matches("SHA256:")
+        .to_ascii_lowercase()
+}
+
+/// 下载官方 api-enhanced release 二进制，校验 SHA-256 后原子安装。
+async fn install_binary(
+    config: &ManagedConfig,
+    logs: &Arc<Mutex<VecDeque<String>>>,
+) -> CoreResult<PathBuf> {
+    if let Some(binary) = installed_binary(config) {
+        return Ok(binary);
+    }
+    let root = install_root(config);
+    tokio::fs::create_dir_all(&root).await.map_err(|e| {
+        CoreError::source_err(
+            "netease",
+            format!("创建安装目录失败 {}：{e}", root.display()),
+        )
+    })?;
+    let asset_name = release_asset_name()?;
+    let version = config.api_version.as_deref().unwrap_or("latest");
+    let release_url = if version == "latest" {
+        "https://api.github.com/repos/NeteaseCloudMusicApiEnhanced/api-enhanced/releases/latest"
+            .to_string()
+    } else {
+        format!(
+            "https://api.github.com/repos/NeteaseCloudMusicApiEnhanced/api-enhanced/releases/tags/{version}"
+        )
+    };
+    push_log(
+        logs,
+        format!("fetching api-enhanced release: {release_url}"),
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(1_800))
+        .user_agent(concat!("Chordial/2.0 (", env!("CARGO_PKG_VERSION"), ")"))
+        .build()
+        .map_err(|e| CoreError::source_err("netease", format!("创建下载客户端失败：{e}")))?;
+    let release: serde_json::Value = client
+        .get(&release_url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| CoreError::source_err("netease", format!("获取 release 失败：{e}")))?
+        .error_for_status()
+        .map_err(|e| CoreError::source_err("netease", format!("release HTTP 错误：{e}")))?
+        .json()
+        .await
+        .map_err(|e| CoreError::source_err("netease", format!("解析 release 失败：{e}")))?;
+    let tag = release
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let asset = release
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some(asset_name))
+        })
+        .ok_or_else(|| {
+            CoreError::source_err("netease", format!("{tag} 中没有资产 {asset_name}"))
+        })?;
+    // 优先用 API asset URL（Accept: application/octet-stream）：它重定向到
+    // release-assets.githubusercontent.com，比 github.com/releases/download
+    // 在受限网络下更容易下载。
+    let api_asset_url = asset
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let url = api_asset_url
+        .or_else(|| {
+            asset
+                .get("browser_download_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| CoreError::source_err("netease", "release 资产缺少下载地址"))?;
+    let api_digest = asset
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .map(normalize_sha256);
+    if let (Some(expected), Some(api)) = (&config.api_sha256, &api_digest)
+        && normalize_sha256(expected) != *api
+    {
+        return Err(CoreError::source_err(
+            "netease",
+            "managed.api_sha256 与 GitHub release 摘要不一致",
+        ));
+    }
+    let expected = config
+        .api_sha256
+        .as_deref()
+        .map(normalize_sha256)
+        .or(api_digest)
+        .ok_or_else(|| {
+            CoreError::source_err(
+                "netease",
+                "release 未提供 SHA-256 且未配置 managed.api_sha256；拒绝安装未校验的二进制",
+            )
+        })?;
+
+    push_log(logs, format!("downloading {url}"));
+    let response = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/octet-stream")
+        .send()
+        .await
+        .map_err(|e| CoreError::source_err("netease", format!("下载失败：{e}")))?
+        .error_for_status()
+        .map_err(|e| CoreError::source_err("netease", format!("下载 HTTP 错误：{e}")))?;
+    let temp = root.join(format!(".download-{}.part", std::process::id()));
+    let mut file = tokio::fs::File::create(&temp)
+        .await
+        .map_err(|e| CoreError::source_err("netease", format!("创建临时文件失败：{e}")))?;
+    use futures::StreamExt;
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+    let mut stream = response.bytes_stream();
+    let mut total: u64 = 0;
+    let mut hasher = sha2::Sha256::new();
+    const MAX_DOWNLOAD: u64 = 300 * 1024 * 1024;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&temp).await;
+                return Err(CoreError::source_err(
+                    "netease",
+                    format!("读取下载流失败：{e}"),
+                ));
+            }
+        };
+        total += chunk.len() as u64;
+        if total > MAX_DOWNLOAD {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(CoreError::source_err(
+                "netease",
+                "api-enhanced 下载超过 300MB，已中止",
+            ));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| CoreError::source_err("netease", format!("写入文件失败：{e}")))?;
+    }
+    file.flush().await.ok();
+    drop(file);
+    let actual: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if actual != expected {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(CoreError::source_err(
+            "netease",
+            format!("api-enhanced 校验失败：期望 {expected}，实际 {actual}"),
+        ));
+    }
+    let binary = root.join(binary_filename());
+    let _ = tokio::fs::remove_file(&binary).await;
+    tokio::fs::rename(&temp, &binary)
+        .await
+        .map_err(|e| CoreError::source_err("netease", format!("安装二进制失败：{e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755));
+    }
+    let meta = InstalledMeta {
+        version: tag.clone(),
+        asset: asset_name.to_string(),
+        sha256: actual.clone(),
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(&meta) {
+        let _ = tokio::fs::write(root.join("installed.json"), json).await;
+    }
+    push_log(
+        logs,
+        format!(
+            "installed api-enhanced {tag} ({:.1} MB, sha256 {})",
+            total as f64 / 1_048_576.0,
+            actual
+        ),
+    );
+    Ok(binary)
+}
+
+fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, line: impl Into<String>) {
+    if let Ok(mut logs) = logs.lock() {
+        if logs.len() >= 200 {
+            logs.pop_front();
+        }
+        logs.push_back(redact(&line.into()));
     }
 }
 
@@ -532,15 +1024,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_falls_back_to_external_without_assets() {
+    fn auto_uses_manager_but_external_stays_direct() {
         let config = ManagedConfig {
             app_dir: Some(std::env::temp_dir().join("chordial-no-such-app")),
             ..Default::default()
         };
         assert!(resolve_app_dir(&config).is_none());
         let endpoint = Arc::new(Endpoint::new("http://127.0.0.1:3000"));
-        let service = NeteaseService::from_config(NeteaseMode::Auto, &config, endpoint);
-        assert!(service.is_none(), "Auto without assets must stay external");
+        let auto = NeteaseService::from_config(NeteaseMode::Auto, &config, endpoint.clone());
+        assert!(auto.is_some(), "Auto may install/fallback at runtime");
+        let external = NeteaseService::from_config(NeteaseMode::External, &config, endpoint);
+        assert!(external.is_none());
+    }
+
+    #[test]
+    fn release_asset_and_digest_helpers() {
+        let asset = release_asset_name().unwrap();
+        assert!(asset.starts_with("ncm-api-"));
+        assert_eq!(normalize_sha256("SHA256:ABCdef"), "abcdef");
+        assert_eq!(normalize_sha256(" abc "), "abc");
+    }
+
+    #[test]
+    fn installed_binary_respects_pinned_version() {
+        let dir = std::env::temp_dir().join(format!("chordial-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join(binary_filename());
+        std::fs::write(&binary, b"stub").unwrap();
+        let config = ManagedConfig {
+            install_dir: Some(dir.clone()),
+            api_version: Some("v1.0.0".into()),
+            ..Default::default()
+        };
+        // 没有 installed.json：宁可重新安装，也不执行未知版本。
+        assert!(installed_binary(&config).is_none());
+        std::fs::write(
+            dir.join("installed.json"),
+            br#"{"version":"v1.0.0","asset":"x","sha256":"y"}"#,
+        )
+        .unwrap();
+        assert_eq!(installed_binary(&config), Some(binary.clone()));
+        let other = ManagedConfig {
+            api_version: Some("v2.0.0".into()),
+            ..config.clone()
+        };
+        assert!(installed_binary(&other).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -565,6 +1095,45 @@ mod tests {
         assert!(!redacted.contains("abc123"));
         assert!(!redacted.contains("xyz"));
         assert!(redacted.contains("other=1"));
+    }
+
+    /// 真实下载官方 api-enhanced release 二进制（约 60-80MB）。
+    /// 默认忽略；网络可用时用 `cargo test -p chordal-netease -- --ignored` 跑。
+    #[test]
+    #[ignore = "downloads api-enhanced release from GitHub"]
+    fn installs_official_binary_from_release() {
+        let dir =
+            std::env::temp_dir().join(format!("chordial-official-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = ManagedConfig {
+            install_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let logs = Arc::new(Mutex::new(VecDeque::new()));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let binary = runtime
+            .block_on(install_binary(&config, &logs))
+            .expect("official api-enhanced download");
+        assert!(binary.is_file());
+        let meta: InstalledMeta =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("installed.json")).unwrap())
+                .unwrap();
+        assert!(!meta.version.is_empty());
+        assert_eq!(meta.sha256.len(), 64);
+
+        // 用刚安装的官方二进制完整跑一遍启动/就绪/停止。
+        let endpoint = Arc::new(Endpoint::new("http://127.0.0.1:1"));
+        let service =
+            NeteaseService::from_config(NeteaseMode::Managed, &config, endpoint.clone()).unwrap();
+        let base = runtime.block_on(service.ensure_ready()).unwrap();
+        assert!(base.starts_with("http://127.0.0.1:"));
+        assert_eq!(endpoint.get(), base);
+        runtime.block_on(service.stop());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真实 spawn 一个最小 Node HTTP 服务，验证端口/就绪/停止。

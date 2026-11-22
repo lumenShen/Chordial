@@ -283,13 +283,6 @@ impl WindowsWindowInner {
     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
         self.start_tracking_mouse(handle, TME_LEAVE);
 
-        let mut lock = self.state.borrow_mut();
-        let Some(mut func) = lock.callbacks.input.take() else {
-            return Some(1);
-        };
-        let scale_factor = lock.scale_factor;
-        drop(lock);
-
         let pressed_button = match MODIFIERKEYS_FLAGS(wparam.loword() as u32) {
             flags if flags.contains(MK_LBUTTON) => Some(MouseButton::Left),
             flags if flags.contains(MK_RBUTTON) => Some(MouseButton::Right),
@@ -304,20 +297,23 @@ impl WindowsWindowInner {
         };
         let x = lparam.signed_loword() as f32;
         let y = lparam.signed_hiword() as f32;
-        let input = PlatformInput::MouseMove(MouseMoveEvent {
+
+        // 只保留最新位置，在下一帧 `draw_window` 前统一派发。这样 1000Hz
+        // 鼠标不会对同一帧做 1000 次命中测试与滑杆状态更新。
+        let mut lock = self.state.borrow_mut();
+        let scale_factor = lock.scale_factor;
+        lock.pending_mouse_move = Some(MouseMoveEvent {
             position: logical_point(x, y, scale_factor),
             pressed_button,
             modifiers: current_modifiers(),
         });
-        let handled = !func(input).propagate;
-        self.state.borrow_mut().callbacks.input = Some(func);
-
-        if handled { Some(0) } else { Some(1) }
+        Some(1)
     }
 
     fn handle_mouse_leave_msg(&self) -> Option<isize> {
         let mut lock = self.state.borrow_mut();
         lock.hovered = false;
+        lock.pending_mouse_move = None;
         if let Some(mut callback) = lock.callbacks.hovered_status_change.take() {
             drop(lock);
             callback(false);
@@ -524,11 +520,7 @@ impl WindowsWindowInner {
         lparam: LPARAM,
     ) -> Option<isize> {
         let modifiers = current_modifiers();
-        let mut lock = self.state.borrow_mut();
-        let Some(mut func) = lock.callbacks.input.take() else {
-            return Some(1);
-        };
-        let scale_factor = lock.scale_factor;
+        let scale_factor = self.state.borrow().scale_factor;
         let wheel_scroll_amount = match modifiers.shift {
             true => {
                 self.system_settings
@@ -543,7 +535,6 @@ impl WindowsWindowInner {
                     .wheel_scroll_lines
             }
         };
-        drop(lock);
 
         let wheel_distance =
             (wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_amount as f32;
@@ -552,9 +543,9 @@ impl WindowsWindowInner {
             y: lparam.signed_hiword().into(),
         };
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
-        let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
-            delta: ScrollDelta::Lines(match modifiers.shift {
+        self.queue_scroll_event(
+            logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
+            ScrollDelta::Lines(match modifiers.shift {
                 true => Point {
                     x: wheel_distance,
                     y: 0.0,
@@ -565,12 +556,30 @@ impl WindowsWindowInner {
                 },
             }),
             modifiers,
-            touch_phase: TouchPhase::Moved,
-        });
-        let handled = !func(input).propagate;
-        self.state.borrow_mut().callbacks.input = Some(func);
+        );
+        Some(0)
+    }
 
-        if handled { Some(0) } else { Some(1) }
+    /// 合并同一帧内的滚轮/触控板增量，等 `draw_window` 时再派发一次。
+    fn queue_scroll_event(
+        &self,
+        position: Point<Pixels>,
+        delta: ScrollDelta,
+        modifiers: Modifiers,
+    ) {
+        let mut lock = self.state.borrow_mut();
+        if let Some(pending) = lock.pending_scroll.as_mut() {
+            pending.delta = pending.delta.coalesce(delta);
+            pending.position = position;
+            pending.modifiers = modifiers;
+        } else {
+            lock.pending_scroll = Some(ScrollWheelEvent {
+                position,
+                delta,
+                modifiers,
+                touch_phase: TouchPhase::Moved,
+            });
+        }
     }
 
     fn handle_mouse_horizontal_wheel_msg(
@@ -579,17 +588,12 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
-        let mut lock = self.state.borrow_mut();
-        let Some(mut func) = lock.callbacks.input.take() else {
-            return Some(1);
-        };
-        let scale_factor = lock.scale_factor;
+        let scale_factor = self.state.borrow().scale_factor;
         let wheel_scroll_chars = self
             .system_settings
             .borrow()
             .mouse_wheel_settings
             .wheel_scroll_chars;
-        drop(lock);
 
         let wheel_distance =
             (-wparam.signed_hiword() as f32 / WHEEL_DELTA as f32) * wheel_scroll_chars as f32;
@@ -598,19 +602,15 @@ impl WindowsWindowInner {
             y: lparam.signed_hiword().into(),
         };
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
-        let event = PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
-            delta: ScrollDelta::Lines(Point {
+        self.queue_scroll_event(
+            logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
+            ScrollDelta::Lines(Point {
                 x: wheel_distance,
                 y: 0.0,
             }),
-            modifiers: current_modifiers(),
-            touch_phase: TouchPhase::Moved,
-        });
-        let handled = !func(event).propagate;
-        self.state.borrow_mut().callbacks.input = Some(func);
-
-        if handled { Some(0) } else { Some(1) }
+            current_modifiers(),
+        );
+        Some(0)
     }
 
     fn retrieve_caret_position(&self) -> Option<POINT> {
@@ -1192,8 +1192,38 @@ impl WindowsWindowInner {
         Some(0)
     }
 
+    /// 每个刷新周期最多派发一次移动与一次滚动。
+    fn flush_pending_input(&self) {
+        let (pending_move, pending_scroll) = {
+            let mut lock = self.state.borrow_mut();
+            (
+                lock.pending_mouse_move.take(),
+                lock.pending_scroll.take(),
+            )
+        };
+        if pending_move.is_none() && pending_scroll.is_none() {
+            return;
+        }
+
+        let mut lock = self.state.borrow_mut();
+        let Some(mut func) = lock.callbacks.input.take() else {
+            return;
+        };
+        drop(lock);
+
+        if let Some(event) = pending_move {
+            func(PlatformInput::MouseMove(event));
+        }
+        if let Some(event) = pending_scroll {
+            func(PlatformInput::ScrollWheel(event));
+        }
+        self.state.borrow_mut().callbacks.input = Some(func);
+    }
+
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        // 先派发本帧合并后的鼠标移动/滚动，再绘制，保证画面与最新输入一致。
+        self.flush_pending_input();
         let mut request_frame = self.state.borrow_mut().callbacks.request_frame.take()?;
         request_frame(RequestFrameOptions {
             require_presentation: false,

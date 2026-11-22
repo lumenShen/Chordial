@@ -50,6 +50,7 @@ fn metrics(n: usize) -> LayoutMetrics {
         width: 1_200.0,
         height: 800.0,
         base_font_size: 30.0,
+        padding_x: 30.0,
         line_heights: vec![90.0; n],
     }
 }

@@ -73,7 +73,7 @@ fn to_amll_plain(lyrics: &CoreLyrics, duration_ms: Option<u64>) -> Vec<LyricLine
     out
 }
 
-/// YRC/逐词歌词 → AMLL 模型。保留词级时间，渲染层会自动进入逐词扫光模式。
+/// YRC/逐词歌词 → AMLL 模型。保留词级时间，渲染层会自动进入整行扫光模式。
 ///
 /// 以 LRC 行级歌词为骨架（避免 YRC 缺失/多出的行被丢掉），按最近时间戳
 /// 挂接逐词时间；YRC 独有的行再追加。整个合并 O((n+m) log m)。
@@ -453,6 +453,13 @@ pub fn fetch_cover_blocking(
         namespace.as_str().to_string(),
         url,
     ))
+}
+
+/// 只取封面原始字节（用于下载时嵌入音频标签 / 写边车封面）。
+/// 与 UI 展示路径一致，网易 CDN 会先缩放到 512×512，避免嵌入原图。
+pub fn fetch_cover_raw_blocking(url: String) -> Option<Vec<u8>> {
+    chordal_netease::shared_runtime()
+        .block_on(async move { fetch_cover_bytes(&url).await.map(|(bytes, _)| bytes) })
 }
 
 #[cfg(test)]

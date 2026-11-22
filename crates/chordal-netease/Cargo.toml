@@ -15,4 +15,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
-tokio = { workspace = true, features = ["process", "io-util", "time"] }
+tokio = { workspace = true, features = ["process", "io-util", "time", "fs"] }
+futures = { workspace = true }
+dirs = { workspace = true }
+sha2 = "0.10"

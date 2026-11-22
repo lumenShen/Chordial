@@ -139,6 +139,13 @@ struct TransformationMatrix {
     translation: vec2<f32>,
 }
 
+struct SpriteMask {
+    light_from: f32,
+    dark_from: f32,
+    light: f32,
+    dark: f32,
+}
+
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     return vec4<f32>(device_position, 0.0, 1.0);
@@ -1153,6 +1160,7 @@ struct MonochromeSprite {
     color: Hsla,
     tile: AtlasTile,
     transformation: TransformationMatrix,
+    mask: SpriteMask,
 }
 var<storage, read> b_mono_sprites: array<MonochromeSprite>;
 
@@ -1160,6 +1168,7 @@ struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) @interpolate(flat) mask: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -1173,6 +1182,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
+    out.mask = vec4<f32>(sprite.mask.light_from, sprite.mask.dark_from, sprite.mask.light, sprite.mask.dark);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
@@ -1182,13 +1192,22 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
     let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
 
+    // AMLL `mask-image` 扫光：左侧 light、右侧 dark，中间线性渐变。
+    let mask = input.mask;
+    let t = select(
+        select(0.0, 1.0, input.position.x >= mask.x),
+        saturate((input.position.x - mask.x) / (mask.y - mask.x)),
+        mask.y > mask.x,
+    );
+    let mask_alpha = mix(mask.z, mask.w, t);
+
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
     // convert to srgb space as the rest of the code (output swapchain) expects that
-    return blend_color(input.color, alpha_corrected);
+    return blend_color(input.color, alpha_corrected * mask_alpha);
 }
 
 // --- polychrome sprites --- //

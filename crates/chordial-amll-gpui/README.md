@@ -3,7 +3,7 @@
 在 [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) 上等价重实现
 [AMLL（Apple Music Like Lyrics）](https://amll.dev/) 的核心歌词组件：
 
-- **Lyric render**：逐字形绘制、逐词扫光渐变、逐词上浮（离场回退）、
+- **Lyric render**：逐字形绘制、整行扫光渐变（跨字/词连续前沿）、逐词上浮（离场回退）、
   强调词按词段合并后逐字缩放/位移/辉光、背景歌词行、对唱行、翻译/音译、
   间奏呼吸点；
 - **LyricPlayer**：AMLL `LyricPlayerBase` 的热行/缓冲行状态机、解析弹簧滚动、
@@ -56,11 +56,18 @@
 
 **语义/参数完全对齐**：热行/缓冲行状态机、弹簧参数与解析解、滚动偏移与逐行
 delay、间奏判定（≥4s、下一行前 250ms）、对齐锚点、隐藏已播放行、模糊/缩放
-阈值（`blur = 1 + 距离`，窄视口 ×0.8）、扫光宽度（`word.height × 0.5` =
-0.6em，边界从 `词起点 − fade` 走到词尾）、逐词上浮（0.05em / 背景行 0.1em，
+阈值（`blur = 1 + 距离`，窄视口 ×0.8）、逐词上浮（0.05em / 背景行 0.1em，
 `max(1s, 词时长)`、`ease-out`、离场倒放）、强调词条件与缓动（含
 `chunkAndSplitLyricWords` 的非 CJK 合并语义）、强调词 `text-shadow` 辉光、
 Mesh 的 BHP 矩阵、UV 映射、旋转/音量/暗角/抖动公式、32×32 调色与滤镜顺序。
+扫光改为**整行一条 mask 前沿**（软边约 1.5em），不再按词各自重播。
+
+**背景的刻意差异**：鼓点包络在本实现里额外驱动网格顶点的整体呼吸（NDC
+向外扩张）与 RGB 提亮，让低分辨率、平滑封面上也能看清击打；AMLL 只做
+UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0–1.5，
+应用默认 0.5，可在设置中调整，0 只保留背景流动）。封面切换按墙钟 420ms
+交叉淡出，退场层保持不透明，避免高刷屏上多层 alpha 叠加导致背景变暗；
+旧背景帧会主动从 gpui sprite atlas 移除。
 
 **逐像素对照（2026-11，amll-player `main`）**：在 1600×1000 与 800×1000 两个
 窗口下逐元素测量真实 AMLL Player（react-full `PrebuiltLyricPlayer`，
@@ -78,6 +85,7 @@ Mesh 的 BHP 矩阵、UV 映射、旋转/音量/暗角/抖动公式、32×32 调
 | 非当前行缩放 | 0.97（播放中）/ 背景行 0.75 |
 | 行缩放锚点 | `.lyricLine { transform-origin: left }`（对唱行 `right`）→ 左/右边缘 × 垂直中心；`translateY` 在外层 `.lyricLineWrapper` |
 | 强调缩放锚点 | 字符 `<span>` 未设 `transform-origin`，取默认 `50% 50%`（字符盒中心） |
+| 间奏点 | `.interludeDots` 的左右 padding = 歌词文本 padding；`transform-origin: center` | 首点与歌词文本左边缘对齐（对唱行与右边缘对齐），整组围绕中心缩放 |
 | 逐词浮动 | 每词 `0 → -0.05em`（BG ×2），`max(1s, 词时长)`、delay = 词起点、`ease-out`；离场 `playbackRate=-1` 回退 |
 | 强调分组 | `chunkAndSplitLyricWords`：非 CJK 合并无空白相邻词；CJK 先拆单字，按时长 ≥1s 判断 |
 | 强调辉光 | `text-shadow: 0 0 min(0.3, blur*0.3)em`，alpha = `empEasing(x) * blur`（真高斯模糊，σ=R/2） |
@@ -104,6 +112,19 @@ Mesh 的 BHP 矩阵、UV 映射、旋转/音量/暗角/抖动公式、32×32 调
   都用 sprite 变换缩放**已缓存的字形位图**，而不是把 `font_size × scale`
   当新字号重新光栅化。效果：滚动时不再「几帧不动、然后跳 1px」，缩放动画
   期间抗锯齿/字形高度也不会逐帧变化，字形图集 key 保持稳定。
+- **扫光遮罩（mask-image）**：动态歌词的亮暗不是逐字改色，而是给整行一条
+  共享的水平渐变遮罩（`SpriteMask`）：`light_from` 左侧为亮层、`dark_from`
+  右侧为暗层，中间按 fragment x 线性插值。前沿在一行的所有词之间**连续
+  推进**（词开始时从上一词尾出发，词结束时到达本词尾），因此渐变带会压在
+  相邻的字/词之间，而不是每个词各自点亮一遍。软边宽度 = `1.5em`（约 1–2
+  个 CJK 字 / 3 个拉丁字符），让效果更像一整层 mask 扫过歌词行。遮罩在
+  fragment shader 里计算，所以同一个宽字形内部也是连续渐变，并且同时作用
+  于强调词的辉光 sprite。AMLL 非活跃行的亮/暗 mask alpha 都是 0.2（均匀
+  暗层），活跃行是 1 / 0.4。
+- **逐词上浮**：普通词在自己的时长内以 `ease-out` 上浮 0.05em（背景行
+  0.1em），行离开热行集合时按 AMLL 的 `playbackRate = -1` 回退；强调词改用
+  字符级 float（`sin(πx)·up + x·up`，按字符 stagger），并与辉光/缩放动画
+  共用同一条时间线。
 - **帧节奏**：由视图内部的 60fps 定时泵驱动（不跟随显示器刷新率）。
   在 120/144Hz 屏上，`request_animation_frame` 会让整个 gpui 场景按刷新率
   提交（实测 CPU 翻倍以上）；60fps 泵只在播放/弹簧未收敛/背景流动时唤醒，
@@ -114,17 +135,19 @@ Mesh 的 BHP 矩阵、UV 映射、旋转/音量/暗角/抖动公式、32×32 调
 | AMLL | 本 crate | 差异 |
 | --- | --- | --- |
 | CSS `filter: blur()` | 字形 alpha 掩码的可分离高斯 / 三次盒式卷积 | 逐字形而非整行；σ 量化 0.5 设备像素、上限 5px |
-| CSS mask 亚像素渐变 | 逐字形 alpha 插值 | 边缘在 1 个字形内量化 |
+| CSS `mask-image` 扫光 | `SpriteMask`：shader 内按 fragment x 的水平渐变 | 整行共享一条前沿（非逐词独立遮罩）；软边 1.5em 更宽，跨字/词更明显 |
 | 浏览器 CSS transition | 80ms 一阶平滑 | 过渡曲线略有不同 |
 | WebGL 三角形光栅（全分辨率） | 低分辨率 CPU 场 + GPU 上采样 | 同一公式；1/64 像素量，GPU 放大 |
 | `requestAnimationFrame` | gpui `request_animation_frame` | 与窗口刷新率一致 |
 | 行 hover 底色 `#fff1` | 未实现行级 hover | 需要逐行命中测试 |
 
 > gpui 0.2.2 未开放自定义 shader / 离屏渲染 / 字形位图（`rasterize_glyph`
-> 为 crate 私有）。`vendor/gpui` 因此加了两个最小补丁：`paint_glyph_with_blur`
+> 为 crate 私有）。`vendor/gpui` 因此加了三个最小补丁：`paint_glyph_with_blur`
 > 在平台光栅化后对 alpha 掩码做卷积，图集按 `(glyph, size, σ bucket)` 缓存；
 > `paint_glyph_scaled` 支持分数基线 + 4×4 子像素档位 + 无网格拟合，并用
-> sprite 变换承载缩放。补丁说明见 `vendor/gpui/PATCHES.md`。
+> sprite 变换承载缩放；`MonochromeSprite` 增加 `SpriteMask`，由
+> Windows/Blade/Metal 三个 fragment shader 按设备像素 x 插值亮暗 alpha。
+> 补丁说明见 `vendor/gpui/PATCHES.md`。
 
 **尚未实现**：AMLL 的滚轮/拖拽歌词滚动（`scroll_offset` 目前恒为 0）；
 非逐词 LRC 不做逐字扫光（与 AMLL `isNonDynamic` 分支一致，只有行级透明度）；

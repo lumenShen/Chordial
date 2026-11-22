@@ -38,7 +38,7 @@ use std::{
     mem,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use util::ResultExt;
 
@@ -1079,6 +1079,12 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Smooth wheel/touchpad scrolling with a frame-rate-independent controller.
+    fn smooth_scroll(mut self) -> Self {
+        self.interactivity().smooth_scroll = true;
+        self
+    }
+
     /// Track the scroll state of this element with the given handle.
     fn anchor_scroll(mut self, scroll_anchor: Option<ScrollAnchor>) -> Self {
         self.interactivity().scroll_anchor = scroll_anchor;
@@ -1491,6 +1497,9 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    /// 使用时间基平滑滚动（`smooth_scroll()`）。
+    pub(crate) smooth_scroll: bool,
+    pub(crate) smooth_scroll_state: Option<Rc<RefCell<SmoothScrollState>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -1612,6 +1621,20 @@ impl Interactivity {
                     );
                 }
 
+                if self.smooth_scroll
+                    && self.scroll_offset.is_some()
+                    && let Some(element_state) = element_state.as_mut()
+                {
+                    self.smooth_scroll_state = Some(
+                        element_state
+                            .smooth_scroll
+                            .get_or_insert_with(|| {
+                                Rc::new(RefCell::new(SmoothScrollState::default()))
+                            })
+                            .clone(),
+                    );
+                }
+
                 let style = self.compute_style_internal(None, element_state.as_mut(), window, cx);
                 let layout_id = f(style, window, cx);
                 (layout_id, element_state)
@@ -1679,8 +1702,13 @@ impl Interactivity {
                                 None
                             };
 
-                            let scroll_offset =
-                                self.clamp_scroll_position(bounds, &style, window, cx);
+                            let scroll_offset = self.clamp_scroll_position(
+                                bounds,
+                                &style,
+                                window,
+                                cx,
+                                self.smooth_scroll_state.as_ref(),
+                            );
                             let result = f(&style, scroll_offset, hitbox, window, cx);
                             (result, element_state)
                         },
@@ -1717,6 +1745,7 @@ impl Interactivity {
         style: &Style,
         window: &mut Window,
         _cx: &mut App,
+        smooth: Option<&Rc<RefCell<SmoothScrollState>>>,
     ) -> Point<Pixels> {
         fn round_to_two_decimals(pixels: Pixels) -> Pixels {
             const ROUNDING_FACTOR: f32 = 100.0;
@@ -1761,6 +1790,16 @@ impl Interactivity {
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
+            }
+
+            if let Some(smooth) = smooth {
+                let mut smooth = smooth.borrow_mut();
+                if scroll_to_bottom {
+                    smooth.target = *scroll_offset;
+                }
+                if smooth.advance(&mut scroll_offset, scroll_max, Instant::now()) {
+                    window.request_animation_frame();
+                }
             }
 
             *scroll_offset
@@ -2414,6 +2453,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let smooth_scroll = self.smooth_scroll_state.clone();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -2443,6 +2483,24 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
+
+                    if let Some(smooth) = smooth_scroll.as_ref() {
+                        let mut smooth = smooth.borrow_mut();
+                        if !smooth.is_animating(*scroll_offset) {
+                            smooth.target = *scroll_offset;
+                            smooth.last_instant = Instant::now();
+                        }
+                        smooth.target.x += delta_x;
+                        smooth.target.y += delta_y;
+                        smooth.clamp_target();
+                        drop(scroll_offset);
+                        // 事件派发阶段不能调用 `request_animation_frame`
+                        // （它需要 prepaint/paint 的 current_view）；这里用
+                        // 捕获的 current_view 直接排下一帧。
+                        window.on_next_frame(move |_, cx| cx.notify(current_view));
+                        return;
+                    }
+
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
@@ -2571,7 +2629,98 @@ pub struct InteractiveElementState {
     pub(crate) hover_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) smooth_scroll: Option<Rc<RefCell<SmoothScrollState>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+}
+
+/// Frame-rate-independent smooth scroll controller.
+#[derive(Debug)]
+pub(crate) struct SmoothScrollState {
+    target: Point<Pixels>,
+    max_offset: Size<Pixels>,
+    last_instant: Instant,
+    last_offset: Point<Pixels>,
+    initialized: bool,
+}
+
+impl Default for SmoothScrollState {
+    fn default() -> Self {
+        Self {
+            target: Point::default(),
+            max_offset: Size::default(),
+            last_instant: Instant::now(),
+            last_offset: Point::default(),
+            initialized: false,
+        }
+    }
+}
+
+impl SmoothScrollState {
+    fn clamp_target(&mut self) {
+        self.target.x = clamp_scroll_axis(self.target.x, self.max_offset.width);
+        self.target.y = clamp_scroll_axis(self.target.y, self.max_offset.height);
+    }
+
+    fn is_animating(&self, offset: Point<Pixels>) -> bool {
+        (f32::from(self.target.x - offset.x)).abs() > 0.25
+            || (f32::from(self.target.y - offset.y)).abs() > 0.25
+    }
+
+    /// Advance `offset` toward `target`. Returns true while a frame is needed.
+    fn advance(
+        &mut self,
+        offset: &mut Point<Pixels>,
+        max_offset: Size<Pixels>,
+        now: Instant,
+    ) -> bool {
+        self.max_offset = max_offset;
+        if !self.initialized {
+            self.target = *offset;
+            self.last_instant = now;
+            self.last_offset = *offset;
+            self.initialized = true;
+            return false;
+        }
+
+        // 外部改写了偏移（程序化跳转、tracked handle、内容变化后的 clamp）时，
+        // 以外部结果为准重新锚定，避免平滑动画把列表拉回旧位置。
+        if *offset != self.last_offset {
+            self.target = *offset;
+            self.last_instant = now;
+            self.last_offset = *offset;
+            return false;
+        }
+
+        self.clamp_target();
+        let dt = (now - self.last_instant).as_secs_f32().clamp(0.0, 0.1);
+        self.last_instant = now;
+        if dt <= 0.0 {
+            return self.is_animating(*offset);
+        }
+
+        // 45ms 时间常数：300Hz 下约 4-5 帧完成主要位移，同时保持轨迹与帧率无关。
+        let alpha = 1.0 - (-dt / 0.045).exp();
+        let mut next = Point::new(
+            offset.x + (self.target.x - offset.x) * alpha,
+            offset.y + (self.target.y - offset.y) * alpha,
+        );
+        let snap = |target: Pixels, value: Pixels| {
+            if (f32::from(target - value)).abs() < 0.25 {
+                target
+            } else {
+                value
+            }
+        };
+        next.x = snap(self.target.x, next.x);
+        next.y = snap(self.target.y, next.y);
+        *offset = next;
+        self.last_offset = next;
+        self.is_animating(next)
+    }
+}
+
+fn clamp_scroll_axis(value: Pixels, max: Pixels) -> Pixels {
+    px(f32::from(value).clamp(-f32::from(max), 0.0))
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -3246,5 +3395,70 @@ impl ScrollHandle {
     /// Get the count of children for scrollable item.
     pub fn children_count(&self) -> usize {
         self.0.borrow().child_bounds.len()
+    }
+}
+
+#[cfg(test)]
+mod smooth_scroll_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const MAX: fn() -> Size<Pixels> = || size(px(0.), px(1000.));
+
+    #[test]
+    fn external_offset_change_reanchors_target() {
+        let mut state = SmoothScrollState::default();
+        let mut offset = Point::new(px(0.), px(0.));
+        let t0 = Instant::now();
+        assert!(!state.advance(&mut offset, MAX(), t0));
+
+        state.target = Point::new(px(0.), px(-200.));
+        let t1 = t0 + Duration::from_millis(8);
+        assert!(state.advance(&mut offset, MAX(), t1));
+        assert!(offset.y < px(0.));
+
+        // 程序化跳转（如列表切换、scroll_to_item）优先于未完成的平滑动画。
+        offset = Point::new(px(0.), px(-600.));
+        let t2 = t1 + Duration::from_millis(8);
+        assert!(!state.advance(&mut offset, MAX(), t2));
+        assert_eq!(offset.y, px(-600.));
+
+        let t3 = t2 + Duration::from_millis(8);
+        assert!(!state.advance(&mut offset, MAX(), t3));
+        assert_eq!(offset.y, px(-600.));
+    }
+
+    #[test]
+    fn smoothing_is_frame_rate_independent() {
+        let start = Instant::now();
+        let mut slow_offset = Point::new(px(0.), px(0.));
+        let mut slow = SmoothScrollState::default();
+        assert!(!slow.advance(&mut slow_offset, MAX(), start));
+        slow.target = Point::new(px(0.), px(-300.));
+
+        let mut fast_offset = Point::new(px(0.), px(0.));
+        let mut fast = SmoothScrollState::default();
+        assert!(!fast.advance(&mut fast_offset, MAX(), start));
+        fast.target = Point::new(px(0.), px(-300.));
+
+        // 同样的 200ms，分别按 60Hz 和 300Hz 步进。
+        for step in 1..=12 {
+            slow.advance(
+                &mut slow_offset,
+                MAX(),
+                start + Duration::from_micros(16_667 * step),
+            );
+        }
+        for step in 1..=60 {
+            fast.advance(
+                &mut fast_offset,
+                MAX(),
+                start + Duration::from_micros(3_333 * step),
+            );
+        }
+
+        let delta = f32::from(slow_offset.y - fast_offset.y).abs();
+        assert!(delta < 2.0, "60Hz vs 300Hz drift was {delta}px");
+        assert!(f32::from(fast_offset.y - px(-300.)).abs() < 5.0);
     }
 }

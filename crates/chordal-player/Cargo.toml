@@ -13,6 +13,7 @@ reqwest = { workspace = true }
 libc = "0.2"
 tracing = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 
 # Windows 原生音频输出（WASAPI 共享模式）。
 [target.'cfg(windows)'.dependencies]

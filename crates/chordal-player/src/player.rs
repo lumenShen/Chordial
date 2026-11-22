@@ -9,7 +9,7 @@
 //! 二次乘性开销。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use chordal_core::perf::PerfScope;
 use crate::analysis::{BandAnalyzer, DEFAULT_BEAT_BAND, normalize_band};
 use crate::backend::{AudioSink, open_sink};
 use crate::decode::AudioDecoder;
+use crate::equalizer::{EqSettings, Equalizer};
 use crate::http_stream::HttpMediaSource;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,15 +92,25 @@ pub struct Player {
     /// 鼓点监听频段下限/上限（Hz，f32 bits）。
     beat_low_hz: Arc<AtomicU32>,
     beat_high_hz: Arc<AtomicU32>,
+    /// 参数均衡器配置（UI 写入，播放线程按版本号热加载）。
+    eq: Arc<RwLock<EqSettings>>,
+    eq_version: Arc<AtomicU64>,
 }
 
 impl Player {
-    /// 默认构造：ALSA dlopen 后端；打开失败 → Failed 状态 + SinkError 事件
-    /// （诚实报错，不静默无声）。
+    /// 默认构造：平台原生后端（Windows WASAPI / Linux ALSA）；打开失败 →
+    /// Failed 状态 + SinkError 事件（诚实报错，不静默无声）。
     pub fn new(device: Option<String>) -> Arc<Self> {
+        let backend = if cfg!(windows) {
+            "wasapi"
+        } else if cfg!(target_os = "linux") {
+            "alsa"
+        } else {
+            "null"
+        };
         Self::with_sink_factory(
             Box::new(move |rate, channels| open_sink(device.as_deref(), rate, channels)),
-            "alsa",
+            backend,
         )
     }
 
@@ -111,10 +122,14 @@ impl Player {
         let beat_level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         let beat_low_hz = Arc::new(AtomicU32::new(DEFAULT_BEAT_BAND.0.to_bits()));
         let beat_high_hz = Arc::new(AtomicU32::new(DEFAULT_BEAT_BAND.1.to_bits()));
+        let eq = Arc::new(RwLock::new(EqSettings::default()));
+        let eq_version = Arc::new(AtomicU64::new(0));
         let thread_status = status.clone();
         let thread_beat_level = beat_level.clone();
         let thread_beat_low = beat_low_hz.clone();
         let thread_beat_high = beat_high_hz.clone();
+        let thread_eq = eq.clone();
+        let thread_eq_version = eq_version.clone();
         std::thread::Builder::new()
             .name("chordial-playback".into())
             .spawn(move || {
@@ -128,6 +143,8 @@ impl Player {
                     beat_level: thread_beat_level,
                     beat_low_hz: thread_beat_low,
                     beat_high_hz: thread_beat_high,
+                    eq: thread_eq,
+                    eq_version: thread_eq_version,
                 }
                 .run();
             })
@@ -140,6 +157,8 @@ impl Player {
             beat_level,
             beat_low_hz,
             beat_high_hz,
+            eq,
+            eq_version,
         })
     }
 
@@ -212,6 +231,22 @@ impl Player {
         }
     }
 
+    /// 热更新参数均衡器。播放线程在下一次写块前按版本号载入，
+    /// 参数变化不会中断当前曲目或重建音频设备。
+    pub fn set_eq(&self, settings: EqSettings) -> u64 {
+        if let Ok(mut eq) = self.eq.write() {
+            *eq = settings.sanitized();
+        }
+        self.eq_version.fetch_add(1, Ordering::Release) + 1
+    }
+
+    pub fn eq_settings(&self) -> EqSettings {
+        self.eq
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub fn status(&self) -> Status {
         self.status
             .read()
@@ -259,6 +294,8 @@ struct PlaybackThread {
     beat_level: Arc<AtomicU32>,
     beat_low_hz: Arc<AtomicU32>,
     beat_high_hz: Arc<AtomicU32>,
+    eq: Arc<RwLock<EqSettings>>,
+    eq_version: Arc<AtomicU64>,
 }
 
 impl PlaybackThread {
@@ -324,9 +361,28 @@ impl PlaybackThread {
                 return;
             }
         };
+        let duration_ms = decoder.duration_ms();
+
+        // 先解出第一个音频包：容器头可能缺声道数（如 MP4/AAC），或实际
+        // 输出采样率与头部声明不一致（如 HE-AAC）。输出设备必须按码流的
+        // **真实**规格打开，否则设备会按错误速率解释样本——听感就是变调
+        // 慢放（44.1k 兜底值遇 48k/96k/单声道素材都会触发）。
+        let mut pending: Vec<f32> = Vec::with_capacity(16 * 1024);
+        loop {
+            match decoder.next_block(&mut pending) {
+                Ok(true) if pending.is_empty() => continue,
+                Ok(true) => break,
+                Ok(false) => break, // 空流：照常打开设备后立即收尾
+                Err(e) => {
+                    self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
+                    let _ = self.event_tx.send(Event::StreamError(e.to_string()));
+                    let _ = self.event_tx.send(Event::TrackEnded(generation));
+                    return;
+                }
+            }
+        }
         let rate = decoder.sample_rate();
         let channels = decoder.channels();
-        let duration_ms = decoder.duration_ms();
 
         let mut sink = match (self.sink_factory)(rate, channels) {
             Ok(sink) => sink,
@@ -354,18 +410,30 @@ impl PlaybackThread {
         let mut position_frames: u64 = req.start_ms * rate as u64 / 1000;
         let mut scratch: Vec<f32> = Vec::new();
         if req.start_ms > 0 {
-            seek_to(&mut decoder, req.start_ms, rate, &mut scratch);
+            // 探测规格用的首包不属于目标起点；容器 seek 失败退化为跳帧时，
+            // 这段已消费的帧数要从跳过量里扣掉。
+            let consumed_frames = (pending.len() / channels) as u64;
+            pending.clear();
+            seek_to(
+                &mut decoder,
+                req.start_ms,
+                rate,
+                consumed_frames,
+                &mut scratch,
+            );
         }
 
         // 鼓点分析器随曲目采样率重建；缓冲区一次性分配，热路径零分配。
         let mut analyzer = BandAnalyzer::new(rate);
+        // 均衡器同样是每曲一个实例（滤波器状态与采样率绑定）。
+        let mut eq = Equalizer::new(rate, channels);
+        let mut eq_version_seen = 0u64;
         // 输出设备有缓冲（ALSA 默认 200ms）：分析发生在“写入”时，而画面
         // 应该跟“可听”的鼓点同步。按绝对帧位置排队，等播放头追到中点
         // 才发布包络。
         let mut beat_queue: VecDeque<(u64, f32)> = VecDeque::new();
         self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
 
-        let mut pending: Vec<f32> = Vec::with_capacity(channels * 4096);
         let mut last_status_update = Instant::now();
         let mut seek_req: Option<u64> = None;
         let mut paused = false;
@@ -428,9 +496,10 @@ impl PlaybackThread {
                         Ok(Command::SeekMs(ms)) => {
                             // 暂停时也必须立即跳转并刷新状态，否则点歌词/进度条无反馈。
                             let _ = sink.flush();
-                            if seek_to(&mut decoder, ms, rate, &mut scratch) {
+                            if seek_to(&mut decoder, ms, rate, 0, &mut scratch) {
                                 position_frames = ms * rate as u64 / 1000;
                                 analyzer.reset();
+                                eq.reset();
                                 beat_queue.clear();
                                 self.patch_status(|s| s.position_ms = ms);
                             }
@@ -467,9 +536,10 @@ impl PlaybackThread {
             // ---- seek ----
             if let Some(ms) = seek_req.take() {
                 let seek_scope = PerfScope::enter("player.seek");
-                if seek_to(&mut decoder, ms, rate, &mut scratch) {
+                if seek_to(&mut decoder, ms, rate, 0, &mut scratch) {
                     position_frames = ms * rate as u64 / 1000;
                     analyzer.reset();
+                    eq.reset();
                     beat_queue.clear();
                     self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
                     self.patch_status(|s| s.position_ms = ms);
@@ -492,10 +562,21 @@ impl PlaybackThread {
                 continue 'play;
             }
 
-            // ---- 按整帧切块写入；音量 O(n) 内联 ----
+            // ---- 按整帧切块写入；EQ → 音量，均为 O(n) 内联 ----
             let take_frames = (pending.len() / channels).min(4096);
             let take_samples = take_frames * channels;
             let chunk = &mut pending[..take_samples];
+            let version = self.eq_version.load(Ordering::Acquire);
+            if version != eq_version_seen {
+                eq_version_seen = version;
+                let settings = self
+                    .eq
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                eq.load(settings, version);
+            }
+            eq.process(chunk);
             if self.volume < 0.999 {
                 for s in chunk.iter_mut() {
                     *s *= self.volume;
@@ -553,13 +634,22 @@ impl PlaybackThread {
 }
 
 /// 容器 seek；失败则重开流并跳帧解码到目标位置。
+/// `already_consumed_frames`：调用方此前已从当前位置消费的帧数（如规格探测
+/// 首包），跳帧时从目标里扣除；持续播放中的 seek 传 0。
 /// `scratch` 复用调用方缓冲，跳帧阶段零额外分配。
-fn seek_to(decoder: &mut AudioDecoder, target_ms: u64, rate: u32, scratch: &mut Vec<f32>) -> bool {
+fn seek_to(
+    decoder: &mut AudioDecoder,
+    target_ms: u64,
+    rate: u32,
+    already_consumed_frames: u64,
+    scratch: &mut Vec<f32>,
+) -> bool {
     if decoder.try_seek_ms(target_ms).unwrap_or(false) {
         return true;
     }
     tracing::debug!(target: "chordial::player", target_ms, "container seek failed, skipping frames");
-    let target_frames = (target_ms as f64 * rate as f64 / 1000.0) as u64;
+    let target_frames =
+        ((target_ms as f64 * rate as f64 / 1000.0) as u64).saturating_sub(already_consumed_frames);
     let channels = decoder.channels();
     let mut skipped = 0u64;
     while skipped < target_frames {

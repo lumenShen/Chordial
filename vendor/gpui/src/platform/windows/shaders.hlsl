@@ -83,6 +83,13 @@ struct TransformationMatrix {
     float2 translation;
 };
 
+struct SpriteMask {
+    float light_from;
+    float dark_from;
+    float light;
+    float dark;
+};
+
 static const float M_PI_F = 3.141592653f;
 static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
 
@@ -1078,12 +1085,14 @@ struct MonochromeSprite {
     Hsla color;
     AtlasTile tile;
     TransformationMatrix transformation;
+    SpriteMask mask;
 };
 
 struct MonochromeSpriteVertexOutput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float4 mask: COLOR1;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1091,6 +1100,7 @@ struct MonochromeSpriteFragmentInput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float4 mask: COLOR1;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1104,11 +1114,13 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
     float4 color = hsla_to_rgba(sprite.color);
+    float4 mask = float4(sprite.mask.light_from, sprite.mask.dark_from, sprite.mask.light, sprite.mask.dark);
 
     MonochromeSpriteVertexOutput output;
     output.position = device_position;
     output.tile_position = tile_position;
     output.color = color;
+    output.mask = mask;
     output.clip_distance = clip_distance;
     return output;
 }
@@ -1116,7 +1128,15 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
-    return float4(input.color.rgb, input.color.a * alpha_corrected);
+
+    // AMLL `mask-image` 扫光：左侧 light、右侧 dark，中间线性渐变。
+    float4 mask = input.mask;
+    float t = mask.y > mask.x
+        ? saturate((input.position.x - mask.x) / (mask.y - mask.x))
+        : (input.position.x >= mask.x ? 1.0 : 0.0);
+    float mask_alpha = lerp(mask.z, mask.w, t);
+
+    return float4(input.color.rgb, input.color.a * alpha_corrected * mask_alpha);
 }
 
 /*

@@ -430,16 +430,27 @@ impl LineLayoutCache {
         let mut previous_frame = &mut *self.previous_frame.lock();
         let mut current_frame = &mut *self.current_frame.write();
 
-        for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
+        // 视图树在两帧之间增删节点时，上一帧的布局索引可能大于本帧
+        // 记录的 used_lines 长度（例如抽屉/覆盖层切换）。越界只会少复用
+        // 几条缓存，不应让整个应用 panic。
+        let lines_len = previous_frame.used_lines.len();
+        let line_start = range.start.lines_index.min(lines_len);
+        let line_end = range.end.lines_index.min(lines_len).max(line_start);
+        for key in &previous_frame.used_lines[line_start..line_end] {
             if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
                 current_frame.lines.insert(key, line);
             }
             current_frame.used_lines.push(key.clone());
         }
 
-        for key in &previous_frame.used_wrapped_lines
-            [range.start.wrapped_lines_index..range.end.wrapped_lines_index]
-        {
+        let wrapped_len = previous_frame.used_wrapped_lines.len();
+        let wrapped_start = range.start.wrapped_lines_index.min(wrapped_len);
+        let wrapped_end = range
+            .end
+            .wrapped_lines_index
+            .min(wrapped_len)
+            .max(wrapped_start);
+        for key in &previous_frame.used_wrapped_lines[wrapped_start..wrapped_end] {
             if let Some((key, line)) = previous_frame.wrapped_lines.remove_entry(key) {
                 current_frame.wrapped_lines.insert(key, line);
             }

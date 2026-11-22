@@ -592,8 +592,15 @@ impl DirectWriteState {
                     f32::INFINITY,
                     f32::INFINITY,
                 )?;
-                let current_text = &text[utf8_offset..(utf8_offset + first_run.len)];
-                utf8_offset += first_run.len;
+                // `first_run.len` 是文本 run 的字节长度；字体回退给出的 run
+                // 边界可能落在多字节字符中间（例如 CJK 的 3 字节字符）。
+                // 直接切片会 panic，这里把边界推到下一个字符起点。
+                let mut run_end = (utf8_offset + first_run.len).min(text.len());
+                while run_end < text.len() && !text.is_char_boundary(run_end) {
+                    run_end += 1;
+                }
+                let current_text = &text[utf8_offset..run_end];
+                utf8_offset = run_end;
                 let current_text_utf16_length = current_text.encode_utf16().count() as u32;
                 let text_range = DWRITE_TEXT_RANGE {
                     startPosition: utf16_offset,

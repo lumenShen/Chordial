@@ -10,7 +10,8 @@ use chordal_core::error::{CoreError, CoreResult};
 use chordal_core::model::{
     AccountProfile, AlbumRef, ArtistRef, AudioQuality, CollectionId, CollectionKind,
     CollectionPage, CollectionSummary, LyricLine, Lyrics, QualityTier, ResolvedStream, SearchKind,
-    SearchResults, SourceId, StreamHandle, Track, TrackId, TrackOrigin, TrackPage,
+    SearchResults, SourceId, StreamHandle, TimedLine, TimedWord, Track, TrackId, TrackOrigin,
+    TrackPage,
 };
 
 /// 音质档位（/song/url/v1 的 level 参数）。
@@ -163,6 +164,9 @@ struct AlbumDetail {
     name: Option<String>,
     #[serde(rename = "picUrl", default)]
     pic_url: Option<String>,
+    /// 发行时间（毫秒），用于写回下载文件的年份标签。
+    #[serde(rename = "publishTime", default)]
+    publish_time: Option<u64>,
 }
 
 /// `/song/detail` 响应 → Track。O(songs) 单遍；找不到 id 视为错误。
@@ -194,10 +198,14 @@ fn detail_to_track(source: &SourceId, song: SongDetail) -> Track {
         })
         .filter(|a| !a.name.is_empty())
         .collect();
-    let album = song.al.map(|a| AlbumRef {
-        id: a.id.map(|i| i.to_string()),
-        name: a.name.unwrap_or_default(),
-        cover: a.pic_url,
+    let mut year = None;
+    let album = song.al.map(|a| {
+        year = a.publish_time.and_then(year_from_ms);
+        AlbumRef {
+            id: a.id.map(|i| i.to_string()),
+            name: a.name.unwrap_or_default(),
+            cover: a.pic_url,
+        }
     });
     let mut track = Track::new(
         TrackId::new(source.clone(), song.id.to_string()),
@@ -210,6 +218,7 @@ fn detail_to_track(source: &SourceId, song: SongDetail) -> Track {
         },
     );
     track.track_no = song.no;
+    track.year = year;
     track
 }
 
@@ -317,6 +326,9 @@ struct NewLyricResp {
     yrc: Option<LyricBody>,
     #[serde(default)]
     tlyric: Option<LyricBody>,
+    /// YRC 逐字对齐的译文；优先于 tlyric。
+    #[serde(default)]
+    ytlrc: Option<LyricBody>,
 }
 
 #[derive(Deserialize)]
@@ -339,104 +351,106 @@ struct LyricBody {
 /// `/lyric/new`：优先使用逐词 YRC（新接口返回“JSON 头 + YRC 文本”混合格式）。
 pub fn map_lyrics_new(body: &serde_json::Value) -> Option<Lyrics> {
     let resp: NewLyricResp = serde_json::from_value(body.clone()).ok()?;
-    let yrc_raw = resp
-        .yrc
-        .and_then(|l| l.lyric)
-        .filter(|s| !s.trim().is_empty());
     let lrc_raw = resp
         .lrc
         .and_then(|l| l.lyric)
         .filter(|s| !s.trim().is_empty());
-    let trans_raw = resp
+    let yrc_raw = resp
+        .yrc
+        .and_then(|l| l.lyric)
+        .filter(|s| !s.trim().is_empty());
+    let tlyric = resp
         .tlyric
         .and_then(|l| l.lyric)
         .filter(|s| !s.trim().is_empty());
+    let ytlrc = resp
+        .ytlrc
+        .and_then(|l| l.lyric)
+        .filter(|s| !s.trim().is_empty());
+    let trans_raw = if yrc_raw.is_some() {
+        ytlrc.or(tlyric)
+    } else {
+        tlyric.or(ytlrc)
+    };
+    build_lyrics(lrc_raw, yrc_raw, trans_raw)
+}
 
-    let mut meta_lines: Vec<LyricLine> = Vec::new();
+/// `/lyric` 兼容接口 → 同一套 YRC 优先/LRC 兜底逻辑。
+pub fn map_lyrics(body: &serde_json::Value) -> Option<Lyrics> {
+    let resp: LyricResp = serde_json::from_value(body.clone()).ok()?;
+    build_lyrics(
+        resp.lrc
+            .and_then(|l| l.lyric)
+            .filter(|s| !s.trim().is_empty()),
+        resp.yrc
+            .and_then(|l| l.lyric)
+            .filter(|s| !s.trim().is_empty()),
+        resp.tlyric
+            .and_then(|l| l.lyric)
+            .filter(|s| !s.trim().is_empty()),
+    )
+}
+
+/// 统一构建：YRC 有内容就作为逐字歌词源；否则用 LRC。
+/// JSON 元数据行（作词/作曲/编曲…）同时挂到行级与逐字级，AMLL 才能显示。
+fn build_lyrics(
+    lrc_raw: Option<String>,
+    yrc_raw: Option<String>,
+    trans_raw: Option<String>,
+) -> Option<Lyrics> {
+    let mut meta: Vec<LyricLine> = Vec::new();
     let mut yrc_text = String::new();
-    if let Some(raw) = &yrc_raw {
-        split_rich_yrc(raw, &mut meta_lines, &mut yrc_text);
+    if let Some(raw) = yrc_raw.as_deref() {
+        split_rich_yrc(raw, &mut meta, &mut yrc_text);
+    }
+    let mut lrc_text = String::new();
+    if let Some(raw) = lrc_raw.as_deref() {
+        split_rich_yrc(raw, &mut meta, &mut lrc_text);
     }
 
-    let mut lyrics = if !yrc_text.trim().is_empty() {
-        Lyrics::parse_yrc(&yrc_text)
-    } else if let Some(raw) = &lrc_raw {
-        Lyrics {
-            lines: parse_rich_lines(raw),
-            raw: lrc_raw.clone().unwrap_or_default(),
-            translation: Vec::new(),
-            timed_lines: Vec::new(),
-        }
+    let yrc_parsed = if yrc_text.trim().is_empty() {
+        None
     } else {
-        return None;
+        let parsed = Lyrics::parse_yrc(&yrc_text);
+        (!parsed.lines.is_empty()).then_some(parsed)
     };
 
-    if !meta_lines.is_empty() {
-        lyrics.lines.extend(meta_lines);
-        lyrics.lines.sort_by_key(|l| l.time_ms);
-    }
+    let mut lyrics = if let Some(parsed) = yrc_parsed {
+        parsed
+    } else if !lrc_text.trim().is_empty() {
+        Lyrics::parse_lrc(&lrc_text)
+    } else if let Some(raw) = lrc_raw.as_deref() {
+        Lyrics::parse_lrc(raw)
+    } else if !yrc_text.trim().is_empty() {
+        Lyrics::parse_yrc(&yrc_text)
+    } else {
+        Lyrics::default()
+    };
 
+    attach_metadata(&mut lyrics, meta);
     if let Some(raw) = trans_raw {
-        let trans = Lyrics::parse_lrc(&raw);
-        if !trans.lines.is_empty() {
-            // tlyric 与 lrc 时间戳可能有几十毫秒偏差，按最近行匹配。
-            for line in &lyrics.lines {
-                let idx = trans.lines.partition_point(|t| t.time_ms < line.time_ms);
-                let best = [idx.saturating_sub(1), idx]
-                    .into_iter()
-                    .filter_map(|i| trans.lines.get(i).map(|t| (i, t)))
-                    .min_by_key(|(_, t)| t.time_ms.abs_diff(line.time_ms));
-                if let Some((_, t)) = best
-                    && t.time_ms.abs_diff(line.time_ms) <= 120
-                {
-                    lyrics.translation.push(t.text.clone());
-                } else {
-                    lyrics.translation.push(String::new());
-                }
-            }
-        }
+        align_translation(&mut lyrics, &raw);
     }
-
-    if lyrics.lines.is_empty() {
+    if lyrics.lines.is_empty() && lyrics.timed_lines.is_empty() {
         None
     } else {
         Some(lyrics)
     }
 }
 
-fn parse_rich_lines(raw: &str) -> Vec<LyricLine> {
-    let mut lines = Vec::new();
-    split_rich_yrc(raw, &mut lines, &mut String::new());
-    lines.sort_by_key(|l| l.time_ms);
-    lines
-}
-
-/// 拆分 `/lyric/new` 的 YRC：JSON 元信息行 → `meta`，YRC 文本行 → `text`。
+/// 拆分 `/lyric/new` 的混合文本：JSON 元信息行 → `meta`，歌词文本行 → `text`。
 fn split_rich_yrc(raw: &str, meta: &mut Vec<LyricLine>, text: &mut String) {
+    let raw = raw.trim_start_matches('\u{feff}');
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         if line.starts_with('{') {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                let t = value.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
-                let text = value
-                    .get("c")
-                    .and_then(|c| c.as_array())
-                    .map(|segments| {
-                        segments
-                            .iter()
-                            .filter_map(|s| s.get("tx").and_then(|t| t.as_str()))
-                            .collect::<String>()
-                    })
-                    .unwrap_or_default();
-                if !text.trim().is_empty() {
-                    meta.push(LyricLine {
-                        time_ms: t,
-                        text: text.trim_end().to_string(),
-                    });
-                }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(meta_line) = meta_line_from_json(&value)
+            {
+                meta.push(meta_line);
             }
         } else {
             text.push_str(line);
@@ -445,56 +459,95 @@ fn split_rich_yrc(raw: &str, meta: &mut Vec<LyricLine>, text: &mut String) {
     }
 }
 
-/// `/lyric` 响应 → Lyrics。原文 + 译文按时间戳对齐：
-/// 构建 `time_ms → 译文` 哈希表 O(t)，逐行查表 O(n)，无嵌套循环。
-pub fn map_lyrics(body: &serde_json::Value) -> Option<Lyrics> {
-    let resp: LyricResp = serde_json::from_value(body.clone()).ok()?;
-    // 空歌词（未收录 / 纯音乐）视为无歌词，避免 UI 显示一块空面板。
-    let lrc_raw = resp
-        .lrc
-        .and_then(|l| l.lyric)
-        .filter(|s| !s.trim().is_empty());
-    let yrc_raw = resp
-        .yrc
-        .and_then(|l| l.lyric)
-        .filter(|s| !s.trim().is_empty());
-
-    let mut lyrics = if let Some(raw) = lrc_raw {
-        Lyrics::parse_lrc(&raw)
+fn meta_line_from_json(value: &serde_json::Value) -> Option<LyricLine> {
+    let time_ms = value.get("t").and_then(json_u64).unwrap_or(0);
+    let text = value
+        .get("c")
+        .and_then(|c| c.as_array())?
+        .iter()
+        .filter_map(|segment| segment.get("tx").and_then(|t| t.as_str()))
+        .collect::<String>();
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        None
     } else {
-        // 没有 LRC 时，YRC 同时提供行级与逐词歌词。
-        Lyrics::parse_yrc(yrc_raw.as_deref()?)
-    };
-    if lyrics.timed_lines.is_empty()
-        && let Some(raw) = yrc_raw
-    {
-        // 有 LRC 行级歌词时，把 YRC 的逐词时间挂上去。
-        let yrc = Lyrics::parse_yrc(&raw);
-        lyrics.timed_lines = yrc.timed_lines;
+        Some(LyricLine { time_ms, text })
     }
-    if lyrics.lines.is_empty() {
-        return None;
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// 把 JSON 元数据行挂到歌词模型：
+/// - 行级 `lines` 永远追加（纯 LRC 时也能显示）；
+/// - 若已有逐字 `timed_lines`，同时生成单字 TimedLine，否则 AMLL 会忽略它们。
+fn attach_metadata(lyrics: &mut Lyrics, mut meta: Vec<LyricLine>) {
+    if meta.is_empty() {
+        return;
     }
-    if let Some(trans_raw) = resp.tlyric.and_then(|t| t.lyric).filter(|s| !s.is_empty()) {
-        let trans = Lyrics::parse_lrc(&trans_raw);
-        let by_time: std::collections::HashMap<u64, &str> = trans
-            .lines
-            .iter()
-            .filter(|l| !l.text.is_empty())
-            .map(|l| (l.time_ms, l.text.as_str()))
-            .collect();
-        lyrics.translation = lyrics
-            .lines
-            .iter()
-            .map(|l| {
-                by_time
-                    .get(&l.time_ms)
-                    .map(|s| (*s).to_string())
-                    .unwrap_or_default()
-            })
-            .collect();
+    meta.sort_by_key(|l| l.time_ms);
+    meta.dedup_by(|a, b| a.time_ms == b.time_ms && a.text == b.text);
+
+    if !lyrics.timed_lines.is_empty() {
+        let mut starts: Vec<u64> = lyrics.timed_lines.iter().map(|l| l.start_ms).collect();
+        starts.sort_unstable();
+        let mut timed_meta = Vec::with_capacity(meta.len());
+        for (i, line) in meta.iter().enumerate() {
+            let mut end = line.time_ms.saturating_add(8_000);
+            if let Some(next) = meta.get(i + 1) {
+                end = end.min(next.time_ms.max(line.time_ms.saturating_add(1)));
+            }
+            let next_timed = starts
+                .get(starts.partition_point(|&s| s <= line.time_ms))
+                .copied();
+            if let Some(next) = next_timed {
+                end = end.min(next.max(line.time_ms.saturating_add(1)));
+            }
+            end = end.max(line.time_ms.saturating_add(1));
+            timed_meta.push(TimedLine {
+                start_ms: line.time_ms,
+                end_ms: end,
+                words: vec![TimedWord {
+                    start_ms: line.time_ms,
+                    end_ms: end,
+                    text: line.text.clone(),
+                }],
+            });
+        }
+        lyrics.timed_lines.extend(timed_meta);
+        lyrics.timed_lines.sort_by_key(|l| l.start_ms);
     }
-    Some(lyrics)
+
+    lyrics.lines.extend(meta);
+    lyrics.lines.sort_by_key(|l| l.time_ms);
+}
+
+/// tlyric 时间戳可能有几十毫秒偏差，按最近行匹配。
+fn align_translation(lyrics: &mut Lyrics, raw: &str) {
+    let trans = Lyrics::parse_lrc(raw);
+    if trans.lines.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(lyrics.lines.len());
+    for line in &lyrics.lines {
+        let idx = trans.lines.partition_point(|t| t.time_ms < line.time_ms);
+        let best = [idx.saturating_sub(1), idx]
+            .into_iter()
+            .filter_map(|i| trans.lines.get(i).map(|t| (i, t)))
+            .min_by_key(|(_, t)| t.time_ms.abs_diff(line.time_ms));
+        if let Some((_, t)) = best
+            && t.time_ms.abs_diff(line.time_ms) <= 120
+        {
+            out.push(t.text.clone());
+        } else {
+            out.push(String::new());
+        }
+    }
+    lyrics.translation = out;
 }
 
 // ---------- 账号 / 集合 ----------
@@ -509,10 +562,12 @@ struct UserAccountResp {
 
 #[derive(Deserialize)]
 struct AccountBody {
-    #[serde(default)]
-    id: Option<u64>,
     #[serde(rename = "vipType", default)]
     vip_type: Option<u64>,
+    /// api-enhanced 未登录时会自动注册匿名账号（type=1000）。
+    /// 这种账号同样返回 code 200 + account.id，但没有 profile/歌单。
+    #[serde(rename = "anonimousUser", default)]
+    anonymous: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -527,13 +582,16 @@ struct ProfileBody {
     vip_type: Option<u64>,
 }
 
-/// `/user/account` → 账号资料。未登录返回 None。
+/// `/user/account` → 账号资料。未登录/匿名账号返回 None。
 pub fn map_account(source: &SourceId, body: &serde_json::Value) -> Option<AccountProfile> {
     let resp: UserAccountResp = serde_json::from_value(body.clone()).ok()?;
-    let profile = resp.profile.unwrap_or_default();
-    let uid = profile
-        .user_id
-        .or_else(|| resp.account.as_ref().and_then(|a| a.id))?;
+    // 匿名账号不是真实登录：uid 是服务端自动注册的临时用户，昵称、歌单全空。
+    if resp.account.as_ref().is_some_and(|a| a.anonymous) {
+        return None;
+    }
+    // 真实登录一定有 profile；只有 account.id 的响应（匿名/过期 Cookie）不可用。
+    let profile = resp.profile?;
+    let uid = profile.user_id?;
     let vip_type = profile
         .vip_type
         .or_else(|| resp.account.as_ref().and_then(|a| a.vip_type))
@@ -989,6 +1047,32 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn song_detail_maps_album_year() {
+        let body = json!({
+            "songs": [{
+                "id": 1,
+                "name": "终于见到了你",
+                "ar": [{"id": 2, "name": "吴琳珂Moske"}],
+                "al": {
+                    "id": 3,
+                    "name": "终于见到了你",
+                    "picUrl": "https://x/c.jpg",
+                    "publishTime": 738_000_000_000u64
+                },
+                "dt": 182_000,
+                "no": 1
+            }]
+        });
+        let track = map_song_detail(&SourceId::new("netease"), &body, "1").unwrap();
+        assert_eq!(track.title, "终于见到了你");
+        assert_eq!(track.primary_artist(), "吴琳珂Moske");
+        assert_eq!(track.album.as_ref().unwrap().name, "终于见到了你");
+        assert_eq!(track.album.as_ref().unwrap().cover.as_deref(), Some("https://x/c.jpg"));
+        assert_eq!(track.year, Some(1993));
+        assert_eq!(track.track_no, Some(1));
+    }
+
+    #[test]
     fn map_search_defensive_against_missing_fields() {
         let body = json!({
             "code": 200,
@@ -1061,9 +1145,107 @@ mod tests {
         });
         let lyrics = map_lyrics_new(&body).expect("lyrics");
         assert!(lyrics.lines.iter().any(|l| l.text == "作词"));
+        // JSON 元数据 + 逐字行，各一条 TimedLine。
+        assert_eq!(lyrics.timed_lines.len(), 2);
+        let meta = lyrics
+            .timed_lines
+            .iter()
+            .find(|l| l.start_ms == 0)
+            .expect("metadata timed line");
+        assert_eq!(meta.words[0].text, "作词");
+        let sung = lyrics
+            .timed_lines
+            .iter()
+            .find(|l| l.start_ms == 1000)
+            .expect("sung line");
+        assert_eq!(sung.words.len(), 2);
+        assert_eq!(sung.words[0].text, "你");
+        assert!(lyrics.translation.iter().any(|t| t == "hello"));
+    }
+
+    #[test]
+    fn map_lyrics_new_real_api_fixture() {
+        let yrc = concat!(
+            "{\"t\":0,\"c\":[{\"tx\":\"作词: \"},{\"tx\":\"宇多田ヒカル\",\"li\":\"http://x/a.jpg\",\"or\":\"orpheus://nm/artist/home?id=1\"}]}\n",
+            "{\"t\":1000,\"c\":[{\"tx\":\"编曲: \"},{\"tx\":\"宇多田ヒカル\"},{\"tx\":\"/\"},{\"tx\":\"A. G. Cook\"}]}\n",
+            "{\"t\":2000,\"c\":[{\"tx\":\"制作人: \"},{\"tx\":\"宇多田ヒカル\"},{\"tx\":\"/\"},{\"tx\":\"A. G. Cook\"}]}\n",
+            "{\"t\":3000,\"c\":[{\"tx\":\"作曲: \"},{\"tx\":\"宇多田ヒカル\"}]}\n",
+            "[20570,1900](20570,360,0)初(20930,150,0)め(21080,120,0)て(21200,170,0)の(21370,60,0)ル(21430,190,0)ー(21620,150,0)ブ(21770,170,0)ル(21940,530,0)は"
+        );
+        let body = json!({
+            "code": 200,
+            "yrc": {"lyric": yrc},
+            "lrc": {"lyric": "[00:20.57]初めてのルーブルは"},
+            "tlyric": {"lyric": "[00:20.54]tlyric 译文"},
+            "ytlrc": {"lyric": "[00:20.570]第一次去卢浮宫时"}
+        });
+        let lyrics = map_lyrics_new(&body).expect("real fixture");
+        assert_eq!(lyrics.timed_lines.len(), 5);
+        assert!(
+            lyrics
+                .timed_lines
+                .iter()
+                .any(|l| l.start_ms == 0 && l.words[0].text == "作词: 宇多田ヒカル")
+        );
+        let sung = lyrics
+            .timed_lines
+            .iter()
+            .find(|l| l.start_ms == 20_570)
+            .expect("first sung line");
+        assert_eq!(sung.words.len(), 9);
+        assert_eq!(
+            sung.words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<String>(),
+            "初めてのルーブルは"
+        );
+        assert_eq!(sung.end_ms, 22_470);
+        let sung_index = lyrics
+            .lines
+            .iter()
+            .position(|l| l.time_ms == 20_570)
+            .expect("line index");
+        assert_eq!(lyrics.translation[sung_index], "第一次去卢浮宫时");
+    }
+
+    #[test]
+    fn map_lyrics_new_falls_back_to_lrc_when_yrc_missing() {
+        let body = json!({
+            "lrc": {"lyric": "[00:01.00]你好
+        [00:02.00]世界"},
+            "yrc": {"lyric": ""}
+        });
+        let lyrics = map_lyrics_new(&body).expect("lrc fallback");
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[0].text, "你好");
+        assert_eq!(lyrics.lines[1].text, "世界");
+        assert!(lyrics.timed_lines.is_empty());
+    }
+
+    #[test]
+    fn map_lyrics_new_prefers_yrc_over_lrc() {
+        let body = json!({
+            "lrc": {"lyric": "[00:01.00]LRC 文本"},
+            "yrc": {"lyric": "[1000,500](1000,200,0)逐(1200,300,0)字"}
+        });
+        let lyrics = map_lyrics_new(&body).expect("yrc preferred");
         assert_eq!(lyrics.timed_lines.len(), 1);
         assert_eq!(lyrics.timed_lines[0].words.len(), 2);
-        assert!(lyrics.translation.iter().any(|t| t == "hello"));
+        assert_eq!(lyrics.lines[0].text, "逐字");
+    }
+
+    #[test]
+    fn map_lyrics_new_metadata_only_yrc_still_uses_lrc() {
+        let body = json!({
+            "lrc": {"lyric": "[00:01.00]你好"},
+            "yrc": {"lyric": "{\"t\":0,\"c\":[{\"tx\":\"作词: \"},{\"tx\":\"某人\"}]}"}
+        });
+        let lyrics = map_lyrics_new(&body).expect("metadata + lrc");
+        assert!(lyrics.lines.iter().any(|l| l.text == "作词: 某人"));
+        assert!(lyrics.lines.iter().any(|l| l.text == "你好"));
+        // 没有逐字行时，元数据只进 lines。
+        assert!(lyrics.timed_lines.is_empty());
     }
 
     #[test]
@@ -1101,6 +1283,17 @@ mod tests {
         assert_eq!(profile.uid, "42");
         assert_eq!(profile.nickname, "听歌的人");
         assert!(profile.vip);
+
+        // 匿名账号（api-enhanced 自动注册）不能当成已登录。
+        let anonymous = json!({
+            "code": 200,
+            "account": {"id": 9, "anonimousUser": true, "type": 1000},
+            "profile": null
+        });
+        assert!(map_account(&source, &anonymous).is_none());
+        // 过期 Cookie：只有 account.id、没有 profile。
+        let stale = json!({"code": 200, "account": {"id": 9}});
+        assert!(map_account(&source, &stale).is_none());
 
         let playlists = json!({
             "code": 200,

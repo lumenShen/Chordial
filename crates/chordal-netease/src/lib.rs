@@ -434,26 +434,20 @@ impl Inner {
     async fn login_begin_inner(&self, method: LoginMethod) -> CoreResult<LoginChallenge> {
         match method {
             LoginMethod::Qr => {
-                let key_body = self
-                    .client
-                    .get_json("/login/qr/key", &[("timestamp", &now_secs().to_string())])
-                    .await?;
+                // 防缓存 timestamp 由 NeteaseClient 统一附加（api-enhanced
+                // 的 apicache 会缓存未登录结果，扫码流程尤其不能命中旧响应）。
+                let key_body = self.client.get_json("/login/qr/key", &[]).await?;
                 let key = key_body
                     .get("data")
                     .and_then(|d| d.get("unikey"))
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| CoreError::source_err("netease", "qr key missing"))?
                     .to_string();
-                let timestamp = now_secs().to_string();
                 let create = self
                     .client
                     .get_json(
                         "/login/qr/create",
-                        &[
-                            ("key", key.as_str()),
-                            ("qrimg", "true"),
-                            ("timestamp", &timestamp),
-                        ],
+                        &[("key", key.as_str()), ("qrimg", "true")],
                     )
                     .await?;
                 let qr_data_url = create
@@ -479,14 +473,9 @@ impl Inner {
         let Some(key) = challenge.key.as_deref() else {
             return Ok(LoginProgress::Failed("登录挑战缺少 key".into()));
         };
-        let timestamp = now_secs().to_string();
         let body = self
             .client
-            .get_json_with_codes(
-                "/login/qr/check",
-                &[("key", key), ("timestamp", &timestamp)],
-                &[800, 801, 802, 803],
-            )
+            .get_json_with_codes("/login/qr/check", &[("key", key)], &[800, 801, 802, 803])
             .await?;
         let code = body
             .get("code")
@@ -554,12 +543,8 @@ impl Inner {
     }
 
     async fn send_captcha_inner(&self, phone: &str) -> CoreResult<()> {
-        let timestamp = now_secs().to_string();
         self.client
-            .get_json(
-                "/captcha/sent",
-                &[("phone", phone), ("timestamp", &timestamp)],
-            )
+            .get_json("/captcha/sent", &[("phone", phone)])
             .await?;
         Ok(())
     }
@@ -569,16 +554,11 @@ impl Inner {
         phone: &str,
         captcha: &str,
     ) -> CoreResult<AccountProfile> {
-        let timestamp = now_secs().to_string();
         let body = self
             .client
             .get_json(
                 "/login/cellphone",
-                &[
-                    ("phone", phone),
-                    ("captcha", captcha),
-                    ("timestamp", &timestamp),
-                ],
+                &[("phone", phone), ("captcha", captcha)],
             )
             .await?;
         let cookie = body
@@ -1009,6 +989,19 @@ impl MusicSource for NeteaseSource {
                 .await;
         }
     }
+
+    /// UI 加载源后预热：托管模式下会启动/安装 api-enhanced。
+    async fn warm_up(&self) -> CoreResult<()> {
+        let inner = self.inner.clone();
+        spawn_inner(move || async move {
+            if let Some(service) = &inner.service {
+                service.ensure_ready().await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| join_error(self.info.id.as_str(), e))?
+    }
 }
 
 #[async_trait]
@@ -1261,6 +1254,12 @@ mod tests {
                     .next()
                     .and_then(|line| line.split_whitespace().nth(1))
                     .unwrap_or("");
+                // api-enhanced 的 apicache 会缓存未登录响应；扫码/校验链路
+                // 每个请求都必须带 cache-buster，否则会读到旧的 801/匿名账号。
+                assert!(
+                    path.contains("timestamp="),
+                    "missing cache buster in {path}"
+                );
                 let cookie = request
                     .lines()
                     .find(|line| line.to_ascii_lowercase().starts_with("cookie:"))
@@ -1270,8 +1269,13 @@ mod tests {
                 } else if path.starts_with("/login/qr/create") {
                     r#"{"code":200,"data":{"qrurl":"u","qrimg":"data:image/png;base64,AAA"}}"#
                 } else if path.starts_with("/login/qr/check") {
-                    r#"{"code":803,"cookie":"MUSIC_U=abc;"}"#
+                    // api-enhanced 的 cookie 是整串 Set-Cookie（带属性）拼接。
+                    r#"{"code":803,"cookie":"MUSIC_U=abc; Max-Age=15552000; Path=/; __csrf=zzz"}"#
                 } else if path.starts_with("/user/account") {
+                    assert!(
+                        !cookie.contains("Max-Age") && !cookie.contains("Path="),
+                        "cookie attributes leaked into request: {cookie}"
+                    );
                     if cookie.contains("MUSIC_U=abc") {
                         r#"{"code":200,"account":{"id":42},"profile":{"userId":42,"nickname":"n","vipType":0}}"#
                     } else {

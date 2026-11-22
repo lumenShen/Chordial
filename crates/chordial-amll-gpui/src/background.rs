@@ -106,6 +106,12 @@ impl ControlPointPreset {
 const TEXTURE_SIZE: usize = 32;
 const MAX_OUTPUT_PIXELS: usize = 200_000;
 const SUBDIVISIONS: usize = 12;
+/// 封面交叉淡入淡出的时长（毫秒）。使用真实墙钟时间推进，与视图帧率解耦：
+/// 高刷屏上视图可能每秒调用 200+ 次 `render`，但光栅只有 30fps。
+const CROSSFADE_MS: f32 = 420.0;
+/// 鼓点包络的跟随时间常数：起音快、回落慢，脉冲轮廓清晰。
+const BEAT_ATTACK_SECS: f32 = 0.035;
+const BEAT_RELEASE_SECS: f32 = 0.18;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Vertex {
@@ -500,8 +506,12 @@ pub struct MeshGradientRenderer {
     fps: u32,
     fps_accum_ms: f32,
     frame_time: f32,
-    volume: f32,
-    smoothed_volume: f32,
+    /// 外部鼓点包络目标（0..1）。
+    beat_target: f32,
+    /// 经过起音/回落平滑后的鼓点强度（0..1），供光栅化使用。
+    beat_volume: f32,
+    /// 鼓点视觉效果的整体倍率（0..=1.5，1.0 = 原始幅度）。
+    beat_strength: f32,
     paused: bool,
     static_mode: bool,
     last_image: Option<Arc<RenderImage>>,
@@ -536,8 +546,9 @@ impl MeshGradientRenderer {
             fps: 30,
             fps_accum_ms: 0.0,
             frame_time: 0.0,
-            volume: 0.0,
-            smoothed_volume: 0.0,
+            beat_target: 0.0,
+            beat_volume: 0.0,
+            beat_strength: 1.0,
             paused: false,
             static_mode: false,
             last_image: None,
@@ -576,13 +587,23 @@ impl MeshGradientRenderer {
     }
 
     pub fn set_low_freq_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0) / 10.0;
+        self.beat_target = volume.clamp(0.0, 1.0) / 10.0;
     }
 
-    /// 0..1 的鼓点包络。映射到内部 volume 的 0..0.25：满幅鼓点会让网格
-    /// 轻微放大/旋转，但不会像 AMLL volume=1 那样缩放到接近消失。
+    /// 0..1 的鼓点包络，驱动网格的呼吸、缩放、旋转与提亮。
+    ///
+    /// 映射到内部 0..1：起音阶段由 [`Self::render`] 用约 35ms 时间常数快速
+    /// 跟随，回落约 180ms，因此 30fps 光栅也能看清每一次击打。视觉幅度
+    /// 进一步乘以 [`Self::set_beat_strength`]，默认倍率由界面设置决定。
     pub fn set_beat_level(&mut self, level: f32) {
-        self.volume = level.clamp(0.0, 1.0) * 0.25;
+        self.beat_target = level.clamp(0.0, 1.0);
+    }
+
+    /// 鼓点视觉效果的整体倍率：0 = 完全关闭（网格仍会缓慢流动），
+    /// 1.0 = 原始幅度，上限 1.5。只缩放呼吸/旋转/缩放/提亮，不改变包络
+    /// 的时序，因此调低后鼓点仍然跟手，只是幅度更克制。
+    pub fn set_beat_strength(&mut self, strength: f32) {
+        self.beat_strength = strength.clamp(0.0, 1.5);
     }
 
     pub fn set_has_lyric(&mut self, _has: bool) {}
@@ -608,7 +629,9 @@ impl MeshGradientRenderer {
             px.swap(0, 2);
         }
         let preset = generate_preset(&mut self.rng);
-        let aspect = if self.out_h > 0 {
+        let aspect = if self.viewport_h > 0 {
+            self.viewport_w as f32 / self.viewport_h as f32
+        } else if self.out_h > 0 {
             self.out_w as f32 / self.out_h as f32
         } else {
             1.0
@@ -628,14 +651,23 @@ impl MeshGradientRenderer {
         if instant {
             self.layers.clear();
         } else {
-            for old in &mut self.layers {
-                old.fading_out = true;
+            // 快速连切时只保留当前画面最上面的一层作为交叉淡出的底色。
+            // 旧实现会累积最多 3 层半透明封面：每次切歌把所有旧层同时淡出、
+            // 新层从 0 淡入，合成后的 alpha 明显小于 1；叠在黑色底上就表现
+            // 为背景“异常变黑”。两层交叉淡出可以保证底层始终不透。
+            if let Some(mut outgoing) = self.layers.pop() {
+                self.layers.clear();
+                let was_fading = outgoing.fading_out;
+                outgoing.fading_out = true;
+                if !was_fading {
+                    // 之前的封面可能还在淡入（alpha < 1）。切歌瞬间把它补满，
+                    // 让混色只发生在新旧封面之间，而不是混向透明。
+                    outgoing.alpha = 1.0;
+                }
+                self.layers.push(outgoing);
             }
         }
         self.layers.push(layer);
-        if self.layers.len() > 3 {
-            self.layers.remove(0);
-        }
         self.needs_clear = true;
     }
 
@@ -693,18 +725,60 @@ impl MeshGradientRenderer {
         }
     }
 
+    /// 推进与“真实时间”相关的状态。
+    ///
+    /// 必须在 FPS 门控**之前**调用：视图在 200Hz+ 屏幕上可能每 3ms 调用一次
+    /// `render`，而背景光栅只有 30fps。若只在光栅帧累加，交叉淡入淡出会慢
+    /// 一个数量级，快速切歌时多层半透明叠加会让背景明显发黑。
+    fn advance_animation(&mut self, dt_ms: f32) {
+        let fade = dt_ms / CROSSFADE_MS;
+        for layer in &mut self.layers {
+            if layer.fading_out {
+                layer.alpha = (layer.alpha - fade).max(0.0);
+            } else {
+                layer.alpha = (layer.alpha + fade).min(1.0);
+            }
+        }
+        // 交叉淡出期间，正在退场的旧封面必须保持不透明：新封面以 alpha=t
+        // 叠在旧封面上，合成 alpha 恒为 1，颜色在两张封面之间插值。否则
+        // 两张半透明封面叠在黑色底上会整体变暗（快速连切时尤其明显）。
+        if let Some(top) = self.layers.iter().rposition(|l| !l.fading_out) {
+            for layer in &mut self.layers[..top] {
+                layer.alpha = 1.0;
+            }
+        }
+        self.layers.retain(|layer| layer.alpha > 0.001);
+        // 当前封面完全显示后，退场的旧封面已无意义，立即丢弃。
+        if self.layers.len() > 1 && self.layers.last().is_some_and(|l| l.alpha >= 1.0) {
+            self.layers.drain(0..self.layers.len() - 1);
+        }
+
+        let target = self.beat_target;
+        let tau = if target > self.beat_volume {
+            BEAT_ATTACK_SECS
+        } else {
+            BEAT_RELEASE_SECS
+        };
+        let k = 1.0 - (-(dt_ms / 1000.0) / tau).exp();
+        self.beat_volume += (target - self.beat_volume) * k;
+        if !self.beat_volume.is_finite() {
+            self.beat_volume = 0.0;
+        }
+        self.beat_volume = self.beat_volume.clamp(0.0, 1.0);
+    }
+
     /// 渲染一帧。返回 `None` 表示本帧无需更新（调用方保留上一张图）。
     pub fn render(&mut self, delta_ms: f32) -> Option<Arc<RenderImage>> {
         if self.disposed || self.viewport_w == 0 || self.viewport_h == 0 {
             return None;
         }
-        if self.paused && !self.needs_clear {
+        let dt = delta_ms.clamp(0.0, 100.0);
+        if !self.paused {
+            self.frame_time += dt * self.flow_speed;
+            self.advance_animation(dt);
+        } else if !self.needs_clear {
             return self.last_image.clone();
         }
-        self.ensure_output();
-        let dt = delta_ms.clamp(0.0, 100.0);
-        self.frame_time += dt * self.flow_speed;
-
         if self.fps > 0 && !self.needs_clear {
             self.fps_accum_ms += dt;
             let interval = 1000.0 / self.fps as f32;
@@ -716,18 +790,7 @@ impl MeshGradientRenderer {
             return self.last_image.clone();
         }
 
-        let delta_factor = dt / 500.0;
-        self.layers.retain_mut(|layer| {
-            if layer.fading_out {
-                layer.alpha = (layer.alpha - delta_factor).max(0.0);
-            } else {
-                layer.alpha = (layer.alpha + delta_factor).min(1.0);
-            }
-            layer.alpha > 0.001
-        });
-        if self.layers.len() > 1 && self.layers.last().is_some_and(|l| l.alpha >= 1.0) {
-            self.layers.drain(0..self.layers.len() - 1);
-        }
+        self.ensure_output();
         if self.layers.is_empty() {
             self.needs_clear = false;
             self.last_image = None;
@@ -741,7 +804,8 @@ impl MeshGradientRenderer {
         }
 
         let aspect = self.out_w as f32 / self.out_h as f32;
-        let volume = self.smoothed_volume;
+        // 包络只决定“什么时候跳”，强度决定“跳多大幅度”。
+        let volume = self.beat_volume * self.beat_strength;
         let scope = PerfScope::enter("amll.bg.raster");
         self.output.fill(0);
         let mut used = 0u64;
@@ -761,7 +825,6 @@ impl MeshGradientRenderer {
             used += (self.out_w * self.out_h) as u64;
         }
         scope.finish(used);
-        self.smoothed_volume += (self.volume - self.smoothed_volume) * (dt / 100.0).min(1.0);
         self.needs_clear = false;
         self.fps_accum_ms = 0.0;
 
@@ -784,6 +847,12 @@ impl MeshGradientRenderer {
     pub fn debug_size(&self) -> (usize, usize) {
         (self.out_w, self.out_h)
     }
+
+    /// 取出当前缓存的背景帧（切换渲染器时由调用方从图集释放）。
+    #[doc(hidden)]
+    pub fn take_last_image(&mut self) -> Option<Arc<RenderImage>> {
+        self.last_image.take()
+    }
 }
 
 fn rasterize_layer(
@@ -795,27 +864,37 @@ fn rasterize_layer(
     volume: f32,
 ) {
     let alpha = layer.alpha;
-    let alpha_volume = alpha * (1.0 - volume * 0.5).max(0.5);
-    let rotation = (frame_time / 10_000.0 + volume) * 2.0;
+    // 鼓点同时驱动四种变化，保证在低分辨率、平滑封面上也看得出来：
+    // 1) 网格整体向外呼吸（顶点级，颜色边界会移动）；
+    // 2) UV 旋转加速；3) UV 缩小（纹理被“推近”）；4) 整体提亮。
+    // 幅度相对上一版整体减半，避免安静场景里也显得过于剧烈；倍率由
+    // `set_beat_strength` 再统一缩放。
+    let beat = volume.clamp(0.0, 1.5);
+    // 鼓点只改变颜色与几何，不降低整体不透明度：叠在黑色底上时任何 alpha
+    // 下降都会被看成“背景变暗”。
+    let alpha_volume = alpha;
+    let rotation = (frame_time / 10_000.0 + beat * 0.35) * 2.0;
     let cos_r = rotation.cos();
     let sin_r = rotation.sin();
-    let zoom = (1.0 - volume * 2.0).max(0.001);
+    let zoom = (1.0 - beat * 0.35).max(0.40);
+    let mesh_scale = 1.0 + beat * 0.10;
+    let light = 1.0 + beat * 0.25;
 
     for tri in layer.indices.chunks_exact(3) {
         let v0 = layer.vertices[tri[0] as usize];
         let v1 = layer.vertices[tri[1] as usize];
         let v2 = layer.vertices[tri[2] as usize];
         let p0 = (
-            (v0.ndc[0] + 1.0) * 0.5 * w as f32,
-            (1.0 - v0.ndc[1]) * 0.5 * h as f32,
+            (v0.ndc[0] * mesh_scale + 1.0) * 0.5 * w as f32,
+            (1.0 - v0.ndc[1] * mesh_scale) * 0.5 * h as f32,
         );
         let p1 = (
-            (v1.ndc[0] + 1.0) * 0.5 * w as f32,
-            (1.0 - v1.ndc[1]) * 0.5 * h as f32,
+            (v1.ndc[0] * mesh_scale + 1.0) * 0.5 * w as f32,
+            (1.0 - v1.ndc[1] * mesh_scale) * 0.5 * h as f32,
         );
         let p2 = (
-            (v2.ndc[0] + 1.0) * 0.5 * w as f32,
-            (1.0 - v2.ndc[1]) * 0.5 * h as f32,
+            (v2.ndc[0] * mesh_scale + 1.0) * 0.5 * w as f32,
+            (1.0 - v2.ndc[1] * mesh_scale) * 0.5 * h as f32,
         );
         let area = (p1.0 - p0.0) * (p2.1 - p0.1) - (p1.1 - p0.1) * (p2.0 - p0.0);
         if area.abs() < 1e-6 {
@@ -862,12 +941,13 @@ fn rasterize_layer(
                     let t = ((0.8 - dist) * 2.0).clamp(0.0, 1.0);
                     let vignette = t * t * (3.0 - 2.0 * t);
                     let mask = 0.6 + vignette * 0.4;
+                    let gain = mask * light;
                     let idx = (row_base + x) * 4;
-                    out[idx] = ((texel[0] as f32 * mask).clamp(0.0, 255.0) + dither * 255.0)
+                    out[idx] = ((texel[0] as f32 * gain).clamp(0.0, 255.0) + dither * 255.0)
                         .clamp(0.0, 255.0) as u8;
-                    out[idx + 1] = ((texel[1] as f32 * mask).clamp(0.0, 255.0) + dither * 255.0)
+                    out[idx + 1] = ((texel[1] as f32 * gain).clamp(0.0, 255.0) + dither * 255.0)
                         .clamp(0.0, 255.0) as u8;
-                    out[idx + 2] = ((texel[2] as f32 * mask).clamp(0.0, 255.0) + dither * 255.0)
+                    out[idx + 2] = ((texel[2] as f32 * gain).clamp(0.0, 255.0) + dither * 255.0)
                         .clamp(0.0, 255.0) as u8;
                     out[idx + 3] = (texel[3] as f32 * alpha_volume).clamp(0.0, 255.0) as u8;
                 }
@@ -1044,6 +1124,12 @@ impl LyricBackgroundRenderer {
             r.set_beat_level(level);
         }
     }
+    /// 鼓点视觉效果倍率，见 [`MeshGradientRenderer::set_beat_strength`]。
+    pub fn set_beat_strength(&mut self, strength: f32) {
+        if let Self::Mesh(r) = self {
+            r.set_beat_strength(strength);
+        }
+    }
     pub fn set_has_lyric(&mut self, has: bool) {
         if let Self::Mesh(r) = self {
             r.set_has_lyric(has);
@@ -1057,6 +1143,14 @@ impl LyricBackgroundRenderer {
     pub fn render(&mut self, delta_ms: f32) -> Option<Arc<RenderImage>> {
         match self {
             Self::Mesh(r) => r.render(delta_ms),
+            Self::Css(_) | Self::None => None,
+        }
+    }
+    /// 取出缓存的背景帧（切换渲染器/销毁视图时释放图集纹理用）。
+    #[doc(hidden)]
+    pub fn take_last_image(&mut self) -> Option<Arc<RenderImage>> {
+        match self {
+            Self::Mesh(r) => r.take_last_image(),
             Self::Css(_) | Self::None => None,
         }
     }
@@ -1250,6 +1344,172 @@ mod tests {
         assert!(
             per_frame / pixels < 1.0,
             "bg raster too slow: {per_frame:.1}us/frame for {pixels} px"
+        );
+    }
+
+    fn solid_album(rgb: [u8; 3]) -> (u32, u32, Vec<u8>) {
+        let (w, h) = (32u32, 32u32);
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for px in data.chunks_exact_mut(4) {
+            px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+        (w, h, data)
+    }
+
+    fn mean_luma(image: &RenderImage) -> f64 {
+        let bytes = image.as_bytes(0).expect("frame bytes");
+        let mut sum = 0.0;
+        let pixels = bytes.len() / 4;
+        for px in bytes.chunks_exact(4) {
+            // BGRA 顺序；三者之和的均值足以比较整体亮度。
+            sum += px[0] as f64 * 0.114 + px[1] as f64 * 0.587 + px[2] as f64 * 0.299;
+        }
+        sum / pixels as f64
+    }
+
+    #[test]
+    fn crossfade_advances_across_fps_gated_calls() {
+        let mut renderer = MeshGradientRenderer::with_seed(5);
+        renderer.set_viewport(200, 120);
+        renderer.set_render_scale(0.5);
+        renderer.set_fps(30);
+        renderer.set_album_rgba(32, 32, solid_album([180, 90, 60]).2);
+        // 模拟 200Hz 视图：每 5ms 调用一次 render，只有约每 7 次才真正光栅化。
+        // 交叉淡入必须按墙钟推进，800ms 后应完全显示。
+        let mut last = None;
+        for _ in 0..160 {
+            last = renderer.render(5.0).or(last);
+        }
+        let image = last.expect("frame");
+        let frame = image.as_bytes(0).expect("bytes");
+        let pixels = frame.len() / 4;
+        let opaque = frame.chunks_exact(4).filter(|p| p[3] > 200).count();
+        assert!(
+            opaque * 100 >= pixels * 95,
+            "crossfade too slow: {opaque}/{pixels} opaque"
+        );
+    }
+
+    #[test]
+    fn rapid_album_switches_never_darken() {
+        const COLORS: [[u8; 3]; 4] = [
+            [220, 60, 50],
+            [40, 160, 210],
+            [80, 200, 90],
+            [220, 180, 60],
+        ];
+        let mut renderer = MeshGradientRenderer::with_seed(9);
+        renderer.set_viewport(160, 92);
+        renderer.set_render_scale(0.5);
+        renderer.set_fps(30);
+        renderer.set_album_rgba(32, 32, solid_album(COLORS[0]).2);
+        for _ in 0..40 {
+            renderer.render(8.0);
+        }
+        // 每 ~30ms 切一首（远快于 420ms 交叉淡出），持续 12 次。
+        for i in 0..12 {
+            renderer.set_album_rgba(32, 32, solid_album(COLORS[(i + 1) % COLORS.len()]).2);
+            let mut last = None;
+            for _ in 0..6 {
+                last = renderer.render(5.0).or(last);
+            }
+            let image = last.expect("frame");
+            let frame = image.as_bytes(0).expect("bytes");
+            let pixels = frame.len() / 4;
+            let opaque = frame.chunks_exact(4).filter(|p| p[3] > 200).count();
+            assert!(
+                opaque * 100 >= pixels * 90,
+                "switch {i} darkened the mesh: {opaque}/{pixels} opaque"
+            );
+        }
+    }
+
+    #[test]
+    fn beat_attack_is_fast_across_fps_gated_calls() {
+        let mut renderer = MeshGradientRenderer::with_seed(13);
+        renderer.set_viewport(160, 92);
+        renderer.set_render_scale(0.5);
+        renderer.set_fps(30);
+        renderer.set_album_rgba(32, 32, solid_album([200, 120, 80]).2);
+        for _ in 0..40 {
+            renderer.render(8.0);
+        }
+        renderer.set_beat_level(1.0);
+        // 100ms 内视图调用 20 次，但只会有约 3 个光栅帧。鼓点平滑也必须
+        // 在这些被门控的调用中推进，否则 30fps 下起音会被拖慢。
+        for _ in 0..20 {
+            renderer.render(5.0);
+        }
+        assert!(
+            renderer.beat_volume > 0.8,
+            "beat attack too slow: {}",
+            renderer.beat_volume
+        );
+    }
+
+    #[test]
+    fn beat_level_visibly_brightens_the_mesh() {
+        let mut renderer = MeshGradientRenderer::with_seed(17);
+        renderer.set_viewport(240, 135);
+        renderer.set_render_scale(0.6);
+        renderer.set_fps(60);
+        let mut data = vec![0u8; 64 * 64 * 4];
+        for (i, px) in data.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[
+                90 + (i % 17) as u8,
+                70 + (i % 23) as u8,
+                50 + (i % 29) as u8,
+                255,
+            ]);
+        }
+        renderer.set_album_rgba(64, 64, data);
+        renderer.set_beat_level(0.0);
+        let mut quiet = None;
+        for _ in 0..40 {
+            quiet = renderer.render(16.0).or(quiet);
+        }
+        renderer.set_beat_level(1.0);
+        let mut loud = None;
+        for _ in 0..20 {
+            loud = renderer.render(16.0).or(loud);
+        }
+        let quiet_luma = mean_luma(&quiet.expect("quiet frame"));
+        let loud_luma = mean_luma(&loud.expect("loud frame"));
+        assert!(
+            loud_luma > quiet_luma * 1.08,
+            "beat pulse too subtle: quiet={quiet_luma:.1} loud={loud_luma:.1}"
+        );
+    }
+
+    #[test]
+    fn zero_beat_strength_disables_the_pulse() {
+        let (w, h, data) = test_album();
+        let mut quiet = MeshGradientRenderer::with_seed(23);
+        let mut loud = MeshGradientRenderer::with_seed(23);
+        for renderer in [&mut quiet, &mut loud] {
+            renderer.set_viewport(180, 100);
+            renderer.set_render_scale(0.6);
+            renderer.set_fps(60);
+            renderer.set_beat_strength(0.0);
+            renderer.set_album_rgba(w, h, data.clone());
+            for _ in 0..40 {
+                renderer.render(16.0);
+            }
+        }
+        quiet.set_beat_level(0.0);
+        loud.set_beat_level(1.0);
+        let mut quiet_frame = None;
+        let mut loud_frame = None;
+        for _ in 0..12 {
+            quiet_frame = quiet.render(16.0).or(quiet_frame);
+            loud_frame = loud.render(16.0).or(loud_frame);
+        }
+        let quiet_frame = quiet_frame.expect("quiet frame");
+        let loud_frame = loud_frame.expect("loud frame");
+        assert_eq!(
+            quiet_frame.as_bytes(0),
+            loud_frame.as_bytes(0),
+            "strength 0 should fully disable the beat pulse"
         );
     }
 }

@@ -616,6 +616,47 @@ impl Default for TransformationMatrix {
     }
 }
 
+/// 单色字形 sprite 的水平渐变遮罩（AMLL `mask-image` 扫光的等价物）。
+///
+/// 逐 fragment 计算：
+/// `alpha *= mix(light, dark, saturate((x - light_from) / (dark_from - light_from)))`
+/// 其中 `x` 是设备像素坐标。`light_from < dark_from` 时左侧亮、右侧暗，中间是
+/// 线性渐变；`light == dark` 时退化为整块 alpha（AMLL 非活跃行的均匀暗色）。
+/// 四个字段依次对应 shader 里的 `SpriteMask`。
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct SpriteMask {
+    /// X coordinate (in device pixels) where the mask is fully `light`.
+    pub light_from: f32,
+    /// X coordinate (in device pixels) where the mask is fully `dark`.
+    pub dark_from: f32,
+    /// Alpha multiplier to the left of the transition.
+    pub light: f32,
+    /// Alpha multiplier to the right of the transition.
+    pub dark: f32,
+}
+
+impl SpriteMask {
+    /// A mask that leaves the glyph alpha unchanged.
+    pub const NONE: Self = Self {
+        light_from: 0.0,
+        dark_from: 0.0,
+        light: 1.0,
+        dark: 1.0,
+    };
+
+    /// Creates a horizontal alpha gradient: fully `light` at and left of
+    /// `light_from`, fully `dark` at and right of `dark_from`, linear between.
+    pub fn new(light_from: f32, dark_from: f32, light: f32, dark: f32) -> Self {
+        Self {
+            light_from,
+            dark_from,
+            light,
+            dark,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub(crate) struct MonochromeSprite {
@@ -626,6 +667,7 @@ pub(crate) struct MonochromeSprite {
     pub color: Hsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
+    pub mask: SpriteMask,
 }
 
 impl From<MonochromeSprite> for Primitive {
@@ -680,9 +722,9 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub(crate) content_mask: ContentMask<P>,
     pub(crate) vertices: Vec<PathVertex<P>>,
     pub(crate) color: Background,
-    start: Point<P>,
-    current: Point<P>,
-    contour_count: usize,
+    pub(crate) start: Point<P>,
+    pub(crate) current: Point<P>,
+    pub(crate) contour_count: usize,
 }
 
 impl Path<Pixels> {
@@ -718,6 +760,35 @@ impl Path<Pixels> {
                 .collect(),
             start: self.start.map(|start| start.scale(factor)),
             current: self.current.scale(factor),
+            contour_count: self.contour_count,
+            color: self.color,
+        }
+    }
+
+    /// Translate this path by the given offset.
+    ///
+    /// Used by cached icon geometry: the path is built once in local
+    /// coordinates and only shifted to the element bounds each frame.
+    pub fn translated(&self, by: Point<Pixels>) -> Path<Pixels> {
+        Path {
+            id: self.id,
+            order: self.order,
+            bounds: Bounds {
+                origin: self.bounds.origin + by,
+                size: self.bounds.size,
+            },
+            content_mask: self.content_mask.clone(),
+            vertices: self
+                .vertices
+                .iter()
+                .map(|vertex| PathVertex {
+                    xy_position: vertex.xy_position + by,
+                    st_position: vertex.st_position,
+                    content_mask: vertex.content_mask.clone(),
+                })
+                .collect(),
+            start: self.start + by,
+            current: self.current + by,
             contour_count: self.contour_count,
             color: self.color,
         }

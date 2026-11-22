@@ -125,11 +125,13 @@ pub fn set_hook(hook: Arc<dyn Fn(&Checkpoint) + Send + Sync>) {
 /// 批处理路径，用 [`budget_for`] 加上每项配额，否则大输入会在 debug 构建里
 /// 误报；真正的复杂度护栏仍是 `perf_scaling` 的 per-item 缩放比。
 pub fn budget_us(name: &str) -> Option<u64> {
-    // 60Hz 帧预算 16ms 以内；网络与磁盘路径放宽到交互可接受的上限。
-    const FRAME: u64 = 16_000;
+    // 300Hz 帧预算 3.33ms；UI 路径留 10% 余量取 3.0ms。
+    // 网络、磁盘与后台解析继续用 16ms 的交互可接受上限，避免误报。
+    const FRAME: u64 = 3_000;
+    const BACKGROUND: u64 = 16_000;
     match name {
         "ui.render.pass" => Some(FRAME),
-        "registry.merge" => Some(FRAME),
+        "registry.merge" => Some(BACKGROUND),
         "registry.search_all" => Some(3_000_000),
         "source.search" => Some(3_000_000),
         "local.scan.index" => Some(5_000_000),
@@ -139,21 +141,21 @@ pub fn budget_us(name: &str) -> Option<u64> {
         "netease.stream_resolve" => Some(3_000_000),
         "player.decode.warmup" => Some(1_000_000),
         "player.seek" => Some(250_000),
-        "lyrics.parse" => Some(FRAME),
+        "lyrics.parse" => Some(BACKGROUND),
         // AMLL 等价实现（歌词解析/整理/整形/绘制 + 背景光栅化）的检查点。
-        // 解析、整理、布局、文本整形与单次绘制都发生在 UI 帧内，按帧预算；
-        // 时间线更新（set_time/update）应当远低于帧预算，取更严格的固定值。
+        // 解析、整理、布局、文本整形与单次绘制都发生在 UI 帧内，按 300Hz
+        // 帧预算；时间线更新（set_time/update）必须远低于帧预算。
         // 背景光栅化按像素配 per_item 配额（见 budget_for），基础值与帧对齐。
         "amll.parse" => Some(FRAME),
         "amll.document" => Some(FRAME),
         "amll.layout" => Some(FRAME),
-        "amll.set_time" => Some(2_000),
-        "amll.update" => Some(1_000),
+        "amll.set_time" => Some(1_000),
+        "amll.update" => Some(500),
         "amll.text.shape" => Some(FRAME),
         "amll.render.pass" => Some(FRAME),
         "amll.bg.raster" => Some(FRAME),
         "amll.convert" => Some(2_000),
-        "amll.cover.decode" => Some(FRAME),
+        "amll.cover.decode" => Some(BACKGROUND),
         _ => None,
     }
 }

@@ -12,8 +12,8 @@ use crate::{
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
     Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    SUBPIXEL_VARIANTS_Y_PRECISE, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    SUBPIXEL_VARIANTS_Y_PRECISE, ScaledPixels, Scene, Shadow, SharedString, Size,
+    SpriteMask, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
@@ -849,6 +849,11 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// 上一帧开始绘制时被标记为 dirty 的视图数（帧统计用）。
+    dirty_views_count: usize,
+    /// 上一帧 draw 的 prepaint / paint 分段时间（帧统计用）。
+    frame_prepaint: Duration,
+    frame_paint: Duration,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -1024,6 +1029,7 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
             move |request_frame_options| {
+                let frame_start = Instant::now();
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
                     handle
@@ -1043,16 +1049,36 @@ impl Window {
                         && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
+                    let mut draw_time = Duration::ZERO;
+                    let mut present_time = Duration::ZERO;
+                    let mut prepaint_time = Duration::ZERO;
+                    let mut paint_time = Duration::ZERO;
+                    let mut dirty_views = 0usize;
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
+                                let draw_start = Instant::now();
                                 let arena_clear_needed = window.draw(cx);
+                                draw_time = draw_start.elapsed();
+                                prepaint_time = window.frame_prepaint;
+                                paint_time = window.frame_paint;
+                                dirty_views = window.dirty_views_count;
+                                let present_start = Instant::now();
                                 window.present();
+                                present_time = present_start.elapsed();
                                 // drop the arena elements after present to reduce latency
                                 arena_clear_needed.clear();
                             })
                             .log_err();
-                    })
+                    });
+                    crate::frame_stats::record(
+                        frame_start,
+                        draw_time,
+                        prepaint_time,
+                        paint_time,
+                        present_time,
+                        dirty_views,
+                    );
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
@@ -1232,6 +1258,9 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            dirty_views_count: 0,
+            frame_prepaint: Duration::ZERO,
+            frame_paint: Duration::ZERO,
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -1914,6 +1943,7 @@ impl Window {
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
         self.invalidate_entities();
+        self.dirty_views_count = self.dirty_views.len();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -2012,6 +2042,7 @@ impl Window {
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
+        let prepaint_start = Instant::now();
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -2065,7 +2096,9 @@ impl Window {
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
+        self.frame_prepaint = prepaint_start.elapsed();
         // Now actually paint the elements.
+        let paint_start = Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -2084,6 +2117,7 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+        self.frame_paint = paint_start.elapsed();
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
@@ -2872,6 +2906,48 @@ impl Window {
             .insert_primitive(path.scale(scale_factor));
     }
 
+    /// Paint a cached path in local coordinates, translated by `offset`.
+    ///
+    /// Combines translation + device-pixel scaling + scene insertion in one
+    /// vertex pass, so cached icon geometry does not allocate an intermediate
+    /// `Path<Pixels>` every frame.
+    pub fn paint_path_translated(
+        &mut self,
+        path: &Path<Pixels>,
+        offset: Point<Pixels>,
+        color: impl Into<Background>,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        let color: Background = color.into();
+        let scaled = Path {
+            id: path.id,
+            order: path.order,
+            bounds: Bounds {
+                origin: (path.bounds.origin + offset).scale(scale_factor),
+                size: path.bounds.size.scale(scale_factor),
+            },
+            content_mask: content_mask.scale(scale_factor),
+            vertices: path
+                .vertices
+                .iter()
+                .map(|vertex| crate::scene::PathVertex {
+                    xy_position: (vertex.xy_position + offset).scale(scale_factor),
+                    st_position: vertex.st_position,
+                    content_mask: vertex.content_mask.scale(scale_factor),
+                })
+                .collect(),
+            start: (path.start + offset).scale(scale_factor),
+            current: (path.current + offset).scale(scale_factor),
+            contour_count: path.contour_count,
+            color: color.opacity(opacity),
+        };
+        self.next_frame.scene.insert_primitive(scaled);
+    }
+
     /// Paint an underline into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -2963,6 +3039,7 @@ impl Window {
             px(0.0),
             1.0,
             false,
+            SpriteMask::NONE,
         )
     }
 
@@ -2995,6 +3072,7 @@ impl Window {
             blur_radius,
             1.0,
             false,
+            SpriteMask::NONE,
         )
     }
 
@@ -3039,6 +3117,43 @@ impl Window {
             blur_radius,
             scale,
             true,
+            SpriteMask::NONE,
+        )
+    }
+
+    /// Like [`Self::paint_glyph_scaled`], but multiplies the glyph's alpha by a
+    /// horizontal gradient mask evaluated per fragment (AMLL's `mask-image`
+    /// sweep).
+    ///
+    /// `mask` coordinates are in window (logical) pixels and are scaled to
+    /// device pixels internally. The mask is baked into the existing sprite
+    /// draw: no extra quads and no re-rasterization, so it stays smooth at any
+    /// sub-pixel sweep position.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_glyph_scaled_masked(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        blur_radius: Pixels,
+        scale: f32,
+        mask: SpriteMask,
+    ) -> Result<()> {
+        self.paint_glyph_inner(
+            origin,
+            font_id,
+            glyph_id,
+            font_size,
+            color,
+            blur_radius,
+            scale,
+            true,
+            mask,
         )
     }
 
@@ -3053,6 +3168,7 @@ impl Window {
         blur_radius: Pixels,
         scale: f32,
         smooth: bool,
+        mask: SpriteMask,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -3168,6 +3284,12 @@ impl Window {
             } else {
                 TransformationMatrix::unit()
             };
+            let mask = SpriteMask {
+                light_from: mask.light_from * scale_factor,
+                dark_from: mask.dark_from * scale_factor,
+                light: mask.light,
+                dark: mask.dark,
+            };
             self.next_frame.scene.insert_primitive(MonochromeSprite {
                 order: 0,
                 pad: 0,
@@ -3176,6 +3298,7 @@ impl Window {
                 color: color.opacity(element_opacity),
                 tile,
                 transformation,
+                mask,
             });
         }
         Ok(())
@@ -3301,6 +3424,7 @@ impl Window {
             color: color.opacity(element_opacity),
             tile,
             transformation,
+            mask: SpriteMask::NONE,
         });
 
         Ok(())
@@ -3490,6 +3614,7 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
+        let clipped_bounds = bounds.intersect(&content_mask.bounds);
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
@@ -3498,7 +3623,11 @@ impl Window {
             content_mask,
             behavior,
         };
-        self.next_frame.hitboxes.push(hitbox.clone());
+        // 完全在裁剪区外的 hitbox 永远不会被命中；不插入可以把滚动容器
+        // 里离屏行的命中测试成本从 O(全部行) 降到 O(可视行)。
+        if !clipped_bounds.is_empty() {
+            self.next_frame.hitboxes.push(hitbox.clone());
+        }
         hitbox
     }
 

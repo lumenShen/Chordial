@@ -4,6 +4,11 @@
 //! 按固定节奏做一次 radix-2 FFT，只累加 `[low, high]` Hz 内的频点功率，
 //! 再经过快攻击/慢释放的包络跟随器输出 0..1 的鼓点强度。
 //!
+//! 输出在绝对能量之外还做了一次「自适应基线 + 瞬态增强」：基线以约 0.9s
+//! 时间常数跟随当前段落的平均能量，击打（相对基线的正向跳变）被放大。
+//! 这样持续铺底的镲片/齿音不会把网格长期顶在高位，军鼓/底鼓的瞬态才会
+//! 产生明显脉冲。
+//!
 //! 设计约束：
 //! - 缓冲区全部在构造时分配，热路径零分配；
 //! - 每秒最多分析 [`ANALYSIS_RATE_HZ`] 次，FFT 长度按采样率自适应
@@ -22,6 +27,8 @@ const MAX_HZ: f32 = 22_050.0;
 /// 包络：6ms 攻击（鼓点几乎瞬时拉满）、160ms 释放（留出可见的回落）。
 const ATTACK_SECS: f32 = 0.006;
 const RELEASE_SECS: f32 = 0.16;
+/// 自适应响度基线的时间常数（秒）：跟随段落平均能量，但慢于一拍。
+const BASELINE_SECS: f32 = 0.9;
 /// 映射下限：-60 dBFS 视为静音，0 dBFS 映射到 1。
 const DB_FLOOR: f32 = -60.0;
 
@@ -61,6 +68,8 @@ pub struct BandAnalyzer {
     rev: Vec<u32>,
     tw_re: Vec<f32>,
     tw_im: Vec<f32>,
+    /// 慢速响度基线（0..1），用于突出相对跳变。
+    baseline: f32,
     level: f32,
 }
 
@@ -110,6 +119,7 @@ impl BandAnalyzer {
             rev,
             tw_re,
             tw_im,
+            baseline: 0.0,
             level: 0.0,
         }
     }
@@ -123,6 +133,7 @@ impl BandAnalyzer {
         self.filled = 0;
         self.since_hop = 0;
         self.level = 0.0;
+        self.baseline = 0.0;
     }
 
     /// 当前鼓点包络（0..1）。
@@ -194,9 +205,19 @@ impl BandAnalyzer {
             0.0
         };
         let db = 20.0 * rms.max(1e-7).log10();
-        let target = ((db - DB_FLOOR) / -DB_FLOOR).clamp(0.0, 1.0);
-
+        let absolute = ((db - DB_FLOOR) / -DB_FLOOR).clamp(0.0, 1.0);
         let dt = self.hop as f32 / self.sample_rate;
+
+        // 自适应基线：持续能量（铺底镲片、齿音）会抬高基线，只有相对基线的
+        // 正向瞬态才被放大。绝对能量保留 35% 作为底，安静段落也能看到纹理。
+        let baseline_coeff = 1.0 - (-dt / BASELINE_SECS).exp();
+        self.baseline += (absolute - self.baseline) * baseline_coeff;
+        if !self.baseline.is_finite() {
+            self.baseline = 0.0;
+        }
+        let onset = (absolute - self.baseline).max(0.0);
+        let target = (absolute * 0.35 + onset * 2.2).clamp(0.0, 1.0);
+
         let coeff = if target > self.level {
             1.0 - (-dt / ATTACK_SECS).exp()
         } else {
@@ -319,5 +340,20 @@ mod tests {
         let quiet = vec![0.0f32; 4800];
         analyzer.push_interleaved(&quiet, 2, DEFAULT_BEAT_BAND.0, DEFAULT_BEAT_BAND.1);
         assert!(analyzer.level() < 0.01, "{}", analyzer.level());
+    }
+
+    #[test]
+    fn transient_hits_stand_out_from_sustained_floor() {
+        let mut analyzer = BandAnalyzer::new(RATE);
+        // 先用低幅带内信号建立自适应基线（模拟持续铺底的镲片/齿音）。
+        feed_sine(&mut analyzer, 6_000.0, 0.05, 2.0, DEFAULT_BEAT_BAND);
+        let floor = analyzer.level();
+        // 一次短促的重击。
+        feed_sine(&mut analyzer, 6_000.0, 0.8, 0.05, DEFAULT_BEAT_BAND);
+        let peak = analyzer.level();
+        assert!(
+            peak > floor + 0.3,
+            "transient not emphasized: floor={floor:.2} peak={peak:.2}"
+        );
     }
 }

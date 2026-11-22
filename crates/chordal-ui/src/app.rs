@@ -5,9 +5,12 @@
 //! - 结果集以 `Arc<Vec<Track>>` 快照持有，render 期间零深拷贝；
 //! - 行回调通过 `WeakEntity` 捕获，行元素按 index 建 id；
 //! - 播放状态 200ms 轮询 + 变化才 `cx.notify()`；
-//! - 渲染 pass 带 `ui.render.pass` 检查点（预算 16ms，超预算告警）。
+//! - 渲染 pass 带 `ui.render.pass` 检查点（300Hz 预算 3ms，超预算告警）。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,29 +20,74 @@ use chordal_core::model::{
     LoginProgress, SearchKind, SearchQuery, SourceId, StreamHandle, Track, TrackOrigin,
 };
 use chordal_core::perf::PerfScope;
-use chordal_core::registry::{SourceRegistry, SourceStatus};
+use chordal_core::registry::{SourceRegistry, SourceSlotSnapshot, SourceStatus};
 use chordal_core::source::MusicSource;
-use chordal_player::{Event as PlayerEvent, Player, PlayerState};
+use chordal_player::{
+    EQ_MAX_BANDS, EQ_MAX_GAIN_DB, EQ_MIN_GAIN_DB, EqBand, Event as PlayerEvent, FilterKind, Player,
+    PlayerState,
+};
 use chordial_amll_gpui::background::BackgroundRendererKind;
 use chordial_amll_gpui::render::{LyricPlayerView, LyricRenderColors, PlaybackClock};
 use chordial_amll_gpui::{AlignAnchor, LyricPlayerConfig, LyricTextStyle};
 use gpui::StatefulInteractiveElement;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, BoxShadow, Context, CursorStyle, Entity, FocusHandle, RenderImage,
-    ResizeEdge, SharedString, Window, div, linear_color_stop, linear_gradient, point, px, size,
-    uniform_list,
+    AnyElement, App, Bounds, BoxShadow, Context, CursorStyle, Entity, FocusHandle, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, RenderImage, ResizeEdge, SharedString, Window, div,
+    linear_color_stop, linear_gradient, point, px, size, uniform_list,
 };
 
 use crate::actions::{
-    ExitImmersive, FocusSearch, NextTrack, PlayPause, PrevTrack, Quit, RescanLibrary, ToggleSidebar,
+    CloseSettings, ExitImmersive, FocusSearch, NextTrack, OpenSettings, PlayFirst, PlayPause,
+    PrevTrack, Quit, RescanLibrary, ToggleEqualizer, TogglePortrait, ToggleSidebar,
 };
+use crate::autoeq::{self, AutoEqStatus};
 use crate::config::SourcePreference;
-use crate::downloads::DownloadStore;
+use crate::downloads::{DownloadExtras, DownloadStore, lyrics_to_lrc};
+use crate::eq::{EqState, EqTab, PresetEntry};
 use crate::input::{InputState, InputView, focus_input};
+use crate::layout_morph::{
+    COMPACT_COVER_GAP, COMPACT_TOP, INFO_LINE_RATIO, LayoutMotion, StageGeometry, StageMode,
+    StageRect, compact_content_w, compact_cover_size, dock_geometry, dock_rect,
+    immersive_geometry, wide_column_x, wide_cover_size, wide_cover_top,
+};
 use crate::lyrics::{cover_url, decode_data_url_image, fetch_cover_blocking, to_amll_lyrics};
 use crate::main_state::Globals;
+use crate::player_page::{PortraitPage, Transition};
+use crate::responsive::{MIN_WIDE_SPLIT_W, ViewportClass};
+use crate::settings::{SettingsAction, SettingsRuntime, SettingsView};
+use crate::sheet_drag::{SheetDrag, SheetDragOutcome, SpringSettle};
 use crate::theme::{Appearance, Theme, fmt_ms};
+
+/// 线性混合两个颜色（RGB + alpha）；用于 Dock↔沉浸页收尾阶段的
+/// 背景/文字配色过渡（黑底白字 → Dock 的玻璃底与主题文字）。
+fn mix_color(a: gpui::Hsla, b: gpui::Hsla, t: f32) -> gpui::Hsla {
+    let t = t.clamp(0.0, 1.0);
+    let a: gpui::Rgba = a.into();
+    let b: gpui::Rgba = b.into();
+    gpui::Rgba {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+    .into()
+}
+
+/// 把无背景的玻璃色预乘到主背景上，得到不透明等效色——卡片落座时
+/// 用它盖住真实 Dock 的内容，避免两层文字/图标重叠。
+fn overlay_color(bg: gpui::Hsla, fg: gpui::Hsla) -> gpui::Hsla {
+    let bg: gpui::Rgba = bg.into();
+    let fg: gpui::Rgba = fg.into();
+    let a = fg.a.clamp(0.0, 1.0);
+    gpui::Rgba {
+        r: fg.r * a + bg.r * (1.0 - a),
+        g: fg.g * a + bg.g * (1.0 - a),
+        b: fg.b * a + bg.b * (1.0 - a),
+        a: 1.0,
+    }
+    .into()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewTab {
@@ -62,11 +110,69 @@ enum LibraryFilter {
     Queue,
 }
 
+/// 底部「更多」抽屉的二级页。抽屉本身不改变播放页布局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawerPage {
+    Root,
+    Sleep,
+}
+
+/// 手机壳（单列）当前页面。宽屏没有这个概念：侧栏/曲目板/右栏同时存在。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhonePage {
+    /// 播放页：封面 + 曲目信息 + 进度 + 传输 + 音量。
+    Player,
+    /// 曲库页：复用桌面曲目板（本地库 / 队列 / 搜索结果 / 集合）。
+    Browse,
+}
+
+/// 收窄到手机宽度时默认落在哪一页。
+///
+/// 用户正在搜索/看集合/看队列时，保留他的浏览上下文；只有在普通曲库
+/// 或播放中时才落到播放页——否则“拉窄窗口”会把正在找歌的人踢回播放器。
+fn phone_default_page(
+    view_tab: ViewTab,
+    filter: LibraryFilter,
+    has_track: bool,
+) -> PhonePage {
+    let browsing = match view_tab {
+        ViewTab::Search | ViewTab::Collection => true,
+        ViewTab::Library => filter == LibraryFilter::Queue,
+    };
+    if browsing || !has_track {
+        PhonePage::Browse
+    } else {
+        PhonePage::Player
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlayMode {
     Sequential,
+    /// 列表循环：播到队尾回绕到第一首。
+    RepeatAll,
     Shuffle,
     RepeatOne,
+}
+
+impl PlayMode {
+    fn full_label(self) -> &'static str {
+        match self {
+            Self::Sequential => "顺序播放模式",
+            Self::RepeatAll => "列表循环播放模式",
+            Self::Shuffle => "随机播放模式",
+            Self::RepeatOne => "单曲循环模式",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Sequential => Self::RepeatAll,
+            Self::RepeatAll => Self::RepeatOne,
+            Self::RepeatOne => Self::Shuffle,
+            Self::Shuffle => Self::Sequential,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +185,8 @@ enum LoginTab {
 #[derive(Clone)]
 struct PreviewLyric {
     start_ms: u64,
-    text: String,
-    translation: String,
+    text: SharedString,
+    translation: SharedString,
 }
 
 /// 当前打开的集合页（歌单 / 专辑 / 歌手）。
@@ -113,6 +219,132 @@ impl PlaybackClock for PlayerClock {
     }
 }
 
+/// 曲目行的预计算显示文本。列表快照变化时一次性构建，render 期间只做
+/// `SharedString` 克隆（引用计数），不再 `format!`/`join`/`to_string`。
+struct TrackRowText {
+    id: chordal_core::model::TrackId,
+    number: SharedString,
+    title: SharedString,
+    subtitle_search: SharedString,
+    subtitle_default: SharedString,
+    duration: SharedString,
+}
+
+impl TrackRowText {
+    fn new(index: usize, track: &Track) -> Self {
+        let artists = track
+            .artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let album = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("");
+        let source_label = match &track.origin {
+            TrackOrigin::Local { .. } => "本地",
+            TrackOrigin::Remote { source } => match source.0.as_str() {
+                "netease" => "网易云",
+                other => other,
+            },
+        };
+        let subtitle_search = if artists.is_empty() {
+            source_label.to_string()
+        } else {
+            format!("{artists}  ·  {source_label}")
+        };
+        let subtitle_default = if !artists.is_empty() && !album.is_empty() {
+            format!("{artists}  ·  {album}")
+        } else if !artists.is_empty() {
+            artists
+        } else {
+            album.to_string()
+        };
+        let duration = track
+            .duration_ms
+            .map(fmt_ms)
+            .unwrap_or_else(|| "--:--".into());
+        Self {
+            id: track.id.clone(),
+            number: SharedString::from((index + 1).to_string()),
+            title: SharedString::from(track.title.clone()),
+            subtitle_search: SharedString::from(subtitle_search),
+            subtitle_default: SharedString::from(subtitle_default),
+            duration: SharedString::from(duration),
+        }
+    }
+}
+
+/// 「正在播放」面板的预计算文本，曲目变化时才重建。
+struct NowPlayingText {
+    title: SharedString,
+    artists: SharedString,
+    album: SharedString,
+    source_label: SharedString,
+    quality: SharedString,
+}
+
+impl NowPlayingText {
+    fn new(track: Option<&Track>, fallback_title: Option<&str>) -> Self {
+        let title = track
+            .map(|t| t.title.as_str())
+            .or(fallback_title)
+            .unwrap_or("未在播放");
+        let artists = track
+            .map(|t| {
+                t.artists
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            })
+            .unwrap_or_default();
+        let album = track
+            .and_then(|t| t.album.as_ref())
+            .map(|a| a.name.as_str())
+            .unwrap_or("");
+        let source_label = track
+            .map(|t| match &t.origin {
+                TrackOrigin::Local { .. } => "本地",
+                TrackOrigin::Remote { source } => match source.0.as_str() {
+                    "netease" => "网易云",
+                    other => other,
+                },
+            })
+            .unwrap_or("");
+        let quality = track.and_then(|t| t.quality.as_deref()).unwrap_or("");
+        Self {
+            title: SharedString::from(title.to_string()),
+            artists: SharedString::from(artists),
+            album: SharedString::from(album.to_string()),
+            source_label: SharedString::from(source_label.to_string()),
+            quality: SharedString::from(quality.to_string()),
+        }
+    }
+}
+
+/// 侧栏「我的歌单」行的预计算文本/ID。
+struct PlaylistRowText {
+    id: CollectionId,
+    element_id: SharedString,
+    title: SharedString,
+    count: SharedString,
+}
+
+impl PlaylistRowText {
+    fn new(playlist: &CollectionSummary) -> Self {
+        Self {
+            id: playlist.id.clone(),
+            element_id: SharedString::from(format!("user-playlist-{}", playlist.id.id)),
+            title: SharedString::from(playlist.title.clone()),
+            count: SharedString::from(
+                playlist
+                    .track_count
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+}
+
 pub struct ChordialApp {
     registry: Arc<SourceRegistry>,
     player: Arc<Player>,
@@ -123,10 +355,12 @@ pub struct ChordialApp {
     /// 显式下载目录，独立于缓存配额。
     downloads: Arc<DownloadStore>,
     source_preference: SourcePreference,
+    /// 平滑滚动开关（配置项，默认 false）。EQ 页面等子模块也读取它。
+    pub(crate) smooth_scroll: bool,
     settings_open: bool,
-    settings_cache_input: Entity<InputState>,
+    /// 新版设置中心（独立实体，见 `settings.rs`）。
+    settings_view: Entity<SettingsView>,
     settings_cache_view: Entity<InputView>,
-    settings_download_input: Entity<InputState>,
     settings_download_view: Entity<InputView>,
     settings_beat_low_input: Entity<InputState>,
     settings_beat_low_view: Entity<InputView>,
@@ -180,7 +414,7 @@ pub struct ChordialApp {
     status_message: Option<String>,
     /// 非错误提示（下载完成、音质选择说明等）。
     info_message: Option<String>,
-    focus_handle: FocusHandle,
+    pub(crate) focus_handle: FocusHandle,
 
     // ---- 歌词页 ----
     lyric_view: Entity<LyricPlayerView>,
@@ -191,16 +425,23 @@ pub struct ChordialApp {
     play_gen: u64,
     appearance: Appearance,
     cover_image: Option<Arc<RenderImage>>,
+    /// 已被替换/清空的图片。`RenderImage` 上传到 gpui sprite atlas 后不会随
+    /// `Arc` 释放自动移除；这里收集起来，在下一帧 `render` 里调用
+    /// `App::drop_image`，否则快速切歌会把图集（只增不减）撑爆并黑屏。
+    retired_images: Vec<Arc<RenderImage>>,
     /// 当前曲目歌词压平后的预览行（右栏用，异步加载完成后整体替换）。
     lyric_preview: Arc<Vec<PreviewLyric>>,
     activated: bool,
     /// 当前客户区尺寸；用于列表/播放条/封面断点。
-    viewport_width: f32,
-    viewport_height: f32,
-    /// 沉浸歌词字号（随窗口高度缩放）。
-    lyric_font_px: f32,
-    /// 沉浸层是否处于竖向布局（宽 < 高）；决定歌词 mask 的底部渐隐。
-    lyric_vertical: bool,
+    pub(crate) viewport_width: f32,
+    pub(crate) viewport_height: f32,
+    /// 当前断点。跨断点时只跑一次状态迁移（关闭抽屉、重置背景等）。
+    viewport_class: ViewportClass,
+    /// 手机壳当前页；宽屏时保留但不参与渲染。
+    phone_page: PhonePage,
+    /// 手机播放页是否已把歌词视图切换成 Mesh 背景。
+    /// 与沉浸层共用同一个 `lyric_view`，必须显式跟踪才能正确交还样式。
+    phone_backdrop: bool,
     /// 宽屏布局下缓存的歌词对齐比例（封面中心占比）。
     lyric_align: f32,
     /// 诊断开关：禁用歌词模糊（CHORDIAL_NO_BLUR=1，性能隔离用）。
@@ -208,6 +449,10 @@ pub struct ChordialApp {
     /// 诊断开关：禁用沉浸背景（CHORDIAL_NO_BG=1，性能隔离用）。
     no_bg: bool,
     immersive: bool,
+    /// 沉浸页顶部拖拽条的下拉关闭手势；None = 当前没有手势。
+    sheet_drag: Option<SheetDrag>,
+    /// 进入沉浸层时 Dock→全屏共享布局的展开弹簧。
+    immersive_expand: Option<SpringSettle>,
 
     // ---- 沉浸层控件动画（AMLL MediaButton / VolumeControl 等价） ----
     /// 进入沉浸页的时刻：所有 MediaButton 播放 pressed 回弹，上一首/下一首
@@ -219,10 +464,66 @@ pub struct ChordialApp {
     ui_anim_repeat: Option<Instant>,
     /// 音量滑杆到达 0 / 1 时喇叭弹跳；bool = 右侧（高音量）。
     ui_anim_volume: Option<(Instant, bool)>,
-    /// 60fps 控件动画泵是否在运行（只在有动画时唤醒，结束后自动退出）。
-    ui_anim_ticker: bool,
     /// 上一次音量输入值（用于检测跨越 0/1 边界）。
     last_volume_input: f32,
+    /// 诊断：持续请求动画帧（CHORDIAL_BENCH_ANIM=1），用于 300Hz 压测。
+    bench_anim: bool,
+
+    // ---- 竖屏播放页 / 沉浸层子页面 ----
+    /// true = 强制竖屏布局（即使窗口是横向）；false = 按窗口宽高自动选择。
+    pub(crate) force_portrait: bool,
+    portrait_page: PortraitPage,
+    portrait_transition: Option<Transition>,
+    portrait_enter: Option<Instant>,
+    portrait_last_input: Instant,
+    portrait_chrome_hidden: bool,
+    portrait_chrome_at: Option<Instant>,
+    portrait_idle_ticker: bool,
+    portrait_toast: Option<(String, Instant)>,
+    /// 底部「更多」抽屉：打开状态、动画起点、当前二级页。
+    /// 布局 1 / 布局 2 共用同一只抽屉与同一组入口。
+    drawer_open: bool,
+    drawer_at: Option<Instant>,
+    drawer_page: DrawerPage,
+    /// 宽屏沉浸层里用户主动关闭歌词的状态；无歌词或关闭歌词时使用布局 2。
+    wide_lyrics_hidden: bool,
+    /// 共享元素（封面 / 曲名 / 艺人）的布局补间。
+    /// 竖屏页面切换与宽屏歌词开/关共用同一套 First→Last 几何。
+    stage_motion: Option<LayoutMotion>,
+    /// 竖屏播放队列的虚拟列表滚动句柄（进入队列时定位当前曲目）。
+    queue_scroll: gpui::UniformListScrollHandle,
+    /// 搜索路由过滤结果缓存：避免每帧对搜索结果做 O(n) 克隆。
+    search_route_cache: RefCell<Option<(Arc<Vec<Track>>, Option<SourceId>, Arc<Vec<Track>>)>>,
+    /// 曲目行显示文本缓存：列表快照不变时 render 期间零字符串分配。
+    row_text_cache: RefCell<Option<(Arc<Vec<Track>>, Arc<Vec<TrackRowText>>)>>,
+    /// 「正在播放」文本缓存。
+    now_playing_text: RefCell<Option<(u64, Arc<NowPlayingText>)>>,
+    /// 侧栏歌单行缓存。
+    playlist_rows: RefCell<Option<(Arc<Vec<CollectionSummary>>, Arc<Vec<PlaylistRowText>>)>>,
+    /// 音源状态快照缓存（按 registry.version 失效）。
+    source_snapshot: RefCell<Option<(u64, Arc<Vec<SourceSlotSnapshot>>)>>,
+    /// 侧栏滚动偏移：参与歌单区保留缓存的版本哈希。
+    sidebar_scroll: gpui::ScrollHandle,
+
+    // ---- 睡眠定时 ----
+    sleep_minutes: Option<u32>,
+    sleep_until: Option<Instant>,
+    sleep_gen: u64,
+
+    // ---- 参数均衡器 ----
+    eq_open: bool,
+    pub(crate) eq_open_at: Option<Instant>,
+    pub(crate) eq: EqState,
+    /// 持有输入框实体；视图通过 `eq_search_view` 使用。
+    #[allow(dead_code)]
+    eq_search_input: Entity<InputState>,
+    pub(crate) eq_search_view: Entity<InputView>,
+    /// 沉浸页进度条：播放线程位置快照 + 快照时刻，用于帧间外推。
+    progress_clock: (u64, bool, Instant),
+    /// 编辑后 400ms 落盘，拖动滑杆时不会每个事件都写配置。
+    eq_save_at: Option<Instant>,
+    /// 防抖落盘代号：连续编辑时只允许最新一次定时器落盘。
+    eq_save_gen: u64,
 }
 
 // Builders 类型别名（main.rs 组装时使用）。
@@ -259,31 +560,27 @@ fn compact_lyric_style(theme: &Theme) -> LyricTextStyle {
 
 /// AMLL 等价字号：Medium 档 `max(max(5vh, 2.5vw), 14px)`；宽 ≤768 用
 /// `max(8vw, 12px)`。是否竖向由宽高比决定（影响底部 mask 渐隐）。
-fn immersive_lyric_style(width: f32, height: f32) -> (LyricTextStyle, f32, bool) {
+fn immersive_lyric_style(width: f32, height: f32) -> LyricTextStyle {
     let font = if width <= 768.0 {
         (width * 0.08).max(12.0)
     } else {
         (height * 0.05).max(width * 0.025).max(14.0)
     };
     let vertical = width < height;
-    (
-        LyricTextStyle {
-            // 字体栈的 Windows 端是 Segoe UI。
-            font_family: "Segoe UI".into(),
-            font_weight: gpui::FontWeight::SEMIBOLD,
-            base_font_size: font,
-            line_height_ratio: 1.2,
-            sub_font_size_ratio: 0.5,
-            sub_line_height_ratio: 1.5,
-            padding_x_em: 1.0,
-            padding_y_ratio: 0.02,
-            // AMLL 歌词容器 mask：横向上下各 10%，竖向只有顶部 10%。
-            edge_fade_bottom: if vertical { 0.0 } else { 0.1 },
-            ..Default::default()
-        },
-        font,
-        vertical,
-    )
+    LyricTextStyle {
+        // 字体栈的 Windows 端是 Segoe UI。
+        font_family: "Segoe UI".into(),
+        font_weight: gpui::FontWeight::SEMIBOLD,
+        base_font_size: font,
+        line_height_ratio: 1.2,
+        sub_font_size_ratio: 0.5,
+        sub_line_height_ratio: 1.5,
+        padding_x_em: 1.0,
+        padding_y_ratio: 0.02,
+        // AMLL 歌词容器 mask：横向上下各 10%，竖向只有顶部 10%。
+        edge_fade_bottom: if vertical { 0.0 } else { 0.1 },
+        ..Default::default()
+    }
 }
 
 impl ChordialApp {
@@ -377,6 +674,21 @@ impl ChordialApp {
                 })
         });
 
+        // 新版设置中心：独立实体，动作回到根视图统一应用。
+        let settings_view = {
+            let weak_settings = weak_self.clone();
+            cx.new(|cx| {
+                SettingsView::new(
+                    move |action, window, cx| {
+                        let _ = weak_settings.update(cx, |app, cx| {
+                            app.handle_settings_action(action, window, cx);
+                        });
+                    },
+                    cx,
+                )
+            })
+        };
+
         let login_phone_input = cx.new(|cx| {
             let mut s = InputState::new(cx);
             s.set_placeholder("手机号");
@@ -439,6 +751,7 @@ impl ChordialApp {
             view.set_background_fps(24);
             view.set_background_render_scale(0.35);
             view.set_background_flow_speed(2.0);
+            view.set_background_beat_strength(cfg.beat_strength);
             // 浅色主题用纸面纯色，避免深色 Mesh 与深色文字对比不足。
             if !theme.is_dark() {
                 view.set_background_kind(BackgroundRendererKind::Css);
@@ -446,6 +759,25 @@ impl ChordialApp {
             view.set_background_color(theme.bg);
             view
         });
+
+        let eq_search_input = cx.new(|cx| {
+            let mut s = InputState::new(cx);
+            s.set_placeholder("搜索耳机");
+            s
+        });
+        let weak_eq = weak_self.clone();
+        let eq_search_view = cx.new(|cx| {
+            InputView::new(eq_search_input.clone(), cx)
+                .with_id("eq-search")
+                .on_submit(move |text, _window, cx| {
+                    let _ = weak_eq.update(cx, |app: &mut ChordialApp, cx| {
+                        app.eq.search = text.trim().to_string();
+                        cx.notify();
+                    });
+                })
+        });
+        let eq = EqState::new(cfg.equalizer.clone(), cfg.eq_saved_presets.clone());
+        player.set_eq(eq.settings.clone());
 
         let mut app = Self {
             registry,
@@ -455,10 +787,10 @@ impl ChordialApp {
             cache,
             downloads: Arc::new(DownloadStore::open(cfg.download_dir.clone())),
             source_preference: cfg.source_preference,
+            smooth_scroll: cfg.smooth_scroll,
             settings_open: false,
-            settings_cache_input,
+            settings_view,
             settings_cache_view,
-            settings_download_input,
             settings_download_view,
             settings_beat_low_input,
             settings_beat_low_view,
@@ -512,30 +844,78 @@ impl ChordialApp {
             play_gen: 0,
             appearance,
             cover_image: None,
+            retired_images: Vec::new(),
             lyric_preview: Arc::new(Vec::new()),
             activated: false,
             viewport_width: 1280.0,
             viewport_height: 800.0,
-            lyric_font_px: 44.0,
-            lyric_vertical: false,
+            viewport_class: ViewportClass::Wide,
+            phone_page: PhonePage::Browse,
+            phone_backdrop: false,
             lyric_align: 0.35,
             no_blur: std::env::var_os("CHORDIAL_NO_BLUR").is_some(),
             no_bg: std::env::var_os("CHORDIAL_NO_BG").is_some(),
             immersive: false,
+            sheet_drag: None,
+            immersive_expand: None,
             ui_anim_enter: None,
             ui_anim_play: None,
             ui_anim_shuffle: None,
             ui_anim_repeat: None,
             ui_anim_volume: None,
-            ui_anim_ticker: false,
             last_volume_input: 0.9,
+            bench_anim: std::env::var_os("CHORDIAL_BENCH_ANIM").is_some(),
+            force_portrait: false,
+            portrait_page: PortraitPage::Art,
+            portrait_transition: None,
+            portrait_enter: None,
+            portrait_last_input: Instant::now(),
+            portrait_chrome_hidden: false,
+            portrait_chrome_at: None,
+            portrait_idle_ticker: false,
+            portrait_toast: None,
+            drawer_open: false,
+            drawer_at: None,
+            drawer_page: DrawerPage::Root,
+            wide_lyrics_hidden: false,
+            stage_motion: None,
+            queue_scroll: gpui::UniformListScrollHandle::new(),
+            search_route_cache: RefCell::new(None),
+            row_text_cache: RefCell::new(None),
+            now_playing_text: RefCell::new(None),
+            playlist_rows: RefCell::new(None),
+            source_snapshot: RefCell::new(None),
+            sidebar_scroll: gpui::ScrollHandle::new(),
+            sleep_minutes: None,
+            sleep_until: None,
+            sleep_gen: 0,
+            eq_open: false,
+            eq_open_at: None,
+            eq,
+            eq_search_input,
+            eq_search_view,
+            progress_clock: (0, false, Instant::now()),
+            eq_save_at: None,
+            eq_save_gen: 0,
         };
 
         if let Some(local) = local_source {
             app.spawn_library_scan(local, cx);
         }
+        app.spawn_netease_warmup(cx);
         app.spawn_account_bootstrap(cx);
         app.spawn_status_poll(cx);
+        if std::env::var_os("CHORDIAL_START_IMMERSIVE").is_some() {
+            app.enter_immersive(cx);
+        }
+        // 诊断 / 截图：启动即打开设置中心。
+        if std::env::var_os("CHORDIAL_START_SETTINGS").is_some() {
+            app.open_settings(cx);
+        }
+        // 诊断 / 截图：启动即打开均衡器。
+        if std::env::var_os("CHORDIAL_START_EQ").is_some() {
+            app.open_eq(cx);
+        }
         app
     }
 
@@ -561,6 +941,12 @@ impl ChordialApp {
                 app.library = tracks.1;
                 app.library_scanning = false;
                 tracing::info!(tracks = tracks.0, "library scan finished");
+                // 诊断：扫描完成后自动播放第一首并进入沉浸页，便于 300Hz
+                // 歌词/播放路径压测（CHORDIAL_AUTOPLAY=1）。
+                if std::env::var_os("CHORDIAL_AUTOPLAY").is_some() && !app.library.is_empty() {
+                    app.play_first(cx);
+                    app.enter_immersive(cx);
+                }
                 cx.notify();
             });
         })
@@ -621,6 +1007,21 @@ impl ChordialApp {
         .detach();
     }
 
+    /// 播放/暂停并立刻刷新状态与按钮回弹，不等待 200ms 轮询。
+    fn toggle_playback(&mut self, cx: &mut Context<Self>) {
+        let was_playing = self.player_status.state == PlayerState::Playing;
+        self.player.toggle();
+        let status = self.player.status();
+        let is_playing = status.state == PlayerState::Playing;
+        self.player_status = status;
+        if self.immersive && was_playing != is_playing {
+            // AMLL 的播放/暂停 SVG 在状态切换时重新挂载，pressed 回弹与
+            // 图标交换必须在同一帧发生。
+            self.ui_anim_play = Some(Instant::now());
+        }
+        cx.notify();
+    }
+
     // ---------- 搜索 ----------
 
     pub fn start_search(&mut self, text: String, cx: &mut Context<Self>) {
@@ -631,6 +1032,7 @@ impl ChordialApp {
         self.search_gen += 1;
         self.searching = true;
         self.view_tab = ViewTab::Search;
+        self.show_phone_browse();
         cx.notify();
 
         let registry = self.registry.clone();
@@ -694,20 +1096,28 @@ impl ChordialApp {
         } else {
             self.searching = false;
             self.view_tab = ViewTab::Search;
+            self.show_phone_browse();
             cx.notify();
         }
     }
 
     /// 无边框窗口的拖动热区。
     ///
-    /// 两端的实现机制不同，不能共用 `start_window_move`：
-    /// - Linux（Wayland/X11）由 gpui 向 compositor 发 move 请求；
-    /// - Windows 上 gpui 的 `start_window_move` 是空实现。必须把热区
-    ///   标记为系统标题栏区域，让 WM_NCHITTEST 返回 HTCAPTION，由
-    ///   DefWindowProc 接管拖动（顺带获得贴边分屏、双击最大化等原生行为）。
+    /// Linux（Wayland/X11）由 gpui 向 compositor 发 move 请求；Windows 有两条
+    /// 路径，同时保留：
+    /// - `WindowControlArea::Drag` 让 `WM_NCHITTEST` 返回 `HTCAPTION`，由
+    ///   DefWindowProc 接管拖动（贴边分屏、双击最大化都是原生行为）；
+    /// - 鼠标按下时再调用 `start_window_move` 兜底。命中测试依赖上一帧的
+    ///   `mouse_hit_test`，在刚切换页面/DPI 变化等时序下可能拿不到
+    ///   HTCAPTION，此时客户区仍会收到 mouse-down，兜底路径保证一定能拖。
+    ///   两条路径不会同时触发：返回 HTCAPTION 时客户区收不到 mouse-down。
     #[cfg(target_os = "windows")]
     fn window_drag_area<E: gpui::InteractiveElement>(element: E) -> E {
-        element.window_control_area(gpui::WindowControlArea::Drag)
+        element
+            .window_control_area(gpui::WindowControlArea::Drag)
+            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                window.start_window_move();
+            })
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -747,10 +1157,11 @@ impl ChordialApp {
             if let Some(v) = h {
                 el = el.h(px(v));
             }
-            el.on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
-                window.start_window_resize(edge);
-            })
-            .into_any_element()
+            el.occlude()
+                .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
+                    window.start_window_resize(edge);
+                })
+                .into_any_element()
         };
         vec![
             edge(
@@ -846,6 +1257,28 @@ impl ChordialApp {
 
     fn enter_immersive(&mut self, cx: &mut Context<Self>) {
         self.immersive = true;
+        self.sheet_drag = None;
+        // Dock→全屏：第一帧就是 Dock 的条状卡片，随后与共享封面/曲名
+        // 一起放大到满窗。
+        self.immersive_expand = Some(SpringSettle::new(
+            1.0,
+            0.0,
+            0.0,
+            Instant::now(),
+            Self::EXPAND_DAMPING,
+            Self::EXPAND_STIFFNESS,
+        ));
+        self.portrait_page = PortraitPage::Art;
+        self.portrait_transition = None;
+        self.portrait_enter = Some(Instant::now());
+        self.portrait_last_input = Instant::now();
+        self.portrait_chrome_hidden = false;
+        self.portrait_chrome_at = None;
+        self.portrait_toast = None;
+        self.hide_drawer_now();
+        self.wide_lyrics_hidden = false;
+        self.stage_motion = None;
+        self.ensure_portrait_idle_ticker(cx);
         // AMLL：页面打开时所有 MediaButton 的 SVG 内容重新挂载 → pressed 回弹；
         // 上一首/下一首的双箭头同时播放一次合并入场动画。
         self.ui_anim_enter = Some(Instant::now());
@@ -855,6 +1288,12 @@ impl ChordialApp {
         self.ui_anim_volume = None;
         self.last_volume_input = self.player_status.volume;
         self.ensure_ui_anim_ticker(cx);
+        // 沉浸层会接管 `lyric_view` 的样式与背景；先撤销手机壳的 Mesh
+        // 背景标记，退出沉浸后下一帧才能重新套用手机播放页样式。
+        self.phone_backdrop = false;
+        let wide = !self.force_portrait
+            && self.viewport_width >= self.viewport_height
+            && self.viewport_width >= MIN_WIDE_SPLIT_W;
         let white = gpui::Hsla {
             h: 0.0,
             s: 0.0,
@@ -864,6 +1303,11 @@ impl ChordialApp {
         self.lyric_view.update(cx, |view, _| {
             // 沉浸层背景 = AMLL 的 Mesh Gradient（动画），铺满整个窗口：
             // 光栅按低分辨率计算，由 GPU 双线性放大到屏幕。
+            view.set_text_visible(wide);
+            view.set_click_seek_enabled(wide);
+            // 浅色主题在主面板用纯色，但沉浸层必须用封面驱动的 Mesh，
+            // 否则会得到一块纯黑/纯纸色背景。
+            view.set_background_kind(BackgroundRendererKind::MeshGradient);
             view.set_background_visible(!self.no_bg);
             view.set_background_color(gpui::rgb(0x111111).into());
             view.set_background_fps(30);
@@ -890,11 +1334,839 @@ impl ChordialApp {
         });
     }
 
-    // ---------- 沉浸层控件动画 ----------
+    // ---------- 播放页（AMLL 沉浸层 + 竖屏子页面） ----------
+
+    /// 兼容旧入口：统一进入 AMLL 沉浸层；竖向窗口使用竖屏布局。
+    fn open_portrait(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.login_open = false;
+        self.eq_open = false;
+        self.force_portrait = true;
+        self.enter_immersive(cx);
+        cx.notify();
+    }
+
+    /// 主面板的歌词入口：宽屏沉浸层直接展示右侧歌词（关闭状态会被重置）；
+    /// 竖屏窗口不承载歌词，只打开同一套播放页。
+    fn open_lyrics_immersive(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.login_open = false;
+        self.eq_open = false;
+        self.force_portrait = false;
+        self.enter_immersive(cx);
+        cx.notify();
+    }
+
+    fn close_portrait(&mut self, cx: &mut Context<Self>) {
+        self.exit_immersive(cx);
+        cx.notify();
+    }
+
+    /// 任意输入都会重置自动隐藏计时；隐藏状态下则立刻淡入。
+    fn bump_portrait(&mut self, cx: &mut Context<Self>) {
+        self.portrait_last_input = Instant::now();
+        if self.portrait_chrome_hidden {
+            self.portrait_chrome_hidden = false;
+            self.portrait_chrome_at = Some(Instant::now());
+            self.ensure_ui_anim_ticker(cx);
+        }
+        self.ensure_portrait_idle_ticker(cx);
+    }
+
+    fn set_portrait_page(&mut self, page: PortraitPage, cx: &mut Context<Self>) {
+        let from = self
+            .portrait_transition
+            .map(|t| t.to)
+            .unwrap_or(self.portrait_page);
+        if from == page {
+            return;
+        }
+        let now = Instant::now();
+        // FLIP：先记录当前屏幕上的共享元素几何（可能正处于上一段补间中），
+        // 再切换页面，最后补间到新页面的页头/大封面几何。播放页在宽屏
+        // 歌词可见时是 WideSplit，因此不能只看 `portrait_page` 的默认模态。
+        let art_mode =
+            self.immersive_stage_mode(cx, self.viewport_width, self.viewport_height);
+        let current_mode = if self.portrait_page == PortraitPage::Art {
+            art_mode
+        } else {
+            Self::stage_mode_for_page(self.portrait_page)
+        };
+        let target_mode = if page == PortraitPage::Art {
+            art_mode
+        } else {
+            Self::stage_mode_for_page(page)
+        };
+        // 队列是覆盖在播放页上的子页面，整页纵向位移。
+        let moving_page = from != page;
+        if moving_page {
+            let transition = Transition::new(from, page);
+            self.stage_motion = Some(self.layout_motion_to(
+                target_mode,
+                current_mode,
+                now,
+                transition.duration_ms,
+            ));
+            self.portrait_transition = Some(transition);
+        } else {
+            self.portrait_transition = None;
+        }
+        self.portrait_page = page;
+        if page == PortraitPage::Queue
+            && let Some(position) = self.queue_pos
+        {
+            // 虚拟列表只渲染可视行；进入队列时把当前曲目滚到视口中心。
+            self.queue_scroll
+                .scroll_to_item(position, gpui::ScrollStrategy::Center);
+        }
+        self.portrait_last_input = Instant::now();
+        self.ensure_ui_anim_ticker(cx);
+        self.ensure_portrait_idle_ticker(cx);
+        cx.notify();
+    }
+
+    fn stage_mode_for_page(page: PortraitPage) -> StageMode {
+        match page {
+            PortraitPage::Art => StageMode::CompactArt,
+            PortraitPage::Queue => StageMode::CompactQueue,
+        }
+    }
+
+    /// 构造一段 First→Last 补间。`fallback` 是当前静止模态；若上一段补间
+    /// 尚未结束，则从它的当前插值几何继续，避免连续点击时画面跳变。
+    fn layout_motion_to(
+        &self,
+        to_mode: StageMode,
+        fallback: StageMode,
+        now: Instant,
+        duration_ms: f32,
+    ) -> LayoutMotion {
+        let from = self.current_stage_geometry(fallback, now);
+        let to = immersive_geometry(to_mode, self.viewport_width, self.viewport_height);
+        LayoutMotion::starting_at(fallback, from, to_mode, to, now, duration_ms)
+    }
+
+    /// 当前屏幕上的共享元素几何：补间进行中就用插值结果。
+    fn current_stage_geometry(&self, fallback: StageMode, now: Instant) -> StageGeometry {
+        if let Some(motion) = self.stage_motion.filter(|motion| motion.active(now)) {
+            return motion.geometry(now);
+        }
+        immersive_geometry(fallback, self.viewport_width, self.viewport_height)
+    }
+
+    /// 当前是否使用布局 1（宽屏/类平板 + 歌词可见）。
+    ///
+    /// 布局 1 的唯一判据是「横向窗口且歌词可见」；竖屏、无歌词、用户收起歌词
+    /// 都回落到布局 2。这样布局不再由两套页面分别决定，避免再次漂移。
+    fn layout_one_active(&self, cx: &App, width: f32, height: f32) -> bool {
+        !self.force_portrait
+            && width >= height
+            && width >= MIN_WIDE_SPLIT_W
+            && self.lyric_view.read(cx).has_lyrics()
+            && !self.wide_lyrics_hidden
+    }
+
+    /// 宽屏沉浸层：歌词开/关在「布局 1」与「布局 2」之间切换，
+    /// 播放器列与歌词列走同一套共享元素 FLIP。
+    fn toggle_wide_lyrics(&mut self, cx: &mut Context<Self>) {
+        if !self.layout_can_toggle_lyrics(cx) {
+            return;
+        }
+        let now = Instant::now();
+        let current_mode = if self.wide_lyrics_hidden {
+            StageMode::CompactArt
+        } else {
+            StageMode::WideSplit
+        };
+        self.wide_lyrics_hidden = !self.wide_lyrics_hidden;
+        let target_mode = if self.wide_lyrics_hidden {
+            StageMode::CompactArt
+        } else {
+            StageMode::WideSplit
+        };
+        self.stage_motion = Some(self.layout_motion_to(target_mode, current_mode, now, 320.0));
+        self.ensure_ui_anim_ticker(cx);
+        cx.notify();
+    }
+
+    /// 歌词开关只对「横向窗口 + 当前有歌词」有意义。
+    fn layout_can_toggle_lyrics(&self, cx: &App) -> bool {
+        !self.force_portrait
+            && self.viewport_width >= self.viewport_height
+            && self.viewport_width >= MIN_WIDE_SPLIT_W
+            && self.lyric_view.read(cx).has_lyrics()
+    }
+
+    // ---------- 断点与手机壳状态 ----------
+
+    fn is_phone(&self) -> bool {
+        self.viewport_class.is_phone()
+    }
+
+    /// 手机壳（非沉浸层）才有「播放页 / 曲库页」的切换。
+    fn phone_shell_active(&self) -> bool {
+        self.is_phone() && !self.immersive
+    }
+
+    fn show_phone_browse(&mut self) {
+        if self.is_phone() {
+            self.phone_page = PhonePage::Browse;
+        }
+    }
+
+    /// 从手机曲库选中曲目后回到播放页；播放解析是异步的，不能等
+    /// `current_track` 落定才切页，否则首次播放会停在曲库页。
+    fn show_phone_player(&mut self) {
+        if self.is_phone() {
+            self.phone_page = PhonePage::Player;
+        }
+    }
+
+    /// 跨断点时收敛一次跨模块状态。
+    ///
+    /// 需要处理的只有「哪些视图属于当前布局」：手机壳没有 Dock/侧栏，
+    /// 离开手机壳时抽屉与手机背景必须交还给桌面/沉浸层，否则会留下
+    /// 一个无入口可关的浮层或一块黑色 Mesh 背景。
+    fn handle_viewport_class_change(
+        &mut self,
+        next: ViewportClass,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.viewport_class;
+        if previous == next {
+            return;
+        }
+        self.viewport_class = next;
+        match (previous, next) {
+            (_, ViewportClass::Phone) => {
+                self.hide_drawer_now();
+                // 首次收窄：保留搜索/集合/队列的浏览上下文；普通曲库
+                // 且有曲目时直接落在播放页（参考手机播放器）。
+                self.phone_page = phone_default_page(
+                    self.view_tab,
+                    self.library_filter,
+                    self.current_track.is_some(),
+                );
+                // 不重置 `force_portrait`：它是用户主动进入竖屏播放页的
+                // 选择，跨断点后仍应保留，交给沉浸层自己判断布局。
+            }
+            (ViewportClass::Phone, _) => {
+                self.hide_drawer_now();
+                self.phone_page = PhonePage::Player;
+            }
+            _ => {}
+        }
+        if !self.immersive {
+            self.sync_phone_backdrop(cx);
+        }
+        cx.notify();
+    }
+
+    /// 手机播放页的 Mesh 背景与沉浸层共用 `lyric_view`，用一次显式状态
+    /// 迁移避免每帧重复设置；离开手机壳/进入沉浸层时交还面板样式。
+    fn sync_phone_backdrop(&mut self, cx: &mut Context<Self>) {
+        let on = self.phone_shell_active()
+            && self.phone_page == PhonePage::Player
+            && self.current_track.is_some();
+        if on == self.phone_backdrop {
+            return;
+        }
+        self.phone_backdrop = on;
+        if on {
+            let (width, height) = (self.viewport_width, self.viewport_height);
+            let scale = (200.0 / width.max(height).max(1.0)).clamp(0.04, 0.5);
+            let no_bg = self.no_bg;
+            let style = immersive_lyric_style(width, height);
+            let white = gpui::white();
+            self.lyric_view.update(cx, |view, _| {
+                view.set_text_visible(false);
+                view.set_click_seek_enabled(false);
+                view.set_background_kind(BackgroundRendererKind::MeshGradient);
+                view.set_background_visible(!no_bg);
+                view.set_background_bounds(None);
+                view.set_background_render_scale(scale);
+                view.set_background_color(gpui::rgb(0x111111).into());
+                view.set_background_fps(30);
+                view.set_background_flow_speed(2.0);
+                view.set_colors(LyricRenderColors {
+                    text: white,
+                    translation: white,
+                    overlay: gpui::Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 0.0,
+                        a: 0.0,
+                    },
+                    interlude_dot: white,
+                    // 没有封面时 Mesh 会退化成纯黑；给手机播放页一个
+                    // 偏蓝的近黑底，至少和参考图的“暗色玻璃”一致。
+                    fallback_background: gpui::rgb(0x171820).into(),
+                    glow: white,
+                });
+                view.set_text_style(style);
+            });
+        } else if !self.immersive {
+            let theme = Theme::get(cx).clone();
+            self.lyric_view.update(cx, |view, _| {
+                view.set_text_visible(true);
+                view.set_click_seek_enabled(true);
+                view.set_background_visible(true);
+                view.set_background_bounds(None);
+                view.set_background_kind(if theme.is_dark() {
+                    BackgroundRendererKind::MeshGradient
+                } else {
+                    BackgroundRendererKind::Css
+                });
+                view.set_colors(LyricRenderColors {
+                    text: theme.text,
+                    translation: theme.text_dim,
+                    overlay: theme.overlay,
+                    interlude_dot: theme.text,
+                    fallback_background: theme.bg,
+                    glow: theme.playing,
+                });
+                view.set_text_style(compact_lyric_style(&theme));
+            });
+        }
+    }
+
+    // ---------- 底部「更多」抽屉 ----------
+
+    const DRAWER_ANIM_MS: f32 = 240.0;
+
+    fn hide_drawer_now(&mut self) {
+        self.drawer_open = false;
+        self.drawer_at = None;
+        self.drawer_page = DrawerPage::Root;
+    }
+
+    fn open_drawer(&mut self, cx: &mut Context<Self>) {
+        if self.eq_open {
+            return;
+        }
+        self.drawer_open = true;
+        self.drawer_page = DrawerPage::Root;
+        self.drawer_at = Some(Instant::now());
+        self.ensure_ui_anim_ticker(cx);
+        cx.notify();
+    }
+
+    fn close_drawer(&mut self, cx: &mut Context<Self>) {
+        if !self.drawer_open {
+            return;
+        }
+        self.drawer_open = false;
+        self.drawer_at = Some(Instant::now());
+        self.ensure_ui_anim_ticker(cx);
+        cx.notify();
+    }
+
+    fn drawer_animating(&self, now: Instant) -> bool {
+        self.drawer_at.is_some_and(|at| {
+            now.saturating_duration_since(at).as_secs_f32() * 1000.0 < Self::DRAWER_ANIM_MS
+        })
+    }
+
+    fn drawer_visible(&self) -> bool {
+        self.drawer_open || self.drawer_at.is_some()
+    }
+
+    fn drawer_progress(&self, now: Instant) -> f32 {
+        let Some(at) = self.drawer_at else {
+            return if self.drawer_open { 1.0 } else { 0.0 };
+        };
+        let t = (now.saturating_duration_since(at).as_secs_f32() * 1000.0
+            / Self::DRAWER_ANIM_MS)
+            .clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        if self.drawer_open { eased } else { 1.0 - eased }
+    }
+
+    pub(crate) fn show_portrait_toast(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        let started = Instant::now();
+        self.portrait_toast = Some((text.into(), started));
+        // Toast 是静态文本，不需要动画帧；用一次性定时器清理即可，
+        // 避免为 1.8 秒的显示期持续 300Hz 重绘。
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1800))
+                .await;
+            let _ = weak.update(cx, |app, cx| {
+                if app
+                    .portrait_toast
+                    .as_ref()
+                    .is_some_and(|(_, timestamp)| *timestamp == started)
+                {
+                    app.portrait_toast = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 3.2 秒无输入后隐藏标题 / 进度 / Dock；移动鼠标或点击即恢复。
+    fn ensure_portrait_idle_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.portrait_idle_ticker {
+            return;
+        }
+        self.portrait_idle_ticker = true;
+        cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(220))
+                    .await;
+                let alive = weak
+                    .update(cx, |app, cx| {
+                        if !app.immersive || app.portrait_chrome_hidden {
+                            app.portrait_idle_ticker = false;
+                            return false;
+                        }
+                        // 横向布局保持 AMLL 常驻控件，不做自动隐藏。
+                        if !app.force_portrait && app.viewport_width >= app.viewport_height {
+                            app.portrait_idle_ticker = false;
+                            return false;
+                        }
+                        let idle = app.portrait_last_input.elapsed() >= Duration::from_millis(3200);
+                        if idle && !app.drawer_open && app.portrait_transition.is_none() {
+                            app.portrait_chrome_hidden = true;
+                            app.portrait_chrome_at = Some(Instant::now());
+                            app.portrait_idle_ticker = false;
+                            app.ensure_ui_anim_ticker(cx);
+                            cx.notify();
+                            return false;
+                        }
+                        true
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn portrait_animating(&self) -> bool {
+        if !self.immersive {
+            return false;
+        }
+        let within = |t: Option<Instant>, ms: u64| {
+            t.is_some_and(|t| t.elapsed() < Duration::from_millis(ms))
+        };
+        self.portrait_transition.is_some()
+            || within(self.portrait_enter, 260)
+            || within(self.portrait_chrome_at, 220)
+    }
+
+    fn cycle_play_mode(&mut self, cx: &mut Context<Self>) {
+        self.play_mode = self.play_mode.next();
+        let text = self.play_mode.full_label();
+        self.show_portrait_toast(text, cx);
+        cx.notify();
+    }
+
+    fn set_sleep_minutes(&mut self, minutes: Option<u32>, cx: &mut Context<Self>) {
+        self.sleep_gen = self.sleep_gen.wrapping_add(1);
+        let generation = self.sleep_gen;
+        self.sleep_minutes = minutes;
+        self.sleep_until = minutes.map(|m| Instant::now() + Duration::from_secs(m as u64 * 60));
+        if let Some(minutes) = minutes {
+            let weak = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_secs(minutes as u64 * 60))
+                    .await;
+                let _ = weak.update(cx, |app, cx| {
+                    if app.sleep_gen != generation {
+                        return;
+                    }
+                    app.sleep_until = None;
+                    app.sleep_minutes = None;
+                    app.player.pause();
+                    app.player_status = app.player.status();
+                    app.portrait_toast = Some(("睡眠定时结束，已暂停播放".into(), Instant::now()));
+                    app.ensure_ui_anim_ticker(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+            self.show_portrait_toast(format!("{minutes} 分钟后暂停播放"), cx);
+        } else {
+            self.show_portrait_toast("已取消睡眠定时", cx);
+        }
+        cx.notify();
+    }
+
+    // ---------- 参数均衡器 ----------
+
+    fn open_eq(&mut self, cx: &mut Context<Self>) {
+        self.eq_open = true;
+        self.eq_open_at = Some(Instant::now());
+        self.eq.settings = self.eq.settings.clone().sanitized();
+        self.player.set_eq(self.eq.settings.clone());
+        self.ensure_ui_anim_ticker(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_eq(&mut self, cx: &mut Context<Self>) {
+        self.eq_open = false;
+        self.eq_save_at = None;
+        self.persist_eq();
+        cx.notify();
+    }
+
+    pub(crate) fn remove_saved_preset(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.eq.saved.len() {
+            self.eq.saved.remove(index);
+            self.persist_eq();
+            cx.notify();
+        }
+    }
+
+    fn eq_animating(&self) -> bool {
+        // 只有打开时的 240ms 入场淡入需要连续帧；400ms 落盘防抖是后台
+        // 一次性任务，不应把整个界面拖入持续重绘。
+        self.eq_open
+            && self
+                .eq_open_at
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(260))
+    }
+
+    /// 把当前配置推给播放线程，并在 400ms 后落盘。
+    pub(crate) fn apply_eq(&mut self, cx: &mut Context<Self>) {
+        self.eq.settings = self.eq.settings.clone().sanitized();
+        self.eq.selected = self
+            .eq
+            .selected
+            .filter(|index| *index < self.eq.settings.bands.len());
+        self.player.set_eq(self.eq.settings.clone());
+        self.eq_save_at = Some(Instant::now());
+        self.eq_save_gen = self.eq_save_gen.wrapping_add(1);
+        let generation = self.eq_save_gen;
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(420))
+                .await;
+            let _ = weak.update(cx, |app, _| {
+                if app.eq_save_gen == generation && app.eq_save_at.is_some() {
+                    app.eq_save_at = None;
+                    app.persist_eq();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn set_eq_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.eq.settings.enabled = on;
+        self.eq.touch();
+        self.apply_eq(cx);
+        self.show_portrait_toast(
+            if on {
+                "均衡器已开启"
+            } else {
+                "均衡器已关闭"
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn add_eq_band(&mut self, cx: &mut Context<Self>) {
+        if self.eq.add_band().is_some() {
+            self.apply_eq(cx);
+        } else {
+            self.show_portrait_toast(format!("最多 {EQ_MAX_BANDS} 个频段"), cx);
+        }
+    }
+
+    pub(crate) fn remove_eq_band(&mut self, cx: &mut Context<Self>) {
+        self.eq.remove_selected();
+        self.apply_eq(cx);
+    }
+
+    pub(crate) fn select_eq_band(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.eq.selected = Some(index);
+        self.eq.type_menu_open = false;
+        self.bump_portrait(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_eq_filter_kind(&mut self, kind: FilterKind, cx: &mut Context<Self>) {
+        if let Some(band) = self.eq.selected_band_mut() {
+            band.kind = kind;
+            self.eq.type_menu_open = false;
+            self.eq.touch();
+            self.apply_eq(cx);
+        }
+    }
+
+    pub(crate) fn set_eq_freq(&mut self, freq_hz: f32, cx: &mut Context<Self>) {
+        if let Some(band) = self.eq.selected_band_mut() {
+            band.freq_hz = freq_hz.clamp(20.0, 20_000.0);
+            self.eq.touch();
+            self.apply_eq(cx);
+        }
+    }
+
+    pub(crate) fn set_eq_gain(&mut self, gain_db: f32, cx: &mut Context<Self>) {
+        if let Some(band) = self.eq.selected_band_mut() {
+            band.gain_db = gain_db.clamp(EQ_MIN_GAIN_DB, EQ_MAX_GAIN_DB);
+            self.eq.touch();
+            self.apply_eq(cx);
+        }
+    }
+
+    pub(crate) fn set_eq_q(&mut self, q: f32, cx: &mut Context<Self>) {
+        if let Some(band) = self.eq.selected_band_mut() {
+            band.q = q.clamp(chordal_player::EQ_MIN_Q, chordal_player::EQ_MAX_Q);
+            self.eq.touch();
+            self.apply_eq(cx);
+        }
+    }
+
+    pub(crate) fn load_eq_preset(&mut self, preset: PresetEntry, cx: &mut Context<Self>) {
+        self.eq.load_preset(&preset);
+        self.apply_eq(cx);
+        self.show_portrait_toast(format!("已应用「{}」", preset.name), cx);
+        cx.notify();
+    }
+
+    // ---------- AutoEQ 耳机档案 ----------
+
+    /// 切换 EQ 分类；进入 AutoEQ 时按需加载仓库索引。
+    pub(crate) fn select_eq_tab(&mut self, tab: EqTab, cx: &mut Context<Self>) {
+        self.eq.tab = tab;
+        self.eq.type_menu_open = false;
+        if tab == EqTab::AutoEq {
+            self.ensure_autoeq(cx);
+        }
+        cx.notify();
+    }
+
+    /// 首次进入 AutoEQ：先读本地缓存（同步、几毫秒），过期或缺失时后台拉取。
+    pub(crate) fn ensure_autoeq(&mut self, cx: &mut Context<Self>) {
+        if self.eq.autoeq.status != AutoEqStatus::Idle || self.eq.autoeq.index_loading {
+            return;
+        }
+        match autoeq::load_cached_index() {
+            Some((entries, modified)) => {
+                self.eq.autoeq.replace_entries(entries);
+                self.eq.autoeq.status = AutoEqStatus::Ready;
+                self.eq.autoeq.from_cache = true;
+                self.eq.autoeq.error = None;
+                cx.notify();
+                if autoeq::index_cache_is_stale(modified) {
+                    self.sync_autoeq(false, cx);
+                }
+            }
+            None => self.sync_autoeq(false, cx),
+        }
+    }
+
+    /// 从 AutoEq 仓库同步索引；已有缓存时列表保持可见，只更新状态。
+    pub(crate) fn sync_autoeq(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.eq.autoeq.index_loading {
+            return;
+        }
+        self.eq.autoeq.index_loading = true;
+        if self.eq.autoeq.entries.is_empty() {
+            self.eq.autoeq.status = AutoEqStatus::Loading;
+        }
+        self.eq.autoeq.error = None;
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { autoeq::fetch_index_blocking() })
+                .await;
+            let _ = weak.update(cx, |app, cx| {
+                app.eq.autoeq.index_loading = false;
+                let toast = match result {
+                    Ok(entries) => {
+                        let count = entries.len();
+                        app.eq.autoeq.replace_entries(entries);
+                        app.eq.autoeq.status = AutoEqStatus::Ready;
+                        app.eq.autoeq.from_cache = false;
+                        app.eq.autoeq.error = None;
+                        tracing::info!(count, "autoeq index synced");
+                        manual.then(|| format!("AutoEQ 已同步：{count} 款耳机"))
+                    }
+                    Err(error) => {
+                        if app.eq.autoeq.entries.is_empty() {
+                            app.eq.autoeq.status = AutoEqStatus::Failed;
+                        }
+                        tracing::warn!(error = %error, "autoeq index sync failed");
+                        app.eq.autoeq.error = Some(error.clone());
+                        manual.then(|| format!("AutoEQ 同步失败：{error}"))
+                    }
+                };
+                if let Some(message) = toast {
+                    app.show_portrait_toast(message, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 预览（`apply = false`）或直接应用（`apply = true`）某个型号；
+    /// 曲线尚未拉取时先读缓存，再按需下载，拉取完成后自动应用。
+    pub(crate) fn select_autoeq_entry(
+        &mut self,
+        file: String,
+        apply: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((name, loaded)) = self
+            .eq
+            .autoeq
+            .find(&file)
+            .map(|entry| (entry.name.clone(), entry.bands.is_some()))
+        else {
+            return;
+        };
+        // 新选择覆盖旧的「拉取完自动应用」请求：预览别的型号不应再触发
+        // 上一次的自动应用。
+        if self.eq.autoeq.pending_apply.as_deref() != Some(file.as_str()) {
+            self.eq.autoeq.pending_apply = None;
+        }
+        self.eq.autoeq_preview = Some(file.clone());
+        if loaded {
+            if apply {
+                self.apply_autoeq_entry(&file, cx);
+            } else {
+                cx.notify();
+            }
+            return;
+        }
+        if let Some((bands, gain)) = autoeq::load_cached_param(&file) {
+            self.store_autoeq_param(&file, bands, gain);
+            if apply {
+                self.apply_autoeq_entry(&file, cx);
+            } else {
+                cx.notify();
+            }
+            return;
+        }
+        if apply {
+            self.eq.autoeq.pending_apply = Some(file.clone());
+            self.show_portrait_toast(format!("正在拉取「{name}」…"), cx);
+        }
+        let already_loading = self
+            .eq
+            .autoeq
+            .find(&file)
+            .is_some_and(|entry| entry.loading);
+        if !already_loading
+            && let Some(entry) = self.eq.autoeq.find_mut(&file)
+        {
+            entry.loading = true;
+            entry.error = None;
+        }
+        cx.notify();
+        if already_loading {
+            return;
+        }
+        cx.spawn(async move |weak, cx| {
+            let key = file.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { autoeq::fetch_param_blocking(&key) })
+                .await;
+            let _ = weak.update(cx, |app, cx| {
+                let pending = app.eq.autoeq.pending_apply.clone();
+                let mut apply_now = false;
+                let mut failure = None;
+                if let Some(entry) = app.eq.autoeq.find_mut(&file) {
+                    entry.loading = false;
+                    match result {
+                        Ok((bands, gain)) => {
+                            entry.bands = Some(bands);
+                            entry.input_gain_db = gain;
+                            entry.error = None;
+                            apply_now = pending.as_deref() == Some(file.as_str());
+                        }
+                        Err(error) => {
+                            entry.error = Some(error.clone());
+                            failure = Some(error);
+                        }
+                    }
+                }
+                if let Some(error) = &failure {
+                    tracing::warn!(file = %file, error = %error, "autoeq param fetch failed");
+                }
+                if apply_now {
+                    app.eq.autoeq.pending_apply = None;
+                    app.apply_autoeq_entry(&file, cx);
+                } else if failure.is_some() {
+                    app.eq.autoeq.pending_apply = None;
+                }
+                if let Some(error) = failure {
+                    app.show_portrait_toast(format!("AutoEQ 拉取失败：{error}"), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn store_autoeq_param(&mut self, file: &str, bands: Vec<EqBand>, input_gain_db: f32) {
+        if let Some(entry) = self.eq.autoeq.find_mut(file) {
+            entry.bands = Some(bands);
+            entry.input_gain_db = input_gain_db;
+            entry.error = None;
+            entry.loading = false;
+        }
+    }
+
+    pub(crate) fn apply_autoeq_entry(&mut self, file: &str, cx: &mut Context<Self>) {
+        let Some((name, settings)) = self
+            .eq
+            .autoeq
+            .find(file)
+            .and_then(|entry| entry.to_settings().map(|settings| (entry.name.clone(), settings)))
+        else {
+            return;
+        };
+        self.eq.load_settings(name.clone(), settings);
+        self.eq.autoeq_preview = Some(file.to_string());
+        self.apply_eq(cx);
+        self.show_portrait_toast(format!("已应用「{name}」"), cx);
+        cx.notify();
+    }
+
+    pub(crate) fn save_eq_preset(&mut self, cx: &mut Context<Self>) {
+        if self.eq.settings.bands.is_empty() {
+            self.show_portrait_toast("空配置无需保存", cx);
+            return;
+        }
+        let name = self.eq.save_as();
+        self.eq.tab = EqTab::Personal;
+        self.eq_save_at = None;
+        self.persist_eq();
+        self.show_portrait_toast(format!("已保存「{name}」"), cx);
+        cx.notify();
+    }
+
+    pub(crate) fn persist_eq(&mut self) {
+        let mut cfg = crate::config::load_or_default();
+        cfg.equalizer = self.eq.settings.clone();
+        cfg.eq_saved_presets = self.eq.saved.clone();
+        crate::config::save(&cfg);
+    }
 
     const UI_ANIM_PRESS_MS: f32 = 700.0;
     const UI_ANIM_ARROWS_MS: f32 = 600.0;
     const UI_ANIM_SPEAKER_MS: f32 = 750.0;
+    /// Dock→全屏展开弹簧：轻微过冲后收敛。
+    const EXPAND_DAMPING: f32 = 21.0;
+    const EXPAND_STIFFNESS: f32 = 200.0;
 
     fn anim_progress(start: Option<Instant>, duration_ms: f32) -> f32 {
         match start {
@@ -912,6 +2184,9 @@ impl ChordialApp {
     }
 
     fn ui_anim_active(&self) -> bool {
+        if self.bench_anim {
+            return true;
+        }
         let running = |start: Option<Instant>, ms: f32| {
             start.is_some_and(|t| t.elapsed().as_secs_f32() * 1000.0 < ms)
         };
@@ -922,35 +2197,58 @@ impl ChordialApp {
             || self
                 .ui_anim_volume
                 .is_some_and(|(t, _)| t.elapsed().as_secs_f32() * 1000.0 < Self::UI_ANIM_SPEAKER_MS)
+            || self
+                .stage_motion
+                .is_some_and(|motion| motion.active(Instant::now()))
+            || self.portrait_animating()
+            || self.sheet_drag.is_some_and(|drag| drag.animating())
+            || self.drawer_animating(Instant::now())
+            || self.immersive_expanding(Instant::now())
+            || self.eq_animating()
     }
 
-    /// 有控件动画时以 60fps 唤醒重绘；动画全部结束后泵自行退出。
+    /// 安排一次重绘。帧节奏由 `Render` 中的 `request_animation_frame` 驱动：
+    /// 只要有动画未结束，就跟随显示器刷新率（300Hz 屏即 300fps），动画
+    /// 结束后自动停止。这里不再维护固定 16ms 定时泵。
     fn ensure_ui_anim_ticker(&mut self, cx: &mut Context<Self>) {
-        if self.ui_anim_ticker {
-            return;
+        cx.notify();
+    }
+
+    /// 在渲染开始前清理已结束的过渡状态，避免动画结束后仍请求下一帧。
+    fn cleanup_finished_animations(&mut self, now: Instant, cx: &mut Context<Self>) {
+        if self
+            .portrait_transition
+            .is_some_and(|transition| transition.done(now))
+        {
+            self.portrait_transition = None;
         }
-        self.ui_anim_ticker = true;
-        cx.spawn(async move |weak, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                let alive = weak
-                    .update(cx, |app, cx| {
-                        if !app.immersive || !app.ui_anim_active() {
-                            app.ui_anim_ticker = false;
-                            return false;
-                        }
-                        cx.notify();
-                        true
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
+        if self.stage_motion.is_some_and(|motion| motion.settled(now)) {
+            self.stage_motion = None;
+        }
+        // 抽屉开/合动画结束：清掉起点；关闭状态由 `drawer_visible` 判定隐藏。
+        if self.drawer_at.is_some_and(|at| {
+            now.saturating_duration_since(at).as_secs_f32() * 1000.0 >= Self::DRAWER_ANIM_MS
+        }) {
+            self.drawer_at = None;
+        }
+        // Dock→全屏展开结束：撤销动画状态，页面由静态布局接管。
+        if self
+            .immersive_expand
+            .is_some_and(|spring| spring.settled(now))
+        {
+            self.immersive_expand = None;
+        }
+        // 下拉关闭：回弹结束直接收手；关闭动画结束才真正退出沉浸层。
+        if let Some(drag) = self.sheet_drag {
+            match drag.settled(now) {
+                Some(SheetDragOutcome::Returned) => self.sheet_drag = None,
+                Some(SheetDragOutcome::Dismissed) => {
+                    self.sheet_drag = None;
+                    self.exit_immersive(cx);
                 }
+                None => {}
             }
-        })
-        .detach();
+        }
     }
 
     /// 音量滑杆输入：跨越 0 / 1 边界时触发 AMLL 的喇叭弹跳。
@@ -972,10 +2270,85 @@ impl ChordialApp {
         }
     }
 
+    // ---------- 沉浸页下拉关闭 ----------
+    //
+    // 顶部拖拽条是统一的 sheet 把手：按下开始记手，向下拖动时整页跟手
+    // 下移并露出主面板，松手后按位移/速度回弹或退出沉浸层（参考视频的
+    // 播放页下拉关闭手感）。
+
+    fn begin_sheet_drag(&mut self, y: f32, cx: &mut Context<Self>) {
+        if !self.immersive || self.eq_open || self.immersive_expanding(Instant::now()) {
+            return;
+        }
+        self.sheet_drag = Some(SheetDrag::begin(y, Instant::now()));
+        cx.notify();
+    }
+
+    fn update_sheet_drag(&mut self, y: f32, cx: &mut Context<Self>) {
+        if let Some(drag) = &mut self.sheet_drag {
+            if drag.update(y, Instant::now()) {
+                cx.notify();
+            }
+        }
+    }
+
+    fn release_sheet_drag(&mut self, height: f32, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let dock_y = dock_rect(self.viewport_width, self.viewport_height).y;
+        if let Some(drag) = &mut self.sheet_drag {
+            drag.release(height, dock_y, now);
+            if !drag.animating() {
+                self.sheet_drag = None;
+            }
+        }
+        self.ensure_ui_anim_ticker(cx);
+        cx.notify();
+    }
+
+    /// Dock→全屏共享布局的当前进度：`1.0` = 页面仍完全贴在 Dock 上，
+    /// `0.0` = 已铺满整个窗口。展开动画与下拉手势共用这一条通道。
+    fn immersive_dock_progress(&self, now: Instant, height: f32) -> f32 {
+        if let Some(spring) = self.immersive_expand {
+            return spring.position(now).clamp(0.0, 1.0);
+        }
+        if let Some(drag) = self.sheet_drag {
+            if drag.engaged() || drag.animating() {
+                let dock_y = dock_rect(self.viewport_width, height).y.max(1.0);
+                return (drag.offset(now) / dock_y).clamp(0.0, 1.0);
+            }
+        }
+        0.0
+    }
+
+    fn immersive_expanding(&self, now: Instant) -> bool {
+        self.immersive_expand
+            .is_some_and(|spring| !spring.settled(now))
+    }
+
+    /// 当前沉浸页的共享元素目标模态（与页面实际布局选择一致）。
+    fn immersive_stage_mode(&self, cx: &App, width: f32, height: f32) -> StageMode {
+        if self.layout_one_active(cx, width, height) {
+            StageMode::WideSplit
+        } else {
+            StageMode::CompactArt
+        }
+    }
+
     fn exit_immersive(&mut self, cx: &mut Context<Self>) {
         self.immersive = false;
+        self.sheet_drag = None;
+        self.immersive_expand = None;
+        self.force_portrait = false;
+        self.portrait_page = PortraitPage::Art;
+        self.portrait_transition = None;
+        self.hide_drawer_now();
+        self.portrait_chrome_hidden = false;
+        self.wide_lyrics_hidden = false;
+        self.stage_motion = None;
         let theme = Theme::get(cx).clone();
         self.lyric_view.update(cx, |view, _| {
+            view.set_text_visible(true);
+            view.set_click_seek_enabled(true);
             view.set_background_visible(true);
             view.set_background_bounds(None);
             view.set_colors(LyricRenderColors {
@@ -998,16 +2371,17 @@ impl ChordialApp {
         self.appearance = mode;
         Theme::for_mode(mode).set_global(cx);
         // 歌词 view 的颜色/字体在构造时缓存，切换主题后需要重放。
-        {
+        if self.phone_backdrop {
+            // 手机播放页的背景与文字是「封面驱动 + 白色」，不跟随明暗
+            // 主题；重放主题样式会把它变回面板色，必须重新套用手机样式。
+            self.phone_backdrop = false;
+            self.sync_phone_backdrop(cx);
+        } else {
             let theme = Theme::get(cx).clone();
             // 沉浸层的字号/字重与面板不同；主题切换时必须按当前模式重放，
             // 否则沉浸层会被换成面板样式（字体高度/行高看起来会突然变化）。
             let style = if self.immersive {
-                let (style, font, vertical) =
-                    immersive_lyric_style(self.viewport_width, self.viewport_height);
-                self.lyric_font_px = font;
-                self.lyric_vertical = vertical;
-                style
+                immersive_lyric_style(self.viewport_width, self.viewport_height)
             } else {
                 compact_lyric_style(&theme)
             };
@@ -1203,6 +2577,31 @@ impl ChordialApp {
         self.queue_pos = Some(index);
         self.status_message = None;
         self.resolve_and_play(cx);
+        // 手机壳：选歌的最终目的是播放，直接回到播放页，避免用户还要
+        // 再找一次返回入口。宽屏三栏同时可见，不需要这一步。
+        self.show_phone_player();
+        cx.notify();
+    }
+
+    /// 从播放队列移除一项；不打断当前播放，只修正 queue_pos。
+    fn remove_queue_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.queue.len() {
+            return;
+        }
+        let mut queue = self.queue.as_ref().clone();
+        queue.remove(index);
+        self.queue = Arc::new(queue);
+        self.queue_pos = match self.queue_pos {
+            Some(pos) if pos > index => Some(pos - 1),
+            Some(pos) if pos == index => {
+                if self.queue.is_empty() {
+                    None
+                } else {
+                    Some(pos.min(self.queue.len() - 1))
+                }
+            }
+            other => other,
+        };
         cx.notify();
     }
 
@@ -1215,7 +2614,16 @@ impl ChordialApp {
                 }
             }
             PlayMode::Shuffle => self.play_random(cx),
-            PlayMode::Sequential => self.play_next(cx),
+            PlayMode::RepeatAll | PlayMode::Sequential => self.play_next(cx),
+        }
+    }
+
+    /// F5：没有当前曲目时从本地库第一首开始；否则等价于播放/暂停。
+    pub fn play_first(&mut self, cx: &mut Context<Self>) {
+        if self.queue_pos.is_none() && !self.library.is_empty() {
+            self.play_from_list(QueueList::Library, 0, cx);
+        } else {
+            self.toggle_playback(cx);
         }
     }
 
@@ -1223,6 +2631,9 @@ impl ChordialApp {
         let Some(pos) = self.queue_pos else { return };
         if pos + 1 < self.queue.len() {
             self.queue_pos = Some(pos + 1);
+            self.resolve_and_play(cx);
+        } else if self.play_mode == PlayMode::RepeatAll && !self.queue.is_empty() {
+            self.queue_pos = Some(0);
             self.resolve_and_play(cx);
         } else {
             self.stop_playback(cx);
@@ -1234,6 +2645,9 @@ impl ChordialApp {
         let Some(pos) = self.queue_pos else { return };
         if self.play_mode == PlayMode::Shuffle {
             self.play_random(cx);
+        } else if pos == 0 && self.play_mode == PlayMode::RepeatAll && !self.queue.is_empty() {
+            self.queue_pos = Some(self.queue.len() - 1);
+            self.resolve_and_play(cx);
         } else {
             self.queue_pos = Some(pos.saturating_sub(1));
             self.resolve_and_play(cx);
@@ -1269,7 +2683,11 @@ impl ChordialApp {
         self.play_gen = self.play_gen.wrapping_add(1);
         self.current_track = None;
         self.lyrics_status = None;
-        self.cover_image = None;
+        if self.is_phone() {
+            self.phone_page = PhonePage::Browse;
+        }
+        let old_cover = self.cover_image.take();
+        self.retire_image(old_cover);
         self.lyric_view.update(cx, |view, _| {
             view.clear_lyrics();
             view.clear_album();
@@ -1287,13 +2705,15 @@ impl ChordialApp {
                 let _ = weak.update(cx, |app, cx| {
                     if is_netease {
                         app.account_state = AccountState::Unknown;
-                        app.account_avatar = None;
+                        let old_avatar = app.account_avatar.take();
+                        app.retire_image(old_avatar);
                         app.user_playlists = Arc::new(Vec::new());
                         app.login_open = false;
                     }
                     if app.collection.as_ref().is_some_and(|c| c.id.source == id2) {
                         app.collection = None;
-                        app.collection_cover = None;
+                        let old_cover = app.collection_cover.take();
+                        app.retire_image(old_cover);
                         if app.view_tab == ViewTab::Collection {
                             app.view_tab = ViewTab::Library;
                         }
@@ -1312,6 +2732,7 @@ impl ChordialApp {
                         if let Err(e) = &result {
                             app.status_message = Some(format!("加载源失败：{e}"));
                         } else if is_netease {
+                            app.spawn_netease_warmup(cx);
                             app.spawn_account_bootstrap(cx);
                         }
                         cx.notify();
@@ -1367,7 +2788,8 @@ impl ChordialApp {
                 Ok(None) => {
                     let _ = weak.update(cx, |app, cx| {
                         app.account_state = AccountState::LoggedOut;
-                        app.account_avatar = None;
+                        let old_avatar = app.account_avatar.take();
+                        app.retire_image(old_avatar);
                         app.user_playlists = Arc::new(Vec::new());
                         app.save_cookie(None);
                         if app
@@ -1376,7 +2798,8 @@ impl ChordialApp {
                             .is_some_and(|c| c.id.kind == CollectionKind::Playlist)
                         {
                             app.collection = None;
-                            app.collection_cover = None;
+                            let old_cover = app.collection_cover.take();
+                            app.retire_image(old_cover);
                             if app.view_tab == ViewTab::Collection {
                                 app.view_tab = ViewTab::Library;
                             }
@@ -1392,6 +2815,104 @@ impl ChordialApp {
                     });
                 }
             }
+        })
+        .detach();
+    }
+
+    fn spawn_netease_warmup(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.netease_source() else {
+            return;
+        };
+        const PREPARING: &str = "正在准备网易云服务…首次运行会自动下载运行组件";
+        self.info_message = Some(PREPARING.into());
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let result = source.warm_up().await;
+            let _ = weak.update(cx, |app, cx| {
+                match result {
+                    Ok(()) => {
+                        if app.info_message.as_deref() == Some(PREPARING) {
+                            app.info_message = None;
+                        }
+                        // 旧版下载只写了音频流；服务就绪后原地补标签，
+                        // 避免历史文件永远停留在“未知艺人/无封面/无歌词”。
+                        app.spawn_download_metadata_repair(cx);
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("网易云服务准备失败：{e}"));
+                        app.info_message = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 扫描下载索引，为缺少标题/艺人标签的历史下载补写元数据。
+    ///
+    /// 只处理“文件仍在、标签为空”的条目：重新取一次在线详情/歌词/封面，
+    /// 复用下载落盘时的同一套写入逻辑，不重新下载音频。
+    fn spawn_download_metadata_repair(&mut self, cx: &mut Context<Self>) {
+        let downloads = self.downloads.clone();
+        let registry = self.registry.clone();
+        cx.spawn(async move |weak, cx| {
+            let pending = cx
+                .background_executor()
+                .spawn({
+                    let downloads = downloads.clone();
+                    async move { downloads.entries_missing_metadata() }
+                })
+                .await;
+            if pending.is_empty() {
+                return;
+            }
+
+            let mut repaired: Vec<PathBuf> = Vec::new();
+            for (id, path) in pending {
+                let Some(source) = registry.get(&id.source) else {
+                    continue;
+                };
+                let Ok(track) = source.track(&id).await else {
+                    continue;
+                };
+                let lyrics = source
+                    .lyrics(&id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|lyrics| lyrics_to_lrc(&lyrics));
+                let cover_url = crate::lyrics::cover_url(&track);
+                let downloads = downloads.clone();
+                let path_for_task = path.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let cover = cover_url.and_then(crate::lyrics::fetch_cover_raw_blocking);
+                        let extras = DownloadExtras { cover, lyrics };
+                        downloads.enrich_file_blocking(&path_for_task, &track, &extras)
+                    })
+                    .await;
+                if result.is_ok() {
+                    repaired.push(path);
+                }
+            }
+            if repaired.is_empty() {
+                return;
+            }
+
+            let count = repaired.len();
+            let _ = weak.update(cx, |app, cx| {
+                app.info_message = Some(format!("已为 {count} 首已下载曲目补齐元数据"));
+                if let Some(local) = app.local_source.clone()
+                    && repaired
+                        .iter()
+                        .any(|path| local.roots().iter().any(|root| path.starts_with(root)))
+                {
+                    app.spawn_library_scan(local, cx);
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -1421,6 +2942,11 @@ impl ChordialApp {
                     Ok(list) => {
                         app.user_playlists = Arc::new(list);
                         app.status_message = None;
+                        // 登录后“正在加载用户歌单”的提示在数据到位后要收掉。
+                        if app.info_message.as_deref() == Some("已登录网易云，正在加载用户歌单")
+                        {
+                            app.info_message = None;
+                        }
                     }
                     Err(e) => {
                         app.user_playlists = Arc::new(Vec::new());
@@ -1443,7 +2969,8 @@ impl ChordialApp {
         self.login_open = false;
         self.login_gen = self.login_gen.wrapping_add(1);
         self.login_challenge = None;
-        self.login_qr = None;
+        let old_qr = self.login_qr.take();
+        self.retire_image(old_qr);
         self.login_status = None;
         self.login_captcha_input
             .update(cx, |state, cx| state.clear(cx));
@@ -1463,7 +2990,8 @@ impl ChordialApp {
         self.login_tab = tab;
         self.login_gen = self.login_gen.wrapping_add(1);
         self.login_challenge = None;
-        self.login_qr = None;
+        let old_qr = self.login_qr.take();
+        self.retire_image(old_qr);
         self.login_status = None;
         match tab {
             LoginTab::Qr => self.start_login(cx),
@@ -1561,7 +3089,8 @@ impl ChordialApp {
                         app.login_open = false;
                         app.login_gen = app.login_gen.wrapping_add(1);
                         app.login_status = None;
-                        app.login_qr = None;
+                        let old_qr = app.login_qr.take();
+                        app.retire_image(old_qr);
                         app.login_challenge = None;
                         app.login_captcha_input
                             .update(cx, |state, cx| state.clear(cx));
@@ -1584,11 +3113,13 @@ impl ChordialApp {
 
     fn load_account_avatar(&mut self, cx: &mut Context<Self>) {
         let Some(profile) = self.account_state.profile().cloned() else {
-            self.account_avatar = None;
+            let old = self.account_avatar.take();
+            self.retire_image(old);
             return;
         };
         let Some(url) = profile.avatar.clone() else {
-            self.account_avatar = None;
+            let old = self.account_avatar.take();
+            self.retire_image(old);
             return;
         };
         let cache = self.cache.clone();
@@ -1601,7 +3132,8 @@ impl ChordialApp {
                 .await;
             if let Some((w, h, rgba)) = decoded {
                 let _ = weak.update(cx, |app, cx| {
-                    app.account_avatar = Some(Self::rgba_to_image(w, h, &rgba));
+                    let old = app.account_avatar.replace(Self::rgba_to_image(w, h, &rgba));
+                    app.retire_image(old);
                     cx.notify();
                 });
             }
@@ -1613,7 +3145,8 @@ impl ChordialApp {
         self.login_gen = self.login_gen.wrapping_add(1);
         let generation = self.login_gen;
         self.login_challenge = None;
-        self.login_qr = None;
+        let old_qr = self.login_qr.take();
+        self.retire_image(old_qr);
         self.login_status = Some("正在获取二维码…".into());
         cx.notify();
 
@@ -1656,7 +3189,8 @@ impl ChordialApp {
                         return false;
                     }
                     app.login_challenge = Some(challenge);
-                    app.login_qr = image;
+                    let old_qr = std::mem::replace(&mut app.login_qr, image);
+                    app.retire_image(old_qr);
                     app.login_status = Some(
                         if app.login_qr.is_some() {
                             "等待扫码"
@@ -1715,7 +3249,8 @@ impl ChordialApp {
                             app.login_open = false;
                             app.login_gen = app.login_gen.wrapping_add(1);
                             app.login_status = None;
-                            app.login_qr = None;
+                            let old_qr = app.login_qr.take();
+                            app.retire_image(old_qr);
                             app.login_challenge = None;
                             app.info_message = Some("已登录网易云，正在加载用户歌单".into());
                             app.load_account_avatar(cx);
@@ -1756,7 +3291,8 @@ impl ChordialApp {
             }
             let _ = weak.update(cx, |app, cx| {
                 app.account_state = AccountState::LoggedOut;
-                app.account_avatar = None;
+                let old_avatar = app.account_avatar.take();
+                app.retire_image(old_avatar);
                 app.user_playlists = Arc::new(Vec::new());
                 app.save_cookie(None);
                 if app
@@ -1765,7 +3301,8 @@ impl ChordialApp {
                     .is_some_and(|c| c.id.kind == CollectionKind::Playlist)
                 {
                     app.collection = None;
-                    app.collection_cover = None;
+                    let old_cover = app.collection_cover.take();
+                    app.retire_image(old_cover);
                     app.view_tab = ViewTab::Library;
                 }
                 app.info_message = Some("已退出网易云账号".into());
@@ -1780,7 +3317,11 @@ impl ChordialApp {
         let generation = self.collection_gen;
         self.view_tab = ViewTab::Collection;
         self.source_route = None;
-        self.collection_cover = None;
+        // 手机壳里专辑/歌手/歌单是曲库页的下一层，不能在播放页背后悄悄
+        // 换内容，否则返回时看起来「没有反应」。
+        self.show_phone_browse();
+        let old_cover = self.collection_cover.take();
+        self.retire_image(old_cover);
         self.collection = Some(CollectionView {
             id: id.clone(),
             title: title.clone(),
@@ -1854,8 +3395,9 @@ impl ChordialApp {
                                 if let Some((w, h, rgba)) = decoded {
                                     let _ = weak.update(cx, |app, cx| {
                                         if app.collection_gen == generation {
-                                            app.collection_cover =
-                                                Some(Self::rgba_to_image(w, h, &rgba));
+                                            let image = Self::rgba_to_image(w, h, &rgba);
+                                            let old = app.collection_cover.replace(image);
+                                            app.retire_image(old);
                                             cx.notify();
                                         }
                                     });
@@ -1914,25 +3456,129 @@ impl ChordialApp {
     fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = true;
         let stats = self.cache.stats();
-        let cfg = crate::config::load_or_default();
-        self.settings_cache_input.update(cx, |state, cx| {
-            state.set_content(stats.root.display().to_string(), cx);
-        });
-        self.settings_download_input.update(cx, |state, cx| {
-            state.set_content(cfg.download_dir.display().to_string(), cx);
-        });
-        self.settings_beat_low_input.update(cx, |state, cx| {
-            state.set_content(format!("{:.0}", self.beat_band.0), cx);
-        });
-        self.settings_beat_high_input.update(cx, |state, cx| {
-            state.set_content(format!("{:.0}", self.beat_band.1), cx);
-        });
+        let runtime = SettingsRuntime {
+            cache_root: stats.root,
+            cache_used_bytes: stats.total_bytes,
+            cache_limit_bytes: stats.limit_bytes,
+            cache_entries: stats.entries,
+            download_root: self.downloads.root().to_path_buf(),
+            eq_name: self.eq.display_name(),
+            eq_band_count: self.eq.settings.bands.len(),
+            eq_enabled: self.eq.settings.enabled,
+            backend: self.player.backend_name().to_string(),
+        };
+        self.settings_view
+            .update(cx, |view, cx| view.sync(runtime, cx));
         cx.notify();
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
         cx.notify();
+    }
+
+    /// 设置中心的动作分发：能即时生效的在这里应用，只能下次启动生效的
+    /// 只写配置，界面已用「重启生效」标注。
+    fn handle_settings_action(
+        &mut self,
+        action: SettingsAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            SettingsAction::Close => self.close_settings(cx),
+            SettingsAction::SetAppearance(mode) => {
+                if self.appearance != mode {
+                    self.toggle_appearance(cx);
+                }
+            }
+            SettingsAction::SetSmoothScroll(on) => {
+                self.smooth_scroll = on;
+                let mut cfg = crate::config::load_or_default();
+                cfg.smooth_scroll = on;
+                crate::config::save(&cfg);
+                cx.notify();
+            }
+            SettingsAction::SetSourcePreference(pref) => {
+                self.set_source_preference(pref, cx);
+            }
+            SettingsAction::SetBeatBand(low, high) => self.commit_beat_band(low, high, cx),
+            SettingsAction::SetBeatStrength(value) => self.commit_beat_strength(value, cx),
+            SettingsAction::SetEqEnabled(on) => self.set_eq_enabled(on, cx),
+            SettingsAction::OpenEqualizer => {
+                self.settings_open = false;
+                self.open_eq(cx);
+            }
+            SettingsAction::SetCacheDir(path) => {
+                self.apply_cache_dir(path.display().to_string(), cx);
+            }
+            SettingsAction::SetCacheLimit(bytes) => self.set_cache_limit_bytes(bytes, cx),
+            SettingsAction::ClearCache => self.clear_cache_now(cx),
+            SettingsAction::SetDownloadDir(path) => {
+                self.apply_download_dir(path.display().to_string(), cx);
+            }
+            SettingsAction::SetSearchTimeout(ms) => {
+                self.search_timeout_ms = ms.clamp(500, 60_000);
+                let mut cfg = crate::config::load_or_default();
+                cfg.search_timeout_ms = self.search_timeout_ms;
+                crate::config::save(&cfg);
+                cx.notify();
+            }
+            SettingsAction::SetNeteaseMode(mode) => {
+                let mut cfg = crate::config::load_or_default();
+                cfg.netease.mode = mode;
+                crate::config::save(&cfg);
+                cx.notify();
+            }
+            SettingsAction::SetNeteaseQuality(level) => {
+                let mut cfg = crate::config::load_or_default();
+                cfg.netease.level = Some(level);
+                crate::config::save(&cfg);
+                cx.notify();
+            }
+            SettingsAction::SetNeteaseBaseUrl(url) => {
+                let mut cfg = crate::config::load_or_default();
+                cfg.netease.base_url = url;
+                crate::config::save(&cfg);
+                cx.notify();
+            }
+            SettingsAction::SetPlayerDevice(device) => {
+                let mut cfg = crate::config::load_or_default();
+                cfg.player_device = device;
+                crate::config::save(&cfg);
+                cx.notify();
+            }
+            SettingsAction::AddLocalRoot(path) => {
+                let mut cfg = crate::config::load_or_default();
+                if !cfg.local_roots.contains(&path) {
+                    cfg.local_roots.push(path);
+                    crate::config::save(&cfg);
+                }
+                let local = self.local_source.clone();
+                if let Some(local) = local {
+                    local.set_roots(cfg.local_roots.clone());
+                    self.spawn_library_scan(local, cx);
+                }
+            }
+            SettingsAction::RemoveLocalRoot(index) => {
+                let mut cfg = crate::config::load_or_default();
+                if cfg.local_roots.len() > 1 && index < cfg.local_roots.len() {
+                    cfg.local_roots.remove(index);
+                    crate::config::save(&cfg);
+                    let local = self.local_source.clone();
+                    if let Some(local) = local {
+                        local.set_roots(cfg.local_roots.clone());
+                        self.spawn_library_scan(local, cx);
+                    }
+                }
+            }
+            SettingsAction::RescanLibrary => {
+                let local = self.local_source.clone();
+                if let Some(local) = local {
+                    self.spawn_library_scan(local, cx);
+                }
+            }
+        }
     }
 
     fn apply_cache_dir(&mut self, text: String, cx: &mut Context<Self>) {
@@ -1993,6 +3639,7 @@ impl ChordialApp {
 
     fn clear_cache_now(&mut self, cx: &mut Context<Self>) {
         let cache = self.cache.clone();
+        let settings = self.settings_view.clone();
         self.info_message = Some("正在清空对象缓存…".into());
         cx.notify();
         cx.spawn(async move |weak, cx| {
@@ -2002,6 +3649,16 @@ impl ChordialApp {
                 .await;
             let _ = weak.update(cx, |app, cx| {
                 app.info_message = Some(format!("已清空对象缓存（{removed} 项）"));
+                let stats = app.cache.stats();
+                settings.update(cx, |view, cx| {
+                    view.update_cache(
+                        stats.total_bytes,
+                        stats.limit_bytes,
+                        stats.entries,
+                        cx,
+                    );
+                    view.set_notice(format!("已清空对象缓存（{removed} 项）"), false, cx);
+                });
                 cx.notify();
             });
         })
@@ -2064,6 +3721,18 @@ impl ChordialApp {
         self.commit_beat_band(low, high, cx);
     }
 
+    /// 应用背景鼓点的视觉倍率（0..=1.5），立即更新渲染器并持久化。
+    fn commit_beat_strength(&mut self, value: f32, cx: &mut Context<Self>) {
+        let value = value.clamp(0.0, 1.5);
+        self.lyric_view
+            .update(cx, |view, _| view.set_background_beat_strength(value));
+        let mut cfg = crate::config::load_or_default();
+        cfg.beat_strength = value;
+        crate::config::save(&cfg);
+        self.info_message = Some(format!("背景鼓点强度：{:.0}%", value * 100.0));
+        cx.notify();
+    }
+
     fn download_current(&mut self, cx: &mut Context<Self>) {
         // 队列里的条目是在线曲目；当前显示曲目可能已切换为本地同曲。
         let Some(track) = self
@@ -2093,6 +3762,18 @@ impl ChordialApp {
         self.info_message = Some(format!("正在下载「{title}」…"));
         cx.notify();
         cx.spawn(async move |weak, cx| {
+            // 搜索结果的专辑封面/序号可能缺失；下载前补一次详情，
+            // 让写进文件的标签与在线页看到的一致。
+            let detail = source.track(&track.id).await.ok();
+            let track_for_download = detail.unwrap_or_else(|| track.clone());
+            let lyrics_lrc = source
+                .lyrics(&track.id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|lyrics| lyrics_to_lrc(&lyrics));
+            let cover_url = crate::lyrics::cover_url(&track_for_download);
+
             let resolved = source.resolve_stream(&track.id).await;
             let (url, format_hint) = match resolved {
                 Ok(resolved) => {
@@ -2116,11 +3797,21 @@ impl ChordialApp {
                     return;
                 }
             };
-            let track_for_download = track.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    downloads.download_blocking(&track_for_download, &url, format_hint.as_deref())
+                    // 封面字节只取一次：嵌入标签 + 写边车都由 DownloadExtras 消费。
+                    let cover = cover_url.and_then(crate::lyrics::fetch_cover_raw_blocking);
+                    let extras = DownloadExtras {
+                        cover,
+                        lyrics: lyrics_lrc,
+                    };
+                    downloads.download_blocking(
+                        &track_for_download,
+                        &url,
+                        format_hint.as_deref(),
+                        &extras,
+                    )
                 })
                 .await;
             let _ = weak.update(cx, |app, cx| {
@@ -2128,6 +3819,13 @@ impl ChordialApp {
                     Ok(path) => {
                         app.info_message = Some(format!("已下载：{}", path.display()));
                         app.status_message = None;
+                        // 下载目录通常位于本地库根目录下：立即增量扫描，
+                        // 让新文件带着标签出现在「本地音乐」里。
+                        if let Some(local) = app.local_source.clone()
+                            && local.roots().iter().any(|root| path.starts_with(root))
+                        {
+                            app.spawn_library_scan(local, cx);
+                        }
                     }
                     Err(e) => app.status_message = Some(format!("下载失败：{e}")),
                 }
@@ -2195,10 +3893,13 @@ impl ChordialApp {
                     app.current_track = Some(detail);
                 }
                 if let Some((w, h, rgba)) = cover {
-                    app.cover_image = Some(Self::rgba_to_image(w, h, &rgba));
+                    let image = Self::rgba_to_image(w, h, &rgba);
+                    let old = app.cover_image.replace(image);
+                    app.retire_image(old);
                     view.update(cx, |view, _| view.set_album_rgba(w, h, rgba));
                 } else {
-                    app.cover_image = None;
+                    let old = app.cover_image.take();
+                    app.retire_image(old);
                     view.update(cx, |view, _| view.clear_album());
                 }
 
@@ -2213,8 +3914,9 @@ impl ChordialApp {
                                     .iter()
                                     .map(|w| w.word.as_str())
                                     .collect::<String>();
-                                let text = text.trim().to_string();
-                                let translation = line.translated_lyric.trim().to_string();
+                                let text = SharedString::from(text.trim().to_string());
+                                let translation =
+                                    SharedString::from(line.translated_lyric.trim().to_string());
                                 (!text.is_empty() || !translation.is_empty()).then_some(
                                     PreviewLyric {
                                         start_ms: line.start_time,
@@ -2250,6 +3952,16 @@ impl ChordialApp {
             });
         })
         .detach();
+    }
+
+    /// 把不再绘制的图片排队，下一帧统一从 gpui sprite atlas 移除。
+    ///
+    /// `RenderImage` 的纹理一旦上传就不会随 `Arc` 释放自动回收；快速切歌时
+    /// 每首封面都占一块图集，最终 `paint_image` 分配失败会表现为黑屏。
+    fn retire_image(&mut self, image: Option<Arc<RenderImage>>) {
+        if let Some(image) = image {
+            self.retired_images.push(image);
+        }
     }
 
     /// RGBA → gpui 需要的 BGRA `RenderImage`（不预乘）。
@@ -2292,20 +4004,9 @@ impl ChordialApp {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let dark = theme.is_dark();
-
-        let light = |id: &'static str, color: gpui::Hsla| {
-            div()
-                .id(id)
-                .size(px(12.0))
-                .rounded(px(6.0))
-                .bg(color)
-                .cursor_pointer()
-        };
-        let close = light("tl-close", crate::theme::hex(0xFF5F57)).on_click(|_, _, cx| cx.quit());
-        let minimize = light("tl-min", crate::theme::hex(0xFEBC2E))
-            .on_click(|_, window, _| window.minimize_window());
-        let maximize = light("tl-max", crate::theme::hex(0x28C840))
-            .on_click(|_, window, _| window.zoom_window());
+        // 中等宽度下状态消息最容易把标题栏挤爆；消息仍会通过列表/提示出现，
+        // 标题栏只保留品牌与窗口操作。
+        let show_messages = self.viewport_width >= 1180.0;
 
         let theme_btn = {
             let weak = weak.clone();
@@ -2324,6 +4025,23 @@ impl ChordialApp {
                 if dark { "切换浅色" } else { "切换深色" },
                 move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| app.toggle_appearance(cx));
+                },
+            )
+        };
+
+        let settings_btn = {
+            let weak = weak.clone();
+            crate::widgets::icon_button(
+                &theme,
+                crate::icons::icon(
+                    crate::icons::Icon::Settings,
+                    14.0,
+                    theme.text_dim,
+                ),
+                26.0,
+                "设置",
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.open_settings(cx));
                 },
             )
         };
@@ -2376,42 +4094,106 @@ impl ChordialApp {
             .bg(theme.sidebar)
             .border_b_1()
             .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(close)
-                    .child(minimize)
-                    .child(maximize),
-            )
+            .child(Self::traffic_lights())
             .child(center)
-            .children(self.status_message.as_ref().map(|msg| {
-                div()
-                    .max_w(px(360.0))
-                    .text_size(px(10.5))
-                    .text_color(theme.danger)
-                    .text_ellipsis()
-                    .child(SharedString::from(msg.clone()))
-            }))
-            .children(self.info_message.as_ref().map(|msg| {
-                div()
-                    .max_w(px(360.0))
-                    .text_size(px(10.5))
-                    .text_color(theme.text_faint)
-                    .text_ellipsis()
-                    .child(SharedString::from(msg.clone()))
-            }))
+            .when(show_messages, |d| {
+                d.children(self.status_message.as_ref().map(|msg| {
+                    div()
+                        .max_w(px(360.0))
+                        .text_size(px(10.5))
+                        .text_color(theme.danger)
+                        .text_ellipsis()
+                        .child(SharedString::from(msg.clone()))
+                        .into_any_element()
+                }))
+                .children(self.info_message.as_ref().map(|msg| {
+                    div()
+                        .max_w(px(360.0))
+                        .text_size(px(10.5))
+                        .text_color(theme.text_faint)
+                        .text_ellipsis()
+                        .child(SharedString::from(msg.clone()))
+                        .into_any_element()
+                }))
+            })
+            .child(settings_btn)
             .child(theme_btn)
             .into_any_element()
     }
 
     // ================= 左侧边栏 =================
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn playlist_rows(&self) -> Arc<Vec<PlaylistRowText>> {
+        let mut cache = self.playlist_rows.borrow_mut();
+        match cache.as_ref() {
+            Some((cached, rows)) if Arc::ptr_eq(cached, &self.user_playlists) => rows.clone(),
+            _ => {
+                let rows = Arc::new(
+                    self.user_playlists
+                        .iter()
+                        .map(PlaylistRowText::new)
+                        .collect::<Vec<_>>(),
+                );
+                *cache = Some((self.user_playlists.clone(), rows.clone()));
+                rows
+            }
+        }
+    }
+
+    fn source_snapshot(&self) -> Arc<Vec<SourceSlotSnapshot>> {
+        let version = self.registry.version();
+        let mut cache = self.source_snapshot.borrow_mut();
+        match cache.as_ref() {
+            Some((cached, slots)) if *cached == version => slots.clone(),
+            _ => {
+                let slots = Arc::new(self.registry.snapshot());
+                *cache = Some((version, slots.clone()));
+                slots
+            }
+        }
+    }
+
+    /// 侧栏歌单保留缓存的输入版本。任何可能改变歌单行内容、位置或 hover
+    /// 状态的输入都必须进入哈希，否则缓存的绘制范围会过期。
+    fn sidebar_playlist_version(&self, mouse: gpui::Point<gpui::Pixels>) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (matches!(self.appearance, crate::theme::Appearance::Dark) as u8).hash(&mut hasher);
+        self.user_playlists.as_ptr().hash(&mut hasher);
+        self.playlists_loading.hash(&mut hasher);
+        self.account_avatar
+            .as_ref()
+            .map(|image| Arc::as_ptr(image) as usize)
+            .hash(&mut hasher);
+        match &self.account_state {
+            chordal_core::model::AccountState::Unsupported => 0u8.hash(&mut hasher),
+            chordal_core::model::AccountState::LoggedOut => 1u8.hash(&mut hasher),
+            chordal_core::model::AccountState::Unknown => 3u8.hash(&mut hasher),
+            chordal_core::model::AccountState::LoggedIn(profile) => {
+                2u8.hash(&mut hasher);
+                profile.uid.hash(&mut hasher);
+                profile.nickname.hash(&mut hasher);
+                profile.avatar.hash(&mut hasher);
+                profile.vip.hash(&mut hasher);
+            }
+        }
+        if let Some(collection) = &self.collection {
+            collection.id.hash(&mut hasher);
+        }
+        self.viewport_width.to_bits().hash(&mut hasher);
+        self.viewport_height.to_bits().hash(&mut hasher);
+        self.sidebar_width().to_bits().hash(&mut hasher);
+        f32::from(self.sidebar_scroll.offset().y)
+            .to_bits()
+            .hash(&mut hasher);
+        f32::from(mouse.x).to_bits().hash(&mut hasher);
+        f32::from(mouse.y).to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn render_sidebar(&self, mouse: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
-        let slots = self.registry.snapshot();
+        let slots = self.source_snapshot();
         let loaded = slots
             .iter()
             .filter(|s| s.status == SourceStatus::Loaded)
@@ -2567,7 +4349,7 @@ impl ChordialApp {
             );
         }
 
-        for slot in slots {
+        for slot in slots.iter() {
             let source_id = slot.info.id.clone();
             let route_active =
                 self.view_tab == ViewTab::Search && self.source_route.as_ref() == Some(&source_id);
@@ -2781,66 +4563,87 @@ impl ChordialApp {
                                 .child("暂无歌单"),
                         );
                     } else {
-                        for playlist in self.user_playlists.iter().take(30) {
-                            let weak = weak.clone();
-                            let id = playlist.id.clone();
-                            let title = playlist.title.clone();
-                            let count = playlist
-                                .track_count
-                                .map(|n| n.to_string())
-                                .unwrap_or_default();
-                            let active = self
-                                .collection
-                                .as_ref()
-                                .is_some_and(|c| c.id == playlist.id);
-                            list = list.child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "user-playlist-{}",
-                                        playlist.id.id
-                                    )))
-                                    .h(px(28.0))
-                                    .px(px(9.0))
-                                    .rounded(px(6.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(7.0))
-                                    .bg(if active {
-                                        theme.active
-                                    } else {
-                                        gpui::transparent_black()
-                                    })
-                                    .hover(|s| s.bg(theme.hover))
-                                    .cursor_pointer()
-                                    .child(crate::icons::icon(
-                                        crate::icons::Icon::Layers,
-                                        12.0,
-                                        if active { theme.text } else { theme.text_faint },
-                                    ))
-                                    .child(
+                        let playlist_rows = self.playlist_rows();
+                        let row_count = playlist_rows.len().min(30);
+                        let mut style = gpui::Style::default();
+                        style.size.width = gpui::relative(1.0).into();
+                        style.size.height = px((row_count as f32) * 28.0).into();
+                        style.flex_shrink = 0.0;
+
+                        let version = self.sidebar_playlist_version(mouse);
+                        let rows = playlist_rows;
+                        let theme_rows = theme.clone();
+                        let weak_rows = weak.clone();
+                        let active_id = self.collection.as_ref().map(|collection| collection.id.clone());
+                        list = list.child(gpui::Retained::new(
+                            "sidebar-playlists",
+                            version,
+                            style,
+                            move |_window, _cx| {
+                                let mut column = div().w_full().flex().flex_col();
+                                for row in rows.iter().take(row_count) {
+                                    let weak = weak_rows.clone();
+                                    let active = active_id.as_ref() == Some(&row.id);
+                                    column = column.child(
                                         div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_size(px(11.5))
-                                            .text_color(theme.text)
-                                            .text_ellipsis()
-                                            .child(SharedString::from(title.clone())),
-                                    )
-                                    .when(!count.is_empty(), |d| {
-                                        d.child(
-                                            div()
-                                                .text_size(px(9.5))
-                                                .text_color(theme.text_faint)
-                                                .child(SharedString::from(count)),
-                                        )
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        let _ = weak.update(cx, |app, cx| {
-                                            app.open_collection(id.clone(), title.clone(), cx);
-                                        });
-                                    }),
-                            );
-                        }
+                                            .id(row.element_id.clone())
+                                            .h(px(28.0))
+                                            .px(px(9.0))
+                                            .rounded(px(6.0))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(7.0))
+                                            .bg(if active {
+                                                theme_rows.active
+                                            } else {
+                                                gpui::transparent_black()
+                                            })
+                                            .hover(|s| s.bg(theme_rows.hover))
+                                            .cursor_pointer()
+                                            .child(crate::icons::icon(
+                                                crate::icons::Icon::Layers,
+                                                12.0,
+                                                if active {
+                                                    theme_rows.text
+                                                } else {
+                                                    theme_rows.text_faint
+                                                },
+                                            ))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme_rows.text)
+                                                    .text_ellipsis()
+                                                    .child(row.title.clone()),
+                                            )
+                                            .when(!row.count.is_empty(), |d| {
+                                                d.child(
+                                                    div()
+                                                        .text_size(px(9.5))
+                                                        .text_color(theme_rows.text_faint)
+                                                        .child(row.count.clone()),
+                                                )
+                                            })
+                                            .on_click({
+                                                let id = row.id.clone();
+                                                let title = row.title.to_string();
+                                                move |_, _, cx| {
+                                                    let _ = weak.update(cx, |app, cx| {
+                                                        app.open_collection(
+                                                            id.clone(),
+                                                            title.clone(),
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            }),
+                                    );
+                                }
+                                column.into_any_element()
+                            },
+                        ));
                     }
                 }
                 AccountState::Unknown => {
@@ -2905,6 +4708,7 @@ impl ChordialApp {
         list = list.child(div().h(px(6.0))).child(section("播放模式"));
         for (mode, label, icon) in [
             (PlayMode::Sequential, "顺序播放", crate::icons::Icon::Menu),
+            (PlayMode::RepeatAll, "列表循环", crate::icons::Icon::Repeat),
             (PlayMode::Shuffle, "随机播放", crate::icons::Icon::Shuffle),
             (PlayMode::RepeatOne, "单曲循环", crate::icons::Icon::Repeat),
         ] {
@@ -2977,7 +4781,9 @@ impl ChordialApp {
                     .id("sidebar-scroll")
                     .flex_1()
                     .min_h_0()
+                    .track_scroll(&self.sidebar_scroll)
                     .overflow_y_scroll()
+                    .when(self.smooth_scroll, |d| d.smooth_scroll())
                     .p(px(10.0))
                     .child(list),
             )
@@ -3048,6 +4854,70 @@ impl ChordialApp {
 
     // ================= 面板标题 =================
 
+    /// 手机曲库页的页头：返回播放 + 标题 + 动作。
+    /// 桌面页头保留 17px 标题；手机没有右栏，页头必须让出宽度给返回键。
+    fn render_phone_pane_header(
+        &self,
+        theme: &Theme,
+        title: impl Into<SharedString>,
+        subtitle: impl Into<SharedString>,
+        right: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        // 没有当前曲目时播放页是空的；此时不摆一个按了没反应的返回键。
+        let back: AnyElement = if self.current_track.is_some() {
+            let weak = weak.clone();
+            crate::widgets::icon_button(
+                theme,
+                crate::icons::icon(crate::icons::Icon::ChevronLeft, 15.0, theme.text_dim),
+                30.0,
+                "返回播放",
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Player;
+                        cx.notify();
+                    });
+                },
+            )
+        } else {
+            div().w(px(30.0)).h(px(30.0)).into_any_element()
+        };
+        div()
+            .h(px(54.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .child(back)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .text_size(px(15.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .text_ellipsis()
+                            .child(title.into()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_faint)
+                            .text_ellipsis()
+                            .child(subtitle.into()),
+                    ),
+            )
+            .children(right)
+            .into_any_element()
+    }
+
     fn render_pane_header(
         &self,
         theme: &Theme,
@@ -3091,65 +4961,31 @@ impl ChordialApp {
     // ================= 曲目列表（窄栏） =================
 
     fn render_track_row(
+        theme: &Theme,
         index: usize,
-        track: &Track,
+        row: &TrackRowText,
         list: QueueList,
         queue_pos: Option<usize>,
         queue_current_id: Option<&chordal_core::model::TrackId>,
         weak: gpui::WeakEntity<ChordialApp>,
-        cx: &mut App,
     ) -> AnyElement {
-        let theme = Theme::get(cx).clone();
-        let is_current =
-            queue_pos == Some(index) && queue_current_id.map(|id| id == &track.id).unwrap_or(false);
-        let artists = track
-            .artists
-            .iter()
-            .map(|a| a.name.as_str())
-            .collect::<Vec<_>>()
-            .join(" / ");
-        let album = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("");
-        let duration = track
-            .duration_ms
-            .map(fmt_ms)
-            .unwrap_or_else(|| "--:--".into());
-        let source_label = match &track.origin {
-            TrackOrigin::Local { .. } => "本地".to_string(),
-            TrackOrigin::Remote { source } => match source.0.as_str() {
-                "netease" => "网易云".to_string(),
-                other => other.to_string(),
-            },
-        };
-        let subtitle = match list {
-            QueueList::Search => {
-                if artists.is_empty() {
-                    source_label
-                } else {
-                    format!("{artists}  ·  {source_label}")
-                }
-            }
-            _ => {
-                if !artists.is_empty() && !album.is_empty() {
-                    format!("{artists}  ·  {album}")
-                } else if !artists.is_empty() {
-                    artists
-                } else {
-                    album.to_string()
-                }
-            }
-        };
+        let is_current = queue_pos == Some(index) && queue_current_id == Some(&row.id);
         let number = if is_current {
             crate::widgets::equalizer(&theme, true)
         } else {
             div()
                 .text_size(px(10.5))
                 .text_color(theme.text_faint)
-                .child(SharedString::from((index + 1).to_string()))
+                .child(row.number.clone())
                 .into_any_element()
+        };
+        let subtitle = match list {
+            QueueList::Search => row.subtitle_search.clone(),
+            _ => row.subtitle_default.clone(),
         };
 
         div()
-            .id(SharedString::from(format!("track-{index}")))
+            .id(gpui::ElementId::named_usize("track", index))
             .w_full()
             .h(px(crate::theme::size::ROW))
             .px(px(12.0))
@@ -3202,14 +5038,14 @@ impl ChordialApp {
                             })
                             .text_color(theme.text)
                             .text_ellipsis()
-                            .child(SharedString::from(track.title.clone())),
+                            .child(row.title.clone()),
                     )
                     .child(
                         div()
                             .text_size(px(10.5))
                             .text_color(theme.text_faint)
                             .text_ellipsis()
-                            .child(SharedString::from(subtitle)),
+                            .child(subtitle),
                     ),
             )
             .child(
@@ -3218,7 +5054,7 @@ impl ChordialApp {
                     .text_size(px(10.5))
                     .text_color(theme.text_faint)
                     .text_align(gpui::TextAlign::Right)
-                    .child(SharedString::from(duration)),
+                    .child(row.duration.clone()),
             )
             .into_any_element()
     }
@@ -3265,28 +5101,47 @@ impl ChordialApp {
         let n = tracks.len();
         let queue_pos = self.queue_pos;
         let queue = self.queue.clone();
+        let current_id = queue_pos.and_then(|i| queue.get(i).map(|t| t.id.clone()));
+        let rows = {
+            let mut cache = self.row_text_cache.borrow_mut();
+            match cache.as_ref() {
+                Some((cached_tracks, rows)) if Arc::ptr_eq(cached_tracks, &tracks) => rows.clone(),
+                _ => {
+                    let rows = Arc::new(
+                        tracks
+                            .iter()
+                            .enumerate()
+                            .map(|(index, track)| TrackRowText::new(index, track))
+                            .collect::<Vec<_>>(),
+                    );
+                    *cache = Some((tracks.clone(), rows.clone()));
+                    rows
+                }
+            }
+        };
         let weak = cx.entity().downgrade();
-        let body: AnyElement = uniform_list("track-list", n, move |range, _window, cx| {
-            let current_id = queue_pos.and_then(|i| queue.get(i).map(|t| t.id.clone()));
+        let row_theme = theme.clone();
+        let mut body = uniform_list("track-list", n, move |range, _window, _cx| {
             range
                 .filter_map(|i| {
-                    tracks.get(i).map(|t| {
+                    rows.get(i).map(|row| {
                         Self::render_track_row(
+                            &row_theme,
                             i,
-                            t,
+                            row,
                             list,
                             queue_pos,
                             current_id.as_ref(),
                             weak.clone(),
-                            cx,
                         )
                     })
                 })
                 .collect::<Vec<_>>()
-        })
-        .flex_1()
-        .min_h_0()
-        .into_any_element();
+        });
+        if self.smooth_scroll {
+            body = body.smooth_scroll();
+        }
+        let body: AnyElement = body.flex_1().min_h_0().into_any_element();
         div()
             .flex()
             .flex_col()
@@ -3470,7 +5325,7 @@ impl ChordialApp {
         let theme = theme.clone();
         let weak = cx.entity().downgrade();
         let n = collections.len();
-        uniform_list("collection-results", n, move |range, _window, _cx| {
+        let mut results = uniform_list("collection-results", n, move |range, _window, _cx| {
             range
                 .filter_map(|i| {
                     let collection = collections.get(i)?;
@@ -3560,10 +5415,11 @@ impl ChordialApp {
                     )
                 })
                 .collect::<Vec<_>>()
-        })
-        .flex_1()
-        .min_h_0()
-        .into_any_element()
+        });
+        if self.smooth_scroll {
+            results = results.smooth_scroll();
+        }
+        results.flex_1().min_h_0().into_any_element()
     }
 
     fn render_collection_search_panel(
@@ -3573,6 +5429,7 @@ impl ChordialApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let weak = cx.entity().downgrade();
+        let phone = self.is_phone();
         let visible: Arc<Vec<CollectionSummary>> = match &self.source_route {
             Some(route) => Arc::new(
                 self.search_collections
@@ -3694,6 +5551,18 @@ impl ChordialApp {
             self.render_collection_results(theme, visible, cx)
         };
 
+        let header = if phone {
+            self.render_phone_pane_header(
+                theme,
+                "搜索",
+                subtitle,
+                Some(actions.into_any_element()),
+                cx,
+            )
+        } else {
+            self.render_pane_header(theme, "搜索", subtitle, Some(actions.into_any_element()))
+        };
+
         div()
             .h_full()
             .when_some(width, |d, w| d.w(px(w)))
@@ -3703,14 +5572,8 @@ impl ChordialApp {
             .flex_col()
             .overflow_hidden()
             .bg(theme.surface)
-            .border_r_1()
-            .border_color(theme.border)
-            .child(self.render_pane_header(
-                theme,
-                "搜索",
-                subtitle,
-                Some(actions.into_any_element()),
-            ))
+            .when(!phone, |d| d.border_r_1().border_color(theme.border))
+            .child(header)
             .child(self.render_search_tabs(theme, cx))
             .child(
                 div()
@@ -3719,7 +5582,11 @@ impl ChordialApp {
                     .child(self.search_input_view.clone()),
             )
             .child(body)
-            .child(div().h(px(84.0)).flex_none())
+            .child(
+                div()
+                    .h(px(if phone { 16.0 } else { 84.0 }))
+                    .flex_none(),
+            )
             .into_any_element()
     }
 
@@ -3735,6 +5602,7 @@ impl ChordialApp {
     fn render_list_panel(&self, width: Option<f32>, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
+        let phone = self.is_phone();
 
         if self.view_tab == ViewTab::Search && self.search_kind != SearchKind::Track {
             return self.render_collection_search_panel(width, &theme, cx);
@@ -3744,13 +5612,32 @@ impl ChordialApp {
             match self.view_tab {
                 ViewTab::Search => {
                     let visible: Arc<Vec<Track>> = match &self.source_route {
-                        Some(route) => Arc::new(
-                            self.search_tracks
-                                .iter()
-                                .filter(|t| &t.id.source == route)
-                                .cloned()
-                                .collect(),
-                        ),
+                        Some(route) => {
+                            let mut cache = self.search_route_cache.borrow_mut();
+                            match cache.as_ref() {
+                                Some((cached_tracks, cached_route, visible))
+                                    if Arc::ptr_eq(cached_tracks, &self.search_tracks)
+                                        && cached_route == &self.source_route =>
+                                {
+                                    visible.clone()
+                                }
+                                _ => {
+                                    let visible = Arc::new(
+                                        self.search_tracks
+                                            .iter()
+                                            .filter(|track| &track.id.source == route)
+                                            .cloned()
+                                            .collect::<Vec<_>>(),
+                                    );
+                                    *cache = Some((
+                                        self.search_tracks.clone(),
+                                        self.source_route.clone(),
+                                        visible.clone(),
+                                    ));
+                                    visible
+                                }
+                            }
+                        }
                         None => self.search_tracks.clone(),
                     };
                     let route_label = self.source_route.as_ref().map(|id| {
@@ -3845,7 +5732,8 @@ impl ChordialApp {
                     .on_click(move |_, _, cx| {
                         let _ = weak.update(cx, |app, cx| {
                             app.collection = None;
-                            app.collection_cover = None;
+                            let old_cover = app.collection_cover.take();
+                            app.retire_image(old_cover);
                             app.view_tab = ViewTab::Library;
                             cx.notify();
                         });
@@ -3904,7 +5792,7 @@ impl ChordialApp {
             .current_track
             .as_ref()
             .is_some_and(|t| t.artists.iter().any(|a| a.id.is_some()));
-        if has_album {
+        if has_album && !phone {
             let weak = weak.clone();
             actions = actions.child(crate::widgets::icon_button(
                 &theme,
@@ -3916,7 +5804,7 @@ impl ChordialApp {
                 },
             ));
         }
-        if has_artist {
+        if has_artist && !phone {
             let weak = weak.clone();
             actions = actions.child(crate::widgets::icon_button(
                 &theme,
@@ -4017,6 +5905,23 @@ impl ChordialApp {
             self.render_track_table(&theme, tracks, list, cx)
         };
 
+        let header = if phone {
+            self.render_phone_pane_header(
+                &theme,
+                title,
+                subtitle,
+                Some(actions.into_any_element()),
+                cx,
+            )
+        } else {
+            self.render_pane_header(
+                &theme,
+                title,
+                subtitle,
+                Some(actions.into_any_element()),
+            )
+        };
+
         div()
             .h_full()
             .when_some(width, |d, w| d.w(px(w)))
@@ -4026,14 +5931,8 @@ impl ChordialApp {
             .flex_col()
             .overflow_hidden()
             .bg(theme.surface)
-            .border_r_1()
-            .border_color(theme.border)
-            .child(self.render_pane_header(
-                &theme,
-                title,
-                subtitle,
-                Some(actions.into_any_element()),
-            ))
+            .when(!phone, |d| d.border_r_1().border_color(theme.border))
+            .child(header)
             .when(self.view_tab == ViewTab::Collection, |d| {
                 d.child(self.render_collection_header(&theme, cx))
             })
@@ -4049,56 +5948,61 @@ impl ChordialApp {
                 )
             })
             .child(body)
-            .child(div().h(px(84.0)).flex_none())
+            .child(
+                div()
+                    .h(px(if phone { 16.0 } else { 84.0 }))
+                    .flex_none(),
+            )
             .into_any_element()
     }
 
     // ================= 右侧：正在播放 =================
+
+    fn now_playing_text(&self) -> Arc<NowPlayingText> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(track) = &self.current_track {
+            track.title.hash(&mut hasher);
+            for artist in &track.artists {
+                artist.name.hash(&mut hasher);
+            }
+            if let Some(album) = &track.album {
+                album.name.hash(&mut hasher);
+            }
+            track.quality.hash(&mut hasher);
+            match &track.origin {
+                TrackOrigin::Local { .. } => 0u8.hash(&mut hasher),
+                TrackOrigin::Remote { source } => {
+                    1u8.hash(&mut hasher);
+                    source.0.hash(&mut hasher);
+                }
+            }
+        }
+        self.player_status.title.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some((cached, text)) = self.now_playing_text.borrow().as_ref()
+            && *cached == key
+        {
+            return text.clone();
+        }
+        let text = Arc::new(NowPlayingText::new(
+            self.current_track.as_ref(),
+            self.player_status.title.as_deref(),
+        ));
+        *self.now_playing_text.borrow_mut() = Some((key, text.clone()));
+        text
+    }
 
     fn render_now_playing(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let playing = self.player_status.state == PlayerState::Playing;
         let has_track = self.current_track.is_some();
-        let title = self
-            .current_track
-            .as_ref()
-            .map(|t| t.title.clone())
-            .or_else(|| self.player_status.title.clone())
-            .unwrap_or_else(|| "未在播放".into());
-        let artists = self
-            .current_track
-            .as_ref()
-            .map(|t| {
-                t.artists
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" / ")
-            })
-            .unwrap_or_default();
-        let album = self
-            .current_track
-            .as_ref()
-            .and_then(|t| t.album.as_ref())
-            .map(|a| a.name.clone())
-            .unwrap_or_default();
-        let source_label = self
-            .current_track
-            .as_ref()
-            .map(|t| match &t.origin {
-                TrackOrigin::Local { .. } => "本地".to_string(),
-                TrackOrigin::Remote { source } => match source.0.as_str() {
-                    "netease" => "网易云".to_string(),
-                    other => other.to_string(),
-                },
-            })
-            .unwrap_or_default();
-        let quality = self
-            .current_track
-            .as_ref()
-            .and_then(|t| t.quality.clone())
-            .unwrap_or_default();
+        let text = self.now_playing_text();
+        let title = text.title.clone();
+        let artists = text.artists.clone();
+        let album = text.album.clone();
+        let source_label = text.source_label.clone();
+        let quality = text.quality.clone();
 
         let panel_w = (self.viewport_width - self.sidebar_width() - self.list_width()).max(360.0);
         let content_w = (panel_w - 56.0).clamp(240.0, 440.0);
@@ -4158,7 +6062,7 @@ impl ChordialApp {
                     .cursor_pointer()
                     .on_click(move |_, window, cx| {
                         let _ = weak.update(cx, |app, cx| {
-                            app.enter_immersive(cx);
+                            app.open_portrait(cx);
                             window.focus(&app.focus_handle);
                             cx.notify();
                         });
@@ -4171,15 +6075,15 @@ impl ChordialApp {
 
         let artist_line = if has_track {
             if artists.is_empty() {
-                "未知艺人".to_string()
+                SharedString::from("未知艺人")
             } else {
                 artists
             }
         } else {
-            "从左侧列表选择一首歌开始".to_string()
+            SharedString::from("从左侧列表选择一首歌开始")
         };
 
-        let pill = |text: String| {
+        let pill = |text: SharedString| {
             div()
                 .h(px(20.0))
                 .px(px(7.0))
@@ -4191,7 +6095,7 @@ impl ChordialApp {
                 .items_center()
                 .text_size(px(9.5))
                 .text_color(theme.text_faint)
-                .child(SharedString::from(text))
+                .child(text)
                 .into_any_element()
         };
 
@@ -4226,16 +6130,16 @@ impl ChordialApp {
                     .text_size(px(10.5))
                     .text_color(theme.text_faint)
                     .text_ellipsis()
-                    .child(SharedString::from(album)),
+                    .child(album.clone()),
             );
         }
         if has_track {
             let mut meta = div().flex().items_center().gap(px(6.0)).mt(px(9.0));
             if !source_label.is_empty() {
-                meta = meta.child(pill(source_label));
+                meta = meta.child(pill(source_label.clone()));
             }
             if !quality.is_empty() {
-                meta = meta.child(pill(quality));
+                meta = meta.child(pill(quality.clone()));
             }
             info = info.child(meta);
 
@@ -4352,9 +6256,9 @@ impl ChordialApp {
                 let line = &preview[i];
                 let active = current_idx == Some(i) && position > 0;
                 let (main, sub) = if line.text.is_empty() {
-                    (line.translation.as_str(), "")
+                    (line.translation.clone(), SharedString::default())
                 } else {
-                    (line.text.as_str(), line.translation.as_str())
+                    (line.text.clone(), line.translation.clone())
                 };
                 lines = lines.child(
                     div()
@@ -4372,7 +6276,7 @@ impl ChordialApp {
                                 })
                                 .text_color(if active { theme.text } else { theme.text_faint })
                                 .text_ellipsis()
-                                .child(SharedString::from(main.to_string())),
+                                .child(main),
                         )
                         .when(!sub.is_empty(), |d| {
                             d.child(
@@ -4380,7 +6284,7 @@ impl ChordialApp {
                                     .text_size(px(10.0))
                                     .text_color(theme.text_faint)
                                     .text_ellipsis()
-                                    .child(SharedString::from(sub.to_string())),
+                                    .child(sub),
                             )
                         }),
                 );
@@ -4408,11 +6312,10 @@ impl ChordialApp {
                 .child("沉浸")
                 .on_click(move |_, window, cx| {
                     let _ = weak.update(cx, |app, cx| {
-                        if app.current_track.is_some() {
-                            app.enter_immersive(cx);
-                            window.focus(&app.focus_handle);
-                            cx.notify();
-                        }
+                        app.force_portrait = false;
+                        app.enter_immersive(cx);
+                        window.focus(&app.focus_handle);
+                        cx.notify();
                     });
                 })
         };
@@ -4483,6 +6386,7 @@ impl ChordialApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .when(self.smooth_scroll, |d| d.smooth_scroll())
                     .child(
                         div()
                             .w_full()
@@ -4503,6 +6407,14 @@ impl ChordialApp {
     // ================= 设置面板 =================
 
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let _ = cx;
+        self.settings_view.clone().into_any_element()
+    }
+
+    /// 旧版设置面板：已由 `settings.rs` 的独立实体取代，保留一版用于对照，
+    /// 待确认新版无回归后删除。
+    #[allow(dead_code)]
+    fn render_settings_legacy(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let stats = self.cache.stats();
@@ -4669,6 +6581,7 @@ impl ChordialApp {
             .w(px(620.0))
             .max_h(px(640.0))
             .overflow_y_scroll()
+            .when(self.smooth_scroll, |d| d.smooth_scroll())
             .rounded(px(14.0))
             .border_1()
             .border_color(theme.border_strong)
@@ -4791,7 +6704,59 @@ impl ChordialApp {
                             .child(div().flex_1())
                             .child(hint("默认 4000–10000 Hz（鼓点/镲片）".into())),
                     ),
-            );
+            )
+            .child(section("均衡器"))
+            .child({
+                let blue: gpui::Hsla = gpui::rgb(0x3B82F6).into();
+                let weak_eq = weak.clone();
+                let weak_toggle = weak.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(hint(format!(
+                        "{} · {} 个频段 · {}",
+                        self.eq.display_name(),
+                        self.eq.settings.bands.len(),
+                        if self.eq.settings.enabled {
+                            "已开启"
+                        } else {
+                            "已关闭"
+                        }
+                    )))
+                    .child(div().flex_1())
+                    .child(crate::widgets::switch(
+                        self.eq.settings.enabled,
+                        blue,
+                        "settings-eq-enabled",
+                        move |on, cx| {
+                            let _ = weak_toggle.update(cx, |app, cx| {
+                                app.set_eq_enabled(on, cx);
+                            });
+                        },
+                    ))
+                    .child(
+                        div()
+                            .id("settings-open-eq")
+                            .h(px(28.0))
+                            .px(px(10.0))
+                            .rounded(px(7.0))
+                            .bg(theme.text)
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(theme.on_accent)
+                            .hover(|s| s.bg(theme.accent_hover))
+                            .child("打开均衡器")
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_eq.update(cx, |app, cx| {
+                                    app.settings_open = false;
+                                    app.open_eq(cx);
+                                });
+                            }),
+                    )
+            });
 
         let weak_overlay = weak.clone();
         div()
@@ -4976,9 +6941,11 @@ impl ChordialApp {
             }
         };
 
+        let card_w = (self.viewport_width - 24.0).clamp(300.0, 380.0);
+        let card_pad = if self.viewport_width < 420.0 { 16.0 } else { 20.0 };
         let card = div()
             .id("login-card")
-            .w(px(380.0))
+            .w(px(card_w))
             .rounded(px(14.0))
             .border_1()
             .border_color(theme.border_strong)
@@ -4989,7 +6956,7 @@ impl ChordialApp {
                 blur_radius: px(36.0),
                 spread_radius: px(0.0),
             }])
-            .p(px(20.0))
+            .p(px(card_pad))
             .flex()
             .flex_col()
             .items_center()
@@ -5045,11 +7012,296 @@ impl ChordialApp {
 
     // ================= 底部悬浮 Dock =================
 
+    fn render_portrait_queue(
+        &self,
+        content_w: f32,
+        shared_hidden: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let queue = self.queue.clone();
+        let current = self.queue_pos;
+        let mode = self.play_mode;
+
+        let hint = {
+            let weak = weak.clone();
+            div()
+                .id("queue-back")
+                .w_full()
+                .h(px(58.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(white.opacity(0.58))
+                .child("此处向下轻扫以返回播放界面")
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.set_portrait_page(PortraitPage::Art, cx);
+                    });
+                })
+        };
+
+        let track_header = {
+            let title = self.current_title_text();
+            let artist = self.current_artist_text();
+            let theme = Theme::dark();
+            let cover = crate::widgets::cover_plain(
+                &theme,
+                self.cover_image.clone(),
+                crate::layout_morph::QUEUE_COVER,
+                crate::layout_morph::QUEUE_COVER_RADIUS,
+                crate::icons::icon(crate::icons::Icon::Note, 20.0, white.opacity(0.35)),
+            );
+            div()
+                .w(px(content_w))
+                .flex()
+                .items_center()
+                .gap(px(crate::layout_morph::QUEUE_COVER_GAP))
+                .pb(px(10.0))
+                .child(
+                    div()
+                        .opacity(if shared_hidden { 0.0 } else { 1.0 })
+                        .child(cover),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .opacity(if shared_hidden { 0.0 } else { 1.0 })
+                        .child(
+                            div()
+                                .text_size(px(16.0))
+                                .line_height(px(16.0 * INFO_LINE_RATIO))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(white.opacity(0.9))
+                                .text_ellipsis()
+                                .child(SharedString::from(title)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .line_height(px(11.0 * INFO_LINE_RATIO))
+                                .text_color(white.opacity(0.45))
+                                .text_ellipsis()
+                                .child(SharedString::from(artist)),
+                        ),
+                )
+        };
+
+        let clear = {
+            let weak = weak.clone();
+            div()
+                .id("queue-clear")
+                .h(px(28.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(white.opacity(0.55))
+                .hover(|s| s.bg(white.opacity(0.08)).text_color(white.opacity(0.85)))
+                .child("清除")
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.stop_playback(cx);
+                        app.queue = Arc::new(Vec::new());
+                        app.queue_pos = None;
+                        cx.notify();
+                    });
+                })
+        };
+        let count_row = div()
+            .w(px(content_w))
+            .h(px(34.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(white.opacity(0.42))
+                    .child(SharedString::from(format!(
+                        "{}/{}",
+                        current.map(|p| p + 1).unwrap_or(0),
+                        queue.len()
+                    ))),
+            )
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(white.opacity(0.92))
+                    .child("播放队列"),
+            )
+            .child(clear);
+
+        let list: AnyElement = if queue.is_empty() {
+            div()
+                .w(px(content_w))
+                .flex_1()
+                .min_h_0()
+                .pt(px(40.0))
+                .text_center()
+                .text_size(px(12.0))
+                .text_color(white.opacity(0.4))
+                .child("队列为空")
+                .into_any_element()
+        } else {
+            let rows_queue = queue.clone();
+            let weak_rows = weak.clone();
+            let mut list = gpui::uniform_list("queue-list", queue.len(), move |range, _window, _cx| {
+                range
+                    .filter_map(|index| {
+                        let track = rows_queue.get(index)?;
+                        let is_current = current == Some(index);
+                        let title = track.title.clone();
+                        let artist = track
+                            .artists
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" / ");
+                        let weak_row = weak_rows.clone();
+                        let weak_remove = weak_rows.clone();
+                        Some(
+                            div()
+                                .id(gpui::ElementId::named_usize("queue-row", index))
+                                .w_full()
+                                .h(px(60.0))
+                                .pb(px(2.0))
+                                .px(px(12.0))
+                                .rounded(px(10.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .when(is_current, |d| d.bg(white.opacity(0.08)))
+                                .hover(|s| s.bg(white.opacity(0.10)))
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.5))
+                                                .font_weight(if is_current {
+                                                    gpui::FontWeight::MEDIUM
+                                                } else {
+                                                    gpui::FontWeight::NORMAL
+                                                })
+                                                .text_color(white.opacity(if is_current {
+                                                    0.96
+                                                } else {
+                                                    0.82
+                                                }))
+                                                .text_ellipsis()
+                                                .child(SharedString::from(title)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(white.opacity(0.38))
+                                                .text_ellipsis()
+                                                .child(SharedString::from(artist)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(gpui::ElementId::named_usize("queue-remove", index))
+                                        .size(px(28.0))
+                                        .rounded(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .text_size(px(14.0))
+                                        .text_color(white.opacity(0.38))
+                                        .hover(|s| {
+                                            s.bg(white.opacity(0.10)).text_color(white.opacity(0.8))
+                                        })
+                                        .child("—")
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            let _ = weak_remove.update(cx, |app, cx| {
+                                                app.remove_queue_at(index, cx);
+                                            });
+                                        }),
+                                )
+                                .on_click(move |_, _, cx| {
+                                    let _ = weak_row.update(cx, |app, cx| {
+                                        app.play_from_list(QueueList::Queue, index, cx);
+                                    });
+                                })
+                                .into_any_element(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            if self.smooth_scroll {
+                list = list.smooth_scroll();
+            }
+            list.track_scroll(self.queue_scroll.clone())
+            .flex_1()
+            .min_h_0()
+            .w(px(content_w))
+            .into_any_element()
+        };
+
+        let pill = {
+            let weak = weak.clone();
+            div()
+                .id("queue-mode-pill")
+                .absolute()
+                .bottom(px(22.0))
+                .left(px(((self.viewport_width - content_w) / 2.0).max(16.0)))
+                .h(px(32.0))
+                .px(px(14.0))
+                .rounded(px(16.0))
+                .bg(white.opacity(0.10))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(white.opacity(0.78))
+                .hover(|s| s.bg(white.opacity(0.15)))
+                .child(SharedString::from(mode.full_label()))
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.cycle_play_mode(cx));
+                })
+        };
+
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(4.0))
+            .child(hint)
+            .child(div().w(px(content_w)).child(track_header))
+            .child(count_row)
+            .child(div().w(px(content_w)).h(px(1.0)).bg(white.opacity(0.10)))
+            .child(list)
+            .child(pill)
+            .into_any_element()
+    }
+
     fn render_dock(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let status = &self.player_status;
-        let title = status.title.clone().unwrap_or_else(|| "未在播放".into());
+        let text = self.now_playing_text();
+        let title = text.title.clone();
         let playing = status.state == PlayerState::Playing;
         let duration = status.duration_ms.unwrap_or(0);
         let position = status.position_ms.min(duration.max(1));
@@ -5058,26 +7310,16 @@ impl ChordialApp {
         } else {
             0.0
         };
-        let artist = match self.current_track.as_ref() {
-            Some(track) => {
-                let joined = track
-                    .artists
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" / ");
-                if !joined.is_empty() {
-                    joined
-                } else {
-                    track
-                        .album
-                        .as_ref()
-                        .map(|a| a.name.clone())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "未知艺人".into())
-                }
+        let artist = if self.current_track.is_some() {
+            if !text.artists.is_empty() {
+                text.artists.clone()
+            } else if !text.album.is_empty() {
+                text.album.clone()
+            } else {
+                SharedString::from("未知艺人")
             }
-            None => "选择一首歌开始".into(),
+        } else {
+            SharedString::from("选择一首歌开始")
         };
 
         let width = self.dock_width();
@@ -5096,11 +7338,9 @@ impl ChordialApp {
             let weak = weak.clone();
             move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
                 let _ = weak.update(cx, |app, cx| {
-                    if app.current_track.is_some() {
-                        app.enter_immersive(cx);
-                        window.focus(&app.focus_handle);
-                        cx.notify();
-                    }
+                    app.open_portrait(cx);
+                    window.focus(&app.focus_handle);
+                    cx.notify();
                 });
             }
         };
@@ -5130,14 +7370,14 @@ impl ChordialApp {
                                 theme.text_dim
                             })
                             .text_ellipsis()
-                            .child(SharedString::from(title)),
+                            .child(title),
                     )
                     .child(
                         div()
                             .text_size(px(10.5))
                             .text_color(theme.text_faint)
                             .text_ellipsis()
-                            .child(SharedString::from(artist)),
+                            .child(artist),
                     ),
             )
             .on_click(open_immersive);
@@ -5185,7 +7425,7 @@ impl ChordialApp {
                 .hover(|s| s.bg(theme.accent_hover))
                 .child(play_icon)
                 .on_click(move |_, _, cx| {
-                    let _ = weak.update(cx, |app, _| app.player.toggle());
+                    let _ = weak.update(cx, |app, cx| app.toggle_playback(cx));
                 })
         };
         let transport = div()
@@ -5342,7 +7582,7 @@ impl ChordialApp {
                 ))
                 .on_click(move |_, window, cx| {
                     let _ = weak.update(cx, |app, cx| {
-                        app.enter_immersive(cx);
+                        app.open_lyrics_immersive(cx);
                         window.focus(&app.focus_handle);
                         cx.notify();
                     });
@@ -5389,25 +7629,176 @@ impl ChordialApp {
             .into_any_element()
     }
 
+    /// 播放线程的位置快照约 33ms 更新一次；沉浸页在两次快照之间按真实
+    /// 帧间隔外推，让进度条在 300Hz 下仍然连续（上限 80ms，避免卡顿后漂移）。
+    fn sync_progress_clock(&mut self) {
+        let (position, playing) = self.player.clock();
+        let (last_position, last_playing, _) = self.progress_clock;
+        if position != last_position || playing != last_playing {
+            self.progress_clock = (position, playing, Instant::now());
+        }
+    }
+
+    fn display_position_ms(&self) -> u64 {
+        let (position, playing, since) = self.progress_clock;
+        if playing {
+            position.saturating_add(since.elapsed().as_millis().min(80) as u64)
+        } else {
+            position
+        }
+    }
+
     fn render_immersive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let bounds = window.bounds();
         let width = f32::from(bounds.size.width);
         let height = f32::from(bounds.size.height);
-        // 背景铺满整个窗口：光栅长边 ≤ 200px（30fps ≈ 25k px/帧），
-        // 最终像素由 GPU 双线性采样到全窗。
-        let bg_scale = (200.0 / width.max(height)).clamp(0.04, 0.5);
+        let now = Instant::now();
+        self.sync_progress_clock();
+
+        // Dock→全屏共享布局：p = 1 时页面完全贴在 Dock 上，p = 0 时满窗。
+        // 根容器保持满窗（输入命中区），真正缩放的是这张卡片。
+        let p = self.immersive_dock_progress(now, height);
+        let full = StageRect {
+            x: 0.0,
+            y: 0.0,
+            w: width,
+            h: height,
+        };
+        let card = full.lerp(dock_rect(width, height), p);
+        let card_w = card.w.max(1.0);
+        let card_h = card.h.max(1.0);
+        // 页面自身的控件在最后 1/3 的收缩距离内淡出（共享封面/曲名仍然可见）。
+        let content_opacity = if p < 0.65 {
+            1.0
+        } else {
+            ((1.0 - p) / 0.2).clamp(0.0, 1.0)
+        };
+        // 页面自带的 Dock 更早淡出：真实 Dock 就在卡片背后，晚淡出会
+        // 看到两层图标叠加（黑边/重影）。
+        let dock_opacity = (1.0 - p * 2.5).clamp(0.0, 1.0);
+        // 靠近 Dock 时把卡片配色过渡回 Dock 的玻璃底与主题文字。这样
+        // p = 1 的卡片与真实 Dock 视觉一致，退出/进入都不会闪一下明暗。
+        let theme = Theme::get(cx).clone();
+        let dock_blend = ((p - 0.72) / 0.28).clamp(0.0, 1.0);
+        let clear_black = gpui::Hsla {
+            a: 0.0,
+            ..gpui::black()
+        };
+        let dock_glass = overlay_color(theme.bg, theme.glass);
+        let dock_title = if self.current_track.is_some() {
+            theme.text
+        } else {
+            theme.text_dim
+        };
+        // 卡片自身必须保持不透明，否则会透出下方真实 Dock 的文字/图标。
+        let card_bg = overlay_color(theme.bg, mix_color(gpui::black(), dock_glass, dock_blend));
+        let card_border = mix_color(clear_black, theme.glass_border, dock_blend);
+        let title_color = mix_color(gpui::white().opacity(0.9), dock_title, dock_blend);
+        let artist_color = mix_color(gpui::white().opacity(0.45), theme.text_faint, dock_blend);
+
+        // 背景铺满卡片；光栅长边 ≤ 200px（30fps ≈ 25k px/帧）。
+        let bg_scale = (200.0 / card_w.max(card_h)).clamp(0.04, 0.5);
         self.lyric_view.update(cx, |view, _| {
+            // 背景按窗口绝对坐标绘制，必须带上卡片原点；否则卡片下移时
+            // 背景会被祖先裁掉一截，底部露出卡片的黑色底，形成“黑边”。
             view.set_background_bounds(Some(Bounds::new(
-                point(px(0.0), px(0.0)),
-                size(px(width), px(height)),
+                point(px(card.x), px(card.y)),
+                size(px(card_w), px(card_h)),
             )));
             view.set_background_render_scale(bg_scale);
         });
-        if width >= height {
-            self.render_immersive_wide(width, height, cx)
+
+        let dock_shared = p > 0.001;
+        // 布局 1 只在「横向窗口 + 歌词可见 + 播放页」时启用；其余情况
+        // （竖屏、无歌词、主动收起歌词、队列子页）统一落到布局 2。
+        let wide_layout = self.portrait_page == PortraitPage::Art
+            && self.layout_one_active(cx, width, height);
+        let page = if wide_layout {
+            self.render_immersive_wide(card_w, card_h, dock_shared, dock_opacity, cx)
         } else {
-            self.render_immersive_compact(width, height, cx)
+            self.render_immersive_compact(card_w, card_h, dock_shared, dock_opacity, cx)
+        };
+
+        let mut card_el = div()
+            .id("immersive-card")
+            .absolute()
+            .left(px(card.x))
+            .top(px(card.y))
+            .w(px(card_w))
+            .h(px(card_h));
+        // 满屏时不要圆角/边框/底色，避免在窗口边缘留下黑边或裁切；
+        // 只有在 Dock↔全屏过渡期间卡片才需要这些装饰。
+        if p > 0.0001 {
+            card_el = card_el
+                .overflow_hidden()
+                .rounded(px(18.0))
+                .border_1()
+                .border_color(card_border)
+                .bg(card_bg);
         }
+        card_el = card_el.child(
+            div()
+                .absolute()
+                .inset_0()
+                .opacity(content_opacity)
+                .child(page),
+        );
+
+        // 共享舞台（封面/曲名/艺人）独立于页面缩放，从 Dock 内的小元素
+        // 连续飞到沉浸页对应位置；坐标从窗口空间平移进卡片空间。
+        if dock_shared {
+            let mode = self.immersive_stage_mode(cx, width, height);
+            let page_geometry = immersive_geometry(mode, width, height);
+            let dock_stage = dock_geometry(width, height);
+            let shared = page_geometry
+                .lerp(dock_stage, p)
+                .translated(-card.x, -card.y);
+            card_el = card_el.child(self.render_shared_stage_colored(
+                shared,
+                title_color,
+                artist_color,
+            ));
+        }
+
+        // 「更多」抽屉画在页面与共享舞台之上；布局 1 / 布局 2 共用。
+        if self.drawer_visible() {
+            card_el = card_el.child(self.render_drawer(card_w, card_h, now, cx));
+        }
+
+        let mut root = div()
+            .id("immersive-root")
+            .size_full()
+            .relative()
+            .child(card_el)
+            .children(Self::resize_handles());
+
+        // 拖拽期间卡片会缩小、把手不再跟随指针；用一张满窗捕获层接管
+        // 后续移动与松手，保证手势连续。
+        if self.sheet_drag.is_some() {
+            root = root.child(
+                div()
+                    .id("immersive-drag-capture")
+                    .absolute()
+                    .inset_0()
+                    .cursor(CursorStyle::ClosedHand)
+                    .on_mouse_move(cx.listener(move |app, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(gpui::MouseButton::Left) {
+                            app.update_sheet_drag(f32::from(event.position.y), cx);
+                        } else if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
+                            app.release_sheet_drag(height, cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |app, _: &MouseUpEvent, _, cx| {
+                            if app.sheet_drag.is_some() {
+                                app.release_sheet_drag(height, cx);
+                            }
+                        }),
+                    ),
+            );
+        }
+        root.into_any_element()
     }
 
     /// 窄窗沉浸：AMLL react-full `VerticalLayout` 的等价几何（宽 < 高）。
@@ -5417,370 +7808,25 @@ impl ChordialApp {
     /// 曲目信息在封面右侧垂直居中（16px：name 500/op.9、artists op.45），
     /// 菜单钮 35×35 贴右缘 3em；歌词铺满其余高度并对齐 0.1/top，
     /// mask 只在顶部 10% 渐隐；歌词打开时不显示传输控件（与 AMLL 竖向一致）。
-    fn render_immersive_compact(
-        &mut self,
-        width: f32,
-        height: f32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let _ = height;
-        let theme = Theme::dark();
+    // ---- AMLL 播放器控件（横向/竖向共用同一套写法） ----
+
+    /// AMLL BouncingSlider 进度条 + 时间/音质标签行。
+    fn amll_progress_block(&self, width: f32, label_font: f32) -> AnyElement {
         let white = gpui::white();
-        let em = 16.0;
-        let gap = 2.0;
-        let row_h = 30.0;
-        let main_top = row_h + gap + row_h + gap;
-        let small_cover = if width <= 480.0 { em * 4.5 } else { em * 6.0 };
-        let side_pad = if width <= 480.0 { 20.0 } else { em * 3.0 };
-        let cover_x = side_pad;
-        let cover_y = main_top + em;
-
         let status = &self.player_status;
-        let title = status.title.clone().unwrap_or_else(|| "未在播放".into());
-        // AMLL MusicInfo：艺人以 ", " 连接，最后一位前用 " & "。
-        let artist = match self.current_track.as_ref() {
-            Some(track) => {
-                let names: Vec<&str> = track
-                    .artists
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .filter(|n| !n.is_empty())
-                    .collect();
-                match names.len() {
-                    0 => track
-                        .album
-                        .as_ref()
-                        .map(|a| a.name.clone())
-                        .unwrap_or_else(|| "未知艺人".into()),
-                    1 => names[0].to_string(),
-                    n => format!("{} & {}", names[..n - 1].join(", "), names[n - 1]),
-                }
-            }
-            None => "选择一首歌开始".into(),
-        };
-
-        // AMLL 竖向：歌词对齐 alignPosition 0.1 / top（歌曲信息下方）。
-        if (self.lyric_align - 0.1).abs() > 0.0005 {
-            self.lyric_align = 0.1;
-            self.lyric_view.update(cx, |view, _| {
-                view.set_player_config(LyricPlayerConfig {
-                    align_anchor: AlignAnchor::Top,
-                    align_position: 0.1,
-                    enable_blur: !self.no_blur,
-                    ..LyricPlayerConfig::default()
-                });
-            });
-        }
-
-        // —— 顶部拖拽 pill（ControlThumb 50×8 r4 白 17.6%，thumb 行内居中）——
-        let pill = Self::window_drag_area(
-            div()
-                .id("immersive-pill-compact")
-                .absolute()
-                .left(px(width / 2.0 - 25.0))
-                .top(px(row_h + gap + 11.0))
-                .w(px(50.0))
-                .h(px(8.0))
-                .rounded(px(4.0))
-                .bg(white.opacity(0.176))
-                .cursor(CursorStyle::OpenHand),
-        );
-
-        // —— 小封面 + 曲目信息 + 菜单钮 ——
-        let small_cover_el = crate::widgets::cover_plain(
-            &theme,
-            self.cover_image.clone(),
-            small_cover,
-            8.0,
-            crate::icons::icon(crate::icons::Icon::Note, 24.0, white.opacity(0.4)),
-        );
-        let info_font = em;
-        let controls_row = div()
-            .absolute()
-            .left(px(cover_x))
-            .right(px(side_pad))
-            .top(px(cover_y))
-            .h(px(small_cover))
-            .flex()
-            .items_center()
-            .child(small_cover_el)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .pl(px(em))
-                    .line_height(px(info_font * 1.25))
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(info_font))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(white.opacity(0.9))
-                            .text_ellipsis()
-                            .child(SharedString::from(title)),
-                    )
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(info_font))
-                            .text_color(white.opacity(0.45))
-                            .text_ellipsis()
-                            .child(SharedString::from(artist)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("immersive-menu-compact")
-                    .size(px(35.0))
-                    .rounded(px(17.5))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .bg(white.opacity(0.08))
-                    .hover(|s| s.bg(white.opacity(0.133)))
-                    .child(crate::icons::icon(crate::icons::Icon::More, 16.0, white)),
-            );
-
-        // —— 歌词：从控制行下缘铺到窗口底部，mask 顶部 10% 渐隐（文本层实现）——
-        let lyric_top = cover_y + small_cover;
-        let lyric_area = div()
-            .absolute()
-            .left_0()
-            .right_0()
-            .top(px(lyric_top))
-            .bottom_0()
-            .child(self.lyric_view.clone());
-
-        let drag_strip = Self::window_drag_area(
-            div()
-                .id("immersive-drag-strip-compact")
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(px(main_top))
-                .cursor(CursorStyle::OpenHand),
-        );
-
-        div()
-            .key_context("ChordialImmersive")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|app, _: &ExitImmersive, window, cx| {
-                app.exit_immersive(cx);
-                window.focus(&app.focus_handle);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|app, _: &PlayPause, _, _cx| app.player.toggle()))
-            .on_action(cx.listener(|app, _: &NextTrack, _, cx| app.play_next(cx)))
-            .on_action(cx.listener(|app, _: &PrevTrack, _, cx| app.play_prev(cx)))
-            .size_full()
-            .relative()
-            .overflow_hidden()
-            .bg(gpui::black())
-            .child(lyric_area)
-            .child(controls_row)
-            .child(drag_strip)
-            .child(pill)
-            .children(Self::resize_handles())
-            .into_any_element()
-    }
-    /// 宽屏沉浸：AMLL react-full `HorizontalLayout` 的等价几何。
-    ///
-    /// 1600×1000 实测：列 info 0.45W / player 0.55W（gap 8px）；行
-    /// drag = 0.12fr / thumb 40 / cover / music-info = 0.8fr / buttom 40 / tail = 0.08fr，
-    /// fr = H − 120 − cover；封面 = min(45vh, 38vw)（H ≤ 1000，否则 50vh）；
-    /// 歌词列右 padding 8%（H > 1000 时 15%）；歌词对齐封面中心（AMLL 用
-    /// ResizeObserver 计算 cover 中线占比后作为 `alignPosition`）。
-    fn render_immersive_wide(
-        &mut self,
-        width: f32,
-        height: f32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = Theme::dark();
-        let weak = cx.entity().downgrade();
-        // AMLL 控件动画进度：进入页面时所有按钮回弹；播放/暂停、shuffle、
-        // repeat 在各自状态切换时重新播放回弹；上/下一首只播放入场双箭头合并。
-        let press_enter = Self::anim_progress(self.ui_anim_enter, Self::UI_ANIM_PRESS_MS);
-        let press_play = Self::anim_progress(
-            Self::latest_anim(self.ui_anim_enter, self.ui_anim_play),
-            Self::UI_ANIM_PRESS_MS,
-        );
-        let press_shuffle = Self::anim_progress(
-            Self::latest_anim(self.ui_anim_enter, self.ui_anim_shuffle),
-            Self::UI_ANIM_PRESS_MS,
-        );
-        let press_repeat = Self::anim_progress(
-            Self::latest_anim(self.ui_anim_enter, self.ui_anim_repeat),
-            Self::UI_ANIM_PRESS_MS,
-        );
-        let arrows = Self::anim_progress(self.ui_anim_enter, Self::UI_ANIM_ARROWS_MS);
-        let speaker_progress = Self::anim_progress(
-            self.ui_anim_volume.map(|(t, _)| t),
-            Self::UI_ANIM_SPEAKER_MS,
-        );
-        let (speaker_low, speaker_high) = match self.ui_anim_volume {
-            Some((_, true)) => (0.0, speaker_progress),
-            Some((_, false)) => (speaker_progress, 0.0),
-            None => (0.0, 0.0),
-        };
-        let status = &self.player_status;
-        let title = status.title.clone().unwrap_or_else(|| "未在播放".into());
-        let playing = status.state == PlayerState::Playing;
         let duration = status.duration_ms.unwrap_or(0);
-        let position = status.position_ms.min(duration.max(1));
+        let position = self.display_position_ms().min(duration.max(1));
+        let remaining = duration.saturating_sub(position);
         let progress = if duration > 0 {
             position as f32 / duration as f32
         } else {
             0.0
-        };
-        let remaining = duration.saturating_sub(position);
-        // AMLL MusicInfo：艺人以 ", " 连接，最后一位前用 " & "。
-        let artist = match self.current_track.as_ref() {
-            Some(track) => {
-                let names: Vec<&str> = track
-                    .artists
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .filter(|n| !n.is_empty())
-                    .collect();
-                match names.len() {
-                    0 => track
-                        .album
-                        .as_ref()
-                        .map(|a| a.name.clone())
-                        .unwrap_or_else(|| "未知艺人".into()),
-                    1 => names[0].to_string(),
-                    n => format!("{} & {}", names[..n - 1].join(", "), names[n - 1]),
-                }
-            }
-            None => "选择一首歌开始".into(),
         };
         let quality = self
             .current_track
             .as_ref()
             .and_then(|t| t.quality.clone())
             .unwrap_or_default();
-
-        // ---- AMLL horizontal 几何 ----
-        let cover = if height <= 1000.0 {
-            (height * 0.45).min(width * 0.38)
-        } else {
-            (height * 0.5).min(width * 0.38)
-        };
-        let gap = 8.0;
-        let fr = (height - 120.0 - cover).max(0.0);
-        let drag = fr * 0.12;
-        let tail = fr * 0.08;
-        let cover_top = drag + gap + 40.0 + gap;
-        // 底部控制行占 [bottom_row_top, +40]，音量行必须停在它上方；信息区
-        // 用剩余高度做 space-between，避免矮窗口时被挤出窗口底边。
-        let bottom_row_top = height - tail - gap - 40.0;
-        let controls_top = cover_top + cover + 20.0;
-        let controls_h = (bottom_row_top - gap - controls_top).max(0.0);
-        let info_w = width * 0.45;
-        let info_center = info_w * 0.5;
-        let lyric_left = info_w + gap;
-        let lyric_col_w = (width - lyric_left).max(0.0);
-        let lyric_pad_right = if height <= 1000.0 {
-            lyric_col_w * 0.08
-        } else {
-            lyric_col_w * 0.15
-        };
-        let align = ((cover_top + cover * 0.5) / height).clamp(0.05, 0.95);
-        if (self.lyric_align - align).abs() > 0.0005 {
-            self.lyric_align = align;
-            self.lyric_view.update(cx, |view, _| {
-                view.set_player_config(LyricPlayerConfig {
-                    align_anchor: AlignAnchor::Center,
-                    align_position: align,
-                    enable_blur: !self.no_blur,
-                    ..LyricPlayerConfig::default()
-                });
-            });
-        }
-
-        let white = gpui::white();
-        // AMLL MediaButton：hover 时白 13% 圆底；图标尺寸按 81px 按钮实测比例。
-        let btn = cover * 0.18;
-        let icon_side = (btn * 0.26).max(14.0);
-        let icon_skip = (btn * 0.32).max(16.0);
-        let icon_play = (btn * 0.37).max(18.0);
-
-        // —— 顶部拖拽 pill（AMLL ControlThumb：50×8、圆角 4、白 17.6%）——
-        let pill = Self::window_drag_area(
-            div()
-                .id("immersive-pill")
-                .absolute()
-                .left(px(info_center - 25.0))
-                .top(px(drag + gap + 16.0))
-                .w(px(50.0))
-                .h(px(8.0))
-                .rounded(px(4.0))
-                .bg(white.opacity(0.176))
-                .cursor(CursorStyle::OpenHand),
-        );
-
-        // —— 封面（AMLL Cover：无圆角，播放时 drop-shadow）——
-        let cover_el = crate::widgets::cover_plain(
-            &theme,
-            self.cover_image.clone(),
-            cover,
-            0.0,
-            crate::icons::icon(crate::icons::Icon::Note, 40.0, white.opacity(0.4)),
-        );
-
-        // —— 曲目信息：字号 max(2vh, 1em)；name 500/op.9、artists 400/op.45 ——
-        let info_font = (height * 0.02).max(16.0);
-        let info_line_h = px(info_font * 1.25);
-        let info_row = div()
-            .w(px(cover))
-            .flex()
-            .items_center()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .line_height(info_line_h)
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(info_font))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(white.opacity(0.9))
-                            .text_ellipsis()
-                            .child(SharedString::from(title.clone())),
-                    )
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(info_font))
-                            .text_color(white.opacity(0.45))
-                            .text_ellipsis()
-                            .child(SharedString::from(artist)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("immersive-menu")
-                    .size(px(35.0))
-                    .rounded(px(17.5))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .bg(white.opacity(0.08))
-                    .hover(|s| s.bg(white.opacity(0.133)))
-                    .child(crate::icons::icon(crate::icons::Icon::More, 16.0, white)),
-            );
-
-        // —— 进度条（BouncingSlider 等价）+ 标签行（12.8px w500 op.5）——
-        let label_font = (height * 0.012).max(12.8);
         let seek = {
             let player = self.player.clone();
             move |fraction: f32, _cx: &mut App| {
@@ -5807,33 +7853,57 @@ impl ChordialApp {
                 .child(SharedString::from(quality.to_uppercase()))
                 .into_any_element()
         };
-        let labels = div()
-            .w(px(cover))
-            .mt(px(4.0))
-            .flex()
-            .items_center()
-            .text_size(px(label_font))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(white.opacity(0.5))
-            .child(SharedString::from(fmt_ms(position)))
-            .child(div().flex_1().flex().justify_center().child(quality_pill))
-            .child(SharedString::from(format!("-{}", fmt_ms(remaining))));
-
-        let progress_block = div()
-            .w(px(cover))
+        div()
+            .w(px(width))
             .flex()
             .flex_col()
             .child(div().h(px(24.0)).child(progress_bar))
-            .child(labels);
+            .child(
+                div()
+                    .w_full()
+                    .mt(px(4.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(label_font))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(white.opacity(0.5))
+                    .child(SharedString::from(fmt_ms(position)))
+                    .child(div().flex_1().flex().justify_center().child(quality_pill))
+                    .child(SharedString::from(format!("-{}", fmt_ms(remaining)))),
+            )
+            .into_any_element()
+    }
 
-        // —— 传输按钮：5 × 18%cover，space-evenly（等宽弹性间隔实现）——
+    /// AMLL MediaButton 传输行：shuffle / prev / play / next / repeat。
+    fn amll_transport(&self, width: f32, btn: f32, cx: &mut Context<Self>) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let playing = self.player_status.state == PlayerState::Playing;
+        let press_enter = Self::anim_progress(self.ui_anim_enter, Self::UI_ANIM_PRESS_MS);
+        let press_play = Self::anim_progress(
+            Self::latest_anim(self.ui_anim_enter, self.ui_anim_play),
+            Self::UI_ANIM_PRESS_MS,
+        );
+        let press_shuffle = Self::anim_progress(
+            Self::latest_anim(self.ui_anim_enter, self.ui_anim_shuffle),
+            Self::UI_ANIM_PRESS_MS,
+        );
+        let press_repeat = Self::anim_progress(
+            Self::latest_anim(self.ui_anim_enter, self.ui_anim_repeat),
+            Self::UI_ANIM_PRESS_MS,
+        );
+        let arrows = Self::anim_progress(self.ui_anim_enter, Self::UI_ANIM_ARROWS_MS);
+        let icon_side = (btn * 0.26).max(14.0);
+        let icon_skip = (btn * 0.32).max(16.0);
+        let icon_play = (btn * 0.37).max(18.0);
         let shuffle_active = self.play_mode == PlayMode::Shuffle;
         let repeat_active = self.play_mode == PlayMode::RepeatOne;
         let sp = || div().flex_1();
-        let shuffle_btn = {
+
+        let shuffle = {
             let weak = weak.clone();
             div()
-                .id("immersive-shuffle")
+                .id("amll-shuffle")
                 .size(px(btn))
                 .rounded(px(btn / 2.0))
                 .flex()
@@ -5860,18 +7930,16 @@ impl ChordialApp {
                         } else {
                             PlayMode::Shuffle
                         };
-                        // AMLL：shuffle/repeat 的 on/off 是两套 SVG，切换时重新挂载
-                        // → 图标播放 pressed 回弹。
                         app.ui_anim_shuffle = Some(Instant::now());
                         app.ensure_ui_anim_ticker(cx);
                         cx.notify();
                     });
                 })
         };
-        let prev_btn = {
+        let prev = {
             let weak = weak.clone();
             div()
-                .id("immersive-prev")
+                .id("amll-prev")
                 .size(px(btn))
                 .rounded(px(btn / 2.0))
                 .flex()
@@ -5892,10 +7960,10 @@ impl ChordialApp {
                     let _ = weak.update(cx, |app, cx| app.play_prev(cx));
                 })
         };
-        let play_btn = {
+        let play = {
             let weak = weak.clone();
             div()
-                .id("immersive-play")
+                .id("amll-play")
                 .size(px(btn))
                 .rounded(px(btn / 2.0))
                 .flex()
@@ -5916,14 +7984,13 @@ impl ChordialApp {
                     },
                 ))
                 .on_click(move |_, _, cx| {
-                    // 状态切换由 200ms 轮询观察；图标交换与回弹在那里同帧触发。
-                    let _ = weak.update(cx, |app, _| app.player.toggle());
+                    let _ = weak.update(cx, |app, cx| app.toggle_playback(cx));
                 })
         };
-        let next_btn = {
+        let next = {
             let weak = weak.clone();
             div()
-                .id("immersive-next")
+                .id("amll-next")
                 .size(px(btn))
                 .rounded(px(btn / 2.0))
                 .flex()
@@ -5944,10 +8011,10 @@ impl ChordialApp {
                     let _ = weak.update(cx, |app, cx| app.play_next(cx));
                 })
         };
-        let repeat_btn = {
+        let repeat = {
             let weak = weak.clone();
             div()
-                .id("immersive-repeat")
+                .id("amll-repeat")
                 .size(px(btn))
                 .rounded(px(btn / 2.0))
                 .flex()
@@ -5980,39 +8047,50 @@ impl ChordialApp {
                     });
                 })
         };
-        let transport = div()
-            .w(px(cover))
+        div()
+            .w(px(width))
             .flex()
             .items_center()
-            .child(shuffle_btn)
+            .child(shuffle)
             .child(sp())
-            .child(prev_btn)
+            .child(prev)
             .child(sp())
-            .child(play_btn)
+            .child(play)
             .child(sp())
-            .child(next_btn)
+            .child(next)
             .child(sp())
-            .child(repeat_btn);
+            .child(repeat)
+            .into_any_element()
+    }
 
-        // —— 音量行：小喇叭 + 滑杆 + 大喇叭（opacity 0.5，margin -12/-8 的等价内距）——
-        let volume_value = status.volume.clamp(0.0, 1.0);
+    /// AMLL VolumeControl 等价音量行。
+    fn amll_volume_row(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let speaker_progress = Self::anim_progress(
+            self.ui_anim_volume.map(|(t, _)| t),
+            Self::UI_ANIM_SPEAKER_MS,
+        );
+        let (speaker_low, speaker_high) = match self.ui_anim_volume {
+            Some((_, true)) => (0.0, speaker_progress),
+            Some((_, false)) => (speaker_progress, 0.0),
+            None => (0.0, 0.0),
+        };
         let volume_slider = {
             let player = self.player.clone();
-            let weak = weak.clone();
             crate::widgets::amll_slider(
-                volume_value,
+                self.player_status.volume.clamp(0.0, 1.0),
                 "volume",
                 move |fraction: f32, cx: &mut App| {
                     player.set_volume(fraction);
-                    // AMLL VolumeControl：到达 0 / 1 时对应喇叭的部件依次弹跳。
                     let _ = weak.update(cx, |app, cx| {
                         app.note_volume_input(fraction, cx);
                     });
                 },
             )
         };
-        let volume_row = div()
-            .w(px(cover))
+        div()
+            .w(px(width))
             .flex()
             .items_center()
             .child(crate::icons::icon_motion(
@@ -6033,97 +8111,1523 @@ impl ChordialApp {
                     speaker: speaker_high,
                     ..Default::default()
                 },
-            ));
+            ))
+            .into_any_element()
+    }
 
-        // —— 左列：封面固定，信息/进度/传输/音量在剩余高度内 space-between；
-        //    间距随窗口高度伸缩，音量行始终落在底部控制行上方。 ——
+    /// 布局 1 / 布局 2 共用的底部控制行。
+    ///
+    /// 左：全屏；右：队列 ·（歌词）· 更多 · 关闭。两套布局只通过
+    /// `show_lyrics` 决定是否露出直接歌词开关，其余按钮、尺寸、间距与
+    /// 交互完全一致，不再维护两套 Dock。
+    fn immersive_bottom_row(
+        &self,
+        width: f32,
+        show_lyrics: bool,
+        lyrics_on: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let btn = |icon: crate::icons::Icon,
+                   id: &'static str,
+                   active: bool,
+                   on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
+            div()
+                .id(id)
+                .size(px(40.0))
+                .rounded(px(20.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(if active { 1.0 } else { 0.45 })
+                .hover(|s| s.opacity(1.0).bg(white.opacity(0.133)))
+                .child(crate::icons::icon(icon, 18.0, white))
+                .on_click(on_click)
+                .into_any_element()
+        };
+
+        let fullscreen = btn(
+            crate::icons::Icon::Expand,
+            "immersive-fullscreen",
+            false,
+            Box::new(|_, window, _| window.toggle_fullscreen()),
+        );
+        let queue = {
+            let weak = weak.clone();
+            btn(
+                crate::icons::Icon::Queue,
+                "immersive-queue",
+                self.portrait_page == PortraitPage::Queue,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.close_drawer(cx);
+                        app.set_portrait_page(PortraitPage::Queue, cx);
+                    });
+                }),
+            )
+        };
+        let lyrics = show_lyrics.then(|| {
+            let weak = weak.clone();
+            btn(
+                crate::icons::Icon::Lyrics,
+                "immersive-lyrics",
+                lyrics_on,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.toggle_wide_lyrics(cx));
+                }),
+            )
+        });
+        let more = {
+            let weak = weak.clone();
+            btn(
+                crate::icons::Icon::More,
+                "immersive-more",
+                self.drawer_open,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        if app.drawer_open {
+                            app.close_drawer(cx);
+                        } else {
+                            app.open_drawer(cx);
+                        }
+                    });
+                }),
+            )
+        };
+        let close = {
+            let weak = weak.clone();
+            btn(
+                crate::icons::Icon::Close,
+                "immersive-close",
+                false,
+                Box::new(move |_, window, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.hide_drawer_now();
+                        app.exit_immersive(cx);
+                        window.focus(&app.focus_handle);
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+
+        // 歌词列一直铺到卡片底边，整条控制行压在歌词之上。gpui 的普通
+        // 命中区不会遮挡背后的命中区，不加 occlude 时点按钮会同时命中
+        // 歌词视图的 on_mouse_down，误触「点歌词跳转时间轴」。这里把整条
+        // 控制行声明为遮挡层：按钮照常可点，但背后的歌词不再接收点击。
+        div()
+            .w(px(width))
+            .h(px(40.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .occlude()
+            .child(fullscreen)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(16.0))
+                    .child(queue)
+                    .when_some(lyrics, |row, button| row.child(button))
+                    .child(more)
+                    .child(close),
+            )
+            .into_any_element()
+    }
+
+    /// 底部「更多」抽屉：布局 1 / 布局 2 共用。
+    ///
+    /// 一级页收纳定时、均衡器、歌词开关、队列、音频信息与艺术家；
+    /// 定时选项是抽屉内的二级页，不再从 Dock 弹浮层。
+    fn render_drawer(
+        &self,
+        width: f32,
+        height: f32,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let phone_main = self.phone_shell_active();
+        let progress = self.drawer_progress(now);
+        let panel_w = (width - 24.0).clamp(280.0, 520.0).min(width.max(1.0));
+        let panel_h = ((height * 0.68).clamp(280.0, 540.0)).min((height - 12.0).max(180.0));
+        let left = ((width - panel_w) * 0.5).max(0.0);
+        let top = height - panel_h * progress;
+
+        let row = |icon: crate::icons::Icon,
+                   id: &'static str,
+                   title: &'static str,
+                   detail: String,
+                   active: bool,
+                   on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
+            let mut labels = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .max_w_full()
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(white.opacity(0.88))
+                        .text_ellipsis()
+                        .child(title),
+                );
+            if !detail.is_empty() {
+                labels = labels.child(
+                    div()
+                        .max_w_full()
+                        .text_size(px(11.0))
+                        .text_color(white.opacity(0.42))
+                        .text_ellipsis()
+                        .child(SharedString::from(detail)),
+                );
+            }
+            div()
+                .id(id)
+                .h(px(46.0))
+                .w_full()
+                .flex_none()
+                .rounded(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(10.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(white.opacity(0.06)))
+                .child(crate::icons::icon(icon, 18.0, white.opacity(0.72)))
+                .child(labels)
+                .when(active, |d| {
+                    d.child(crate::icons::icon(
+                        crate::icons::Icon::Check,
+                        14.0,
+                        white.opacity(0.8),
+                    ))
+                })
+                .on_click(on_click)
+                .into_any_element()
+        };
+
+        let (panel_title, back_row) = match self.drawer_page {
+            DrawerPage::Root => (if phone_main { "菜单" } else { "更多" }, None),
+            DrawerPage::Sleep => {
+                let weak = weak.clone();
+                let back = row(
+                    crate::icons::Icon::ChevronLeft,
+                    "drawer-back",
+                    "返回",
+                    String::new(),
+                    false,
+                    Box::new(move |_, _, cx| {
+                        let _ = weak.update(cx, |app, cx| {
+                            app.drawer_page = DrawerPage::Root;
+                            cx.notify();
+                        });
+                    }),
+                );
+                ("睡眠定时", Some(back))
+            }
+        };
+
+        let mut body = div().w_full().flex().flex_col().gap(px(2.0));
+        if let Some(back) = back_row {
+            body = body.child(back);
+        }
+        match self.drawer_page {
+            DrawerPage::Root => {
+                // 手机壳没有侧栏与标题栏按钮，抽屉就是唯一的导航面板：
+                // 播放页 / 全部音乐 / 搜索 / 设置 / 主题都从这里进出。
+                if phone_main {
+                    let section = div()
+                        .px(px(10.0))
+                        .pt(px(4.0))
+                        .pb(px(2.0))
+                        .text_size(px(10.5))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(white.opacity(0.38))
+                        .child("导航");
+                    let current = self
+                        .current_track
+                        .as_ref()
+                        .map(|t| t.title.clone())
+                        .unwrap_or_else(|| "未在播放".into());
+                    let player = {
+                        let weak = weak.clone();
+                        row(
+                            crate::icons::Icon::Play,
+                            "drawer-phone-player",
+                            "正在播放",
+                            current,
+                            self.phone_page == PhonePage::Player,
+                            Box::new(move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.phone_page = PhonePage::Player;
+                                    app.close_drawer(cx);
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    };
+                    let library = {
+                        let weak = weak.clone();
+                        let active = self.phone_page == PhonePage::Browse
+                            && self.view_tab == ViewTab::Library
+                            && self.library_filter == LibraryFilter::All;
+                        row(
+                            crate::icons::Icon::Note,
+                            "drawer-phone-library",
+                            "所有音乐",
+                            format!("{} 首", self.library.len()),
+                            active,
+                            Box::new(move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.phone_page = PhonePage::Browse;
+                                    app.view_tab = ViewTab::Library;
+                                    app.library_filter = LibraryFilter::All;
+                                    app.source_route = None;
+                                    app.close_drawer(cx);
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    };
+                    let search = {
+                        let weak = weak.clone();
+                        row(
+                            crate::icons::Icon::Search,
+                            "drawer-phone-search",
+                            "搜索",
+                            "歌曲 / 专辑 / 歌手 / 歌单".into(),
+                            self.phone_page == PhonePage::Browse
+                                && self.view_tab == ViewTab::Search,
+                            Box::new(move |_, window, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.phone_page = PhonePage::Browse;
+                                    app.view_tab = ViewTab::Search;
+                                    app.close_drawer(cx);
+                                    focus_input(&app.search_input, window, cx);
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    };
+                    let settings = {
+                        let weak = weak.clone();
+                        row(
+                            crate::icons::Icon::Settings,
+                            "drawer-phone-settings",
+                            "设置",
+                            "外观、播放、音源与存储".into(),
+                            self.settings_open,
+                            Box::new(move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.hide_drawer_now();
+                                    app.open_settings(cx);
+                                });
+                            }),
+                        )
+                    };
+                    let theme_row = {
+                        let weak = weak.clone();
+                        let dark = Theme::get(cx).is_dark();
+                        row(
+                            if dark {
+                                crate::icons::Icon::Sun
+                            } else {
+                                crate::icons::Icon::Moon
+                            },
+                            "drawer-phone-theme",
+                            if dark { "切换到浅色" } else { "切换到深色" },
+                            String::new(),
+                            false,
+                            Box::new(move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.toggle_appearance(cx);
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    };
+                    body = body
+                        .child(section)
+                        .child(player)
+                        .child(library)
+                        .child(search)
+                        .child(settings)
+                        .child(theme_row)
+                        .child(
+                            div()
+                                .h(px(1.0))
+                                .my(px(4.0))
+                                .bg(white.opacity(0.08)),
+                        );
+                }
+                let sleep_detail = self
+                    .sleep_minutes
+                    .map(|m| format!("{m} 分钟后暂停"))
+                    .unwrap_or_else(|| "未设置".into());
+                let sleep = {
+                    let weak = weak.clone();
+                    row(
+                        crate::icons::Icon::Clock,
+                        "drawer-sleep",
+                        "睡眠定时",
+                        sleep_detail,
+                        self.sleep_minutes.is_some(),
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.drawer_page = DrawerPage::Sleep;
+                                cx.notify();
+                            });
+                        }),
+                    )
+                };
+                let eq_detail = format!(
+                    "{} · {}",
+                    self.eq.preset_name,
+                    if self.eq.settings.enabled {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    }
+                );
+                let eq = {
+                    let weak = weak.clone();
+                    row(
+                        crate::icons::Icon::Equalizer,
+                        "drawer-eq",
+                        "均衡器",
+                        eq_detail,
+                        self.eq.settings.enabled,
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.hide_drawer_now();
+                                app.open_eq(cx);
+                            });
+                        }),
+                    )
+                };
+                let queue = {
+                    let weak = weak.clone();
+                    let active = phone_main
+                        && self.phone_page == PhonePage::Browse
+                        && self.view_tab == ViewTab::Library
+                        && self.library_filter == LibraryFilter::Queue;
+                    row(
+                        crate::icons::Icon::Queue,
+                        "drawer-queue",
+                        "播放队列",
+                        format!("{} 首", self.queue.len()),
+                        active,
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.hide_drawer_now();
+                                if app.phone_shell_active() {
+                                    app.phone_page = PhonePage::Browse;
+                                    app.view_tab = ViewTab::Library;
+                                    app.library_filter = LibraryFilter::Queue;
+                                } else {
+                                    app.set_portrait_page(PortraitPage::Queue, cx);
+                                }
+                                cx.notify();
+                            });
+                        }),
+                    )
+                };
+                body = body.child(sleep).child(eq);
+                if self.layout_can_toggle_lyrics(cx) {
+                    let weak = weak.clone();
+                    let visible = !self.wide_lyrics_hidden;
+                    body = body.child(row(
+                        crate::icons::Icon::Lyrics,
+                        "drawer-lyrics",
+                        "歌词",
+                        if visible {
+                            "显示中 · 点击收起".into()
+                        } else {
+                            "已收起 · 点击显示".into()
+                        },
+                        visible,
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.close_drawer(cx);
+                                app.toggle_wide_lyrics(cx);
+                            });
+                        }),
+                    ));
+                }
+                body = body.child(queue);
+
+                let quality = self
+                    .current_track
+                    .as_ref()
+                    .and_then(|t| t.quality.clone())
+                    .unwrap_or_default();
+                let source = self
+                    .current_track
+                    .as_ref()
+                    .map(|t| match &t.origin {
+                        TrackOrigin::Local { .. } => "本地音乐".to_string(),
+                        TrackOrigin::Remote { source } => match source.0.as_str() {
+                            "netease" => "网易云音乐".to_string(),
+                            other => other.to_string(),
+                        },
+                    })
+                    .unwrap_or_else(|| "—".into());
+                body = body.child(
+                    div()
+                        .w_full()
+                        .flex_none()
+                        .rounded(px(10.0))
+                        .bg(white.opacity(0.05))
+                        .border_1()
+                        .border_color(white.opacity(0.06))
+                        .p(px(12.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(white.opacity(0.8))
+                                .child("音频信息"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(white.opacity(0.45))
+                                .child(SharedString::from(if quality.is_empty() {
+                                    "音质信息未知".to_string()
+                                } else {
+                                    quality
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(white.opacity(0.45))
+                                .child(SharedString::from(format!("音源：{source}"))),
+                        ),
+                );
+
+                let artists = self
+                    .current_track
+                    .as_ref()
+                    .map(|t| t.artists.clone())
+                    .unwrap_or_default();
+                if !artists.is_empty() {
+                    let mut card = div()
+                        .w_full()
+                        .flex_none()
+                        .rounded(px(10.0))
+                        .bg(white.opacity(0.05))
+                        .border_1()
+                        .border_color(white.opacity(0.06))
+                        .p(px(10.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .px(px(2.0))
+                                .pb(px(2.0))
+                                .text_size(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(white.opacity(0.8))
+                                .child("参与创作的艺术家"),
+                        );
+                    for artist in artists {
+                        let weak_artist = weak.clone();
+                        let linked = artist.id.is_some();
+                        card = card.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "drawer-artist-{}",
+                                    artist.name
+                                )))
+                                .h(px(34.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(9.0))
+                                .px(px(2.0))
+                                .rounded(px(7.0))
+                                .when(linked, |d| {
+                                    d.cursor_pointer().hover(|s| s.bg(white.opacity(0.05)))
+                                })
+                                .child(
+                                    div()
+                                        .size(px(24.0))
+                                        .rounded(px(12.0))
+                                        .bg(white.opacity(0.08))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(crate::icons::icon(
+                                            crate::icons::Icon::Person,
+                                            12.0,
+                                            white.opacity(0.55),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(12.0))
+                                        .text_color(white.opacity(0.82))
+                                        .text_ellipsis()
+                                        .child(SharedString::from(artist.name.clone())),
+                                )
+                                .when(linked, |d| {
+                                    d.on_click(move |_, window, cx| {
+                                        let _ = weak_artist.update(cx, |app, cx| {
+                                            app.hide_drawer_now();
+                                            app.exit_immersive(cx);
+                                            app.open_artist_for_current(cx);
+                                            window.focus(&app.focus_handle);
+                                            cx.notify();
+                                        });
+                                    })
+                                }),
+                        );
+                    }
+                    body = body.child(card);
+                }
+
+                // 「退出播放页」只属于沉浸模态；手机壳的曲库页由返回键
+                // 和底部曲库按钮处理，不能再出现一个名字不符的入口。
+                if self.immersive {
+                    let exit = {
+                        let weak = weak.clone();
+                        row(
+                            crate::icons::Icon::Close,
+                            "drawer-exit",
+                            "退出播放页",
+                            "Esc".into(),
+                            false,
+                            Box::new(move |_, window, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.hide_drawer_now();
+                                    app.exit_immersive(cx);
+                                    window.focus(&app.focus_handle);
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    };
+                    body = body.child(exit);
+                }
+            }
+            DrawerPage::Sleep => {
+                for (label, minutes) in [
+                    ("15 分钟", Some(15u32)),
+                    ("30 分钟", Some(30u32)),
+                    ("60 分钟", Some(60u32)),
+                    ("关闭定时", None),
+                ] {
+                    let weak = weak.clone();
+                    let active = self.sleep_minutes == minutes;
+                    body = body.child(row(
+                        crate::icons::Icon::Clock,
+                        match minutes {
+                            Some(15) => "drawer-sleep-15",
+                            Some(30) => "drawer-sleep-30",
+                            Some(60) => "drawer-sleep-60",
+                            _ => "drawer-sleep-off",
+                        },
+                        label,
+                        if active {
+                            "当前已启用".into()
+                        } else {
+                            String::new()
+                        },
+                        active,
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.set_sleep_minutes(minutes, cx);
+                                app.close_drawer(cx);
+                            });
+                        }),
+                    ));
+                }
+            }
+        }
+
+        let header_close = {
+            let weak = weak.clone();
+            div()
+                .id("drawer-close")
+                .size(px(28.0))
+                .rounded(px(14.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .hover(|s| s.bg(white.opacity(0.1)))
+                .child(crate::icons::icon(
+                    crate::icons::Icon::Close,
+                    14.0,
+                    white.opacity(0.7),
+                ))
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.close_drawer(cx));
+                })
+        };
+
+        let panel = div()
+            .id("immersive-drawer-panel")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(panel_w))
+            .h(px(panel_h))
+            .rounded(px(20.0))
+            .border_1()
+            .border_color(white.opacity(0.10))
+            .bg(gpui::rgb(0x1C1C22))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w_full()
+                    .pt(px(8.0))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(38.0))
+                            .h(px(4.0))
+                            .rounded(px(2.0))
+                            .bg(white.opacity(0.18)),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px(px(16.0))
+                    .pt(px(4.0))
+                    .pb(px(8.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(white.opacity(0.92))
+                            .child(panel_title),
+                    )
+                    .child(header_close),
+            )
+            .child(
+                div()
+                    .id("drawer-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(self.smooth_scroll, |d| d.smooth_scroll())
+                    .px(px(10.0))
+                    .pb(px(12.0))
+                    .child(body),
+            );
+
+        let scrim = {
+            let weak = weak.clone();
+            div()
+                .id("immersive-drawer-scrim")
+                .absolute()
+                .inset_0()
+                .bg(gpui::black().opacity(0.38 * progress))
+                .occlude()
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.close_drawer(cx));
+                })
+        };
+
+        scrim.child(panel).into_any_element()
+    }
+
+    /// 沉浸层统一的曲名文案。共享元素与页面占位共用同一份文本，
+    /// 保证补间结束交还静态布局时不会发生文字替换。
+    fn current_title_text(&self) -> String {
+        self.current_track
+            .as_ref()
+            .map(|t| t.title.clone())
+            .or_else(|| self.player_status.title.clone())
+            .unwrap_or_else(|| "未在播放".into())
+    }
+
+    /// 沉浸层统一的艺人文案（AMLL 语义：`A, B & C`，无艺人时回退专辑）。
+    fn current_artist_text(&self) -> String {
+        match self.current_track.as_ref() {
+            Some(track) => {
+                let names: Vec<&str> = track
+                    .artists
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                match names.len() {
+                    0 => track
+                        .album
+                        .as_ref()
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| "未知艺人".into()),
+                    1 => names[0].to_string(),
+                    n => format!("{} & {}", names[..n - 1].join(", "), names[n - 1]),
+                }
+            }
+            None => "选择一首歌开始".into(),
+        }
+    }
+
+    /// 只有曲目信息与右侧圆钮（封面态放在大封面下方）。
+    fn amll_info_row(
+        &self,
+        width: f32,
+        font: f32,
+        back: bool,
+        interactive: bool,
+        hide_text: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let title = self.current_title_text();
+        let artist = self.current_artist_text();
+        let action = {
+            let base = div()
+                .id("amll-info-action")
+                .size(px(35.0))
+                .rounded(px(17.5))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(white.opacity(0.08))
+                .hover(|s| s.bg(white.opacity(0.133)))
+                .child(crate::icons::icon(
+                    if back {
+                        crate::icons::Icon::ChevronLeft
+                    } else {
+                        crate::icons::Icon::More
+                    },
+                    16.0,
+                    white,
+                ));
+            if interactive {
+                let weak = weak.clone();
+                base.on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        if back {
+                            app.set_portrait_page(PortraitPage::Art, cx);
+                        } else {
+                            app.open_drawer(cx);
+                        }
+                    });
+                })
+                .into_any_element()
+            } else {
+                base.into_any_element()
+            }
+        };
+        div()
+            .w(px(width))
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .opacity(if hide_text { 0.0 } else { 1.0 })
+                    .child(
+                        div()
+                            .max_w_full()
+                            .text_size(px(font))
+                            .line_height(px(font * INFO_LINE_RATIO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(white.opacity(0.9))
+                            .text_ellipsis()
+                            .child(SharedString::from(title)),
+                    )
+                    .child(
+                        div()
+                            .max_w_full()
+                            .text_size(px(font))
+                            .line_height(px(font * INFO_LINE_RATIO))
+                            .text_color(white.opacity(0.45))
+                            .text_ellipsis()
+                            .child(SharedString::from(artist)),
+                    ),
+            )
+            .child(action)
+            .into_any_element()
+    }
+
+    /// 桌面宽屏与竖屏共用的 AMLL 播放器列。
+    ///
+    /// 封面、信息、进度、传输、音量共用同一个列宽；歌词关闭/无歌词时由调用方
+    /// 把这整列水平居中。这样两端只有定位不同，控件本身不再各写一套。
+    fn amll_player_column(
+        &self,
+        column_w: f32,
+        height: f32,
+        controls_h: f32,
+        chrome_o: f32,
+        menu_interactive: bool,
+        shared_hidden: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let theme = Theme::dark();
+        let cover = crate::widgets::cover_plain(
+            &theme,
+            self.cover_image.clone(),
+            column_w,
+            0.0,
+            crate::icons::icon(
+                crate::icons::Icon::Note,
+                (column_w * 0.1).clamp(28.0, 40.0),
+                white.opacity(0.4),
+            ),
+        );
+        let info_font = (height * 0.02).max(16.0);
+        let info = div()
+            .w(px(column_w))
+            .opacity(chrome_o)
+            .child(self.amll_info_row(
+                column_w,
+                info_font,
+                false,
+                menu_interactive,
+                shared_hidden,
+                cx,
+            ));
+        let label_font = (height * 0.012).max(12.8);
+        let progress = div()
+            .w(px(column_w))
+            .h(px(46.0))
+            .opacity(chrome_o)
+            .child(self.amll_progress_block(column_w, label_font));
+        let btn = (column_w * 0.18).clamp(40.0, 88.0);
+        let transport = self.amll_transport(column_w, btn, cx);
+        let volume = self.amll_volume_row(column_w, cx);
         let controls = div()
-            .w(px(cover))
-            .h(px(controls_h))
-            .mt(px(20.0))
+            .w(px(column_w))
+            .h(px(controls_h.max(0.0)))
             .flex()
             .flex_col()
             .items_center()
             .justify_between()
-            .child(info_row)
-            .child(progress_block)
+            .child(info)
+            .child(progress)
             .child(transport)
-            .child(volume_row);
-        let info_column = div()
-            .absolute()
-            .left_0()
-            .top(px(cover_top))
-            .w(px(info_w))
+            .child(volume);
+        div()
+            .w(px(column_w))
             .flex()
             .flex_col()
             .items_center()
-            .child(cover_el)
-            .child(controls);
+            .child(
+                div()
+                    .opacity(if shared_hidden { 0.0 } else { 1.0 })
+                    .child(cover),
+            )
+            .child(div().h(px(20.0)))
+            .child(controls)
+            .into_any_element()
+    }
 
-        // —— 歌词列：player-side 全高，右 padding 8% ——
-        let lyric_area = div()
+    /// 共享元素舞台：一帧内只画一份封面 + 曲名/艺人，用插值几何定位。
+    ///
+    /// 调用方已在页面里把同名元素设为透明（保留占位），因此这里不做交叉
+    /// 淡入——两端文案一致，字号、行高、位置连续变化即可。
+    fn render_shared_stage(&self, geometry: StageGeometry) -> AnyElement {
+        let white = gpui::white();
+        self.render_shared_stage_colored(geometry, white.opacity(0.9), white.opacity(0.45))
+    }
+
+    /// 带文字的共享舞台；Dock 收尾时文字颜色会过渡回主面板主题色。
+    fn render_shared_stage_colored(
+        &self,
+        geometry: StageGeometry,
+        title_color: gpui::Hsla,
+        artist_color: gpui::Hsla,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let theme = Theme::dark();
+        let title = self.current_title_text();
+        let artist = self.current_artist_text();
+        let cover_size = geometry.cover.w.max(1.0);
+        let cover = crate::widgets::cover_plain(
+            &theme,
+            self.cover_image.clone(),
+            cover_size,
+            geometry.cover_radius,
+            crate::icons::icon(
+                crate::icons::Icon::Note,
+                (cover_size * 0.22).clamp(14.0, 40.0),
+                white.opacity(0.35),
+            ),
+        );
+        div()
             .absolute()
-            .left(px(lyric_left))
-            .top_0()
-            .bottom_0()
-            .right_0()
-            .pr(px(lyric_pad_right))
-            .child(self.lyric_view.clone());
+            .inset_0()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(geometry.cover.x))
+                    .top(px(geometry.cover.y))
+                    .child(cover),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(geometry.info.x))
+                    .top(px(geometry.info.y))
+                    .w(px(geometry.info.w.max(1.0)))
+                    .flex()
+                    .flex_col()
+                    .gap(px(geometry.line_gap))
+                    .child(
+                        div()
+                            .max_w_full()
+                            .text_size(px(geometry.title_size))
+                            .line_height(px(geometry.title_size * INFO_LINE_RATIO))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(title_color)
+                            .text_ellipsis()
+                            .child(SharedString::from(title)),
+                    )
+                    .child(
+                        div()
+                            .max_w_full()
+                            .text_size(px(geometry.artist_size))
+                            .line_height(px(geometry.artist_size * INFO_LINE_RATIO))
+                            .text_color(artist_color)
+                            .text_ellipsis()
+                            .child(SharedString::from(artist)),
+                    ),
+            )
+            .into_any_element()
+    }
 
-        // —— 底部控制行：左全屏、右队列/退出，40×40 圆钮 opacity 0.45，gap 32 ——
-        let fullscreen_btn = div()
-            .id("immersive-fullscreen")
-            .size(px(40.0))
-            .rounded(px(20.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .opacity(0.45)
-            .hover(|s| s.opacity(1.0).bg(white.opacity(0.133)))
-            .child(crate::icons::icon(crate::icons::Icon::Expand, 18.0, white))
-            .on_click(|_, window, _| window.toggle_fullscreen());
-        let queue_btn = {
-            let weak = weak.clone();
+    /// AMLL 顶部拖拽 pill（50×8，白 17.6%）。
+    ///
+    /// 它只是把手的视觉标识；按下命中区由外层 dismiss-handle 承担，
+    /// 拖动是「下拉关闭沉浸页」而不是移动窗口。
+    fn amll_pill(&self, left: f32, top: f32, id: &'static str) -> AnyElement {
+        div()
+            .id(id)
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(50.0))
+            .h(px(8.0))
+            .rounded(px(4.0))
+            .bg(gpui::white().opacity(0.176))
+            .into_any_element()
+    }
+
+    /// 竖屏播放页：AMLL 竖向布局 + Salt Player 的子页面/自动隐藏逻辑。
+    fn render_immersive_compact(
+        &mut self,
+        width: f32,
+        height: f32,
+        dock_shared: bool,
+        dock_opacity: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let now = Instant::now();
+        // 同一列宽供封面、信息、进度、传输、音量与 Dock 使用。
+        let content_w = compact_content_w(width, height);
+        // AMLL 竖向布局的控件常驻：红框内的信息/进度与 Dock 不再淡出，
+        // 避免停手 3.2 秒后中间留下一大片空白。
+        let chrome_o = 1.0;
+        let enter = self
+            .portrait_enter
+            .map(|t| (t.elapsed().as_secs_f32() / 0.26).clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        let enter = 1.0 - (1.0 - enter).powi(3);
+        let page = self.portrait_page;
+        let transition = self.portrait_transition.filter(|t| !t.done(now));
+        // 共享元素补间：页面滑入/滑出时，封面与曲目信息走独立的 FLIP 路径，
+        // 页面内的同名元素暂时透明，只保留占位。
+        let stage = self
+            .stage_motion
+            .filter(|motion| motion.active(now) && motion.touches_compact())
+            .map(|motion| motion.geometry(now))
+            .filter(|geometry| geometry.is_valid());
+        let shared_hidden = stage.is_some() || dock_shared;
+        // 竖屏页不显示歌词：歌词视图退化为全窗 Mesh 背景。
+        self.lyric_align = 0.1;
+        self.lyric_view.update(cx, |view, _| {
+            view.set_text_visible(false);
+            view.set_click_seek_enabled(false);
+            view.set_player_config(LyricPlayerConfig {
+                align_anchor: AlignAnchor::Top,
+                align_position: 0.1,
+                enable_blur: !self.no_blur,
+                ..LyricPlayerConfig::default()
+            });
+        });
+        self.ensure_portrait_idle_ticker(cx);
+
+        let lyric_view_el = div().absolute().inset_0().child(self.lyric_view.clone());
+
+        // 顶部拖动带：播放页的整条页头都可拖动窗口；pill 附近保留
+        // 下拉关闭手势。队列/更多页的页头有自己的可点元素，不铺拖动带。
+        // Dock→全屏的位移由外层卡片承担，页面内部不再二次偏移。
+        let sheet_offset = 0.0;
+        let art_page = page == PortraitPage::Art && transition.is_none() && !self.eq_open;
+        let drag_band = art_page.then(|| {
+            Self::window_drag_area(
+                div()
+                    .id("immersive-drag-band-compact")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(COMPACT_TOP))
+                    .cursor(CursorStyle::OpenHand),
+            )
+        });
+        let handle_w = 120.0_f32.min(width);
+        let handle_top = 0.0;
+        let dismiss_handle = art_page.then(|| {
             div()
-                .id("immersive-queue")
-                .size(px(40.0))
-                .rounded(px(20.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .opacity(0.45)
-                .hover(|s| s.opacity(1.0).bg(white.opacity(0.133)))
-                .child(crate::icons::icon(crate::icons::Icon::Queue, 18.0, white))
-                .on_click(move |_, window, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        app.exit_immersive(cx);
-                        app.view_tab = ViewTab::Library;
-                        app.library_filter = LibraryFilter::Queue;
-                        window.focus(&app.focus_handle);
-                        cx.notify();
-                    });
-                })
+                .id("immersive-dismiss-handle-compact")
+                .absolute()
+                .top(px(handle_top))
+                .left(px((width - handle_w) / 2.0))
+                .w(px(handle_w))
+                .h(px(56.0))
+                .cursor(CursorStyle::OpenHand)
+                .occlude()
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|app, event: &MouseDownEvent, _, cx| {
+                        app.begin_sheet_drag(f32::from(event.position.y), cx);
+                    }),
+                )
+                .child(self.amll_pill(
+                    handle_w / 2.0 - 25.0,
+                    20.0 - handle_top,
+                    "immersive-pill-compact",
+                ))
+        });
+
+        // 页面本体：下拉时整块下移，露出背后的主面板。
+        let mut sheet = div()
+            .id("immersive-sheet-compact")
+            .absolute()
+            .left_0()
+            .top(px(sheet_offset))
+            .w(px(width))
+            .h(px(height))
+            .overflow_hidden()
+            .bg(gpui::black())
+            .opacity(enter)
+            .child(lyric_view_el)
+            .when_some(drag_band, |sheet, band| sheet.child(band))
+            .when_some(dismiss_handle, |sheet, handle| sheet.child(handle));
+
+        let overlay = div()
+            .id("immersive-compact-overlay")
+            .key_context("ChordialImmersive")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|app, _: &ExitImmersive, window, cx| {
+                if app.drawer_open {
+                    app.close_drawer(cx);
+                } else if app.eq_open {
+                    app.close_eq(cx);
+                } else {
+                    app.exit_immersive(cx);
+                }
+                window.focus(&app.focus_handle);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &TogglePortrait, _, cx| {
+                app.exit_immersive(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &ToggleEqualizer, _, cx| {
+                if app.eq_open {
+                    app.close_eq(cx);
+                } else {
+                    app.open_eq(cx);
+                }
+            }))
+            .on_action(cx.listener(|app, _: &PlayPause, _, cx| app.toggle_playback(cx)))
+            .on_action(cx.listener(|app, _: &NextTrack, _, cx| app.play_next(cx)))
+            .on_action(cx.listener(|app, _: &PrevTrack, _, cx| app.play_prev(cx)))
+            .on_action(cx.listener(|app, _: &PlayFirst, _, cx| app.play_first(cx)))
+            .on_mouse_move(cx.listener(move |app, event: &MouseMoveEvent, _, cx| {
+                app.bump_portrait(cx);
+                let y = f32::from(event.position.y);
+                match event.pressed_button {
+                    Some(gpui::MouseButton::Left) => app.update_sheet_drag(y, cx),
+                    None => {
+                        if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
+                            app.release_sheet_drag(height, cx);
+                        }
+                    }
+                    _ => {}
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(move |app, _: &MouseUpEvent, _, cx| {
+                    if app.sheet_drag.is_some() {
+                        app.release_sheet_drag(height, cx);
+                    }
+                }),
+            )
+            .on_click(cx.listener(|app, _, _, cx| app.bump_portrait(cx)))
+            .size_full()
+            .relative()
+            .overflow_hidden();
+
+        if let Some(tr) = transition {
+            let (mut from_off, from_o, mut to_off, to_o) = tr.frames(now, width, height);
+            // 从队列页返回播放页时方向相反：子页退出、播放页归位。
+            if matches!(tr.from, PortraitPage::Queue) {
+                from_off = -from_off;
+                to_off = -to_off;
+            }
+            let (fx, fy) = match tr.kind {
+                crate::player_page::TransitionKind::Vertical => (0.0, from_off),
+                crate::player_page::TransitionKind::Fade => (0.0, 0.0),
+            };
+            let (tx, ty) = match tr.kind {
+                crate::player_page::TransitionKind::Vertical => (0.0, to_off),
+                crate::player_page::TransitionKind::Fade => (0.0, 0.0),
+            };
+            let from = gpui::batch_layer(self.render_compact_page(
+                tr.from,
+                content_w,
+                height,
+                width,
+                chrome_o,
+                dock_opacity,
+                shared_hidden,
+                cx,
+            ));
+            let to = gpui::batch_layer(self.render_compact_page(
+                tr.to,
+                content_w,
+                height,
+                width,
+                chrome_o,
+                dock_opacity,
+                shared_hidden,
+                cx,
+            ));
+            sheet = sheet
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(fx))
+                        .top(px(fy))
+                        .size_full()
+                        .opacity(from_o)
+                        .child(from),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(tx))
+                        .top(px(ty))
+                        .size_full()
+                        .opacity(to_o)
+                        .child(to),
+                );
+            self.ensure_ui_anim_ticker(cx);
+        } else {
+            if self.portrait_transition.is_some() {
+                self.portrait_transition = None;
+            }
+            sheet = sheet.child(gpui::batch_layer(self.render_compact_page(
+                page,
+                content_w,
+                height,
+                width,
+                chrome_o,
+                dock_opacity,
+                shared_hidden,
+                cx,
+            )));
+        }
+
+        // 共享元素舞台画在页面之上：封面从大图连续缩到队列页头，
+        // 曲名与艺人同步移动、缩放，而不是随页面一起硬切。
+        if let Some(geometry) = stage {
+            sheet = sheet.child(self.render_shared_stage(geometry));
+        }
+
+        if let Some((text, started)) = self.portrait_toast.clone() {
+            if started.elapsed() < Duration::from_millis(1800) {
+                sheet = sheet.child(
+                    div()
+                        .absolute()
+                        .bottom(px(118.0))
+                        .left(px((width - 300.0) / 2.0))
+                        .w(px(300.0))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .rounded(px(16.0))
+                                .bg(gpui::rgba(0x00000099))
+                                .px(px(14.0))
+                                .py(px(7.0))
+                                .text_size(px(11.5))
+                                .text_color(white.opacity(0.92))
+                                .child(SharedString::from(text)),
+                        ),
+                );
+            }
+        }
+        overlay.child(sheet).into_any_element()
+    }
+
+    fn render_compact_page(
+        &self,
+        page: PortraitPage,
+        content_w: f32,
+        height: f32,
+        width: f32,
+        chrome_o: f32,
+        dock_opacity: f32,
+        shared_hidden: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match page {
+            PortraitPage::Art => {
+                self.render_compact_art(
+                    width,
+                    height,
+                    chrome_o,
+                    dock_opacity,
+                    shared_hidden,
+                    cx,
+                )
+            }
+            PortraitPage::Queue => self.render_portrait_queue(content_w, shared_hidden, cx),
+        }
+    }
+
+    /// 竖屏播放页：与桌面宽屏同一根 `amll_player_column`，只是把整列水平居中。
+    /// 页面不渲染歌词文本；歌词视图仅作为全窗 Mesh 背景。
+    fn render_compact_art(
+        &self,
+        width: f32,
+        height: f32,
+        chrome_o: f32,
+        dock_opacity: f32,
+        shared_hidden: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cover = compact_cover_size(width, height);
+        let available = (height
+            - COMPACT_TOP
+            - crate::layout_morph::COMPACT_BOTTOM
+            - crate::layout_morph::COMPACT_DOCK_H
+            - 8.0)
+            .max(0.0);
+        let controls_h = (available - cover - COMPACT_COVER_GAP).max(0.0);
+        // 从布局 1 / 队列页切换过来时，播放列跟随共享封面的 x 一起滑动，
+        // 而不是整列硬切到居中位置。
+        let now = Instant::now();
+        let motion_x = self
+            .stage_motion
+            .filter(|motion| motion.active(now) && motion.touches_compact())
+            .map(|motion| motion.geometry(now).cover.x);
+        let left = motion_x.unwrap_or_else(|| ((width - cover) / 2.0).max(0.0));
+        div()
+            .size_full()
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(COMPACT_TOP))
+                    .w(px(cover))
+                    .child(self.amll_player_column(
+                        cover,
+                        height,
+                        controls_h,
+                        chrome_o,
+                        true,
+                        shared_hidden,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .bottom(px(crate::layout_morph::COMPACT_BOTTOM))
+                    .w(px(cover))
+                    .opacity(dock_opacity)
+                    .child(self.immersive_bottom_row(cover, false, false, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// 宽屏沉浸：AMLL react-full `HorizontalLayout` 的等价几何。
+    ///
+    /// 1600×1000 实测：列 info 0.45W / player 0.55W（gap 8px）；行
+    /// drag = 0.12fr / thumb 40 / cover / music-info = 0.8fr / buttom 40 / tail = 0.08fr，
+    /// fr = H − 120 − cover；封面 = min(45vh, 38vw)（H ≤ 1000，否则 50vh）；
+    /// 歌词列右 padding 8%（H > 1000 时 15%）；歌词对齐封面中心（AMLL 用
+    /// ResizeObserver 计算 cover 中线占比后作为 `alignPosition`）。
+    fn render_immersive_wide(
+        &mut self,
+        width: f32,
+        height: f32,
+        dock_shared: bool,
+        dock_opacity: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let now = Instant::now();
+        // 布局 1 只在歌词可见时启用；这里仍读一次状态，避免未来入口漂移。
+        let lyrics_on = self.lyric_view.read(cx).has_lyrics() && !self.wide_lyrics_hidden;
+        self.lyric_view.update(cx, |view, _| {
+            view.set_text_visible(lyrics_on);
+            view.set_click_seek_enabled(lyrics_on);
+        });
+
+        // ---- AMLL horizontal 几何 ----
+        let cover = wide_cover_size(width, height);
+        let gap = 8.0;
+        let fr = (height - 120.0 - cover).max(0.0);
+        let drag = fr * 0.12;
+        let cover_top = wide_cover_top(width, height);
+        // 底部控制行与布局 2 使用同一个底边距（16px）；音量行必须停在
+        // 控制行上方，信息区用剩余高度做 space-between。
+        let bottom_row_top = height - 16.0 - 40.0;
+        let controls_top = cover_top + cover + COMPACT_COVER_GAP;
+        let controls_h = (bottom_row_top - gap - controls_top).max(0.0);
+        let info_w = width * 0.45;
+        let lyric_left = info_w + gap;
+        let lyric_col_w = (width - lyric_left).max(0.0);
+        let lyric_pad_right = if height <= 1000.0 {
+            lyric_col_w * 0.08
+        } else {
+            lyric_col_w * 0.15
         };
-        let close_btn = {
-            let weak = weak.clone();
+
+        // 布局 1 固定为「左播放列 + 右歌词」；歌词开关切换时会立即落到
+        // 布局 2，因此这里不再维护居中分支。
+        let split_x = wide_column_x(width, height);
+        let wide_motion = self
+            .stage_motion
+            .filter(|motion| motion.active(now) && motion.touches_wide())
+            .filter(|motion| motion.from.is_valid() && motion.to.is_valid());
+        let stage = wide_motion.map(|motion| motion.geometry(now));
+        let mut column_x = split_x;
+        if let Some(geometry) = stage {
+            column_x = geometry.cover.x;
+        }
+        let shared_hidden = stage.is_some() || dock_shared;
+
+        let align = ((cover_top + cover * 0.5) / height).clamp(0.05, 0.95);
+        if lyrics_on && (self.lyric_align - align).abs() > 0.0005 {
+            self.lyric_align = align;
+            self.lyric_view.update(cx, |view, _| {
+                view.set_player_config(LyricPlayerConfig {
+                    align_anchor: AlignAnchor::Center,
+                    align_position: align,
+                    enable_blur: !self.no_blur,
+                    ..LyricPlayerConfig::default()
+                });
+            });
+        }
+        // —— 顶部窗口拖动带：整条空白头部都可拖动窗口（AMLL drag-area）。
+        //    pill 只保留一个小的下拉关闭命中区，其余宽度全部用来移动窗口。
+        // Dock→全屏的位移由外层卡片承担，页面内部不再二次偏移。
+        let sheet_offset = 0.0;
+        let pill_top = drag + gap + 16.0;
+        let drag_band = (!self.eq_open).then(|| {
+            Self::window_drag_area(
+                div()
+                    .id("immersive-drag-band")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(pill_top + 8.0))
+                    .cursor(CursorStyle::OpenHand),
+            )
+        });
+
+        // 下拉关闭把手：与 pill 等宽的窄条，occlude 掉下层的窗口拖动带。
+        // EQ 覆盖层打开时不启用，避免顶部的 EQ 控件被手势抢走。
+        let handle_w = 160.0_f32.min(width);
+        let handle_top = (pill_top - 20.0).max(0.0);
+        let dismiss_handle = (!self.eq_open).then(|| {
             div()
-                .id("immersive-close")
-                .size(px(40.0))
-                .rounded(px(20.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .opacity(0.45)
-                .hover(|s| s.opacity(1.0).bg(white.opacity(0.133)))
-                .child(crate::icons::icon(crate::icons::Icon::Close, 18.0, white))
-                .on_click(move |_, window, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        app.exit_immersive(cx);
-                        window.focus(&app.focus_handle);
-                        cx.notify();
-                    });
-                })
+                .id("immersive-dismiss-handle")
+                .absolute()
+                .top(px(handle_top))
+                .left(px(column_x + cover * 0.5 - handle_w / 2.0))
+                .w(px(handle_w))
+                .h(px(56.0))
+                .cursor(CursorStyle::OpenHand)
+                .occlude()
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|app, event: &MouseDownEvent, _, cx| {
+                        app.begin_sheet_drag(f32::from(event.position.y), cx);
+                    }),
+                )
+                .child(self.amll_pill(
+                    handle_w / 2.0 - 25.0,
+                    pill_top - handle_top,
+                    "immersive-pill",
+                ))
+        });
+
+        // —— 共用 AMLL 播放器列：封面 / 信息 / 进度 / 传输 / 音量 ——
+        let info_column = div()
+            .absolute()
+            .left(px(column_x))
+            .top(px(cover_top))
+            .w(px(cover))
+            .child(self.amll_player_column(
+                cover,
+                height,
+                controls_h,
+                1.0,
+                false,
+                shared_hidden,
+                cx,
+            ));
+
+        // —— 歌词开启时占右列；关闭/无歌词时整窗只保留 Mesh 背景 ——
+        let lyric_area = if lyrics_on {
+            div()
+                .absolute()
+                .left(px(lyric_left))
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .pr(px(lyric_pad_right))
+                .child(self.lyric_view.clone())
+        } else {
+            div().absolute().inset_0().child(self.lyric_view.clone())
         };
+
+        // —— 统一的底部控制行：与布局 2 共用同一个构建函数 ——
         let bottom_row = div()
             .absolute()
             .left_0()
@@ -6131,142 +9635,708 @@ impl ChordialApp {
             .top(px(bottom_row_top))
             .h(px(40.0))
             .px(px(32.0))
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(fullscreen_btn)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(32.0))
-                    .child(queue_btn)
-                    .child(close_btn),
-            );
+            .opacity(dock_opacity)
+            .child(self.immersive_bottom_row(
+                (width - 64.0).max(1.0),
+                true,
+                lyrics_on,
+                cx,
+            ));
 
-        // 顶部拖拽区（AMLL drag-area 行：整宽、可拖动窗口）
-        let drag_strip = Self::window_drag_area(
-            div()
-                .id("immersive-drag-strip")
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(px(drag))
-                .cursor(CursorStyle::OpenHand),
-        );
+        let stage_el = stage.map(|geometry| self.render_shared_stage(geometry));
+
+        // 页面本体：下拉时整块下移，露出背后的主面板。拖动带在下、pill
+        // 把手在上（occlude），因此只有 pill 附近是下拉手势，其余顶部拖窗口。
+        let sheet = div()
+            .id("immersive-sheet")
+            .absolute()
+            .left_0()
+            .top(px(sheet_offset))
+            .w(px(width))
+            .h(px(height))
+            .overflow_hidden()
+            .bg(gpui::black())
+            .child(lyric_area)
+            .child(gpui::batch_layer(info_column))
+            .when_some(stage_el, |sheet, stage| sheet.child(stage))
+            .child(gpui::batch_layer(bottom_row))
+            .when_some(drag_band, |sheet, band| sheet.child(band))
+            .when_some(dismiss_handle, |sheet, handle| sheet.child(handle));
 
         div()
             .key_context("ChordialImmersive")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|app, _: &ExitImmersive, window, cx| {
-                app.exit_immersive(cx);
+                if app.drawer_open {
+                    app.close_drawer(cx);
+                } else if app.eq_open {
+                    app.close_eq(cx);
+                } else {
+                    app.exit_immersive(cx);
+                }
                 window.focus(&app.focus_handle);
                 cx.notify();
             }))
-            .on_action(cx.listener(|app, _: &PlayPause, _, _cx| app.player.toggle()))
+            .on_action(cx.listener(|app, _: &TogglePortrait, _, cx| {
+                app.exit_immersive(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &ToggleEqualizer, _, cx| {
+                if app.eq_open {
+                    app.close_eq(cx);
+                } else {
+                    app.open_eq(cx);
+                }
+            }))
+            .on_action(cx.listener(|app, _: &PlayPause, _, cx| app.toggle_playback(cx)))
             .on_action(cx.listener(|app, _: &NextTrack, _, cx| app.play_next(cx)))
             .on_action(cx.listener(|app, _: &PrevTrack, _, cx| app.play_prev(cx)))
+            .on_action(cx.listener(|app, _: &PlayFirst, _, cx| app.play_first(cx)))
+            .on_mouse_move(cx.listener(move |app, event: &MouseMoveEvent, _, cx| {
+                let y = f32::from(event.position.y);
+                match event.pressed_button {
+                    Some(gpui::MouseButton::Left) => app.update_sheet_drag(y, cx),
+                    None => {
+                        if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
+                            app.release_sheet_drag(height, cx);
+                        }
+                    }
+                    _ => {}
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(move |app, _: &MouseUpEvent, _, cx| {
+                    if app.sheet_drag.is_some() {
+                        app.release_sheet_drag(height, cx);
+                    }
+                }),
+            )
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(gpui::black())
-            .child(lyric_area)
-            .child(info_column)
-            .child(drag_strip)
-            .child(pill)
-            .child(bottom_row)
-            .children(Self::resize_handles())
+            .child(sheet)
             .into_any_element()
     }
 }
 
 impl Render for ChordialApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
+        // 回收上一帧替换下来的封面/头像/二维码纹理，避免长会话/快速切歌
+        // 把 sprite atlas（只增不减）撑爆后整块背景变黑。
+        for image in std::mem::take(&mut self.retired_images) {
+            cx.drop_image(image, Some(window));
+        }
+        self.cleanup_finished_animations(now, cx);
+        // 跟随显示器刷新率驱动动画：300Hz 屏即 ~300fps，60Hz 屏即 60fps。
+        // 动画全部结束后不再请求下一帧。
+        if self.ui_anim_active() {
+            window.request_animation_frame();
+        }
         let viewport = window.viewport_size();
         self.viewport_width = f32::from(viewport.width);
         self.viewport_height = f32::from(viewport.height);
+        // 断点迁移必须在任何页面渲染之前：它会收敛手机页/抽屉/歌词背景，
+        // 避免布局切换的第一帧出现“桌面根节点 + 手机内容”的混合态。
+        let class = ViewportClass::of(self.viewport_width);
+        self.handle_viewport_class_change(class, cx);
         if self.immersive {
             let width = f32::from(viewport.width);
             let height = f32::from(viewport.height);
-            let (style, font, vertical) = immersive_lyric_style(width, height);
-            if (font - self.lyric_font_px).abs() > 1.0 || vertical != self.lyric_vertical {
-                self.lyric_font_px = font;
-                self.lyric_vertical = vertical;
-                self.lyric_view
-                    .update(cx, |view, _| view.set_text_style(style));
+            // 每帧重算沉浸样式；视图内部按完整样式去重，只有字号/字重/行高
+            // 真正变化时才重排。不能只比较字号：窗口高度恰好让沉浸字号落在
+            // 44px 附近时，面板样式（MEDIUM 44 / 行高 1.35）会被误认为已应用。
+            let style = immersive_lyric_style(width, height);
+            self.lyric_view
+                .update(cx, |view, _| view.set_text_style(style));
+            let scope = PerfScope::enter("ui.render.pass");
+            let base = self.render_immersive(window, cx);
+            scope.finish(1);
+            if self.eq_open {
+                return div()
+                    .size_full()
+                    .relative()
+                    .child(base)
+                    .child(gpui::batch_layer(self.render_eq(window, cx)))
+                    .into_any_element();
             }
-            return self.render_immersive(window, cx).into_any_element();
+            // Dock→全屏展开或下拉收起时，卡片没有铺满窗口：把主面板画在
+            // 背后，让露出的区域真的能看到列表与 Dock。手机宽度下背后
+            // 必须是手机壳，否则会露出被压扁的三栏。
+            let dock_p = self.immersive_dock_progress(now, height);
+            if dock_p > 0.0001 {
+                let main = if self.is_phone() {
+                    self.render_phone_main(window, cx, true)
+                } else {
+                    self.render_main(window, cx, true)
+                };
+                // 沉浸层必须绝对定位覆盖在主面板之上；作为普通 flex 子元素
+                // 会被排到主面板后面/下方，拖拽时只剩主面板可见。
+                return div()
+                    .size_full()
+                    .relative()
+                    .child(main)
+                    .child(div().absolute().inset_0().child(base))
+                    .into_any_element();
+            }
+            return base;
         }
+        self.sync_phone_backdrop(cx);
+        if self.is_phone() {
+            self.render_phone_main(window, cx, false)
+        } else {
+            self.render_main(window, cx, false)
+        }
+    }
+}
+
+impl ChordialApp {
+    /// 主面板的根节点：三个布局（宽屏 / 中等 / 手机）共用同一套快捷键、
+    /// 焦点上下文与边框。只负责“外壳”，页面内容由调用方追加。
+    fn main_root(
+        &mut self,
+        background: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = Theme::get(cx).clone();
+        let mut root = div();
+        if !background {
+            root = root
+                .key_context("ChordialMain")
+                .track_focus(&self.focus_handle);
+        }
+        root.on_action(cx.listener(|app, _: &PlayPause, _window, cx| {
+            app.toggle_playback(cx);
+        }))
+        .on_action(cx.listener(|app, _: &NextTrack, _, cx| app.play_next(cx)))
+        .on_action(cx.listener(|app, _: &PrevTrack, _, cx| app.play_prev(cx)))
+        .on_action(cx.listener(|app, _: &PlayFirst, _, cx| app.play_first(cx)))
+        .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
+            if app.is_phone() && !app.immersive {
+                // 手机壳的搜索框在曲库页。切页与聚焦必须分两拍：本帧
+                // 输入框还没挂载，focus 会被下一帧的布局丢掉。
+                app.phone_page = PhonePage::Browse;
+                app.view_tab = ViewTab::Search;
+                let input = app.search_input.clone();
+                cx.defer_in(window, move |_, window, cx| {
+                    focus_input(&input, window, cx);
+                });
+                cx.notify();
+            } else {
+                focus_input(&app.search_input, window, cx);
+            }
+        }))
+        .on_action(cx.listener(|app, _: &RescanLibrary, _, cx| {
+            if let Some(local) = app.local_source.clone() {
+                app.spawn_library_scan(local, cx);
+            }
+        }))
+        .on_action(cx.listener(|app, _: &ToggleSidebar, _, cx| {
+            // 手机壳没有侧栏；Ctrl+B 改成开合手机抽屉（同样的“导航”语义）。
+            match (app.is_phone() && !app.immersive, app.drawer_open) {
+                (true, true) => app.close_drawer(cx),
+                (true, false) => app.open_drawer(cx),
+                (false, _) => {
+                    app.sidebar_open = !app.sidebar_open;
+                    cx.notify();
+                }
+            }
+        }))
+        .on_action(cx.listener(|app, _: &OpenSettings, _, cx| {
+            app.open_settings(cx);
+        }))
+        .on_action(cx.listener(|app, _: &CloseSettings, _, cx| {
+            // Esc 在手机壳里兼作「关抽屉 / 返回播放」，与系统返回键同义。
+            if app.settings_open {
+                app.close_settings(cx);
+            } else if app.drawer_open {
+                app.close_drawer(cx);
+            } else if app.is_phone()
+                && app.phone_page == PhonePage::Browse
+                && app.current_track.is_some()
+            {
+                app.phone_page = PhonePage::Player;
+                cx.notify();
+            }
+        }))
+        .on_action(cx.listener(|app, _: &ExitImmersive, window, cx| {
+            if app.eq_open {
+                app.close_eq(cx);
+            } else if app.immersive {
+                app.close_portrait(cx);
+            }
+            window.focus(&app.focus_handle);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|app, _: &TogglePortrait, window, cx| {
+            if app.immersive {
+                app.close_portrait(cx);
+            } else {
+                app.open_portrait(cx);
+                window.focus(&app.focus_handle);
+            }
+            cx.notify();
+        }))
+        .on_action(cx.listener(|app, _: &ToggleEqualizer, window, cx| {
+            if app.eq_open {
+                app.close_eq(cx);
+            } else {
+                app.open_eq(cx);
+                window.focus(&app.focus_handle);
+            }
+            cx.notify();
+        }))
+        .on_action(cx.listener(|app, _: &Quit, _, cx| {
+            app.cache.flush();
+            // 先停掉托管 sidecar（不清理缓存、不注销账号），再退出。
+            let registry = app.registry.clone();
+            cx.spawn(async move |weak, cx| {
+                for info in registry.loaded_sources() {
+                    if let Some(source) = registry.get(&info.id) {
+                        source.stop_services().await;
+                    }
+                }
+                let _ = weak.update(cx, |_, cx| cx.quit());
+            })
+            .detach();
+        }))
+        .size_full()
+        .relative()
+        .flex()
+        .flex_col()
+        .bg(theme.bg)
+        .border_1()
+        .border_color(theme.border)
+        .text_color(theme.text)
+    }
+
+    /// 主面板（非沉浸层）。沉浸页下拉关闭时也会画在 sheet 背后，
+    /// 让页面下移时露出熟悉的列表与播放条。
+    ///
+    /// `background = true` 时只作为静态背景：不注册键位上下文与焦点节点，
+    /// 避免与同时渲染的沉浸层抢同一个 `focus_handle`。
+    fn render_main(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        background: bool,
+    ) -> AnyElement {
         if !self.activated {
             self.activated = true;
             window.activate_window();
         }
         let scope = PerfScope::enter("ui.render.pass");
-        let theme = Theme::get(cx).clone();
-        let show_now = self.viewport_width >= 1020.0;
+        let show_now = self.viewport_width >= crate::responsive::WIDE_MIN_W;
         let list_width = show_now.then(|| self.list_width());
+        // 均衡器面板几乎铺满窗口：列表/正在播放完全落在面板背后，跳过
+        // 它们的布局与绘制，EQ 列表滚动/预览时不再为不可见内容付费。
+        // 侧栏左侧一窄条仍可见，保留。
+        let covered_by_eq = self.eq_open
+            && !self.settings_open
+            && !self.login_open
+            && !self.immersive
+            && !background;
 
-        let view = div()
-            .key_context("ChordialMain")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|app, _: &PlayPause, _window, _cx| {
-                app.player.toggle();
-                app.player_status = app.player.status();
-            }))
-            .on_action(cx.listener(|app, _: &NextTrack, _, cx| app.play_next(cx)))
-            .on_action(cx.listener(|app, _: &PrevTrack, _, cx| app.play_prev(cx)))
-            .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
-                focus_input(&app.search_input, window, cx)
-            }))
-            .on_action(cx.listener(|app, _: &RescanLibrary, _, cx| {
-                if let Some(local) = app.local_source.clone() {
-                    app.spawn_library_scan(local, cx);
-                }
-            }))
-            .on_action(cx.listener(|app, _: &ToggleSidebar, _, cx| {
-                app.sidebar_open = !app.sidebar_open;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|app, _: &Quit, _, cx| {
-                app.cache.flush();
-                // 先停掉托管 sidecar（不清理缓存、不注销账号），再退出。
-                let registry = app.registry.clone();
-                cx.spawn(async move |weak, cx| {
-                    for info in registry.loaded_sources() {
-                        if let Some(source) = registry.get(&info.id) {
-                            source.stop_services().await;
-                        }
-                    }
-                    let _ = weak.update(cx, |_, cx| cx.quit());
-                })
-                .detach();
-            }))
-            .size_full()
-            .relative()
+        let middle = div()
             .flex()
-            .flex_col()
-            .bg(theme.bg)
-            .border_1()
-            .border_color(theme.border)
-            .text_color(theme.text)
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .when(self.sidebar_open, |d| {
+                d.child(gpui::batch_layer(
+                    self.render_sidebar(window.mouse_position(), cx),
+                ))
+            })
+            .when(!covered_by_eq, |d| {
+                d.child(gpui::batch_layer(self.render_list_panel(list_width, cx)))
+                    .when(show_now, |d| {
+                        d.child(gpui::batch_layer(self.render_now_playing(cx)))
+                    })
+            });
+
+        let view = self
+            .main_root(background, cx)
             .child(self.render_titlebar(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .when(self.sidebar_open, |d| d.child(self.render_sidebar(cx)))
-                    .child(self.render_list_panel(list_width, cx))
-                    .when(show_now, |d| d.child(self.render_now_playing(cx))),
-            )
-            .child(self.render_dock(cx))
+            .child(middle)
+            .child(gpui::batch_layer(self.render_dock(cx)))
             .when(self.settings_open, |d| d.child(self.render_settings(cx)))
             .when(self.login_open, |d| d.child(self.render_login(cx)))
+            .when(self.eq_open, |d| {
+                d.child(gpui::batch_layer(self.render_eq(window, cx)))
+            })
             .children(Self::resize_handles());
         scope.finish(1);
         view.into_any_element()
+    }
+
+    // ================= 手机壳（单列） =================
+
+    /// 手机壳：没有侧栏/右栏/Dock，播放页与曲库页二选一。
+    /// 抽屉是唯一的“全局面板”，承载曲库、队列、设置与均衡器入口。
+    fn render_phone_main(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        background: bool,
+    ) -> AnyElement {
+        if !self.activated && !background {
+            self.activated = true;
+            window.activate_window();
+        }
+        let scope = PerfScope::enter("ui.render.pass");
+        let now = Instant::now();
+        self.sync_phone_backdrop(cx);
+        let width = self.viewport_width;
+        let height = self.viewport_height;
+        let body: AnyElement = if self.phone_page == PhonePage::Player
+            && self.current_track.is_some()
+        {
+            self.render_phone_player(cx)
+        } else {
+            self.render_phone_browse(cx)
+        };
+
+        let view = self
+            .main_root(background, cx)
+            .child(div().flex_1().min_h_0().overflow_hidden().child(body))
+            .when(!background && self.drawer_visible(), |d| {
+                d.child(self.render_drawer(width, height, now, cx))
+            })
+            .when(!background && self.settings_open, |d| {
+                d.child(self.render_settings(cx))
+            })
+            .when(!background && self.login_open, |d| {
+                d.child(self.render_login(cx))
+            })
+            .when(!background && self.eq_open, |d| {
+                d.child(gpui::batch_layer(self.render_eq(window, cx)))
+            })
+            .children(Self::resize_handles());
+        scope.finish(1);
+        view.into_any_element()
+    }
+
+    /// 手机播放页：沿用竖屏沉浸层的 AMLL 几何（同一列宽、同一控件顺序），
+    /// 只是把右上角的菜单入口换成手机壳抽屉，并保留窗口红绿灯。
+    fn render_phone_player(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let width = self.viewport_width;
+        let height = self.viewport_height;
+        let cover = compact_cover_size(width, height);
+        let left = ((width - cover) * 0.5).max(0.0);
+        let available = (height
+            - COMPACT_TOP
+            - crate::layout_morph::COMPACT_BOTTOM
+            - crate::layout_morph::COMPACT_DOCK_H
+            - 8.0)
+            .max(0.0);
+        let controls_h = (available - cover - COMPACT_COVER_GAP).max(0.0);
+
+        // 沉浸层展开/收起时主面板会作为“背后的页面”再渲染一次；此时
+        // `phone_backdrop` 为 false，绝不能再把同一个 lyric_view 塞进第二
+        // 棵树里。用静态渐变兜底，等沉浸层交还后再切回 Mesh。
+        let backdrop: AnyElement = if !self.no_bg && self.phone_backdrop {
+            div()
+                .absolute()
+                .inset_0()
+                .bg(gpui::black())
+                .child(self.lyric_view.clone())
+                .into_any_element()
+        } else {
+            div()
+                .absolute()
+                .inset_0()
+                .bg(linear_gradient(
+                    165.0,
+                    linear_color_stop(crate::theme::hex(0x232329), 0.0),
+                    linear_color_stop(crate::theme::hex(0x08080A), 1.0),
+                ))
+                .into_any_element()
+        };
+
+        div()
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .child(backdrop)
+            .child(self.render_phone_titlebar(true, cx))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(COMPACT_TOP))
+                    .w(px(cover))
+                    .child(self.amll_player_column(
+                        cover,
+                        height,
+                        controls_h,
+                        1.0,
+                        true,
+                        false,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .bottom(px(crate::layout_morph::COMPACT_BOTTOM))
+                    .w(px(cover))
+                    .child(self.phone_bottom_row(cover, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// 手机曲库页：桌面曲目板直接铺满，外层只负责标题栏与返回播放。
+    fn render_phone_browse(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.surface)
+            .child(self.render_phone_titlebar(false, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.render_list_panel(None, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// 手机标题栏：播放页为透明覆盖层（顶部轻压暗 + 居中 pill），
+    /// 曲库页为实心 sidebar 色。红绿灯与拖拽区保留，否则无边框窗口
+    /// 在手机宽度下会失去关闭/移动能力。
+    fn render_phone_titlebar(&self, overlay: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let weak = cx.entity().downgrade();
+        let menu = {
+            let weak = weak.clone();
+            crate::widgets::icon_button(
+                &theme,
+                crate::icons::icon(crate::icons::Icon::Menu, 16.0, theme.text_dim),
+                30.0,
+                "菜单",
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        if app.drawer_open {
+                            app.close_drawer(cx);
+                        } else {
+                            app.open_drawer(cx);
+                        }
+                    });
+                },
+            )
+        };
+        let center = {
+            let pill = overlay.then(|| {
+                div()
+                    .w(px(50.0))
+                    .h(px(8.0))
+                    .rounded(px(4.0))
+                    .bg(gpui::white().opacity(0.176))
+                    .into_any_element()
+            });
+            let brand = (!overlay).then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(crate::icons::icon(
+                        crate::icons::Icon::Note,
+                        12.0,
+                        theme.accent,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text_dim)
+                            .child("Chordial"),
+                    )
+                    .into_any_element()
+            });
+            Self::window_drag_area(
+                div()
+                    .id(if overlay {
+                        "phone-titlebar-drag-overlay"
+                    } else {
+                        "phone-titlebar-drag"
+                    })
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(CursorStyle::OpenHand),
+            )
+            .children(pill)
+            .children(brand)
+        };
+
+        let bar = div()
+            .h(px(40.0))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(14.0))
+            .when(overlay, |d| {
+                d.absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(gpui::black().opacity(0.30), 0.0),
+                        linear_color_stop(gpui::black().opacity(0.0), 1.0),
+                    ))
+            })
+            .when(!overlay, |d| {
+                d.bg(theme.sidebar)
+                    .border_b_1()
+                    .border_color(theme.border)
+            })
+            .child(Self::traffic_lights())
+            .child(center)
+            .child(menu);
+        bar.into_any_element()
+    }
+
+    /// 手机播放页底部：全屏 / 曲库 / 队列 / 更多。
+    /// 桌面 Dock 的内容不在这里重复，只保留手机最常用的出口。
+    fn phone_bottom_row(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let btn = |icon: crate::icons::Icon,
+                   id: &'static str,
+                   active: bool,
+                   on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
+            div()
+                .id(id)
+                .size(px(40.0))
+                .rounded(px(20.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(if active { 1.0 } else { 0.45 })
+                .hover(|s| s.opacity(1.0).bg(white.opacity(0.133)))
+                .child(crate::icons::icon(icon, 18.0, white))
+                .on_click(on_click)
+                .into_any_element()
+        };
+
+        let fullscreen = btn(
+            crate::icons::Icon::Expand,
+            "phone-fullscreen",
+            false,
+            Box::new(|_, window, _| window.toggle_fullscreen()),
+        );
+        let library = {
+            let weak = weak.clone();
+            let active = self.phone_page == PhonePage::Browse
+                && self.view_tab == ViewTab::Library
+                && self.library_filter == LibraryFilter::All;
+            btn(
+                crate::icons::Icon::Note,
+                "phone-library",
+                active,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Browse;
+                        app.view_tab = ViewTab::Library;
+                        app.library_filter = LibraryFilter::All;
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+        let queue = {
+            let weak = weak.clone();
+            let active = self.phone_page == PhonePage::Browse
+                && self.view_tab == ViewTab::Library
+                && self.library_filter == LibraryFilter::Queue;
+            btn(
+                crate::icons::Icon::Queue,
+                "phone-queue",
+                active,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Browse;
+                        app.view_tab = ViewTab::Library;
+                        app.library_filter = LibraryFilter::Queue;
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+        let more = {
+            let weak = weak.clone();
+            btn(
+                crate::icons::Icon::More,
+                "phone-more",
+                self.drawer_open,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        if app.drawer_open {
+                            app.close_drawer(cx);
+                        } else {
+                            app.open_drawer(cx);
+                        }
+                    });
+                }),
+            )
+        };
+
+        div()
+            .w(px(width))
+            .h(px(40.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .occlude()
+            .child(fullscreen)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    // 最小窗口时 cover 列只有 ~184px，4 个 40px 按钮需要
+                    // 收紧间距，否则会顶出封面列。
+                    .gap(px(if width < 240.0 { 8.0 } else { 14.0 }))
+                    .child(library)
+                    .child(queue)
+                    .child(more),
+            )
+            .into_any_element()
+    }
+
+    /// 无边框窗口的三颗红绿灯。桌面标题栏与手机标题栏共用。
+    fn traffic_lights() -> AnyElement {
+        let light = |id: &'static str, color: gpui::Hsla| {
+            div()
+                .id(id)
+                .size(px(12.0))
+                .rounded(px(6.0))
+                .bg(color)
+                .cursor_pointer()
+        };
+        let close = light("tl-close", crate::theme::hex(0xFF5F57))
+            .on_click(|_, _, cx| cx.quit());
+        let minimize = light("tl-min", crate::theme::hex(0xFEBC2E))
+            .on_click(|_, window, _| window.minimize_window());
+        let maximize = light("tl-max", crate::theme::hex(0x28C840))
+            .on_click(|_, window, _| window.zoom_window());
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(close)
+            .child(minimize)
+            .child(maximize)
+            .into_any_element()
     }
 }
 
@@ -6276,6 +10346,7 @@ impl Drop for ChordialApp {
         self.cache.flush();
     }
 }
+
 
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
@@ -6321,7 +10392,7 @@ fn parse_hz_input(raw: &str) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hz_input;
+    use super::{LibraryFilter, PhonePage, ViewTab, parse_hz_input, phone_default_page};
 
     #[test]
     fn parses_common_hz_inputs() {
@@ -6332,5 +10403,32 @@ mod tests {
         assert_eq!(parse_hz_input("10000hz"), Some(10_000.0));
         assert_eq!(parse_hz_input(""), None);
         assert_eq!(parse_hz_input("abc"), None);
+    }
+
+    #[test]
+    fn phone_entry_preserves_browsing_context() {
+        // 普通曲库 + 正在播放：落到播放页。
+        assert_eq!(
+            phone_default_page(ViewTab::Library, LibraryFilter::All, true),
+            PhonePage::Player
+        );
+        // 没有曲目：曲库页，避免空白封面。
+        assert_eq!(
+            phone_default_page(ViewTab::Library, LibraryFilter::All, false),
+            PhonePage::Browse
+        );
+        // 搜索 / 集合 / 队列是主动浏览行为，不因收窄而被打断。
+        assert_eq!(
+            phone_default_page(ViewTab::Search, LibraryFilter::All, true),
+            PhonePage::Browse
+        );
+        assert_eq!(
+            phone_default_page(ViewTab::Collection, LibraryFilter::All, true),
+            PhonePage::Browse
+        );
+        assert_eq!(
+            phone_default_page(ViewTab::Library, LibraryFilter::Queue, true),
+            PhonePage::Browse
+        );
     }
 }

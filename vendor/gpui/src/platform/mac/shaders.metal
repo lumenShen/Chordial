@@ -609,6 +609,7 @@ struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  float4 mask [[flat]];
   float4 clip_distance;
 };
 
@@ -616,6 +617,7 @@ struct MonochromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  float4 mask [[flat]];
   float4 clip_distance;
 };
 
@@ -635,10 +637,13 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
                                                  sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
   float4 color = hsla_to_rgba(sprite.color);
+  float4 mask = float4(sprite.mask.light_from, sprite.mask.dark_from,
+                       sprite.mask.light, sprite.mask.dark);
   return MonochromeSpriteVertexOutput{
       device_position,
       tile_position,
       color,
+      mask,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -655,7 +660,15 @@ fragment float4 monochrome_sprite_fragment(
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float4 color = input.color;
-  color.a *= sample.a;
+
+  // AMLL `mask-image` 扫光：左侧 light、右侧 dark，中间线性渐变。
+  float4 mask = input.mask;
+  float t = mask.y > mask.x
+                ? saturate((input.position.x - mask.x) / (mask.y - mask.x))
+                : (input.position.x >= mask.x ? 1.0 : 0.0);
+  float mask_alpha = mix(mask.z, mask.w, t);
+
+  color.a *= sample.a * mask_alpha;
   return color;
 }
 

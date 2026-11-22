@@ -25,6 +25,9 @@ const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
 pub(crate) struct VSyncProvider {
     interval: Duration,
     f: Box<dyn Fn() -> bool>,
+    /// 诊断用：忽略 DwmFlush，按固定节奏唤醒（`GPUI_BENCH_HZ`）。
+    /// 没有 300Hz 显示器时也能按 3.33ms 周期压测整条绘制链路。
+    bench_interval: Option<Duration>,
 }
 
 impl VSyncProvider {
@@ -33,11 +36,37 @@ impl VSyncProvider {
             .context("Failed to get DWM interval")
             .log_err()
             .unwrap_or(DEFAULT_VSYNC_INTERVAL);
+        let bench_interval = std::env::var("GPUI_BENCH_HZ")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|hz| hz.is_finite() && *hz >= 1.0 && *hz <= 2000.0)
+            .map(|hz| Duration::from_secs_f64(1.0 / hz));
+        log::info!(
+            target: "gpui::frame",
+            "vsync interval={:?} ({:.1}Hz){}",
+            interval,
+            1.0 / interval.as_secs_f64(),
+            bench_interval
+                .map(|bench| format!(
+                    " bench={:.1}Hz",
+                    1.0 / bench.as_secs_f64()
+                ))
+                .unwrap_or_default(),
+        );
         let f = Box::new(|| unsafe { DwmFlush().is_ok() });
-        Self { interval, f }
+        Self {
+            interval,
+            f,
+            bench_interval,
+        }
     }
 
     pub(crate) fn wait_for_vsync(&self) {
+        if let Some(interval) = self.bench_interval {
+            sleep_precise(interval);
+            return;
+        }
+
         let vsync_start = Instant::now();
         let wait_succeeded = (self.f)();
         let elapsed = vsync_start.elapsed();
@@ -51,6 +80,24 @@ impl VSyncProvider {
         if !wait_succeeded || elapsed < VSYNC_INTERVAL_THRESHOLD {
             log::trace!("VSyncProvider::wait_for_vsync() took less time than expected");
             std::thread::sleep(self.interval);
+        }
+    }
+}
+
+/// 混合 sleep + 自旋：Windows 默认定时器粒度约 15.6ms，单纯 sleep 无法
+/// 稳定表达 3.33ms。仅在 `GPUI_BENCH_HZ` 诊断模式下使用。
+fn sleep_precise(interval: Duration) {
+    let deadline = Instant::now() + interval;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline - now;
+        if remaining > Duration::from_micros(800) {
+            std::thread::sleep(remaining - Duration::from_micros(500));
+        } else {
+            std::hint::spin_loop();
         }
     }
 }

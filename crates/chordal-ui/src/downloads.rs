@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Duration;
 
-use chordal_core::model::{Track, TrackId};
+use chordal_core::model::{Lyrics, SourceId, Track, TrackId};
+use lofty::config::WriteOptions;
+use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::picture::{MimeType, Picture, PictureType};
+use lofty::tag::{Accessor, ItemKey, Tag};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -18,6 +22,18 @@ struct DownloadIndex {
     /// `source\u{1}id` → 相对 download_dir 的路径。
     #[serde(default)]
     entries: HashMap<String, PathBuf>,
+}
+
+/// 下载时顺带写回文件的附加元数据。
+///
+/// 音频文件本身只承载流数据；标题/艺人/专辑等字段必须显式写入标签，
+/// 否则本地库扫描只能从文件名兜底（标题带 `[id]`、艺人未知）。
+#[derive(Debug, Clone, Default)]
+pub struct DownloadExtras {
+    /// 封面原始字节（JPEG/PNG/WebP…），同时嵌入标签和写边车文件。
+    pub cover: Option<Vec<u8>>,
+    /// 已渲染为通用 LRC 的歌词文本，写入边车 `.lrc`。
+    pub lyrics: Option<String>,
 }
 
 pub struct DownloadStore {
@@ -57,13 +73,58 @@ impl DownloadStore {
             .filter(|path| path.is_file())
     }
 
+    /// 给一个已存在的下载文件补写元数据（下载完成后 / 旧版本下载修复）。
+    pub fn enrich_file_blocking(
+        &self,
+        path: &Path,
+        track: &Track,
+        extras: &DownloadExtras,
+    ) -> Result<(), String> {
+        if !path.is_file() {
+            return Err(format!("文件不存在：{}", path.display()));
+        }
+        write_embedded_metadata(path, track, extras)?;
+        write_sidecars(path, extras)
+    }
+
+    /// 列出“文件在、但标题或艺人标签为空”的旧下载。
+    ///
+    /// 旧版本只把音频流写盘，没有标签；启动后按 `TrackId` 重新取详情即可
+    /// 原地补齐，无需重新下载。
+    pub fn entries_missing_metadata(&self) -> Vec<(TrackId, PathBuf)> {
+        // 先快照索引再读文件：标签解析是磁盘 IO，不应一直占着索引读锁。
+        let entries: Vec<(String, PathBuf)> = {
+            let Ok(entries) = self.entries.read() else {
+                return Vec::new();
+            };
+            entries
+                .iter()
+                .map(|(key, rel)| (key.clone(), self.root.join(rel)))
+                .collect()
+        };
+        entries
+            .into_iter()
+            .filter_map(|(key, path)| {
+                if !path.is_file() || has_track_metadata(&path) {
+                    return None;
+                }
+                Some((track_id_from_entry_key(&key)?, path))
+            })
+            .collect()
+    }
+
     /// 以阻塞方式下载。`format_hint` 来自解析结果（如 `flac`/`mp3`），
     /// 优先于 URL 后缀，避免 CDN 用 `.mp3` 路径承载 flac。
+    ///
+    /// 音频落盘后会立即写入标签（标题/艺人/专辑/序号/年份/歌词/封面），
+    /// 并写同名 `.lrc` / `.cover.<ext>` 边车文件；这样文件被本地库扫描时
+    /// 仍携带完整元数据，而不是只剩一个带 id 的文件名。
     pub fn download_blocking(
         &self,
         track: &Track,
         url: &str,
         format_hint: Option<&str>,
+        extras: &DownloadExtras,
     ) -> Result<PathBuf, String> {
         if let Some(path) = self.path_for(&track.id) {
             return Ok(path);
@@ -142,6 +203,18 @@ impl DownloadStore {
         }
         std::fs::rename(&part, &dest).map_err(|e| format!("保存文件失败：{e}"))?;
 
+        // 标签/边车写入失败不应让整次下载失败：音频已经完整落盘，
+        // 可以正常播放，只是本地库会退回文件名兜底。
+        if let Err(error) = self.enrich_file_blocking(&dest, track, extras) {
+            tracing::warn!(
+                target: "chordial::download",
+                track = %track.id,
+                path = %dest.display(),
+                %error,
+                "failed to write downloaded track metadata"
+            );
+        }
+
         if let Ok(mut entries) = self.entries.write() {
             let rel = dest
                 .strip_prefix(&self.root)
@@ -203,6 +276,195 @@ impl DownloadStore {
 
 fn entry_key(id: &TrackId) -> String {
     format!("{}\u{1}{}", id.source.as_str(), id.id)
+}
+
+fn track_id_from_entry_key(key: &str) -> Option<TrackId> {
+    let (source, id) = key.split_once('\u{1}')?;
+    Some(TrackId::new(SourceId::new(source), id))
+}
+
+/// 标题 + 艺人齐全才认为标签可用；专辑名允许缺失（单曲下载常见）。
+fn has_track_metadata(path: &Path) -> bool {
+    let Ok(tagged) = lofty::read_from_path(path) else {
+        return false;
+    };
+    let Some(tag) = tagged.primary_tag() else {
+        return false;
+    };
+    tag.title().is_some_and(|value| !value.trim().is_empty())
+        && tag.artist().is_some_and(|value| !value.trim().is_empty())
+}
+
+/// 把领域曲目写进音频文件自身的标签。
+///
+/// `lofty` 同时覆盖 ID3v2（mp3/aac/wav）、Vorbis Comments（flac/ogg/opus）
+/// 与 MP4 ilst（m4a/alac），因此调用方不需要按扩展名分支。
+fn write_embedded_metadata(
+    path: &Path,
+    track: &Track,
+    extras: &DownloadExtras,
+) -> Result<(), String> {
+    let mut tagged =
+        lofty::read_from_path(path).map_err(|error| format!("读取音频标签失败：{error}"))?;
+    // 优先写入该格式的原生标签（例如 mp3 即使只有 ID3v1 也补一个 ID3v2），
+    // 否则封面/歌词这类字段会因目标标签能力不足而被静默丢弃。
+    let tag_type = tagged.file_type().primary_tag_type();
+    if tagged.tag(tag_type).is_none() {
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged
+        .tag_mut(tag_type)
+        .ok_or_else(|| "音频格式不支持写入标签".to_string())?;
+
+    if !track.title.trim().is_empty() {
+        tag.set_title(track.title.clone());
+    }
+    let artists: Vec<&str> = track
+        .artists
+        .iter()
+        .map(|artist| artist.name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !artists.is_empty() {
+        // 本地库按 `/` 拆分多位艺人，与常见 ID3 约定一致。
+        tag.set_artist(artists.join("/"));
+    }
+    if let Some(album) = track
+        .album
+        .as_ref()
+        .map(|album| album.name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        tag.set_album(album.to_string());
+    }
+    if let Some(track_no) = track.track_no.filter(|no| *no > 0) {
+        tag.set_track(track_no);
+    }
+    if let Some(year) = track.year.filter(|year| *year > 0) {
+        tag.insert_text(ItemKey::RecordingDate, year.to_string());
+    }
+    if let Some(lyrics) = extras
+        .lyrics
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        // USLT/©lyr 的语义是纯文本歌词；时间戳只保留在 `.lrc` 边车里。
+        let plain = lrc_to_plain(lyrics);
+        if !plain.is_empty() {
+            tag.insert_text(ItemKey::UnsyncLyrics, plain);
+        }
+    }
+    if let Some(cover) = extras.cover.as_deref().filter(|bytes| !bytes.is_empty())
+        && tag.pictures().is_empty()
+    {
+        // 部分 CDN 文件已经内嵌封面（只是缺文本标签）；不要重复追加。
+        tag.push_picture(
+            Picture::unchecked(cover.to_vec())
+                .pic_type(PictureType::CoverFront)
+                .mime_type(picture_mime(cover))
+                .description("Cover")
+                .build(),
+        );
+    }
+
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|error| format!("写入音频标签失败：{error}"))
+}
+
+/// 写同名边车文件。本地库扫描会优先读取 `.lrc` 与 `<stem>.cover.*`，
+/// 即使文件被拷贝到不支持标签的工具/设备，元数据也还在目录里。
+fn write_sidecars(path: &Path, extras: &DownloadExtras) -> Result<(), String> {
+    if let Some(cover) = extras.cover.as_deref().filter(|bytes| !bytes.is_empty()) {
+        let sidecar = path.with_extension(format!("cover.{}", image_extension(cover)));
+        std::fs::write(&sidecar, cover).map_err(|error| format!("写入封面边车失败：{error}"))?;
+    }
+    if let Some(lyrics) = extras
+        .lyrics
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        let sidecar = path.with_extension("lrc");
+        std::fs::write(&sidecar, lyrics).map_err(|error| format!("写入歌词边车失败：{error}"))?;
+    }
+    Ok(())
+}
+
+/// 领域歌词 → 通用 LRC。优先使用已解析的行级时间戳；文本本身可能是
+/// YRC（逐词），直接存 `Lyrics::raw` 会让本地 LRC 解析器读不到。
+pub fn lyrics_to_lrc(lyrics: &Lyrics) -> Option<String> {
+    let mut out = String::new();
+    if !lyrics.lines.is_empty() {
+        for line in &lyrics.lines {
+            push_lrc_line(&mut out, line.time_ms, &line.text);
+        }
+    } else if !lyrics.timed_lines.is_empty() {
+        for line in &lyrics.timed_lines {
+            push_lrc_line(&mut out, line.start_ms, &line.text());
+        }
+    } else if !lyrics.raw.trim().is_empty() {
+        out.push_str(lyrics.raw.trim_start_matches('\u{feff}'));
+        out.push('\n');
+    }
+    (!out.trim().is_empty()).then_some(out)
+}
+
+fn push_lrc_line(out: &mut String, time_ms: u64, text: &str) {
+    let minutes = time_ms / 60_000;
+    let seconds = (time_ms / 1_000) % 60;
+    let centis = (time_ms % 1_000) / 10;
+    out.push_str(&format!(
+        "[{minutes:02}:{seconds:02}.{centis:02}]{}\n",
+        text.trim_end()
+    ));
+}
+
+/// 去掉 LRC 时间/元信息标签，得到适合写进 `USLT`/`©lyr` 的纯文本。
+fn lrc_to_plain(lrc: &str) -> String {
+    let mut out = String::new();
+    for line in lrc.lines() {
+        let mut rest = line.trim();
+        while let Some(stripped) = rest.strip_prefix('[') {
+            let Some(close) = stripped.find(']') else {
+                break;
+            };
+            rest = stripped[close + 1..].trim_start();
+        }
+        if rest.is_empty() {
+            continue;
+        }
+        out.push_str(rest);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn picture_mime(bytes: &[u8]) -> MimeType {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        MimeType::Jpeg
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        MimeType::Png
+    } else if bytes.starts_with(b"GIF8") {
+        MimeType::Gif
+    } else if bytes.starts_with(b"BM") {
+        MimeType::Bmp
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        MimeType::Unknown("image/webp".into())
+    } else {
+        MimeType::Unknown("application/octet-stream".into())
+    }
+}
+
+fn image_extension(bytes: &[u8]) -> &'static str {
+    match picture_mime(bytes) {
+        MimeType::Png => "png",
+        MimeType::Gif => "gif",
+        MimeType::Bmp => "bmp",
+        MimeType::Unknown(kind) if kind == "image/webp" => "webp",
+        _ => "jpg",
+    }
 }
 
 fn sanitize_component(raw: &str) -> String {
@@ -339,6 +601,170 @@ mod tests {
         drop(store);
         let store = DownloadStore::open(root.clone());
         assert!(store.path_for(&id).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn renders_lrc_from_parsed_lines() {
+        let lyrics = Lyrics {
+            lines: vec![chordal_core::model::LyricLine {
+                time_ms: 62_530,
+                text: "你好".into(),
+            }],
+            // YRC 原文不能被本地 LRC 解析器直接使用，必须重新渲染。
+            raw: "[62530,1000](62530,100,0)你(62630,100,0)好".into(),
+            ..Default::default()
+        };
+        assert_eq!(lyrics_to_lrc(&lyrics).as_deref(), Some("[01:02.53]你好\n"));
+        assert!(lyrics_to_lrc(&Lyrics::default()).is_none());
+        assert_eq!(
+            lrc_to_plain("[ar:歌手]\n[00:01.00][00:03.00]你好\n\n[00:04.00]世界\n"),
+            "你好\n世界"
+        );
+    }
+
+    /// 最小合法 WAV：lofty 能识别格式并写入 ID3v2 标签。
+    fn minimal_wav() -> Vec<u8> {
+        let samples: [i16; 8] = [0; 8];
+        let data_len = (samples.len() * 2) as u32;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&44_100u32.to_le_bytes());
+        wav.extend_from_slice(&176_400u32.to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x05, 0x02, 0x00, 0x5E, 0x1D, 0x1D, 0x89, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn writes_tags_cover_and_lyrics_sidecars() {
+        let root = std::env::temp_dir().join(format!("chordial-enrich-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let id = TrackId::new(SourceId::new("netease"), "42");
+        let track = Track::new(
+            id.clone(),
+            "海阔天空",
+            vec![chordal_core::model::ArtistRef {
+                id: None,
+                name: "Beyond".into(),
+            }],
+            Some(chordal_core::model::AlbumRef {
+                id: None,
+                name: "乐与怒".into(),
+                cover: None,
+            }),
+            Some(326_000),
+            TrackOrigin::Remote {
+                source: SourceId::new("netease"),
+            },
+        );
+        let path = root.join("海阔天空 [42].wav");
+        std::fs::write(&path, minimal_wav()).unwrap();
+
+        let store = DownloadStore::open(root.clone());
+        {
+            let mut entries = store.entries.write().unwrap();
+            entries.insert(entry_key(&id), PathBuf::from("海阔天空 [42].wav"));
+        }
+        assert_eq!(store.entries_missing_metadata().len(), 1);
+
+        let extras = DownloadExtras {
+            cover: Some(PNG_1X1.to_vec()),
+            lyrics: Some("[00:01.00]hello\n".into()),
+        };
+        store.enrich_file_blocking(&path, &track, &extras).unwrap();
+
+        let tagged = lofty::read_from_path(&path).unwrap();
+        let tag = tagged.primary_tag().expect("written tag");
+        assert_eq!(tag.title().as_deref(), Some("海阔天空"));
+        assert_eq!(tag.artist().as_deref(), Some("Beyond"));
+        assert_eq!(tag.album().as_deref(), Some("乐与怒"));
+        assert_eq!(tag.get_string(ItemKey::UnsyncLyrics), Some("hello"));
+        assert_eq!(tag.pictures().len(), 1);
+        assert!(path.with_extension("lrc").is_file());
+        assert!(path.with_extension("cover.png").is_file());
+        assert!(store.entries_missing_metadata().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 0.2s 静音 MP3（64kbps），只用于验证标签写入 + 本地库读回。
+    const TINY_MP3: &[u8] = include_bytes!("../tests/fixtures/tiny.mp3");
+
+    #[test]
+    fn enriched_file_is_scanned_back_with_metadata() {
+        let root = std::env::temp_dir().join(format!("chordial-scanback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("终于见到了你 [2608436149].mp3");
+        std::fs::write(&path, TINY_MP3).unwrap();
+
+        let track = Track::new(
+            TrackId::new(SourceId::new("netease"), "2608436149"),
+            "终于见到了你",
+            vec![chordal_core::model::ArtistRef {
+                id: None,
+                name: "吴琳珂Moske".into(),
+            }],
+            Some(chordal_core::model::AlbumRef {
+                id: None,
+                name: "终于见到了你".into(),
+                cover: None,
+            }),
+            Some(182_000),
+            TrackOrigin::Remote {
+                source: SourceId::new("netease"),
+            },
+        );
+        let extras = DownloadExtras {
+            cover: Some(PNG_1X1.to_vec()),
+            lyrics: Some("[00:01.00]你好\n".into()),
+        };
+        write_embedded_metadata(&path, &track, &extras).unwrap();
+        write_sidecars(&path, &extras).unwrap();
+
+        // 模拟本地库扫描：标题/艺人/专辑来自文件标签，封面来自单曲边车。
+        let source = chordal_local::LocalSource::new(
+            SourceId::new("local-test"),
+            chordal_local::LocalSourceConfig {
+                roots: vec![root.clone()],
+            },
+            "test",
+        );
+        source.scan_blocking();
+        let tracks = source.all_tracks();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "终于见到了你");
+        assert_eq!(tracks[0].primary_artist(), "吴琳珂Moske");
+        assert_eq!(
+            tracks[0].album.as_ref().map(|album| album.name.as_str()),
+            Some("终于见到了你")
+        );
+        let cover = tracks[0]
+            .album
+            .as_ref()
+            .and_then(|album| album.cover.as_deref());
+        assert!(cover.is_some_and(|url| url.starts_with("file://") && url.ends_with(".cover.png")));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

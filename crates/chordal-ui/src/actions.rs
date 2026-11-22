@@ -11,7 +11,12 @@ actions!(
         FocusSearch,
         RescanLibrary,
         ToggleSidebar,
+        TogglePortrait,
+        ToggleEqualizer,
+        PlayFirst,
         ExitImmersive,
+        OpenSettings,
+        CloseSettings,
         Quit
     ]
 );
@@ -24,7 +29,15 @@ pub fn install_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-k", FocusSearch, Some("ChordialMain")),
         KeyBinding::new("ctrl-r", RescanLibrary, Some("ChordialMain")),
         KeyBinding::new("ctrl-b", ToggleSidebar, Some("ChordialMain")),
+        KeyBinding::new("f2", TogglePortrait, Some("ChordialMain")),
+        KeyBinding::new("f5", PlayFirst, Some("ChordialMain")),
+        KeyBinding::new("f5", PlayFirst, Some("ChordialImmersive")),
+        KeyBinding::new("f2", TogglePortrait, Some("ChordialImmersive")),
+        KeyBinding::new("f3", ToggleEqualizer, Some("ChordialMain")),
+        KeyBinding::new("f9", OpenSettings, None),
+        KeyBinding::new("f3", ToggleEqualizer, Some("ChordialImmersive")),
         KeyBinding::new("escape", ExitImmersive, Some("ChordialImmersive")),
+        KeyBinding::new("escape", CloseSettings, Some("ChordialMain")),
         KeyBinding::new("space", PlayPause, Some("ChordialImmersive")),
         KeyBinding::new("ctrl-space", PlayPause, Some("ChordialImmersive")),
         KeyBinding::new("ctrl-right", NextTrack, Some("ChordialImmersive")),

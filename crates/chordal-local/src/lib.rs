@@ -110,7 +110,8 @@ pub struct ScanSummary {
 /// 本地音乐源。
 pub struct LocalSource {
     info: SourceInfo,
-    config: LocalSourceConfig,
+    /// 设置面板可在运行时替换目录；扫描开始前取快照，避免持锁遍历文件系统。
+    config: RwLock<LocalSourceConfig>,
     tag_reader: RwLock<Box<dyn TagReader>>,
     index: RwLock<Index>,
     /// 扫描代数：每次扫描自增，UI 可观察。
@@ -151,11 +152,35 @@ impl LocalSource {
         };
         Arc::new(Self {
             info,
-            config,
+            config: RwLock::new(config),
             tag_reader: RwLock::new(tag_reader),
             index: RwLock::new(Index::default()),
             scan_generation: AtomicU64::new(0),
         })
+    }
+
+    /// 替换音乐目录（空列表忽略）。下一次 `scan_blocking` 生效。
+    pub fn set_roots(&self, roots: Vec<PathBuf>) {
+        let roots: Vec<PathBuf> = roots
+            .into_iter()
+            .filter(|root| !root.as_os_str().is_empty())
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        self.config
+            .write()
+            .expect("local config lock poisoned")
+            .roots = roots;
+    }
+
+    /// 当前音乐目录快照。
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.config
+            .read()
+            .expect("local config lock poisoned")
+            .roots
+            .clone()
     }
 
     /// 完整/增量扫描（阻塞，调用方负责线程池）。
@@ -179,8 +204,14 @@ impl LocalSource {
             .collect();
 
         let exts: HashSet<&str> = AUDIO_EXTS.iter().copied().collect();
+        let roots = self
+            .config
+            .read()
+            .expect("local config lock poisoned")
+            .roots
+            .clone();
         let mut files: Vec<PathBuf> = Vec::new();
-        for root in &self.config.roots {
+        for root in &roots {
             let walker = walkdir::WalkDir::new(root)
                 .follow_links(false)
                 .into_iter()
@@ -237,10 +268,14 @@ impl LocalSource {
                         .read(path);
                     let mut track = build_track(&self.info.id, &track_id, path, meta);
                     if let Some(parent) = path.parent() {
-                        let cover = folder_covers
-                            .entry(parent.to_path_buf())
-                            .or_insert_with(|| find_folder_cover(parent))
-                            .clone();
+                        // 下载器会给每首歌写 `<stem>.cover.<ext>` 边车；它比
+                        // 目录级 cover.jpg 更精确（同目录可能有多张专辑）。
+                        let cover = find_track_cover(path).or_else(|| {
+                            folder_covers
+                                .entry(parent.to_path_buf())
+                                .or_insert_with(|| find_folder_cover(parent))
+                                .clone()
+                        });
                         if cover.is_some() {
                             if let Some(album) = track.album.as_mut() {
                                 album.cover = cover;
@@ -393,6 +428,20 @@ fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     Some((mtime, md.len()))
+}
+
+/// 单曲封面边车：下载器写入的 `<stem>.cover.jpg/png/...`。
+/// 同目录多张专辑/多首单曲时，目录级 cover.jpg 可能张冠李戴。
+fn find_track_cover(path: &Path) -> Option<String> {
+    let dir = path.parent()?;
+    let stem = path.file_stem()?.to_string_lossy();
+    for ext in ["jpg", "jpeg", "png", "webp", "gif", "bmp"] {
+        let candidate = dir.join(format!("{stem}.cover.{ext}"));
+        if candidate.is_file() {
+            return Some(format!("file://{}", candidate.to_string_lossy()));
+        }
+    }
+    None
 }
 
 /// 同目录封面探测：常见命名，返回 `file://` URL。
@@ -1496,6 +1545,21 @@ mod tests {
         let track = &src.all_tracks()[0];
         let cover = track.album.as_ref().and_then(|a| a.cover.as_deref());
         assert!(cover.is_some_and(|c| c.starts_with("file://") && c.ends_with("cover.jpg")));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn prefers_per_track_cover_sidecar() {
+        let tmp = std::env::temp_dir().join(format!("chordial-track-cover-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        write_file(&tmp, "song.mp3");
+        fs::write(tmp.join("cover.jpg"), b"folder image").unwrap();
+        fs::write(tmp.join("song.cover.png"), b"track image").unwrap();
+        let (src, _) = make_source(vec![tmp.clone()]);
+        src.scan_blocking();
+        let track = &src.all_tracks()[0];
+        let cover = track.album.as_ref().and_then(|a| a.cover.as_deref());
+        assert!(cover.is_some_and(|c| c.starts_with("file://") && c.ends_with("song.cover.png")));
         let _ = fs::remove_dir_all(&tmp);
     }
 

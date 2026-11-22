@@ -15,7 +15,18 @@ fn write_wav(path: &Path, seconds: f64, rate: u32) {
 }
 
 fn write_wav_tones(path: &Path, seconds: f64, rate: u32, left_hz: f64, right_hz: f64) {
-    let channels = 2u16;
+    write_wav_frames(path, seconds, rate, 2, |ch| {
+        if ch == 0 { left_hz } else { right_hz }
+    });
+}
+
+fn write_wav_frames(
+    path: &Path,
+    seconds: f64,
+    rate: u32,
+    channels: u16,
+    freq_for: impl Fn(u16) -> f64,
+) {
     let total_frames = (seconds * rate as f64) as u32;
     let data_len = (total_frames as usize) * channels as usize * 2;
     let mut f = File::create(path).unwrap();
@@ -41,8 +52,7 @@ fn write_wav_tones(path: &Path, seconds: f64, rate: u32, left_hz: f64, right_hz:
     for frame in 0..total_frames {
         for ch in 0..channels {
             let t = frame as f64 / rate as f64;
-            let freq = if ch == 0 { left_hz } else { right_hz };
-            let s = (t * freq * std::f64::consts::TAU).sin();
+            let s = (t * freq_for(ch) * std::f64::consts::TAU).sin();
             let v = (s * i16::MAX as f64 * 0.5) as i16;
             f.write_all(&v.to_le_bytes()).unwrap();
         }
@@ -153,6 +163,40 @@ fn pause_resume_and_stop_control_state() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(player.status().state, PlayerState::Stopped);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sink_opens_with_real_track_spec() {
+    // 回归：输出设备必须在首包解码前按容器头部的真实规格打开。
+    // 兜底的 44.1kHz/2ch 会把 96kHz 单声道素材解释成 4 倍慢放。
+    let dir = std::env::temp_dir().join(format!("chordial-player-spec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mono96k.wav");
+    write_wav_frames(&path, 0.3, 96_000, 1, |_| 440.0);
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen_in_factory = seen.clone();
+    let player = Player::with_sink_factory(
+        Box::new(move |rate, channels| {
+            *seen_in_factory.lock().unwrap() = Some((rate, channels));
+            Ok(Box::new(chordal_player::NullSink::new()) as Box<_>)
+        }),
+        "null",
+    );
+    player.play(StreamHandle::File(path.clone()), "spec", 0);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && seen.lock().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some((96_000, 1)),
+        "sink must open with the WAV header's real rate/channels"
+    );
+    player.stop();
 
     let _ = std::fs::remove_dir_all(&dir);
 }

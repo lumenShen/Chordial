@@ -9,3 +9,9 @@
 # 本地机器特定配置（target-dir / 本地链接目录），不入库。
 # 需要时从 .cargo/config.toml 复制到自己的环境。
 .cargo/
+# 本地临时产物 / 截图 / 录屏 / 工具目录，不入库。
+.tmp-*/
+.tmp_*/
+.effibuddy/
+.v2c/
+.zcode/

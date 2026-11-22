@@ -139,6 +139,7 @@ mod macos {
             "BorderStyle".into(),
             "SpriteInputIndex".into(),
             "MonochromeSprite".into(),
+            "SpriteMask".into(),
             "PolychromeSprite".into(),
             "PathSprite".into(),
             "SurfaceInputIndex".into(),

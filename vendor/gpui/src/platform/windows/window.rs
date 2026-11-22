@@ -53,6 +53,10 @@ pub struct WindowsWindowState {
     pub click_state: ClickState,
     pub current_cursor: Option<HCURSOR>,
     pub nc_button_pressed: Option<u32>,
+    /// 高回报率鼠标：每帧只派发最后一次移动。
+    pub pending_mouse_move: Option<MouseMoveEvent>,
+    /// 高回报率滚轮/触控板：每帧合并一次滚动增量。
+    pub pending_scroll: Option<ScrollWheelEvent>,
 
     pub display: WindowsDisplay,
     fullscreen: Option<StyleAndBounds>,
@@ -139,6 +143,8 @@ impl WindowsWindowState {
             click_state,
             current_cursor,
             nc_button_pressed,
+            pending_mouse_move: None,
+            pending_scroll: None,
             display,
             fullscreen,
             initial_placement,
@@ -585,6 +591,51 @@ impl PlatformWindow for WindowsWindow {
             point
         };
         logical_point(point.x as f32, point.y as f32, scale_factor)
+    }
+
+    /// 从客户区热区开始拖动窗口。
+    ///
+    /// `WM_SYSCOMMAND` + `SC_MOVE` 会进入系统模态移动循环，效果与拖动原生
+    /// 标题栏一致：贴边分屏、跨显示器 DPI 变化、双击最大化都交给系统处理。
+    /// 低 4 位的 `2` 表示由鼠标发起（否则系统会进入键盘移动模式）。
+    /// 用 `PostMessageW` 而不是 `SendMessageW`，避免在 gpui 的 mouse-down
+    /// 分发过程中重入窗口过程。
+    fn start_window_move(&self) {
+        unsafe {
+            let _ = ReleaseCapture();
+            PostMessageW(
+                Some(self.0.hwnd),
+                WM_SYSCOMMAND,
+                WPARAM((SC_MOVE | 0x0002) as usize),
+                LPARAM(0),
+            )
+            .log_err();
+        }
+    }
+
+    /// 从客户区热区开始缩放窗口（`SC_SIZE` 的低 4 位选择边/角）。
+    fn start_window_resize(&self, edge: ResizeEdge) {
+        // 1=左 2=右 3=上 4=左上 5=右上 6=下 7=左下 8=右下。
+        let direction = match edge {
+            ResizeEdge::Left => 1,
+            ResizeEdge::Right => 2,
+            ResizeEdge::Top => 3,
+            ResizeEdge::TopLeft => 4,
+            ResizeEdge::TopRight => 5,
+            ResizeEdge::Bottom => 6,
+            ResizeEdge::BottomLeft => 7,
+            ResizeEdge::BottomRight => 8,
+        };
+        unsafe {
+            let _ = ReleaseCapture();
+            PostMessageW(
+                Some(self.0.hwnd),
+                WM_SYSCOMMAND,
+                WPARAM((SC_SIZE + direction) as usize),
+                LPARAM(0),
+            )
+            .log_err();
+        }
     }
 
     fn modifiers(&self) -> Modifiers {

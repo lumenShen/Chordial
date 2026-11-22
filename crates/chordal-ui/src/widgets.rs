@@ -5,25 +5,15 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Component, Hsla, ImageSource, IntoElement, MouseButton,
-    MouseMoveEvent, ObjectFit, PathBuilder, Pixels, RenderImage, RenderOnce, SharedString, Window,
+    MouseMoveEvent, ObjectFit, Pixels, RenderImage, RenderOnce, SharedString, Window,
     canvas, div, img, point, px,
 };
 
 use crate::theme::Theme;
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_id(prefix: &str) -> SharedString {
-    SharedString::from(format!(
-        "{prefix}-{}",
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    ))
-}
 
 pub fn icon_button<F>(
     theme: &Theme,
@@ -60,8 +50,10 @@ pub fn text_button<F>(
 where
     F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 {
+    let label = label.into();
     let base = div()
-        .id(next_id("text-btn"))
+        // 稳定 ID：随机 ID 会在 hover/按下重绘时变化，导致 click 丢失。
+        .id(SharedString::from(format!("text-btn-{label}")))
         .h(px(30.0))
         .px(px(12.0))
         .rounded(px(6.0))
@@ -80,7 +72,7 @@ where
             .text_color(theme.text)
             .hover(|s| s.bg(theme.surface_alt))
     };
-    base.child(label.into())
+    base.child(label)
         .on_click(on_click)
         .into_any_element()
 }
@@ -97,6 +89,8 @@ pub struct Slider {
     colors: SliderColors,
     height: f32,
     id: &'static str,
+    /// 始终显示白色圆形拇指（均衡器滑杆）。
+    knob: bool,
     on_change: Rc<RefCell<Box<dyn FnMut(f32)>>>,
 }
 
@@ -112,6 +106,25 @@ pub fn slider(
         colors,
         height: 16.0,
         id,
+        knob: false,
+        on_change: Rc::new(RefCell::new(Box::new(on_change))),
+    })
+    .into_any_element()
+}
+
+/// 带常驻白色拇指的滑杆（均衡器输入/输出增益、滤波器参数）。
+pub fn knob_slider(
+    value: f32,
+    colors: SliderColors,
+    id: &'static str,
+    on_change: impl FnMut(f32) + 'static,
+) -> AnyElement {
+    Component::new(Slider {
+        value: value.clamp(0.0, 1.0),
+        colors,
+        height: 24.0,
+        id,
+        knob: true,
         on_change: Rc::new(RefCell::new(Box::new(on_change))),
     })
     .into_any_element()
@@ -121,6 +134,15 @@ struct SliderState {
     bounds: Cell<Bounds<Pixels>>,
     hovered: Cell<bool>,
     dragging: Cell<bool>,
+    /// 绘制该滑杆时所属的视图；高频拖动/悬停只通知它，避免
+    /// `refresh_windows()` 让所有 AnyView 缓存失效。
+    view: Cell<Option<gpui::EntityId>>,
+}
+
+fn notify_slider_view(state: &SliderState, cx: &mut App) {
+    if let Some(view) = state.view.get() {
+        cx.notify(view);
+    }
 }
 
 impl RenderOnce for Slider {
@@ -132,12 +154,14 @@ impl RenderOnce for Slider {
             )),
             hovered: Cell::new(false),
             dragging: Cell::new(false),
+            view: Cell::new(None),
         });
         let on_change = self.on_change;
         let value = self.value;
         let colors = self.colors;
         let height = self.height;
         let id = self.id;
+        let knob = self.knob;
 
         let state_down = state.clone();
         let change_down = on_change.clone();
@@ -158,7 +182,7 @@ impl RenderOnce for Slider {
                 state_down.dragging.set(true);
                 if let Some(f) = fraction_at(state_down.bounds.get(), event.position) {
                     (change_down.borrow_mut())(f);
-                    cx.refresh_windows();
+                    notify_slider_view(&state_down, cx);
                 }
             })
             .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
@@ -167,7 +191,7 @@ impl RenderOnce for Slider {
                     && let Some(f) = fraction_at(state_move.bounds.get(), event.position)
                 {
                     (change_move.borrow_mut())(f);
-                    cx.refresh_windows();
+                    notify_slider_view(&state_move, cx);
                 }
             })
             .on_mouse_up(MouseButton::Left, move |_, _, _| {
@@ -175,12 +199,13 @@ impl RenderOnce for Slider {
             })
             .on_hover(move |hovered, _, cx| {
                 state_hover.hovered.set(*hovered);
-                cx.refresh_windows();
+                notify_slider_view(&state_hover, cx);
             })
             .child(
                 canvas(
-                    move |bounds, _, _| {
+                    move |bounds, window, _| {
                         state_bounds.bounds.set(bounds);
+                        state_bounds.view.set(Some(window.current_view()));
                         bounds
                     },
                     move |_bounds, bounds, window, _| {
@@ -189,6 +214,7 @@ impl RenderOnce for Slider {
                             value,
                             colors,
                             state_paint.hovered.get() || state_paint.dragging.get(),
+                            knob,
                             window,
                         );
                     },
@@ -238,6 +264,7 @@ impl RenderOnce for AmllSlider {
             )),
             hovered: Cell::new(false),
             dragging: Cell::new(false),
+            view: Cell::new(None),
         });
         let on_change = self.on_change;
         let value = self.value;
@@ -262,7 +289,7 @@ impl RenderOnce for AmllSlider {
                 state_down.dragging.set(true);
                 if let Some(f) = fraction_at(state_down.bounds.get(), event.position) {
                     (change_down.borrow_mut())(f, cx);
-                    cx.refresh_windows();
+                    notify_slider_view(&state_down, cx);
                 }
             })
             .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
@@ -271,7 +298,7 @@ impl RenderOnce for AmllSlider {
                     && let Some(f) = fraction_at(state_move.bounds.get(), event.position)
                 {
                     (change_move.borrow_mut())(f, cx);
-                    cx.refresh_windows();
+                    notify_slider_view(&state_move, cx);
                 }
             })
             .on_mouse_up(MouseButton::Left, move |_, _, _| {
@@ -279,12 +306,13 @@ impl RenderOnce for AmllSlider {
             })
             .on_hover(move |hovered, _, cx| {
                 state_hover.hovered.set(*hovered);
-                cx.refresh_windows();
+                notify_slider_view(&state_hover, cx);
             })
             .child(
                 canvas(
-                    move |bounds, _, _| {
+                    move |bounds, window, _| {
                         state_bounds.bounds.set(bounds);
+                        state_bounds.view.set(Some(window.current_view()));
                         bounds
                     },
                     move |_bounds, bounds, window, _| {
@@ -323,15 +351,36 @@ fn paint_amll_slider(bounds: Bounds<Pixels>, value: f32, active: bool, w: &mut W
     }
 }
 
+/// 小圆点用圆角 quad 绘制，避免为每个滑杆拇指触发一次全屏路径通道。
+fn paint_dot(w: &mut Window, cx: Pixels, cy: Pixels, r: f32, color: Hsla) {
+    w.paint_quad(
+        gpui::fill(
+            Bounds::new(
+                point(cx - px(r), cy - px(r)),
+                gpui::size(px(r * 2.0), px(r * 2.0)),
+            ),
+            color,
+        )
+        .corner_radii(px(r)),
+    );
+}
+
 fn paint_slider(
     bounds: Bounds<Pixels>,
     value: f32,
     colors: SliderColors,
     active: bool,
+    knob: bool,
     w: &mut Window,
 ) {
     let cy = bounds.center().y;
-    let thickness = if active { 4.0 } else { 2.0 };
+    let thickness = if knob {
+        if active { 6.0 } else { 5.0 }
+    } else if active {
+        4.0
+    } else {
+        2.0
+    };
     let track = Bounds::new(
         point(bounds.left(), cy - px(thickness / 2.0)),
         gpui::size(bounds.size.width, px(thickness)),
@@ -345,20 +394,11 @@ fn paint_slider(
     if f32::from(fill_w) > 0.0 {
         w.paint_quad(gpui::fill(fill, colors.fill).corner_radii(px(thickness / 2.0)));
     }
-    if active {
-        let r = 5.0;
+    if knob || active {
+        let r = if knob { 5.5 } else { 5.0 };
         let cx = bounds.left() + fill_w;
         let cy = bounds.center().y;
-        let mut b = PathBuilder::fill();
-        b.move_to(point(cx, cy - px(r)));
-        for i in 1..=24 {
-            let a = -std::f32::consts::FRAC_PI_2 + i as f32 / 24.0 * std::f32::consts::TAU;
-            b.line_to(point(cx + px(r * a.cos()), cy + px(r * a.sin())));
-        }
-        b.close();
-        if let Ok(path) = b.build() {
-            w.paint_path(path, colors.thumb);
-        }
+        paint_dot(w, cx, cy, r, colors.thumb);
     }
 }
 
@@ -463,6 +503,275 @@ pub fn empty_state(theme: &Theme, icon: AnyElement, title: &str, hint: &str) -> 
                 .child(SharedString::from(hint.to_string())),
         )
         .into_any_element()
+}
+
+/// 开/关开关（均衡器启用、频段启用）。点击时停止冒泡，避免卡片同时被选中。
+pub fn switch(
+    on: bool,
+    accent: Hsla,
+    id: impl Into<SharedString>,
+    on_change: impl Fn(bool, &mut App) + 'static,
+) -> AnyElement {
+    let knob = if on { 20.0 } else { 2.0 };
+    let id: SharedString = id.into();
+    let element_id = SharedString::from(format!("switch-{}", id.as_ref()));
+    div()
+        .id(element_id)
+        .w(px(42.0))
+        .h(px(22.0))
+        .rounded(px(11.0))
+        .bg(if on {
+            accent
+        } else {
+            gpui::white().opacity(0.18)
+        })
+        .relative()
+        .cursor_pointer()
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            on_change(!on, cx);
+            cx.refresh_windows();
+        })
+        .child(
+            div()
+                .absolute()
+                .top(px(2.0))
+                .left(px(knob))
+                .size(px(18.0))
+                .rounded(px(9.0))
+                .bg(gpui::white()),
+        )
+        .into_any_element()
+}
+
+struct VSliderState {
+    bounds: Cell<Bounds<Pixels>>,
+    dragging: Cell<bool>,
+    view: Cell<Option<gpui::EntityId>>,
+}
+
+fn notify_vslider_view(state: &VSliderState, cx: &mut App) {
+    if let Some(view) = state.view.get() {
+        cx.notify(view);
+    }
+}
+
+/// 均衡器滑杆：回调带回 `&mut App`，可在拖动时直接更新实体并重绘。
+pub fn eq_knob_slider(
+    value: f32,
+    colors: SliderColors,
+    id: &'static str,
+    on_change: impl FnMut(f32, &mut App) + 'static,
+) -> AnyElement {
+    Component::new(EqKnobSlider {
+        value: value.clamp(0.0, 1.0),
+        colors,
+        id,
+        on_change: Rc::new(RefCell::new(Box::new(on_change))),
+    })
+    .into_any_element()
+}
+
+struct EqKnobSlider {
+    value: f32,
+    colors: SliderColors,
+    id: &'static str,
+    on_change: Rc<RefCell<Box<dyn FnMut(f32, &mut App)>>>,
+}
+
+impl RenderOnce for EqKnobSlider {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let state = Rc::new(SliderState {
+            bounds: Cell::new(Bounds::new(
+                point(px(0.), px(0.)),
+                gpui::size(px(0.), px(0.)),
+            )),
+            hovered: Cell::new(false),
+            dragging: Cell::new(false),
+            view: Cell::new(None),
+        });
+        let on_change = self.on_change;
+        let value = self.value;
+        let colors = self.colors;
+        let id = self.id;
+
+        let state_down = state.clone();
+        let change_down = on_change.clone();
+        let state_move = state.clone();
+        let change_move = on_change.clone();
+        let state_up = state.clone();
+        let state_hover = state.clone();
+        let state_bounds = state.clone();
+        let state_paint = state.clone();
+
+        div()
+            .id(SharedString::from(format!("eq-slider-{id}")))
+            .h(px(24.0))
+            .w_full()
+            .relative()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                state_down.dragging.set(true);
+                if let Some(f) = fraction_at(state_down.bounds.get(), event.position) {
+                    (change_down.borrow_mut())(f, cx);
+                    notify_slider_view(&state_down, cx);
+                }
+            })
+            .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
+                if state_move.dragging.get()
+                    && event.pressed_button == Some(MouseButton::Left)
+                    && let Some(f) = fraction_at(state_move.bounds.get(), event.position)
+                {
+                    (change_move.borrow_mut())(f, cx);
+                    notify_slider_view(&state_move, cx);
+                }
+            })
+            .on_mouse_up(MouseButton::Left, move |_, _, _| {
+                state_up.dragging.set(false);
+            })
+            .on_hover(move |hovered, _, cx| {
+                state_hover.hovered.set(*hovered);
+                notify_slider_view(&state_hover, cx);
+            })
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        state_bounds.bounds.set(bounds);
+                        state_bounds.view.set(Some(window.current_view()));
+                        bounds
+                    },
+                    move |_bounds, bounds, window, _| {
+                        paint_slider(
+                            bounds,
+                            value,
+                            colors,
+                            state_paint.hovered.get() || state_paint.dragging.get(),
+                            true,
+                            window,
+                        );
+                    },
+                )
+                .size_full(),
+            )
+    }
+}
+
+/// 竖向音量条（竖屏播放页右侧）：2px 轨道，白色填充，hover 显示拇指。
+pub fn vertical_slider(
+    value: f32,
+    id: &'static str,
+    on_change: impl FnMut(f32) + 'static,
+) -> AnyElement {
+    Component::new(VSlider {
+        value: value.clamp(0.0, 1.0),
+        id,
+        on_change: Rc::new(RefCell::new(Box::new(on_change))),
+    })
+    .into_any_element()
+}
+
+struct VSlider {
+    value: f32,
+    id: &'static str,
+    on_change: Rc<RefCell<Box<dyn FnMut(f32)>>>,
+}
+
+impl RenderOnce for VSlider {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let state = Rc::new(VSliderState {
+            bounds: Cell::new(Bounds::new(
+                point(px(0.), px(0.)),
+                gpui::size(px(0.), px(0.)),
+            )),
+            dragging: Cell::new(false),
+            view: Cell::new(None),
+        });
+        let on_change = self.on_change;
+        let value = self.value;
+        let id = self.id;
+        // 拖动期间本地值立刻跟手；外部状态（200ms 轮询）随后对齐。
+        let shown = Rc::new(Cell::new(value));
+
+        let d_down = state.clone();
+        let c_down = on_change.clone();
+        let s_down = shown.clone();
+        let d_move = state.clone();
+        let c_move = on_change.clone();
+        let s_move = shown.clone();
+        let d_up = state.clone();
+        let b_paint = state.clone();
+        let b_paint2 = state.clone();
+        let s_paint = shown.clone();
+
+        div()
+            .id(SharedString::from(format!("vslider-{id}")))
+            .w(px(20.0))
+            .h_full()
+            .relative()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                d_down.dragging.set(true);
+                if let Some(f) = vertical_fraction_at(d_down.bounds.get(), event.position) {
+                    s_down.set(f);
+                    (c_down.borrow_mut())(f);
+                    notify_vslider_view(&d_down, cx);
+                }
+            })
+            .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
+                if d_move.dragging.get()
+                    && event.pressed_button == Some(MouseButton::Left)
+                    && let Some(f) = vertical_fraction_at(d_move.bounds.get(), event.position)
+                {
+                    s_move.set(f);
+                    (c_move.borrow_mut())(f);
+                    notify_vslider_view(&d_move, cx);
+                }
+            })
+            .on_mouse_up(MouseButton::Left, move |_, _, _| {
+                d_up.dragging.set(false);
+            })
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        b_paint2.bounds.set(bounds);
+                        b_paint2.view.set(Some(window.current_view()));
+                        bounds
+                    },
+                    move |_bounds, bounds, window, _| {
+                        paint_vertical(bounds, s_paint.get(), b_paint.dragging.get(), window);
+                    },
+                )
+                .size_full(),
+            )
+    }
+}
+
+fn vertical_fraction_at(bounds: Bounds<Pixels>, position: gpui::Point<Pixels>) -> Option<f32> {
+    let h = f32::from(bounds.size.height);
+    if h <= 0.0 {
+        return None;
+    }
+    let from_bottom = f32::from(bounds.bottom() - position.y) / h;
+    Some(from_bottom.clamp(0.0, 1.0))
+}
+
+fn paint_vertical(bounds: Bounds<Pixels>, value: f32, dragging: bool, w: &mut Window) {
+    let cx = bounds.center().x;
+    let top = bounds.top();
+    let height = bounds.size.height;
+    let track = Bounds::new(point(cx - px(1.5), top), gpui::size(px(3.0), height));
+    w.paint_quad(gpui::fill(track, gpui::white().opacity(0.28)).corner_radii(px(1.5)));
+    let fill_h = height * value.clamp(0.0, 1.0);
+    if f32::from(fill_h) > 0.0 {
+        let fill = Bounds::new(
+            point(cx - px(1.5), bounds.bottom() - fill_h),
+            gpui::size(px(3.0), fill_h),
+        );
+        w.paint_quad(gpui::fill(fill, gpui::white().opacity(0.92)).corner_radii(px(1.5)));
+    }
+    if dragging {
+        paint_dot(w, cx, bounds.bottom() - fill_h, 5.0, gpui::white());
+    }
 }
 
 #[cfg(test)]

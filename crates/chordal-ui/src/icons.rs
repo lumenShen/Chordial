@@ -3,12 +3,15 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::f32::consts::TAU;
+use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Bounds, Hsla, IntoElement, PathBuilder, Pixels, Styled, Window, canvas, div, point,
-    px,
+    AnyElement, Bounds, Hsla, IntoElement, Path, PathBuilder, Pixels, Styled, Window, canvas, div,
+    point, px,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +35,14 @@ pub enum Icon {
     More,
     Check,
     Expand,
+    ChevronLeft,
+    ChevronRight,
+    Cast,
+    /// 三段竖向推子（播放页 Dock 的均衡器入口）。
+    Equalizer,
+    Headphones,
+    Person,
+    Plus,
     Shuffle,
     Repeat,
     Clock,
@@ -75,6 +86,27 @@ impl Default for IconMotion {
     }
 }
 
+thread_local! {
+    /// 静止图标的已 tessellate 路径（局部坐标，原点 0,0）。
+    /// 首次绘制时捕获，之后每帧只做平移 + 克隆，不再跑 lyon。
+    static ICON_PATH_CACHE: RefCell<HashMap<(u8, u32), Rc<Vec<Path<Pixels>>>>> =
+        RefCell::new(HashMap::new());
+    static CAPTURE_PATHS: RefCell<Option<Vec<Path<Pixels>>>> = const { RefCell::new(None) };
+}
+
+fn emit_path(window: &mut Window, path: Path<Pixels>, color: Hsla) {
+    let capturing = CAPTURE_PATHS.with(|capture| capture.borrow().is_some());
+    if capturing {
+        CAPTURE_PATHS.with(|capture| {
+            if let Some(paths) = capture.borrow_mut().as_mut() {
+                paths.push(path);
+            }
+        });
+    } else {
+        window.paint_path(path, color);
+    }
+}
+
 pub fn icon(name: Icon, size: f32, color: Hsla) -> AnyElement {
     icon_motion(name, size, color, IconMotion::default())
 }
@@ -87,12 +119,55 @@ pub fn icon_motion(name: Icon, size: f32, color: Hsla, motion: IconMotion) -> An
             canvas(
                 move |bounds, _window, _cx| (bounds, name, color, size, motion),
                 |bounds, (_, name, color, size, motion), window, _cx| {
-                    paint(bounds, name, color, size, motion, window);
+                    paint_cached(bounds, name, color, size, motion, window);
                 },
             )
             .size_full(),
         )
         .into_any_element()
+}
+
+/// 静止图标走几何缓存；只有按压/双箭头/喇叭弹跳等动画图标才每帧重建。
+fn paint_cached(
+    bounds: Bounds<Pixels>,
+    name: Icon,
+    color: Hsla,
+    size: f32,
+    motion: IconMotion,
+    window: &mut Window,
+) {
+    let still = (motion.press <= 0.0 || motion.press >= 1.0)
+        && motion.arrows >= 1.0
+        && (motion.speaker <= 0.0 || motion.speaker >= 1.0);
+    if !still {
+        paint(bounds.origin, name, color, size, motion, window);
+        return;
+    }
+
+    let key = (name as u8, size.to_bits());
+    if let Some(paths) = ICON_PATH_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        for path in paths.iter() {
+            window.paint_path_translated(path, bounds.origin, color);
+        }
+        return;
+    }
+
+    CAPTURE_PATHS.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+    paint(point(px(0.0), px(0.0)), name, color, size, motion, window);
+    let captured = CAPTURE_PATHS
+        .with(|capture| capture.borrow_mut().take())
+        .unwrap_or_default();
+    let paths = Rc::new(captured);
+    for path in paths.iter() {
+        window.paint_path_translated(path, bounds.origin, color);
+    }
+    ICON_PATH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(key, paths);
+    });
 }
 
 /// 2D 仿射变换：`p' = p * s + t`。
@@ -180,7 +255,7 @@ fn fill_poly_xf(
     }
     b.close();
     if let Ok(path) = b.build() {
-        window.paint_path(path, color);
+        emit_path(window, path, color);
     }
 }
 
@@ -227,21 +302,122 @@ fn stroke_poly_xf_width(
         b.line_to(at(p.0, p.1));
     }
     if let Ok(path) = b.build() {
-        window.paint_path(path, color);
+        emit_path(window, path, color);
     }
 }
 
-fn circle_pts(cx: f32, cy: f32, r: f32) -> Vec<(f32, f32)> {
-    (0..=28)
-        .map(|i| {
-            let a = -TAU / 4.0 + i as f32 / 28.0 * TAU;
-            (cx + r * a.cos(), cy + r * a.sin())
-        })
-        .collect()
+const CIRCLE_STEPS: usize = 28;
+
+/// 圆形填充：直接写入 path，避免每帧为 `circle_pts` 分配 Vec。
+fn fill_circle(
+    window: &mut Window,
+    color: Hsla,
+    origin: gpui::Point<Pixels>,
+    s: f32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+) {
+    fill_circle_xf(window, color, origin, s, cx, cy, r, Xf::IDENTITY);
+}
+
+fn fill_circle_xf(
+    window: &mut Window,
+    color: Hsla,
+    origin: gpui::Point<Pixels>,
+    s: f32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    xf: Xf,
+) {
+    if r <= 0.0 || !xf.visible() {
+        return;
+    }
+    let mut b = PathBuilder::fill();
+    for i in 0..=CIRCLE_STEPS {
+        let a = -TAU / 4.0 + i as f32 / CIRCLE_STEPS as f32 * TAU;
+        let (x, y) = xf.apply(cx + r * a.cos(), cy + r * a.sin());
+        let p = point(origin.x + px(x * s), origin.y + px(y * s));
+        if i == 0 {
+            b.move_to(p);
+        } else {
+            b.line_to(p);
+        }
+    }
+    b.close();
+    if let Ok(path) = b.build() {
+        emit_path(window, path, color);
+    }
+}
+
+/// 圆形描边：同样避免 Vec 分配。
+fn stroke_circle(
+    window: &mut Window,
+    color: Hsla,
+    origin: gpui::Point<Pixels>,
+    s: f32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+) {
+    if r <= 0.0 {
+        return;
+    }
+    let mut b = PathBuilder::stroke(px((1.5 * s).max(0.75)));
+    for i in 0..=CIRCLE_STEPS {
+        let a = -TAU / 4.0 + i as f32 / CIRCLE_STEPS as f32 * TAU;
+        let p = point(
+            origin.x + px((cx + r * a.cos()) * s),
+            origin.y + px((cy + r * a.sin()) * s),
+        );
+        if i == 0 {
+            b.move_to(p);
+        } else {
+            b.line_to(p);
+        }
+    }
+    if let Ok(path) = b.build() {
+        emit_path(window, path, color);
+    }
+}
+
+/// 圆弧描边（`Refresh` / `Headphones` 的开口弧）。
+fn stroke_arc(
+    window: &mut Window,
+    color: Hsla,
+    origin: gpui::Point<Pixels>,
+    s: f32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    start: f32,
+    span: f32,
+    steps: usize,
+) {
+    if steps == 0 {
+        return;
+    }
+    let mut b = PathBuilder::stroke(px((1.5 * s).max(0.75)));
+    for i in 0..=steps {
+        let a = start + i as f32 / steps as f32 * span;
+        let p = point(
+            origin.x + px((cx + r * a.cos()) * s),
+            origin.y + px((cy + r * a.sin()) * s),
+        );
+        if i == 0 {
+            b.move_to(p);
+        } else {
+            b.line_to(p);
+        }
+    }
+    if let Ok(path) = b.build() {
+        emit_path(window, path, color);
+    }
 }
 
 fn paint(
-    bounds: Bounds<Pixels>,
+    origin: gpui::Point<Pixels>,
     name: Icon,
     color: Hsla,
     size: f32,
@@ -249,7 +425,7 @@ fn paint(
     window: &mut Window,
 ) {
     let s = size / 16.0;
-    let o = bounds.origin;
+    let o = origin;
     let line = |window: &mut Window, pts: &[(f32, f32)]| stroke_poly(window, color, o, s, pts);
     // AMLL MediaButton 的 content 在挂载/播放状态切换时播放 pressed 弹簧；
     // 围绕图标中心缩放，对所有绘制（含描边宽度）生效。
@@ -297,7 +473,7 @@ fn paint(
             fill_poly(window, color, o, s, &[(4.0, 3.2), (4.0, 12.8), (9.4, 8.0)]);
         }
         Icon::Search => {
-            line(window, &circle_pts(7.0, 7.0, 4.3));
+            stroke_circle(window, color, o, s, 7.0, 7.0, 4.3);
             line(window, &[(10.2, 10.2), (13.2, 13.2)]);
         }
         Icon::Volume => {
@@ -355,10 +531,10 @@ fn paint(
             line(window, &[(3.0, 4.0), (13.0, 4.0)]);
             line(window, &[(3.0, 8.0), (11.0, 8.0)]);
             line(window, &[(3.0, 12.0), (8.0, 12.0)]);
-            fill_poly(window, color, o, s, &circle_pts(11.4, 12.0, 0.85));
+            fill_circle(window, color, o, s, 11.4, 12.0, 0.85);
         }
         Icon::Sun => {
-            line(window, &circle_pts(8.0, 8.0, 3.0));
+            stroke_circle(window, color, o, s, 8.0, 8.0, 3.0);
             for i in 0..8 {
                 let a = i as f32 / 8.0 * TAU;
                 line(
@@ -393,32 +569,37 @@ fn paint(
             line(window, &[(12.0, 4.0), (4.0, 12.0)]);
         }
         Icon::Refresh => {
-            let arc: Vec<_> = (0..24)
-                .map(|i| {
-                    let a = -TAU * 0.15 + i as f32 / 24.0 * TAU * 0.8;
-                    (8.0 + 4.6 * a.cos(), 8.0 + 4.6 * a.sin())
-                })
-                .collect();
-            line(window, &arc);
+            stroke_arc(
+                window,
+                color,
+                o,
+                s,
+                8.0,
+                8.0,
+                4.6,
+                -TAU * 0.15,
+                TAU * 0.8,
+                24,
+            );
             fill_poly(window, color, o, s, &[(12.8, 2.6), (13.4, 7.0), (9.2, 5.8)]);
         }
         Icon::ChevronDown => {
             line(window, &[(4.5, 6.5), (8.0, 10.0)]);
             line(window, &[(11.5, 6.5), (8.0, 10.0)]);
-            fill_poly(window, color, o, s, &circle_pts(8.0, 10.0, 0.85));
+            fill_circle(window, color, o, s, 8.0, 10.0, 0.85);
         }
         Icon::Alert => {
             line(window, &[(8.0, 2.6), (14.0, 13.0), (2.0, 13.0), (8.0, 2.6)]);
             line(window, &[(8.0, 6.2), (8.0, 9.4)]);
-            fill_poly(window, color, o, s, &circle_pts(8.0, 11.4, 0.8));
+            fill_circle(window, color, o, s, 8.0, 11.4, 0.8);
         }
         Icon::Note => {
-            fill_poly(window, color, o, s, &circle_pts(5.4, 11.4, 2.2));
+            fill_circle(window, color, o, s, 5.4, 11.4, 2.2);
             line(window, &[(7.4, 11.0), (7.4, 3.8), (12.0, 4.8)]);
         }
         Icon::More => {
             for x in [3.6, 8.0, 12.4] {
-                fill_poly(window, color, o, s, &circle_pts(x, 8.0, 1.1));
+                fill_circle(window, color, o, s, x, 8.0, 1.1);
             }
         }
         Icon::Check => {
@@ -429,6 +610,68 @@ fn paint(
             line(window, &[(10.0, 3.0), (13.0, 3.0), (13.0, 6.0)]);
             line(window, &[(3.0, 10.0), (3.0, 13.0), (6.0, 13.0)]);
             line(window, &[(13.0, 10.0), (13.0, 13.0), (10.0, 13.0)]);
+        }
+        Icon::ChevronLeft => {
+            line(window, &[(11.0, 4.5), (7.5, 8.0), (11.0, 11.5)]);
+        }
+        Icon::ChevronRight => {
+            line(window, &[(5.0, 4.5), (8.5, 8.0), (5.0, 11.5)]);
+        }
+        Icon::Cast => {
+            line(
+                window,
+                &[
+                    (2.6, 6.2),
+                    (2.6, 4.0),
+                    (13.4, 4.0),
+                    (13.4, 12.0),
+                    (9.0, 12.0),
+                ],
+            );
+            fill_circle(window, color, o, s, 3.2, 11.0, 0.75);
+            line(window, &[(2.8, 8.0), (5.8, 11.0)]);
+            line(window, &[(2.8, 4.6), (8.6, 10.4)]);
+        }
+        Icon::Equalizer => {
+            for (x, y) in [(4.2, 9.6), (8.0, 5.2), (11.8, 8.0)] {
+                line(window, &[(x, 3.2), (x, 12.8)]);
+                fill_circle(window, color, o, s, x, y, 1.25);
+            }
+        }
+        Icon::Headphones => {
+            stroke_arc(
+                window,
+                color,
+                o,
+                s,
+                8.0,
+                8.4,
+                5.2,
+                std::f32::consts::PI,
+                std::f32::consts::PI,
+                28,
+            );
+            line(window, &[(2.8, 8.4), (2.8, 11.6)]);
+            line(window, &[(13.2, 8.4), (13.2, 11.6)]);
+            line(window, &[(2.8, 11.6), (5.0, 11.6), (5.0, 9.2), (2.8, 9.2)]);
+            line(
+                window,
+                &[(13.2, 11.6), (11.0, 11.6), (11.0, 9.2), (13.2, 9.2)],
+            );
+        }
+        Icon::Person => {
+            stroke_circle(window, color, o, s, 8.0, 5.6, 2.4);
+            let arc: Vec<_> = (0..20)
+                .map(|i| {
+                    let a = std::f32::consts::PI + i as f32 / 20.0 * std::f32::consts::PI;
+                    (8.0 + 4.6 * a.cos(), 13.4 + 3.6 * a.sin())
+                })
+                .collect();
+            line(window, &arc);
+        }
+        Icon::Plus => {
+            line(window, &[(8.0, 3.4), (8.0, 12.6)]);
+            line(window, &[(3.4, 8.0), (12.6, 8.0)]);
         }
         Icon::Shuffle => {
             line_xf(window, &[(3.0, 4.5), (6.6, 4.5), (9.4, 11.5), (12.2, 11.5)]);
@@ -443,7 +686,7 @@ fn paint(
             fill_xf(window, &[(2.6, 9.0), (4.0, 6.8), (5.4, 9.0)]);
         }
         Icon::Clock => {
-            line(window, &circle_pts(8.0, 8.0, 5.2));
+            stroke_circle(window, color, o, s, 8.0, 8.0, 5.2);
             line(window, &[(8.0, 4.9), (8.0, 8.2), (10.6, 9.6)]);
         }
         Icon::Drive => {
@@ -460,7 +703,7 @@ fn paint(
                 ],
             );
             line(window, &[(4.2, 9.2), (7.2, 9.2)]);
-            fill_poly(window, color, o, s, &circle_pts(11.4, 9.2, 0.7));
+            fill_circle(window, color, o, s, 11.4, 9.2, 0.7);
         }
         Icon::Cloud => {
             line(
@@ -506,8 +749,8 @@ fn paint(
             line(window, &[(3.0, 12.4), (13.0, 12.4)]);
         }
         Icon::Settings => {
-            line(window, &circle_pts(8.0, 8.0, 4.6));
-            line(window, &circle_pts(8.0, 8.0, 1.5));
+            stroke_circle(window, color, o, s, 8.0, 8.0, 4.6);
+            stroke_circle(window, color, o, s, 8.0, 8.0, 1.5);
             for i in 0..8 {
                 let a = i as f32 / 8.0 * std::f32::consts::TAU;
                 line(
@@ -522,8 +765,8 @@ fn paint(
         Icon::Sliders => {
             line(window, &[(2.6, 5.0), (13.4, 5.0)]);
             line(window, &[(2.6, 11.0), (13.4, 11.0)]);
-            fill_poly(window, color, o, s, &circle_pts(6.0, 5.0, 1.4));
-            fill_poly(window, color, o, s, &circle_pts(10.0, 11.0, 1.4));
+            fill_circle(window, color, o, s, 6.0, 5.0, 1.4);
+            fill_circle(window, color, o, s, 10.0, 11.0, 1.4);
         }
     }
 }
