@@ -1,0 +1,19 @@
+[package]
+name = "chordal-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Chordial 2.0 local library music source adapter (filesystem scan + symphonia tags)"
+
+[dependencies]
+chordal-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+walkdir = { workspace = true }
+tracing = { workspace = true }
+encoding_rs = { workspace = true }
+
+# 标签/时长读取（纯 Rust，无系统依赖）。解码运行时不在本 crate 发生。
+symphonia = { workspace = true }

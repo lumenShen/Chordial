@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+          components: rustfmt, clippy
+      - name: System deps (gpui / x11)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-xcb-dev libwayland-dev libvulkan-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings

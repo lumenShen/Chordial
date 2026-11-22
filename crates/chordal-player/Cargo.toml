@@ -1,0 +1,23 @@
+[package]
+name = "chordal-player"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Chordial 2.0 playback engine: symphonia decoding, dlopen ALSA sink, HTTP progressive streaming"
+
+[dependencies]
+chordal-core = { workspace = true }
+symphonia = { workspace = true }
+reqwest = { workspace = true }
+libc = "0.2"
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Windows 原生音频输出（WASAPI 共享模式）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+] }

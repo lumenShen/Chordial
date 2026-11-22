@@ -1,0 +1,20 @@
+[package]
+name = "chordal-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Chordial 2.0 domain core: music source adapter contracts, registry and perf checkpoints"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+futures-timer = "3.0"
+tracing = { workspace = true }
+rustc-hash = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+

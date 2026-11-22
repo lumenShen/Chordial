@@ -1,0 +1,18 @@
+[package]
+name = "chordal-netease"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Chordial 2.0 NetEase Cloud Music adapter over a self-hosted api-enhanced HTTP service"
+
+[dependencies]
+chordal-cache = { workspace = true }
+chordal-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "time"] }

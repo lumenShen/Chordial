@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chordal-cache",
+    "crates/chordal-core",
+    "crates/chordal-local",
+    "crates/chordal-netease",
+    "crates/chordal-player",
+    "crates/chordal-ui",
+    "crates/chordial-amll-gpui",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+
+[workspace.dependencies]
+chordal-cache = { path = "crates/chordal-cache" }
+chordal-core = { path = "crates/chordal-core" }
+chordal-local = { path = "crates/chordal-local" }
+chordal-netease = { path = "crates/chordal-netease" }
+chordal-player = { path = "crates/chordal-player" }
+chordial-amll-gpui = { path = "crates/chordial-amll-gpui" }
+
+gpui = "0.2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+async-trait = "0.1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+walkdir = "2.5"
+unicode-segmentation = "1.12"
+encoding_rs = "0.8"
+# 合并去重等热点哈希表使用 FxHash（非加密哈希），避免 SipHash 在小字符串上的开销。
+rustc-hash = "2.1"
+dirs = "6.0"
+
+# 解码（纯 Rust，无系统依赖）。元数据读取与音频解码共用一套 codec 集合。
+symphonia = { version = "0.5", default-features = false, features = [
+    "mp3", "flac", "ogg", "wav", "aac", "isomp4", "pcm",
+] }
+
+# 网络层统一 rustls，避免系统 OpenSSL 版本问题。
+# "blocking" 供播放线程的 MediaSource 流式下载使用（单一 crate 版本，
+# 避免包别名导致的 lib 名冲突）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "stream", "blocking", "rustls-tls", "http2", "charset", "gzip",
+] }
+
+tokio = { version = "1.47", features = ["rt-multi-thread", "time", "sync"] }
+
+[profile.release]
+lto = "thin"
+debug = true
+
+# gpui 等重依赖在 opt-level 0 下步进极慢；依赖编译到 O1，
+# 调试运行保持流畅，代价只是首次构建稍慢。
+[profile.dev.package."*"]
+opt-level = 1
+
+# crates.io 的 xattr 0.2.3 在 Linux 上引用了被现代 libc 移除的
+# libc::ENOATTR，任何全新构建都会失败。vendor/xattr 是修复版
+# （Linux 分支改为 libc::ENODATA），纯修复、无 API 变化。
+#
+# gpui 没有内容模糊 API（filter: blur），歌词行只能用稀疏字形叠加近似，
+# 重影明显。vendor/gpui 增加了 paint_glyph_with_blur：在字形光栅化阶段
+# 对 alpha 掩码做真高斯/三次盒式卷积，复用字形图集缓存，每字形仍只画一次。
+# 补丁位置见 vendor/gpui/PATCHES.md。
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
+gpui = { path = "vendor/gpui" }

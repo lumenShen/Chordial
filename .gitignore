@@ -1,0 +1,11 @@
+/target
+/dist
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+# 本地构建缓存目录（见 .cargo/config.toml，target 实际在 ~/.cache/chordial-target）
+# 本地机器特定配置（target-dir / 本地链接目录），不入库。
+# 需要时从 .cargo/config.toml 复制到自己的环境。
+.cargo/

@@ -1,0 +1,13 @@
+# NOTICE
+
+Chordial 2.0 includes `chordial-amll-gpui`, an independent Rust/gpui
+reimplementation of the behavior and visual parameters of
+[Apple Music Like Lyrics (AMLL)](https://github.com/Steve-xmh/applemusic-like-lyrics),
+which is licensed under GPL-3.0.
+
+`chordial-amll-gpui` was written from the public behavior, documentation and
+observable rendering results of AMLL. No AMLL source code is copied into this
+repository. AMLL is credited here as the behavioral reference; see the crate
+README for the component-by-component mapping.
+
+The rest of Chordial 2.0 is licensed under the MIT license (see LICENSE).

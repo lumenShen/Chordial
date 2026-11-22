@@ -1,0 +1,30 @@
+[package]
+name = "chordal-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Chordial 2.0 desktop UI (gpui)"
+
+[[bin]]
+name = "chordial"
+path = "src/main.rs"
+
+[dependencies]
+chordal-cache = { workspace = true }
+chordal-core = { workspace = true }
+chordal-local = { workspace = true }
+chordal-netease = { workspace = true }
+chordal-player = { workspace = true }
+chordial-amll-gpui = { workspace = true }
+reqwest = { workspace = true }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+gpui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+unicode-segmentation = { workspace = true }
+dirs = { workspace = true }
