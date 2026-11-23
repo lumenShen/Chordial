@@ -94,8 +94,9 @@ UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0
 
 **GPU 渲染路径（2026-11 优化）**：
 
-- **背景**：沉浸层背景 = 动画 Mesh Gradient，铺满整个窗口。光栅长边固定
-  ≤ 200px（30fps ≈ 25k px/帧，约为主屏 1/64 的像素量），由 `paint_image`
+- **背景**：沉浸层背景 = 动画 Mesh Gradient，铺满整个窗口。光栅分辨率由
+  调用方 `set_background_render_scale` 控制（Chordial 默认按显示区域 ÷ 4，
+  并受 200k 像素硬上限约束；30fps 时约 6M px/s），由 `paint_image`
   交给 GPU **双线性采样放大到全窗** —— 屏幕上每个输出像素的采样/混合都在
   GPU 上完成。光栅内循环做了三处优化：增量重心坐标递推、位运算镜像重复
   采样（去掉逐像素 `rem_euclid`）、调色板 BGRA 预转换（帧缓冲零拷贝）。

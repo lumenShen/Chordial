@@ -433,6 +433,8 @@ pub struct ChordialApp {
     pub(crate) smooth_scroll: bool,
     /// 动态歌词整行扫光的渐变带宽度（em）；设置 → 播放可调。
     lyric_sweep_fade_em: f32,
+    /// 流体背景光栅分辨率除数（1..=20）：scale = 1 / N；设置 → 播放可调。
+    background_render_divisor: u32,
     settings_open: bool,
     /// 新版设置中心（独立实体，见 `settings.rs`）。
     settings_view: Entity<SettingsView>,
@@ -834,6 +836,9 @@ impl ChordialApp {
 
         let theme = Theme::get(cx).clone();
         let appearance = theme.mode;
+        let background_render_divisor =
+            crate::config::clamp_background_render_divisor(cfg.background_render_divisor);
+        let initial_bg_scale = 1.0 / background_render_divisor as f32;
         let clock: Arc<dyn PlaybackClock> = Arc::new(PlayerClock(player.clone()));
         let lyric_view = cx.new(|cx| {
             let mut view = LyricPlayerView::new(cx);
@@ -865,7 +870,7 @@ impl ChordialApp {
                 ..Default::default()
             });
             view.set_background_fps(24);
-            view.set_background_render_scale(0.35);
+            view.set_background_render_scale(initial_bg_scale);
             view.set_background_flow_speed(2.0);
             view.set_background_beat_strength(cfg.beat_strength);
             // 浅色主题用纸面纯色，避免深色 Mesh 与深色文字对比不足。
@@ -907,6 +912,7 @@ impl ChordialApp {
             lyric_sweep_fade_em: crate::config::clamp_lyric_sweep_fade_em(
                 cfg.lyric_sweep_fade_em,
             ),
+            background_render_divisor,
             settings_open: false,
             settings_view,
             settings_cache_view,
@@ -1714,7 +1720,7 @@ impl ChordialApp {
         self.phone_backdrop = mode;
         if mode != PhoneBackdrop::Off {
             let (width, height) = (self.viewport_width, self.viewport_height);
-            let scale = (200.0 / width.max(height).max(1.0)).clamp(0.04, 0.5);
+            let scale = self.background_render_scale();
             let no_bg = self.no_bg;
             let no_blur = self.no_blur;
             let sweep = self.lyric_sweep_fade_em;
@@ -3746,6 +3752,9 @@ impl ChordialApp {
             }
             SettingsAction::SetBeatBand(low, high) => self.commit_beat_band(low, high, cx),
             SettingsAction::SetBeatStrength(value) => self.commit_beat_strength(value, cx),
+            SettingsAction::SetBackgroundRenderDivisor(divisor) => {
+                self.commit_background_render_divisor(divisor, cx)
+            }
             SettingsAction::SetLyricSweepFade(value) => self.commit_lyric_sweep_fade(value, cx),
             SettingsAction::SetEqEnabled(on) => self.set_eq_enabled(on, cx),
             SettingsAction::OpenEqualizer => {
@@ -3973,6 +3982,25 @@ impl ChordialApp {
         cfg.beat_strength = value;
         crate::config::save(&cfg);
         self.info_message = Some(format!("背景鼓点强度：{:.0}%", value * 100.0));
+        cx.notify();
+    }
+
+    /// 流体背景光栅缩放：输出分辨率 = 显示区域 ÷ 除数。
+    fn background_render_scale(&self) -> f32 {
+        1.0 / self.background_render_divisor.max(1) as f32
+    }
+
+    /// 应用流体背景分辨率除数（1..=20），立即更新渲染器并持久化。
+    fn commit_background_render_divisor(&mut self, divisor: u32, cx: &mut Context<Self>) {
+        let divisor = crate::config::clamp_background_render_divisor(divisor);
+        self.background_render_divisor = divisor;
+        let scale = self.background_render_scale();
+        self.lyric_view
+            .update(cx, |view, _| view.set_background_render_scale(scale));
+        let mut cfg = crate::config::load_or_default();
+        cfg.background_render_divisor = divisor;
+        crate::config::save(&cfg);
+        self.info_message = Some(format!("流体背景分辨率：1/{divisor}"));
         cx.notify();
     }
 
@@ -8093,8 +8121,8 @@ impl ChordialApp {
         let title_color = mix_color(gpui::white().opacity(0.9), dock_title, dock_blend);
         let artist_color = mix_color(gpui::white().opacity(0.45), theme.text_faint, dock_blend);
 
-        // 背景铺满卡片；光栅长边 ≤ 200px（30fps ≈ 25k px/帧）。
-        let bg_scale = (200.0 / card_w.max(card_h)).clamp(0.04, 0.5);
+        // 背景铺满卡片；光栅分辨率 = 卡片区域 ÷ 设置里的除数。
+        let bg_scale = self.background_render_scale();
         self.lyric_view.update(cx, |view, _| {
             // 背景按窗口绝对坐标绘制，必须带上卡片原点；否则卡片下移时
             // 背景会被祖先裁掉一截，底部露出卡片的黑色底，形成“黑边”。

@@ -4,14 +4,15 @@
 //! 偶有漂移，映射必须"缺什么补什么"，绝不 panic。
 //! 所有 map 函数均为 O(返回条目数) 单遍。
 
+use std::collections::HashSet;
+
 use serde::Deserialize;
 
 use chordal_core::error::{CoreError, CoreResult};
 use chordal_core::model::{
     AccountProfile, AlbumRef, ArtistRef, AudioQuality, CollectionId, CollectionKind,
     CollectionPage, CollectionSummary, LyricLine, Lyrics, QualityTier, ResolvedStream, SearchKind,
-    SearchResults, SourceId, StreamHandle, TimedLine, TimedWord, Track, TrackId, TrackOrigin,
-    TrackPage,
+    SearchResults, SourceId, StreamHandle, Track, TrackId, TrackOrigin, TrackPage,
 };
 
 /// 音质档位（/song/url/v1 的 level 参数）。
@@ -392,7 +393,7 @@ pub fn map_lyrics(body: &serde_json::Value) -> Option<Lyrics> {
 }
 
 /// 统一构建：YRC 有内容就作为逐字歌词源；否则用 LRC。
-/// JSON 元数据行（作词/作曲/编曲…）同时挂到行级与逐字级，AMLL 才能显示。
+/// 制作信息（作词/作曲/编曲…）单独收集到 [`Lyrics::credits`]，不进入歌词流。
 fn build_lyrics(
     lrc_raw: Option<String>,
     yrc_raw: Option<String>,
@@ -414,11 +415,16 @@ fn build_lyrics(
         let parsed = Lyrics::parse_yrc(&yrc_text);
         (!parsed.lines.is_empty()).then_some(parsed)
     };
+    let lrc_parsed = if lrc_text.trim().is_empty() {
+        None
+    } else {
+        Some(Lyrics::parse_lrc(&lrc_text))
+    };
 
     let mut lyrics = if let Some(parsed) = yrc_parsed {
         parsed
-    } else if !lrc_text.trim().is_empty() {
-        Lyrics::parse_lrc(&lrc_text)
+    } else if let Some(parsed) = lrc_parsed.clone() {
+        parsed
     } else if let Some(raw) = lrc_raw.as_deref() {
         Lyrics::parse_lrc(raw)
     } else if !yrc_text.trim().is_empty() {
@@ -427,7 +433,17 @@ fn build_lyrics(
         Lyrics::default()
     };
 
-    attach_metadata(&mut lyrics, meta);
+    // 正文里混入的「作词: xxx」行同样要摘出来，否则仍会按时间轴进入歌词流。
+    strip_inline_credits(&mut lyrics, &mut meta);
+    // 即使 YRC 胜出，也保留 LRC 骨架里的制作信息（YRC 常常只有 JSON 元数据）。
+    if let Some(lrc) = &lrc_parsed {
+        for line in &lrc.lines {
+            if is_credit_line(&line.text) {
+                meta.push(line.clone());
+            }
+        }
+    }
+    attach_credits(&mut lyrics, meta);
     if let Some(raw) = trans_raw {
         align_translation(&mut lyrics, &raw);
     }
@@ -482,48 +498,179 @@ fn json_u64(value: &serde_json::Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
-/// 把 JSON 元数据行挂到歌词模型：
-/// - 行级 `lines` 永远追加（纯 LRC 时也能显示）；
-/// - 若已有逐字 `timed_lines`，同时生成单字 TimedLine，否则 AMLL 会忽略它们。
-fn attach_metadata(lyrics: &mut Lyrics, mut meta: Vec<LyricLine>) {
+/// 常见制作信息角色词。命中还要求后面跟着分隔符（冒号/斜杠/破折号），
+/// 避免把「词不达意」这类正常歌词误判成元数据。
+const CREDIT_ROLES: &[&str] = &[
+    "作词人",
+    "作曲人",
+    "作词",
+    "作曲",
+    "词曲",
+    "编曲人",
+    "编曲",
+    "制作人",
+    "音乐制作人",
+    "制作",
+    "监制人",
+    "监制",
+    "出品人",
+    "出品",
+    "执行制作",
+    "制作统筹",
+    "统筹",
+    "企划",
+    "策划",
+    "发行人",
+    "发行",
+    "版权",
+    "母带工程师",
+    "母带制作",
+    "母带",
+    "混音工程师",
+    "混音师",
+    "混音",
+    "录音工程师",
+    "录音师",
+    "录音室",
+    "录音",
+    "配唱制作人",
+    "和声编写",
+    "和声",
+    "吉他",
+    "贝斯",
+    "键盘",
+    "弦乐",
+    "原唱",
+    "原曲",
+    "演唱",
+    "音频编辑",
+    "艺术总监",
+    "插画",
+    "摄影",
+    // 英文制作信息（前缀匹配前会转小写）。
+    "lyrics by",
+    "lyric by",
+    "lyrics",
+    "composed by",
+    "composer",
+    "composition",
+    "music by",
+    "written by",
+    "words by",
+    "arranged by",
+    "arranger",
+    "arrangement",
+    "produced by",
+    "producer",
+    "executive producer",
+    "mastering engineer",
+    "mastered by",
+    "mastering",
+    "mixed by",
+    "mixing",
+    "recorded by",
+    "recording",
+    "backing vocals",
+    "guitar",
+    "bass",
+    "drums",
+    "keyboard",
+    "strings",
+    "vocals",
+];
+
+/// 单字/过短的角色词只有紧跟冒号时才算元数据（`词: xxx` / `曲：xxx`）。
+const STRICT_CREDIT_ROLES: &[&str] = &["词", "曲", "op", "sp", "mix"];
+
+/// 该行是否只是一条制作信息（作词/作曲/编曲…）。
+fn is_credit_line(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    let matches = |role: &str| -> bool {
+        let Some(rest) = lower.strip_prefix(role) else {
+            return false;
+        };
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return true;
+        }
+        if STRICT_CREDIT_ROLES.contains(&role) {
+            matches!(rest.chars().next(), Some(':' | '：'))
+        } else {
+            matches!(
+                rest.chars().next(),
+                Some(':' | '：' | '/' | '／' | '-' | '—' | '–')
+            )
+        }
+    };
+    CREDIT_ROLES.iter().any(|role| matches(role))
+        || STRICT_CREDIT_ROLES.iter().any(|role| matches(role))
+}
+
+/// 去重用的归一化键：忽略空白与全/半角冒号差异（`作词: A` == `作词：A`）。
+fn credit_key(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .map(|ch| match ch {
+            '：' => ':',
+            _ => ch,
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// 把正文里混入的制作信息行从时间轴摘到 `meta`。
+///
+/// YRC 有时会把「作词: xxx」写成普通逐词行，LRC 也常见同样的首行；
+/// 这些行如果留在 `lines` / `timed_lines` 里就会跟着歌词滚动。
+fn strip_inline_credits(lyrics: &mut Lyrics, meta: &mut Vec<LyricLine>) {
+    let mut kept = Vec::with_capacity(lyrics.lines.len());
+    for line in lyrics.lines.drain(..) {
+        if is_credit_line(&line.text) {
+            meta.push(line);
+        } else {
+            kept.push(line);
+        }
+    }
+    lyrics.lines = kept;
+
+    lyrics.timed_lines.retain(|line| {
+        let text = line.text();
+        if is_credit_line(&text) {
+            meta.push(LyricLine {
+                time_ms: line.start_ms,
+                text,
+            });
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// 把制作信息写入 [`Lyrics::credits`]，按首次出现顺序去重。
+///
+/// 这些信息不进入 `lines` / `timed_lines`，因此不会按歌词时间轴滚动；
+/// 展示层统一把它们放在歌词末尾作为补充信息。
+fn attach_credits(lyrics: &mut Lyrics, mut meta: Vec<LyricLine>) {
     if meta.is_empty() {
         return;
     }
     meta.sort_by_key(|l| l.time_ms);
-    meta.dedup_by(|a, b| a.time_ms == b.time_ms && a.text == b.text);
 
-    if !lyrics.timed_lines.is_empty() {
-        let mut starts: Vec<u64> = lyrics.timed_lines.iter().map(|l| l.start_ms).collect();
-        starts.sort_unstable();
-        let mut timed_meta = Vec::with_capacity(meta.len());
-        for (i, line) in meta.iter().enumerate() {
-            let mut end = line.time_ms.saturating_add(8_000);
-            if let Some(next) = meta.get(i + 1) {
-                end = end.min(next.time_ms.max(line.time_ms.saturating_add(1)));
-            }
-            let next_timed = starts
-                .get(starts.partition_point(|&s| s <= line.time_ms))
-                .copied();
-            if let Some(next) = next_timed {
-                end = end.min(next.max(line.time_ms.saturating_add(1)));
-            }
-            end = end.max(line.time_ms.saturating_add(1));
-            timed_meta.push(TimedLine {
-                start_ms: line.time_ms,
-                end_ms: end,
-                words: vec![TimedWord {
-                    start_ms: line.time_ms,
-                    end_ms: end,
-                    text: line.text.clone(),
-                }],
-            });
+    let mut seen = HashSet::with_capacity(meta.len());
+    for line in meta {
+        let text = line.text.trim().to_string();
+        if text.is_empty() {
+            continue;
         }
-        lyrics.timed_lines.extend(timed_meta);
-        lyrics.timed_lines.sort_by_key(|l| l.start_ms);
+        if seen.insert(credit_key(&text)) {
+            lyrics.credits.push(text);
+        }
     }
-
-    lyrics.lines.extend(meta);
-    lyrics.lines.sort_by_key(|l| l.time_ms);
 }
 
 /// tlyric 时间戳可能有几十毫秒偏差，按最近行匹配。
@@ -1144,15 +1291,10 @@ mod tests {
             "tlyric": {"lyric": "[00:01.00]hello"}
         });
         let lyrics = map_lyrics_new(&body).expect("lyrics");
-        assert!(lyrics.lines.iter().any(|l| l.text == "作词"));
-        // JSON 元数据 + 逐字行，各一条 TimedLine。
-        assert_eq!(lyrics.timed_lines.len(), 2);
-        let meta = lyrics
-            .timed_lines
-            .iter()
-            .find(|l| l.start_ms == 0)
-            .expect("metadata timed line");
-        assert_eq!(meta.words[0].text, "作词");
+        // 元数据只进 credits，不进入歌词时间轴。
+        assert_eq!(lyrics.credits, vec!["作词".to_string()]);
+        assert_eq!(lyrics.timed_lines.len(), 1);
+        assert!(!lyrics.lines.iter().any(|l| l.text == "作词"));
         let sung = lyrics
             .timed_lines
             .iter()
@@ -1180,13 +1322,18 @@ mod tests {
             "ytlrc": {"lyric": "[00:20.570]第一次去卢浮宫时"}
         });
         let lyrics = map_lyrics_new(&body).expect("real fixture");
-        assert_eq!(lyrics.timed_lines.len(), 5);
-        assert!(
-            lyrics
-                .timed_lines
-                .iter()
-                .any(|l| l.start_ms == 0 && l.words[0].text == "作词: 宇多田ヒカル")
+        // 四条制作信息进 credits；歌词时间轴只剩真正演唱的行。
+        assert_eq!(
+            lyrics.credits,
+            vec![
+                "作词: 宇多田ヒカル".to_string(),
+                "编曲: 宇多田ヒカル/A. G. Cook".to_string(),
+                "制作人: 宇多田ヒカル/A. G. Cook".to_string(),
+                "作曲: 宇多田ヒカル".to_string(),
+            ]
         );
+        assert_eq!(lyrics.timed_lines.len(), 1);
+        assert_eq!(lyrics.lines.len(), 1);
         let sung = lyrics
             .timed_lines
             .iter()
@@ -1242,10 +1389,68 @@ mod tests {
             "yrc": {"lyric": "{\"t\":0,\"c\":[{\"tx\":\"作词: \"},{\"tx\":\"某人\"}]}"}
         });
         let lyrics = map_lyrics_new(&body).expect("metadata + lrc");
-        assert!(lyrics.lines.iter().any(|l| l.text == "作词: 某人"));
-        assert!(lyrics.lines.iter().any(|l| l.text == "你好"));
-        // 没有逐字行时，元数据只进 lines。
+        assert_eq!(lyrics.credits, vec!["作词: 某人".to_string()]);
+        assert_eq!(lyrics.lines.len(), 1);
+        assert_eq!(lyrics.lines[0].text, "你好");
         assert!(lyrics.timed_lines.is_empty());
+    }
+
+    #[test]
+    fn map_lyrics_new_dedupes_repeated_credits() {
+        // QQ 的 YRC 常把同一组制作信息在不同时间戳重复下发；
+        // 全/半角冒号与空格差异也算同一条。
+        let yrc = concat!(
+            "{\"t\":0,\"c\":[{\"tx\":\"作词: \"},{\"tx\":\"萧玮\"}]}\n",
+            "{\"t\":1000,\"c\":[{\"tx\":\"作曲：\"},{\"tx\":\"张亚东\"}]}\n",
+            "{\"t\":2000,\"c\":[{\"tx\":\"作词 : \"},{\"tx\":\"萧玮\"}]}\n",
+            "{\"t\":3000,\"c\":[{\"tx\":\"作曲: 张亚东\"}]}\n",
+            "[5000,500](5000,200,0)我(5200,300,0)爱(5300,200,0)你"
+        );
+        let body = json!({ "yrc": {"lyric": yrc} });
+        let lyrics = map_lyrics_new(&body).expect("dedupe");
+        assert_eq!(
+            lyrics.credits,
+            vec!["作词: 萧玮".to_string(), "作曲：张亚东".to_string()]
+        );
+        assert_eq!(lyrics.timed_lines.len(), 1);
+        assert_eq!(lyrics.lines.len(), 1);
+    }
+
+    #[test]
+    fn map_lyrics_new_moves_inline_credit_lines_out_of_timeline() {
+        // 正文里直接写出来的制作信息行（YRC 逐词行 / LRC 行）同样要截获。
+        let yrc = concat!(
+            "[0,1500](0,300,0)作(300,300,0)词(600,300,0):(900,300,0)萧(1200,300,0)玮\n",
+            "[5000,500](5000,200,0)我(5200,300,0)爱(5300,200,0)你"
+        );
+        let body = json!({
+            "lrc": {"lyric": "[00:00.00]编曲: 张亚东\n[00:05.00]我爱你"},
+            "yrc": {"lyric": yrc}
+        });
+        let lyrics = map_lyrics_new(&body).expect("inline credits");
+        assert_eq!(
+            lyrics.credits,
+            vec!["作词:萧玮".to_string(), "编曲: 张亚东".to_string()]
+        );
+        assert_eq!(lyrics.lines.len(), 1);
+        assert_eq!(lyrics.lines[0].text, "我爱你");
+        assert_eq!(lyrics.timed_lines.len(), 1);
+        assert_eq!(lyrics.timed_lines[0].text(), "我爱你");
+    }
+
+    #[test]
+    fn credit_line_detection_is_conservative() {
+        // 角色词后必须有分隔符，正常歌词不能被误伤。
+        assert!(is_credit_line("作词: 某人"));
+        assert!(is_credit_line("作曲：某人"));
+        assert!(is_credit_line("制作人/某人"));
+        assert!(is_credit_line("词: 某人"));
+        assert!(is_credit_line("词曲：某人"));
+        assert!(is_credit_line("Guitar: John"));
+        assert!(!is_credit_line("词不达意"));
+        assert!(!is_credit_line("作曲系的我"));
+        assert!(!is_credit_line("Guitar solo"));
+        assert!(!is_credit_line("我爱你"));
     }
 
     #[test]

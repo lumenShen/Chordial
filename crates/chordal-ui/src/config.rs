@@ -79,6 +79,10 @@ pub struct AppConfig {
     /// 默认 0.5，保持可感知但不过分剧烈。
     #[serde(default = "default_beat_strength")]
     pub beat_strength: f32,
+    /// 流体背景（Mesh Gradient）光栅分辨率除数：输出分辨率 = 显示区域 ÷ N。
+    /// 越大越省性能、越模糊；默认 4（1/4 边长、1/16 像素量）。
+    #[serde(default = "default_background_render_divisor")]
+    pub background_render_divisor: u32,
     /// 参数均衡器（最后一次编辑的配置）。
     #[serde(default)]
     pub equalizer: chordal_player::EqSettings,
@@ -136,6 +140,24 @@ fn default_beat_strength() -> f32 {
     DEFAULT_BEAT_STRENGTH
 }
 
+/// 流体背景光栅分辨率默认除数：输出 = 显示区域 ÷ N。
+pub const DEFAULT_BACKGROUND_RENDER_DIVISOR: u32 = 4;
+
+/// 除数下限：1 = 原始分辨率（仍受渲染器 200k 像素硬上限约束）。
+pub const BACKGROUND_RENDER_DIVISOR_MIN: u32 = 1;
+
+/// 除数上限：对应渲染器 `render_scale` 的下限 0.05。
+pub const BACKGROUND_RENDER_DIVISOR_MAX: u32 = 20;
+
+fn default_background_render_divisor() -> u32 {
+    DEFAULT_BACKGROUND_RENDER_DIVISOR
+}
+
+/// 把分辨率除数夹到可渲染范围；手改配置与设置输入框共用。
+pub fn clamp_background_render_divisor(value: u32) -> u32 {
+    value.clamp(BACKGROUND_RENDER_DIVISOR_MIN, BACKGROUND_RENDER_DIVISOR_MAX)
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         let music = dirs::audio_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -154,6 +176,7 @@ impl Default for AppConfig {
             beat_band_low_hz: chordal_player::DEFAULT_BEAT_BAND.0,
             beat_band_high_hz: chordal_player::DEFAULT_BEAT_BAND.1,
             beat_strength: DEFAULT_BEAT_STRENGTH,
+            background_render_divisor: DEFAULT_BACKGROUND_RENDER_DIVISOR,
             equalizer: chordal_player::EqSettings::default(),
             eq_saved_presets: Vec::new(),
         }
@@ -183,6 +206,8 @@ pub fn load_or_default() -> AppConfig {
                 // 手改配置时也保证倍率落在可渲染范围。
                 cfg.beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
                 cfg.lyric_sweep_fade_em = clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
+                cfg.background_render_divisor =
+                    clamp_background_render_divisor(cfg.background_render_divisor);
                 return cfg;
             }
             Err(e) => {
@@ -236,6 +261,21 @@ mod tests {
     }
 
     #[test]
+    fn background_render_divisor_defaults_to_quarter_resolution() {
+        assert_eq!(
+            AppConfig::default().background_render_divisor,
+            DEFAULT_BACKGROUND_RENDER_DIVISOR
+        );
+    }
+
+    #[test]
+    fn background_render_divisor_is_clamped() {
+        assert_eq!(clamp_background_render_divisor(0), 1);
+        assert_eq!(clamp_background_render_divisor(3), 3);
+        assert_eq!(clamp_background_render_divisor(99), 20);
+    }
+
+    #[test]
     fn smooth_scroll_roundtrips() {
         let mut cfg = AppConfig::default();
         cfg.smooth_scroll = true;
@@ -259,5 +299,9 @@ mod tests {
         let parsed: AppConfig = serde_json::from_str(json).unwrap();
         assert!(!parsed.smooth_scroll);
         assert!((parsed.lyric_sweep_fade_em - 0.6).abs() < 1e-6);
+        assert_eq!(
+            parsed.background_render_divisor,
+            DEFAULT_BACKGROUND_RENDER_DIVISOR
+        );
     }
 }

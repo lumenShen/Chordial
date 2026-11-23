@@ -101,6 +101,8 @@ pub enum SettingsAction {
     SetBeatBand(f32, f32),
     /// 鼓点视觉效果倍率（0..=1.5，1.0 = 原始幅度）。
     SetBeatStrength(f32),
+    /// 流体背景光栅分辨率除数（1..=20，1 = 原始分辨率）。
+    SetBackgroundRenderDivisor(u32),
     /// 动态歌词整行扫光渐变带宽度（em，0.1..=4.0）。
     SetLyricSweepFade(f32),
     SetEqEnabled(bool),
@@ -169,6 +171,7 @@ pub struct SettingsView {
     smooth_scroll: bool,
     beat_band: (f32, f32),
     beat_strength: f32,
+    background_render_divisor: u32,
     lyric_sweep_fade_em: f32,
     cache_dir: PathBuf,
     download_dir: PathBuf,
@@ -197,6 +200,7 @@ pub struct SettingsView {
     beat_low_field: TextField,
     beat_high_field: TextField,
     beat_strength_field: TextField,
+    background_divisor_field: TextField,
     lyric_sweep_field: TextField,
     search_timeout_field: TextField,
     netease_url_field: TextField,
@@ -216,6 +220,8 @@ impl SettingsView {
             chordal_player::normalize_band(cfg.beat_band_low_hz, cfg.beat_band_high_hz);
         let beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
         let lyric_sweep_fade_em = crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
+        let background_render_divisor =
+            crate::config::clamp_background_render_divisor(cfg.background_render_divisor);
         let quality = cfg.netease.level.unwrap_or_default();
         let weak = cx.entity().downgrade();
 
@@ -271,6 +277,19 @@ impl SettingsView {
                 move |text, window, cx| {
                     let _ =
                         weak.update(cx, |view, cx| view.submit_beat_strength(text, window, cx));
+                },
+                cx,
+            )
+        };
+        let background_divisor_field = {
+            let weak = weak.clone();
+            TextField::new(
+                "settings-background-divisor",
+                "4",
+                move |text, window, cx| {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.submit_background_divisor(text, window, cx)
+                    });
                 },
                 cx,
             )
@@ -339,6 +358,7 @@ impl SettingsView {
             smooth_scroll: cfg.smooth_scroll,
             beat_band,
             beat_strength,
+            background_render_divisor,
             lyric_sweep_fade_em,
             cache_dir: cfg.cache_dir,
             download_dir: cfg.download_dir,
@@ -363,6 +383,7 @@ impl SettingsView {
             beat_low_field,
             beat_high_field,
             beat_strength_field,
+            background_divisor_field,
             lyric_sweep_field,
             search_timeout_field,
             netease_url_field,
@@ -383,6 +404,8 @@ impl SettingsView {
         self.beat_band =
             chordal_player::normalize_band(cfg.beat_band_low_hz, cfg.beat_band_high_hz);
         self.beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
+        self.background_render_divisor =
+            crate::config::clamp_background_render_divisor(cfg.background_render_divisor);
         self.lyric_sweep_fade_em =
             crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
         self.cache_dir = cfg.cache_dir.clone();
@@ -448,6 +471,8 @@ impl SettingsView {
             .set(format!("{:.0}", self.beat_band.1), cx);
         self.beat_strength_field
             .set(format!("{:.0}", self.beat_strength * 100.0), cx);
+        self.background_divisor_field
+            .set(self.background_render_divisor.to_string(), cx);
         self.lyric_sweep_field
             .set(format!("{:.2}", self.lyric_sweep_fade_em), cx);
         self.search_timeout_field
@@ -564,6 +589,50 @@ impl SettingsView {
             .set(format!("{:.0}", value * 100.0), cx);
         self.emit(SettingsAction::SetBeatStrength(value), window, cx);
         self.notice_ok(format!("背景鼓点强度 {:.0}%", value * 100.0), cx);
+    }
+
+    /// 提交流体背景分辨率除数（整数，1–20）。
+    fn submit_background_divisor(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.trim().trim_start_matches('÷').trim();
+        let Ok(divisor) = text.parse::<u32>() else {
+            self.notice_error("分辨率除数需为 1–20 的整数", cx);
+            return;
+        };
+        if !(crate::config::BACKGROUND_RENDER_DIVISOR_MIN
+            ..=crate::config::BACKGROUND_RENDER_DIVISOR_MAX)
+            .contains(&divisor)
+        {
+            self.notice_error("分辨率除数范围 1–20", cx);
+            return;
+        }
+        self.apply_background_divisor(divisor, window, cx);
+    }
+
+    fn set_background_divisor_preset(
+        &mut self,
+        divisor: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_background_divisor(divisor, window, cx);
+    }
+
+    fn apply_background_divisor(
+        &mut self,
+        divisor: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let divisor = crate::config::clamp_background_render_divisor(divisor);
+        self.background_render_divisor = divisor;
+        self.background_divisor_field.set(divisor.to_string(), cx);
+        self.emit(SettingsAction::SetBackgroundRenderDivisor(divisor), window, cx);
+        self.notice_ok(format!("流体背景分辨率 1/{divisor}"), cx);
     }
 
     /// 提交整行扫光渐变带宽度（em，0.1–4.0）。
@@ -1080,6 +1149,34 @@ impl SettingsView {
             .child(strength_preset("强烈 100%", 1.0))
             .into_any_element();
 
+        let divisor_preset = |label: &'static str, value: u32| {
+            let weak = weak.clone();
+            let active = self.background_render_divisor == value;
+            chip(theme, label, active, move |_, window, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.set_background_divisor_preset(value, window, cx);
+                });
+            })
+        };
+
+        let divisor_controls = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .w(px(52.0))
+                    .child(self.background_divisor_field.view.clone()),
+            )
+            .child(hint(theme, "N"))
+            .child(div().w(px(8.0)))
+            .child(divisor_preset("÷1", 1))
+            .child(divisor_preset("÷2", 2))
+            .child(divisor_preset("÷4", 4))
+            .child(divisor_preset("÷8", 8))
+            .child(divisor_preset("÷12", 12))
+            .into_any_element();
+
         let sweep_preset = |label: &'static str, value: f32| {
             let weak = weak.clone();
             let active = (self.lyric_sweep_fade_em - value).abs() < 0.001;
@@ -1160,6 +1257,15 @@ impl SettingsView {
                             "效果强度",
                             Some("0–150%：呼吸/旋转/缩放/提亮的整体倍率，回车应用".into()),
                             strength_controls,
+                        ),
+                        setting_row(
+                            theme,
+                            "渲染分辨率除数",
+                            Some(
+                                "光栅分辨率 = 背景区域 ÷ N；N 越大越省性能、越模糊，默认 4，回车应用"
+                                    .into(),
+                            ),
+                            divisor_controls,
                         ),
                     ],
                 ),

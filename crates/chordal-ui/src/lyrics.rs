@@ -14,16 +14,51 @@ use chordial_amll_gpui::model::{LyricLine, LyricWord};
 ///
 /// - 行结束时间取下一行开始时间；最后一行取 `duration_ms`（未知时 +8s）；
 /// - 译文按行下标并入 `translated_lyric`；
-/// - 单行内只有一个词（LRC 语义），逐词格式由其它解析器产生。
+/// - 单行内只有一个词（LRC 语义），逐词格式由其它解析器产生；
+/// - 制作信息（[`CoreLyrics::credits`]）追加在最后一行之后，不参与歌词时间轴。
 pub fn to_amll_lyrics(lyrics: &CoreLyrics, duration_ms: Option<u64>) -> Vec<LyricLine> {
     let scope = PerfScope::enter("amll.convert");
-    let lines = if !lyrics.timed_lines.is_empty() {
+    let mut lines = if !lyrics.timed_lines.is_empty() {
         to_amll_timed(lyrics, duration_ms)
     } else {
         to_amll_plain(lyrics, duration_ms)
     };
+    append_credits(&mut lines, &lyrics.credits, duration_ms);
     scope.finish(lines.len() as u64);
     lines
+}
+
+/// 制作信息（作词 / 作曲 / 编曲 / 制作人…）不参与歌词时间轴：
+/// 统一追加到最后一行歌词之后（曲目结束处），作为补充信息展示。
+///
+/// 这样可以避免 YRC 元数据行在歌曲开头以「歌词」的身份滚动，
+/// 同时保留信息；用户滚到歌词末尾即可看到。
+fn append_credits(out: &mut Vec<LyricLine>, credits: &[String], duration_ms: Option<u64>) {
+    if out.is_empty() || credits.is_empty() {
+        return;
+    }
+    let last_end = out.iter().map(|line| line.end_time).max().unwrap_or(0);
+    let mut start = duration_ms
+        .map_or(last_end, |duration| duration.max(last_end))
+        .saturating_add(1);
+    for credit in credits {
+        let text = credit.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let end = start.saturating_add(8_000);
+        out.push(LyricLine {
+            words: vec![LyricWord::new(text, start, end)],
+            translated_lyric: String::new(),
+            roman_lyric: String::new(),
+            start_time: start,
+            end_time: end,
+            is_bg: false,
+            is_duet: false,
+        });
+        // 逐个 1ms 递增，避免同一时间戳被播放器当成重叠行。
+        start = start.saturating_add(1);
+    }
 }
 
 fn to_amll_plain(lyrics: &CoreLyrics, duration_ms: Option<u64>) -> Vec<LyricLine> {
@@ -483,6 +518,7 @@ mod tests {
             raw: String::new(),
             translation: vec!["你好".into()],
             timed_lines: Vec::new(),
+            credits: Vec::new(),
         };
         let lines = to_amll_lyrics(&lyrics, Some(10_000));
         assert_eq!(lines.len(), 2);
@@ -518,6 +554,7 @@ mod tests {
                     },
                 ],
             }],
+            credits: Vec::new(),
         };
         let lines = to_amll_lyrics(&lyrics, Some(10_000));
         assert_eq!(lines.len(), 1);
@@ -543,10 +580,50 @@ mod tests {
             raw: String::new(),
             translation: Vec::new(),
             timed_lines: Vec::new(),
+            credits: Vec::new(),
         };
         let lines = to_amll_lyrics(&lyrics, None);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "a");
+    }
+
+    #[test]
+    fn appends_credits_after_last_lyric_line() {
+        let lyrics = CoreLyrics {
+            lines: vec![
+                CoreLine {
+                    time_ms: 1_000,
+                    text: "hello".into(),
+                },
+                CoreLine {
+                    time_ms: 3_000,
+                    text: "world".into(),
+                },
+            ],
+            raw: String::new(),
+            translation: Vec::new(),
+            timed_lines: Vec::new(),
+            credits: vec!["作词: 萧玮".into(), "作曲: 张亚东".into()],
+        };
+        let lines = to_amll_lyrics(&lyrics, Some(10_000));
+        assert_eq!(lines.len(), 4);
+        // 正文歌词保持原样，制作信息只在最后两行出现。
+        assert_eq!(lines[0].text(), "hello");
+        assert_eq!(lines[1].text(), "world");
+        assert_eq!(lines[2].text(), "作词: 萧玮");
+        assert_eq!(lines[3].text(), "作曲: 张亚东");
+        assert!(lines[2].start_time >= 10_000);
+        assert!(lines[3].start_time > lines[2].start_time);
+    }
+
+    #[test]
+    fn does_not_append_credits_without_lyrics() {
+        let lyrics = CoreLyrics {
+            raw: String::new(),
+            credits: vec!["作词: 萧玮".into()],
+            ..CoreLyrics::default()
+        };
+        assert!(to_amll_lyrics(&lyrics, Some(10_000)).is_empty());
     }
 
     #[test]
