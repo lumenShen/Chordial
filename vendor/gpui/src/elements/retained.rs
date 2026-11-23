@@ -53,6 +53,11 @@ impl IntoElement for Retained {
 #[derive(Default)]
 struct RetainedCache {
     version: Option<u64>,
+    /// Frames in which `prepaint_range` / `paint_range` were last recorded or
+    /// re-based. They are indices into that frame's stores, so they can only
+    /// be replayed in the immediately following frame.
+    prepaint_frame: u64,
+    paint_frame: u64,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
@@ -89,7 +94,14 @@ impl Element for Retained {
         let (layout_id, _hit, child) =
             window.with_element_state::<RetainedCache, _>(global_id, |cache, window| {
                 let mut cache = cache.unwrap_or_default();
-                let hit = cache.version == Some(version) && !window.refreshing;
+                // The cached ranges point into the previous frame's stores.
+                // Only reuse them when the subtree was actually replayed in
+                // the previous frame; otherwise they are stale and would
+                // replay unrelated entries.
+                let hit = cache.version == Some(version)
+                    && cache.prepaint_frame + 1 == window.frame_sequence()
+                    && cache.paint_frame + 1 == window.frame_sequence()
+                    && !window.refreshing;
                 cache.version = Some(version);
                 let layout_id = window.request_layout(style, [], cx);
                 let child = if hit {
@@ -126,17 +138,33 @@ impl Element for Retained {
             child.layout_as_root(bounds.size.into(), window, cx);
             child.prepaint_at(bounds.origin, window, cx);
             let end = window.prepaint_index();
-            window.with_element_state::<RetainedCache, _>(global_id, |cache, _| {
+            window.with_element_state::<RetainedCache, _>(global_id, |cache, window| {
                 let mut cache = cache.unwrap_or_default();
                 cache.prepaint_range = start..end;
+                cache.prepaint_frame = window.frame_sequence();
                 ((), cache)
             });
             Some(child)
         } else {
             window.with_element_state::<RetainedCache, _>(global_id, |cache, window| {
                 let cache = cache.unwrap_or_default();
+                // Re-base the replayed range. Cached indices point into the
+                // frame in which the subtree was last built, while the entries
+                // are appended at a new offset every frame. Keeping the old
+                // indices would make them refer to unrelated entries (or to no
+                // entries at all) as soon as the number of element states
+                // recorded before this subtree changes.
+                let start = window.prepaint_index();
                 window.reuse_prepaint(cache.prepaint_range.clone());
-                ((), cache)
+                let end = window.prepaint_index();
+                (
+                    (),
+                    RetainedCache {
+                        prepaint_range: start..end,
+                        prepaint_frame: window.frame_sequence(),
+                        ..cache
+                    },
+                )
             });
             None
         }
@@ -158,16 +186,28 @@ impl Element for Retained {
             let start = window.paint_index();
             child.paint(window, cx);
             let end = window.paint_index();
-            window.with_element_state::<RetainedCache, _>(global_id, |cache, _| {
+            window.with_element_state::<RetainedCache, _>(global_id, |cache, window| {
                 let mut cache = cache.unwrap_or_default();
                 cache.paint_range = start..end;
+                cache.paint_frame = window.frame_sequence();
                 ((), cache)
             });
         } else {
             window.with_element_state::<RetainedCache, _>(global_id, |cache, window| {
                 let cache = cache.unwrap_or_default();
+                // See `prepaint`: replaying a range never updates its indices,
+                // so re-base them to where this frame appended the entries.
+                let start = window.paint_index();
                 window.reuse_paint(cache.paint_range.clone());
-                ((), cache)
+                let end = window.paint_index();
+                (
+                    (),
+                    RetainedCache {
+                        paint_range: start..end,
+                        paint_frame: window.frame_sequence(),
+                        ..cache
+                    },
+                )
             });
         }
     }

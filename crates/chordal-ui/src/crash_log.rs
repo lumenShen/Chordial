@@ -320,11 +320,17 @@ fn install_panic_hook() {
                         path.display(),
                         ctx.log_path.display()
                     );
+                    // 先走默认 hook 打印真实 panic 位置，再弹模态对话框：
+                    // 对话框会泵消息，可能立刻触发的后台任务 panic 会打在这
+                    // 两条输出前面，让人误以为是原始崩溃点。
+                    previous(info);
                     show_crash_dialog(&format!(
                         "Chordial 遇到问题并已停止。\n\n崩溃报告已保存到：\n{}\n\n完整日志：\n{}\n\n请将这两个文件附在问题反馈中。",
                         path.display(),
                         ctx.log_path.display()
                     ));
+                    IN_PANIC_HOOK.store(false, Ordering::SeqCst);
+                    return;
                 }
                 Err(e) => {
                     let _ = writeln!(
@@ -332,11 +338,14 @@ fn install_panic_hook() {
                         "\nChordial 发生崩溃，但崩溃报告写入失败：{e}\n线程：{thread_name}\n位置：{}\npanic：{message}\n\n{backtrace}",
                         location.as_deref().unwrap_or("<unknown>")
                     );
+                    previous(info);
                     show_crash_dialog(&format!(
                         "Chordial 遇到问题并已停止。\n\n崩溃报告写入失败：{e}\n\npanic：{message}\n位置：{}\n日志目录：{}",
                         location.as_deref().unwrap_or("<unknown>"),
                         ctx.log_dir.display()
                     ));
+                    IN_PANIC_HOOK.store(false, Ordering::SeqCst);
+                    return;
                 }
             }
         }

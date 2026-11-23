@@ -168,6 +168,23 @@ Blade/Metal shader 同步修改但未在本机运行。
    `LineLayoutIndex` 夹到上一帧实际长度内。视图树在两帧之间增删节点
    （抽屉/覆盖层切换）时上一帧索引可能超过当前缓存长度，原实现直接
    切片会 panic；夹取后只是少复用几条布局缓存，不影响正确性。
+12. **保留子树区间重定位**（`src/elements/retained.rs`）：缓存里的
+   `prepaint_range` / `paint_range` 是上一帧（子树重建那一帧）的索引，
+   命中时原实现只回放、不更新。由于回放的条目在每帧的实际偏移会随
+   前面的元素状态数量变化，旧索引很快就不再指向本子树的条目；超过
+   当前帧长度时 `reuse_paint` 直接切片 panic（实测
+   `range end index 292 out of range for slice of length 272`）。现在
+   命中时像 `AnyView` 一样，在回放前后取一次 `prepaint_index()` /
+   `paint_index()` 并把区间重定位到本帧追加的位置。
+   `Window` 同时增加单调帧序号（`draw` 时自增），缓存记录区间所在的
+   帧号；只有“上一帧刚回放过”才允许命中，否则重建子树。这样即使
+   某帧被外层复用跳过（元素状态被外层区间带过），也不会拿更早的帧
+   的区间去回放别的条目。
+13. **复用区间夹取**（`src/window.rs`）：`reuse_prepaint` / `reuse_paint`
+   对 hitboxes、tooltip、deferred draws、dispatch tree、cursor styles、
+   input handlers、mouse listeners、element states、tab stop、scene
+   等所有切片都先按上一帧实际长度夹取，越界时（例如区间来自更早的帧）
+   只少复用条目并打一条 `gpui::window` debug 日志，不再 panic。
 
 ## 重新应用
 

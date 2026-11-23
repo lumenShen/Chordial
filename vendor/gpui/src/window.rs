@@ -851,6 +851,9 @@ pub struct Window {
     pub(crate) dirty_views: FxHashSet<EntityId>,
     /// 上一帧开始绘制时被标记为 dirty 的视图数（帧统计用）。
     dirty_views_count: usize,
+    /// 单调递增的帧序号，每次 `draw` 加一。用于判断元素状态里记录的
+    /// prepaint/paint 复用区间是否还指向上一帧（见 `elements::retained`）。
+    frame_sequence: u64,
     /// 上一帧 draw 的 prepaint / paint 分段时间（帧统计用）。
     frame_prepaint: Duration,
     frame_paint: Duration,
@@ -930,6 +933,26 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> Bounds<Pixels>
                 .map(|display| display.default_bounds())
                 .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), DEFAULT_WINDOW_SIZE))
         })
+}
+
+/// Clamps a range recorded by a previous frame against the current length of
+/// the store it refers to.
+///
+/// Reuse ranges are recorded as indices into the frame that produced them.
+/// They are normally replayed in the immediately following frame, but an
+/// element whose state was carried along by an enclosing reused subtree can
+/// keep a range from an older frame. Slicing with such a stale range panics,
+/// so clamp it instead: replaying fewer (or different) entries only costs a
+/// little cache reuse, never correctness of what was actually drawn.
+fn clamp_reuse_range(range: Range<usize>, len: usize) -> Range<usize> {
+    if range.start <= range.end && range.end <= len {
+        return range;
+    }
+
+    let start = range.start.min(len);
+    let end = range.end.clamp(start, len);
+    log::debug!("clamped stale reuse range {range:?} to {start}..{end} (len {len})");
+    start..end
 }
 
 impl Window {
@@ -1259,6 +1282,7 @@ impl Window {
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
             dirty_views_count: 0,
+            frame_sequence: 0,
             frame_prepaint: Duration::ZERO,
             frame_paint: Duration::ZERO,
             focus_listeners: SubscriberSet::new(),
@@ -1942,6 +1966,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.frame_sequence = self.frame_sequence.wrapping_add(1);
         self.invalidate_entities();
         self.dirty_views_count = self.dirty_views.len();
         cx.entities.clear_accessed();
@@ -2253,6 +2278,12 @@ impl Window {
         self.element_id_stack.clear();
     }
 
+    /// 当前帧序号。复用区间只在“记录它的下一帧”里有效：区间记录的是
+    /// 该帧的存储下标，而 `rendered_frame` 恰好是上一帧。
+    pub(crate) fn frame_sequence(&self) -> u64 {
+        self.frame_sequence
+    }
+
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
@@ -2265,28 +2296,40 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .cloned(),
+        let hitboxes = clamp_reuse_range(
+            range.start.hitboxes_index..range.end.hitboxes_index,
+            self.rendered_frame.hitboxes.len(),
+        );
+        self.next_frame
+            .hitboxes
+            .extend(self.rendered_frame.hitboxes[hitboxes].iter().cloned());
+        let tooltips = clamp_reuse_range(
+            range.start.tooltips_index..range.end.tooltips_index,
+            self.rendered_frame.tooltip_requests.len(),
         );
         self.next_frame.tooltip_requests.extend(
-            self.rendered_frame.tooltip_requests
-                [range.start.tooltips_index..range.end.tooltips_index]
+            self.rendered_frame.tooltip_requests[tooltips]
                 .iter_mut()
                 .map(|request| request.take()),
         );
+        let element_states = clamp_reuse_range(
+            range.start.accessed_element_states_index..range.end.accessed_element_states_index,
+            self.rendered_frame.accessed_element_states.len(),
+        );
         self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
+            self.rendered_frame.accessed_element_states[element_states]
                 .iter()
                 .map(|(id, type_id)| (GlobalElementId(id.0.clone()), *type_id)),
         );
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
 
-        let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
+        let dispatch_nodes = clamp_reuse_range(
             range.start.dispatch_tree_index..range.end.dispatch_tree_index,
+            self.rendered_frame.dispatch_tree.len(),
+        );
+        let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
+            dispatch_nodes,
             &mut self.rendered_frame.dispatch_tree,
             self.focus,
         );
@@ -2295,9 +2338,12 @@ impl Window {
             self.next_frame.focus = self.focus;
         }
 
+        let deferred_draws = clamp_reuse_range(
+            range.start.deferred_draws_index..range.end.deferred_draws_index,
+            self.rendered_frame.deferred_draws.len(),
+        );
         self.next_frame.deferred_draws.extend(
-            self.rendered_frame.deferred_draws
-                [range.start.deferred_draws_index..range.end.deferred_draws_index]
+            self.rendered_frame.deferred_draws[deferred_draws]
                 .iter()
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
@@ -2326,41 +2372,59 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        let cursor_styles = clamp_reuse_range(
+            range.start.cursor_styles_index..range.end.cursor_styles_index,
+            self.rendered_frame.cursor_styles.len(),
+        );
         self.next_frame.cursor_styles.extend(
-            self.rendered_frame.cursor_styles
-                [range.start.cursor_styles_index..range.end.cursor_styles_index]
+            self.rendered_frame.cursor_styles[cursor_styles]
                 .iter()
                 .cloned(),
         );
+        let input_handlers = clamp_reuse_range(
+            range.start.input_handlers_index..range.end.input_handlers_index,
+            self.rendered_frame.input_handlers.len(),
+        );
         self.next_frame.input_handlers.extend(
-            self.rendered_frame.input_handlers
-                [range.start.input_handlers_index..range.end.input_handlers_index]
+            self.rendered_frame.input_handlers[input_handlers]
                 .iter_mut()
                 .map(|handler| handler.take()),
         );
+        let mouse_listeners = clamp_reuse_range(
+            range.start.mouse_listeners_index..range.end.mouse_listeners_index,
+            self.rendered_frame.mouse_listeners.len(),
+        );
         self.next_frame.mouse_listeners.extend(
-            self.rendered_frame.mouse_listeners
-                [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
+            self.rendered_frame.mouse_listeners[mouse_listeners]
                 .iter_mut()
                 .map(|listener| listener.take()),
         );
+        let element_states = clamp_reuse_range(
+            range.start.accessed_element_states_index..range.end.accessed_element_states_index,
+            self.rendered_frame.accessed_element_states.len(),
+        );
         self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
+            self.rendered_frame.accessed_element_states[element_states]
                 .iter()
                 .map(|(id, type_id)| (GlobalElementId(id.0.clone()), *type_id)),
         );
-        self.next_frame.tab_stops.replay(
-            &self.rendered_frame.tab_stops.insertion_history
-                [range.start.tab_handle_index..range.end.tab_handle_index],
+        let tab_stops = clamp_reuse_range(
+            range.start.tab_handle_index..range.end.tab_handle_index,
+            self.rendered_frame.tab_stops.insertion_history.len(),
         );
+        self.next_frame
+            .tab_stops
+            .replay(&self.rendered_frame.tab_stops.insertion_history[tab_stops]);
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
+        let scene = clamp_reuse_range(
             range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
+            self.rendered_frame.scene.len(),
         );
+        self.next_frame
+            .scene
+            .replay(scene, &self.rendered_frame.scene);
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
