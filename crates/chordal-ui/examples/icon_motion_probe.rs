@@ -3,7 +3,7 @@
 //!
 //! `cargo run -p chordal-ui --example icon_motion_probe`
 
-#[path = "../src/icons.rs"]
+#[path = "../src/icons/mod.rs"]
 mod icons;
 
 use gpui::prelude::*;

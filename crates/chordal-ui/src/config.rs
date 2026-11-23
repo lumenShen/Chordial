@@ -80,9 +80,17 @@ pub struct AppConfig {
     #[serde(default = "default_beat_strength")]
     pub beat_strength: f32,
     /// 流体背景（Mesh Gradient）光栅分辨率除数：输出分辨率 = 显示区域 ÷ N。
-    /// 越大越省性能、越模糊；默认 4（1/4 边长、1/16 像素量）。
+    /// 越大越省性能、越模糊；默认 2（1/2 边长、1/4 像素量），更接近真实
+    /// 场景的流体细节。光栅仍有 20 万像素硬上限，4K 下成本有界。
     #[serde(default = "default_background_render_divisor")]
     pub background_render_divisor: u32,
+    /// 一次性迁移标记：旧配置的除数 4 是旧默认值，迁到新的 2 之后
+    /// 用户若主动再选 4 不会被反复改写。
+    #[serde(default)]
+    pub bg_divisor_v2_migrated: bool,
+    /// 画面性能诊断浮窗（FPS、1% Low、CPU、内存）。默认关闭。
+    #[serde(default)]
+    pub perf_overlay: bool,
     /// 参数均衡器（最后一次编辑的配置）。
     #[serde(default)]
     pub equalizer: chordal_player::EqSettings,
@@ -140,8 +148,8 @@ fn default_beat_strength() -> f32 {
     DEFAULT_BEAT_STRENGTH
 }
 
-/// 流体背景光栅分辨率默认除数：输出 = 显示区域 ÷ N。
-pub const DEFAULT_BACKGROUND_RENDER_DIVISOR: u32 = 4;
+/// 流体背景光栅分辨率默认除数：输出 = 显示区域 ÷ 2（硬上限仍生效）。
+pub const DEFAULT_BACKGROUND_RENDER_DIVISOR: u32 = 2;
 
 /// 除数下限：1 = 原始分辨率（仍受渲染器 200k 像素硬上限约束）。
 pub const BACKGROUND_RENDER_DIVISOR_MIN: u32 = 1;
@@ -177,6 +185,9 @@ impl Default for AppConfig {
             beat_band_high_hz: chordal_player::DEFAULT_BEAT_BAND.1,
             beat_strength: DEFAULT_BEAT_STRENGTH,
             background_render_divisor: DEFAULT_BACKGROUND_RENDER_DIVISOR,
+            // 新配置直接用新默认值，无需迁移。
+            bg_divisor_v2_migrated: true,
+            perf_overlay: false,
             equalizer: chordal_player::EqSettings::default(),
             eq_saved_presets: Vec::new(),
         }
@@ -208,6 +219,12 @@ pub fn load_or_default() -> AppConfig {
                 cfg.lyric_sweep_fade_em = clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
                 cfg.background_render_divisor =
                     clamp_background_render_divisor(cfg.background_render_divisor);
+                // 旧默认除数 4 一次性迁到 2；用户之后主动设回 4 不再被改写。
+                if !cfg.bg_divisor_v2_migrated && cfg.background_render_divisor == 4 {
+                    cfg.background_render_divisor = 2;
+                    cfg.bg_divisor_v2_migrated = true;
+                    save(&cfg);
+                }
                 return cfg;
             }
             Err(e) => {
@@ -261,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn background_render_divisor_defaults_to_quarter_resolution() {
+    fn background_render_divisor_defaults_to_half_resolution() {
         assert_eq!(
             AppConfig::default().background_render_divisor,
             DEFAULT_BACKGROUND_RENDER_DIVISOR
@@ -273,6 +290,20 @@ mod tests {
         assert_eq!(clamp_background_render_divisor(0), 1);
         assert_eq!(clamp_background_render_divisor(3), 3);
         assert_eq!(clamp_background_render_divisor(99), 20);
+    }
+
+    #[test]
+    fn perf_overlay_defaults_off() {
+        assert!(!AppConfig::default().perf_overlay);
+    }
+
+    #[test]
+    fn perf_overlay_roundtrips() {
+        let mut cfg = AppConfig::default();
+        cfg.perf_overlay = true;
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.perf_overlay);
     }
 
     #[test]
@@ -298,6 +329,7 @@ mod tests {
         }"#;
         let parsed: AppConfig = serde_json::from_str(json).unwrap();
         assert!(!parsed.smooth_scroll);
+        assert!(!parsed.perf_overlay);
         assert!((parsed.lyric_sweep_fade_em - 0.6).abs() < 1e-6);
         assert_eq!(
             parsed.background_render_divisor,

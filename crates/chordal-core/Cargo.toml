@@ -15,6 +15,10 @@ futures-timer = "3.0"
 tracing = { workspace = true }
 rustc-hash = { workspace = true }
 
+# 进程常驻内存读取：Linux / macOS 需要 sysconf / getrusage。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }
 

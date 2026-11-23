@@ -4,6 +4,9 @@
 //!
 //! - 把 tracing 日志同时写到 `<数据目录>/chordial/logs/chordial.log`
 //!   （单文件 8 MiB，超出后滚动为 `chordial.1.log`）；
+//! - 同一调用点的重复日志按秒限流，且文件落盘另有每秒字节预算：
+//!   底层 API 批量失败时（例如 Windows 配额耗尽，GPUI 每秒记录上万条
+//!   相同错误），日志本身不会写满磁盘；
 //! - 安装 panic hook：任意线程 panic 都写一份 `crash-*.log`，
 //!   内含 panic 信息、位置、栈、当天日志尾部；
 //! - Unix 安装 SIGSEGV/SIGABRT 等致命信号处理，Windows 安装
@@ -16,17 +19,29 @@
 //! 会自动脱敏。
 
 use std::backtrace::Backtrace;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use tracing::{Event, Metadata, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
-use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::layer::{Context, Filter, Layer as _, SubscriberExt as _};
 use tracing_subscriber::util::SubscriberInitExt as _;
+
+mod panic_hook;
+mod report;
+mod time_util;
+
+use panic_hook::*;
+use report::*;
+use time_util::*;
 
 /// 单个日志文件的滚动阈值。当前文件 + 上一份最多约 16 MiB。
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -143,6 +158,101 @@ impl CrashContext {
 // tracing：stdout + 文件
 // ---------------------------------------------------------------------------
 
+/// 同一调用点在窗口内最多写出的日志条数。
+///
+/// Windows 资源耗尽时，底层 API（消息队列/线程池/GDI 配额）会以每秒数万次
+/// 的频率失败，GPUI 对每次失败都走 `log_err()`。此前这些记录会原样写进
+/// stdout 与日志文件：实测 10 分钟写出 4.2 GiB，既占满磁盘又让 UI 线程
+/// 把时间耗在 `FormatMessageW`/格式化/落盘上，进一步加剧资源耗尽。
+/// 限流直接丢弃重复调用点的事件，且不触发消息格式化。
+const LOG_BURST_PER_CALLSITE: u32 = 4;
+const LOG_BURST_WINDOW: Duration = Duration::from_secs(1);
+
+/// 限流表上限。程序里的调用点数量有限；超限时先清掉过期窗口。
+const LOG_GUARD_MAX_CALLSITES: usize = 1024;
+
+/// 日志落盘的全局字节预算：每秒最多写入的字节数。
+///
+/// 单点限流只能挡住"同一行代码反复报错"。若一次故障横跨大量不同调用点
+/// （GPUI 的 Win32 封装、线程池、D3D 各有各的失败点），各点各自合规仍可能
+/// 叠加成每秒几十 MB。这里在落盘唯一入口再设一道总量闸门：正常调试日志
+/// 每秒只有几十 KB，1 MiB/s 留了足够余量；风暴则被截断为每秒最多 1 MiB，
+/// 并在预算恢复时补一行丢弃统计，不会静默吞掉。
+const LOG_BYTE_BUDGET_PER_SEC: u64 = 1024 * 1024;
+const LOG_BYTE_BUDGET_WINDOW: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct Burst {
+    window_start: Instant,
+    emitted: u32,
+}
+
+/// 按调用点（level + target + file + line）限流的 tracing 过滤器。
+///
+/// 键只依赖事件元数据，不读取字段、不格式化消息：即使每秒有上万个
+/// 相同失败，被抑制的事件也不会付出格式化成本。每个输出层各持一份状态，
+/// 因此 stdout 与文件各自保留每个调用点的前几条记录。
+#[derive(Clone)]
+struct LogStormGuard {
+    bursts: Arc<Mutex<HashMap<u64, Burst>>>,
+}
+
+impl LogStormGuard {
+    fn new() -> Self {
+        Self {
+            bursts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn allow_at(&self, key: u64, now: Instant) -> bool {
+        let mut bursts = self.bursts.lock().unwrap_or_else(|e| e.into_inner());
+        if bursts.len() > LOG_GUARD_MAX_CALLSITES {
+            bursts.retain(|_, burst| now.duration_since(burst.window_start) < LOG_BURST_WINDOW);
+            if bursts.len() > LOG_GUARD_MAX_CALLSITES {
+                bursts.clear();
+            }
+        }
+        match bursts.get_mut(&key) {
+            Some(burst) if now.duration_since(burst.window_start) < LOG_BURST_WINDOW => {
+                if burst.emitted >= LOG_BURST_PER_CALLSITE {
+                    return false;
+                }
+                burst.emitted += 1;
+                true
+            }
+            _ => {
+                bursts.insert(
+                    key,
+                    Burst {
+                        window_start: now,
+                        emitted: 1,
+                    },
+                );
+                true
+            }
+        }
+    }
+}
+
+fn event_key(meta: &Metadata<'_>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    meta.level().as_str().hash(&mut hasher);
+    meta.target().hash(&mut hasher);
+    meta.file().hash(&mut hasher);
+    meta.line().hash(&mut hasher);
+    hasher.finish()
+}
+
+impl<S: Subscriber> Filter<S> for LogStormGuard {
+    fn enabled(&self, _meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
+        true
+    }
+
+    fn event_enabled(&self, event: &Event<'_>, _cx: &Context<'_, S>) -> bool {
+        self.allow_at(event_key(event.metadata()), Instant::now())
+    }
+}
+
 fn install_tracing() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,chordial=debug"));
@@ -154,11 +264,12 @@ fn install_tracing() {
             .with_ansi(false)
             .with_target(true)
             .with_thread_names(true)
+            .with_filter(LogStormGuard::new())
     });
 
     let result = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_target(true))
+        .with(fmt::layer().with_target(true).with_filter(LogStormGuard::new()))
         .with(file_layer)
         .try_init();
     if result.is_err() {
@@ -169,6 +280,47 @@ fn install_tracing() {
     }
 }
 
+/// 日志写入的字节速率限制器：每个窗口重新计数。
+///
+/// 与 [`LogStormGuard`] 互补——那个按调用点去重，这个管总量。
+#[derive(Clone, Copy)]
+struct ByteBudget {
+    window_start: Instant,
+    window_bytes: u64,
+    dropped_bytes: u64,
+}
+
+impl ByteBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            window_bytes: 0,
+            dropped_bytes: 0,
+        }
+    }
+
+    /// 窗口到期则清零计数，返回上一窗口被丢弃的字节数（用于补一行统计）。
+    fn roll_at(&mut self, now: Instant) -> Option<u64> {
+        if now.duration_since(self.window_start) < LOG_BYTE_BUDGET_WINDOW {
+            return None;
+        }
+        self.window_start = now;
+        self.window_bytes = 0;
+        let dropped = std::mem::take(&mut self.dropped_bytes);
+        (dropped > 0).then_some(dropped)
+    }
+
+    /// 预算内则记账放行；超预算只累计丢弃量。
+    fn try_take(&mut self, len: u64) -> bool {
+        if self.window_bytes.saturating_add(len) > LOG_BYTE_BUDGET_PER_SEC {
+            self.dropped_bytes = self.dropped_bytes.saturating_add(len);
+            return false;
+        }
+        self.window_bytes += len;
+        true
+    }
+}
+
 struct LogSink {
     path: PathBuf,
     prev_path: PathBuf,
@@ -176,6 +328,7 @@ struct LogSink {
     written: u64,
     max_bytes: u64,
     disabled: bool,
+    budget: ByteBudget,
 }
 
 impl LogSink {
@@ -197,6 +350,7 @@ impl LogSink {
             written,
             max_bytes,
             disabled: false,
+            budget: ByteBudget::new(Instant::now()),
         })
     }
 
@@ -205,6 +359,21 @@ impl LogSink {
         if self.disabled {
             return;
         }
+        let now = Instant::now();
+        if let Some(dropped) = self.budget.roll_at(now) {
+            // 预算恢复时补一行统计：限流不能静默。
+            let marker = format!(
+                "[日志限流] 上一窗口丢弃 {dropped} 字节日志（上限 {LOG_BYTE_BUDGET_PER_SEC} B/s）\n"
+            );
+            self.write_raw(marker.as_bytes());
+        }
+        if !self.budget.try_take(buf.len() as u64) {
+            return;
+        }
+        self.write_raw(buf);
+    }
+
+    fn write_raw(&mut self, buf: &[u8]) {
         if self.written.saturating_add(buf.len() as u64) > self.max_bytes {
             self.rotate();
         }
@@ -252,9 +421,9 @@ impl LogSink {
 }
 
 #[derive(Clone, Copy)]
-struct SinkWriter;
+pub(super) struct SinkWriter;
 
-struct SinkGuard;
+pub(super) struct SinkGuard;
 
 impl<'a> fmt::MakeWriter<'a> for SinkWriter {
     type Writer = SinkGuard;
@@ -284,405 +453,6 @@ impl io::Write for SinkGuard {
 
 // ---------------------------------------------------------------------------
 // panic hook
-// ---------------------------------------------------------------------------
-
-fn install_panic_hook() {
-    if PANIC_HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // panic 发生在日志/报告代码里时避免递归。
-        if IN_PANIC_HOOK.swap(true, Ordering::SeqCst) {
-            previous(info);
-            return;
-        }
-
-        if let Some(ctx) = CONTEXT.get() {
-            let payload = info.payload();
-            let message = payload
-                .downcast_ref::<&str>()
-                .map(|text| (*text).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<非字符串 panic 载荷>".to_string());
-            let location = info
-                .location()
-                .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
-            let thread = std::thread::current();
-            let thread_name = thread.name().unwrap_or("<unnamed>");
-            let backtrace = Backtrace::force_capture().to_string();
-
-            match write_panic_report(ctx, &message, location.as_deref(), thread_name, &backtrace) {
-                Ok(path) => {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "\nChordial 发生崩溃，报告已写入：\n  {}\n完整日志：{}\n请将这两个文件附在反馈中。",
-                        path.display(),
-                        ctx.log_path.display()
-                    );
-                    // 先走默认 hook 打印真实 panic 位置，再弹模态对话框：
-                    // 对话框会泵消息，可能立刻触发的后台任务 panic 会打在这
-                    // 两条输出前面，让人误以为是原始崩溃点。
-                    previous(info);
-                    show_crash_dialog(&format!(
-                        "Chordial 遇到问题并已停止。\n\n崩溃报告已保存到：\n{}\n\n完整日志：\n{}\n\n请将这两个文件附在问题反馈中。",
-                        path.display(),
-                        ctx.log_path.display()
-                    ));
-                    IN_PANIC_HOOK.store(false, Ordering::SeqCst);
-                    return;
-                }
-                Err(e) => {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "\nChordial 发生崩溃，但崩溃报告写入失败：{e}\n线程：{thread_name}\n位置：{}\npanic：{message}\n\n{backtrace}",
-                        location.as_deref().unwrap_or("<unknown>")
-                    );
-                    previous(info);
-                    show_crash_dialog(&format!(
-                        "Chordial 遇到问题并已停止。\n\n崩溃报告写入失败：{e}\n\npanic：{message}\n位置：{}\n日志目录：{}",
-                        location.as_deref().unwrap_or("<unknown>"),
-                        ctx.log_dir.display()
-                    ));
-                    IN_PANIC_HOOK.store(false, Ordering::SeqCst);
-                    return;
-                }
-            }
-        }
-
-        IN_PANIC_HOOK.store(false, Ordering::SeqCst);
-        previous(info);
-    }));
-}
-
-fn write_panic_report(
-    ctx: &CrashContext,
-    message: &str,
-    location: Option<&str>,
-    thread: &str,
-    backtrace: &str,
-) -> io::Result<PathBuf> {
-    let report = build_panic_report(ctx, message, location, thread, backtrace);
-    write_report_file(&ctx.log_dir, "crash", &report)
-}
-
-// ---------------------------------------------------------------------------
-// 崩溃弹窗
-// ---------------------------------------------------------------------------
-
-/// 默认弹窗；`CHORDIAL_CRASH_DIALOG=0` 可关闭（CI / 自动化脚本）。
-fn dialog_enabled() -> bool {
-    !matches!(
-        std::env::var("CHORDIAL_CRASH_DIALOG").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
-    )
-}
-
-/// 每次进程只弹一次，避免多线程连续 panic 叠出一堆窗口。
-fn show_crash_dialog(body: &str) {
-    if !dialog_enabled() || DIALOG_SHOWN.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let body = redact_secrets(body);
-
-    #[cfg(windows)]
-    windows_dialog(&body);
-
-    #[cfg(unix)]
-    unix_dialog(&body);
-
-    #[cfg(not(any(unix, windows)))]
-    let _ = body;
-}
-
-#[cfg(windows)]
-fn windows_dialog(body: &str) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::Diagnostics::Debug::IsDebuggerPresent;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
-    };
-    use windows::core::HSTRING;
-
-    // 调试器在场时不要用模态框打断断点。
-    if unsafe { IsDebuggerPresent() }.as_bool() {
-        return;
-    }
-
-    let text = HSTRING::from(body);
-    let caption = HSTRING::from("Chordial 崩溃");
-    unsafe {
-        MessageBoxW(
-            HWND::default(),
-            &text,
-            &caption,
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
-        );
-    }
-}
-
-#[cfg(unix)]
-fn unix_dialog(body: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::Command;
-
-        // 参数经 argv 传给 AppleScript，避免拼字符串注入。
-        let script = "on run argv\n\
-            display dialog (item 1 of argv) with title (item 2 of argv) \
-            buttons {\"好\"} default button 1 with icon caution\n\
-            end run";
-        let _ = Command::new("osascript")
-            .args(["-e", script, "--", body, "Chordial 崩溃"])
-            .status();
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        use std::process::Command;
-
-        // 没有图形会话（SSH / CI）就不尝试拉起对话框。
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            return;
-        }
-
-        fn run(program: &str, args: &[&str], body: &str) -> bool {
-            Command::new(program).args(args).arg(body).status().is_ok()
-        }
-
-        let _ = run(
-            "zenity",
-            &["--error", "--title", "Chordial 崩溃", "--text"],
-            body,
-        ) || run("kdialog", &["--title", "Chordial 崩溃", "--error"], body)
-            || run("xmessage", &["-center", "-title", "Chordial 崩溃"], body);
-    }
-}
-
-fn build_panic_report(
-    ctx: &CrashContext,
-    message: &str,
-    location: Option<&str>,
-    thread: &str,
-    backtrace: &str,
-) -> String {
-    let mut out = String::with_capacity(8192);
-    out.push_str("Chordial 崩溃报告\n");
-    out.push_str("请把本文件（以及同目录的 chordial.log）附在问题反馈中。\n\n");
-    out.push_str(&format!("version   : {}\n", env!("CARGO_PKG_VERSION")));
-    out.push_str(&format!(
-        "os        : {} {}\n",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    ));
-    out.push_str(&format!("time      : {}\n", utc_timestamp()));
-    out.push_str(&format!("pid       : {}\n", std::process::id()));
-    out.push_str(&format!("thread    : {thread}\n"));
-    out.push_str(&format!("panic     : {message}\n"));
-    if let Some(location) = location {
-        out.push_str(&format!("location  : {location}\n"));
-    }
-    out.push_str(&format!("log       : {}\n", ctx.log_path.display()));
-
-    out.push_str("\n----- backtrace -----\n");
-    out.push_str(backtrace.trim_end());
-    out.push('\n');
-
-    append_log_tail(&mut out, ctx);
-    redact_secrets(&out)
-}
-
-fn append_log_tail(out: &mut String, ctx: &CrashContext) {
-    if let Some(tail) = read_tail(&ctx.log_path, LOG_TAIL_BYTES, LOG_TAIL_LINES)
-        && !tail.trim().is_empty()
-    {
-        out.push_str("\n----- 最近日志（本次运行） -----\n");
-        out.push_str(&tail);
-        if !tail.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    if let Some(tail) = read_tail(&ctx.prev_log_path, PREV_LOG_TAIL_BYTES, LOG_TAIL_LINES)
-        && !tail.trim().is_empty()
-    {
-        out.push_str("\n----- 最近日志（上次运行） -----\n");
-        out.push_str(&tail);
-        if !tail.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-}
-
-fn write_report_file(dir: &Path, prefix: &str, content: &str) -> io::Result<PathBuf> {
-    fs::create_dir_all(dir)?;
-    let seq = REPORT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = format!(
-        "{prefix}-{}-{}-{seq}.log",
-        utc_compact(),
-        std::process::id()
-    );
-    let path = dir.join(&name);
-    let tmp = dir.join(format!(".{name}.tmp"));
-
-    // 先写临时文件再改名，避免崩溃时留下半截报告。
-    fs::write(&tmp, content)?;
-    if fs::rename(&tmp, &path).is_err() {
-        // 同名报告已存在或临时文件被占用：直接写最终文件兜底。
-        fs::write(&path, content)?;
-        let _ = fs::remove_file(&tmp);
-    }
-    // latest 只是方便用户找文件，写失败不影响主报告。
-    let _ = fs::write(dir.join(LATEST_CRASH_NAME), content);
-    let _ = prune_reports(dir, CRASH_KEEP);
-    Ok(path)
-}
-
-/// 只保留最新的 `keep` 份报告（按文件名中的时间戳排序）。
-fn prune_reports(dir: &Path, keep: usize) -> usize {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut reports: Vec<(String, PathBuf)> = entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_report = (name.starts_with("crash-") || name.starts_with("fatal-"))
-                && name.ends_with(".log")
-                && name != LATEST_CRASH_NAME;
-            is_report.then(|| (name, entry.path()))
-        })
-        .collect();
-    // 文件名以 UTC 时间戳开头，字典序即时间序。
-    reports.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut removed = 0;
-    for (_, path) in reports.into_iter().skip(keep) {
-        if fs::remove_file(path).is_ok() {
-            removed += 1;
-        }
-    }
-    removed
-}
-
-fn rotate_previous_log(ctx: &CrashContext) {
-    let Ok(meta) = fs::metadata(&ctx.log_path) else {
-        return;
-    };
-    if meta.len() == 0 {
-        return;
-    }
-    let _ = fs::remove_file(&ctx.prev_log_path);
-    let _ = fs::rename(&ctx.log_path, &ctx.prev_log_path);
-}
-
-// ---------------------------------------------------------------------------
-// 日志尾部 / 脱敏
-// ---------------------------------------------------------------------------
-
-fn read_tail(path: &Path, max_bytes: u64, max_lines: usize) -> Option<String> {
-    let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let start = len.saturating_sub(max_bytes);
-    file.seek(SeekFrom::Start(start)).ok()?;
-
-    let mut buf = Vec::with_capacity((len - start).min(max_bytes) as usize);
-    file.take(max_bytes).read_to_end(&mut buf).ok()?;
-
-    // 从中间截断时丢掉第一行残片。
-    let slice = if start > 0 {
-        let newline = buf.iter().position(|byte| *byte == b'\n')?;
-        &buf[newline + 1..]
-    } else {
-        &buf[..]
-    };
-    let text = String::from_utf8_lossy(slice);
-    let lines: Vec<&str> = text.lines().collect();
-    let start_line = lines.len().saturating_sub(max_lines);
-    Some(lines[start_line..].join("\n"))
-}
-
-/// 崩溃报告会被用户公开上传，去掉登录态等敏感值。
-fn redact_secrets(input: &str) -> String {
-    const NEEDLES: [&str; 2] = ["MUSIC_U=", "__csrf="];
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-
-    loop {
-        let mut next: Option<(usize, &str)> = None;
-        for needle in NEEDLES {
-            if let Some(pos) = rest.find(needle)
-                && next.is_none_or(|(best, _)| pos < best)
-            {
-                next = Some((pos, needle));
-            }
-        }
-        let Some((pos, needle)) = next else {
-            out.push_str(rest);
-            break;
-        };
-
-        let value_start = pos + needle.len();
-        out.push_str(&rest[..value_start]);
-        let value = &rest[value_start..];
-        let value_end = value
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, ';' | '&' | ',' | '"' | '\'' | '}' | ']')
-            })
-            .unwrap_or(value.len());
-        out.push_str("<redacted>");
-        rest = &value[value_end..];
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// UTC 时间戳（不额外引入时间库）
-// ---------------------------------------------------------------------------
-
-fn utc_timestamp() -> String {
-    format_utc(now_unix_secs(), false)
-}
-
-fn utc_compact() -> String {
-    format_utc(now_unix_secs(), true)
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn format_utc(secs: u64, compact: bool) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    let hour = rem / 3_600;
-    let minute = (rem % 3_600) / 60;
-    let second = rem % 60;
-    if compact {
-        format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}Z")
-    } else {
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-    }
-}
-
-/// Howard Hinnant 的 civil_from_days：把 Unix 天数转成公历日期。
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
-// ---------------------------------------------------------------------------
-// 原生崩溃：Unix
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -993,105 +763,4 @@ mod fatal {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("chordial-crash-test-{}-{tag}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create test dir");
-        dir
-    }
-
-    #[test]
-    fn utc_format_matches_known_instants() {
-        assert_eq!(format_utc(0, false), "1970-01-01T00:00:00Z");
-        assert_eq!(format_utc(0, true), "19700101-000000Z");
-        assert_eq!(format_utc(1_700_000_000, false), "2023-11-14T22:13:20Z");
-        assert_eq!(format_utc(1_700_000_000, true), "20231114-221320Z");
-    }
-
-    #[test]
-    fn redacts_cookie_values() {
-        let input = "cookie: MUSIC_U=abc123; __csrf=xyz; other=1";
-        let output = redact_secrets(input);
-        assert!(!output.contains("abc123"));
-        assert!(!output.contains("xyz"));
-        assert!(output.contains("other=1"));
-        assert_eq!(output.matches("<redacted>").count(), 2);
-    }
-
-    #[test]
-    fn panic_report_contains_details_and_log_tail() {
-        let dir = test_dir("panic-report");
-        let ctx = CrashContext::new(dir.clone());
-        fs::write(
-            &ctx.log_path,
-            "line-1\nline-2 secret MUSIC_U=should-not-leak\nline-3 tail-marker\n",
-        )
-        .expect("write log");
-
-        let path = write_panic_report(
-            &ctx,
-            "boom message",
-            Some("crates/x.rs:12:34"),
-            "main",
-            "frame-a\nframe-b",
-        )
-        .expect("write report");
-
-        let report = fs::read_to_string(&path).expect("read report");
-        assert!(report.contains("boom message"));
-        assert!(report.contains("crates/x.rs:12:34"));
-        assert!(report.contains("frame-a"));
-        assert!(report.contains("tail-marker"));
-        assert!(report.contains("thread    : main"));
-        assert!(!report.contains("should-not-leak"));
-        assert!(dir.join(LATEST_CRASH_NAME).is_file());
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn log_sink_rotates_to_previous_file() {
-        let dir = test_dir("sink-rotate");
-        let ctx = CrashContext::new(dir.clone());
-        let mut sink = LogSink::open_with_limit(&ctx, 8).expect("open sink");
-
-        sink.write(b"aaaaa");
-        sink.write(b"bbbbb");
-
-        assert_eq!(
-            fs::read_to_string(&ctx.prev_log_path).expect("read prev"),
-            "aaaaa"
-        );
-        assert_eq!(
-            fs::read_to_string(&ctx.log_path).expect("read current"),
-            "bbbbb"
-        );
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn prune_keeps_newest_reports_and_latest() {
-        let dir = test_dir("prune");
-        for index in 0..25 {
-            fs::write(
-                dir.join(format!("crash-20260101-0000{index:02}-1-1.log")),
-                "x",
-            )
-            .expect("write report");
-        }
-        fs::write(dir.join(LATEST_CRASH_NAME), "x").expect("write latest");
-
-        let removed = prune_reports(&dir, 20);
-        assert_eq!(removed, 5);
-        assert!(dir.join(LATEST_CRASH_NAME).is_file());
-        assert!(!dir.join("crash-20260101-000000-1-1.log").exists());
-        assert!(dir.join("crash-20260101-000024-1-1.log").is_file());
-
-        let _ = fs::remove_dir_all(dir);
-    }
-}
+mod tests;

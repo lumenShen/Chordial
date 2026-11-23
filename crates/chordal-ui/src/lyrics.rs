@@ -262,7 +262,13 @@ fn cover_client() -> Option<&'static reqwest::Client> {
 }
 
 const MAX_COVER_BYTES: u64 = 24 * 1024 * 1024;
-const MAX_COVER_DIMENSION: u32 = 8192;
+/// 解码尺寸硬上限。最终纹理最长边只有 512px，4096 已覆盖全部正常封面
+/// （网易云走 CDN 预缩放）；再大的图只会让解码期 RGBA 缓冲线性膨胀
+/// （8192² × 4B ≈ 256 MiB），收益为零。
+const MAX_COVER_DIMENSION: u32 = 4096;
+/// 图片解码器的临时分配上限（128 MiB）：4096² RGBA = 64 MiB，留出一倍
+/// 余量给解码器自身的中间缓冲。超过时返回解码错误而不是触发 OOM。
+const MAX_COVER_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
 
 /// 网易云 CDN 支持 `?param=WxH` 服务端缩放；用它避免下载/解码 6000×6000 原图。
 fn cdn_resize(url: &str) -> String {
@@ -332,7 +338,7 @@ pub fn decode_cover_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_COVER_DIMENSION);
     limits.max_image_height = Some(MAX_COVER_DIMENSION);
-    limits.max_alloc = Some(320 * 1024 * 1024);
+    limits.max_alloc = Some(MAX_COVER_DECODE_ALLOC);
     reader.limits(limits);
     let image = reader.decode().ok()?.into_rgba8();
     scope.finish(bytes.len() as u64);

@@ -95,6 +95,15 @@ impl RenderImage {
     pub fn frame_count(&self) -> usize {
         self.data.len()
     }
+
+    /// Consume the image and return its frames.
+    ///
+    /// Callers that drop a texture from the sprite atlas can use this to take
+    /// back the pixel buffers and recycle them (e.g. software rasterizers that
+    /// produce one full-frame image per tick).
+    pub fn into_frames(self) -> SmallVec<[Frame; 1]> {
+        self.data
+    }
 }
 
 impl fmt::Debug for RenderImage {

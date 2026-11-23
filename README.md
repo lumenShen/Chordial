@@ -17,6 +17,7 @@ crates/
 │   ├── source.rs     #   MusicSource / CatalogSource / AccountSource 契约
 │   ├── registry.rs   #   SourceRegistry：注册/加载/卸载 + 并发聚合搜索（单源超时隔离）
 │   ├── perf.rs       #   性能检查点：环形账本 + 预算告警 + 外接 profiler 钩子
+│   ├── mem.rs        #   运行内存观测：分配器计数 + RSS/CPU + 命名 gauge
 │   └── error.rs
 ├── chordal-cache     # 磁盘对象缓存池
 │                     #   {source}/{kind}/{id} 命名空间 · 默认 5 GiB LRU
@@ -278,7 +279,8 @@ cargo run --release -p chordal-ui
 （`beat_strength`，0–150%，默认 50%）同样可在「设置 → 播放 → 背景律动」里调整，
 播放线程按该频段的瞬态能量驱动背景网格的呼吸缩放/旋转/提亮（响应延迟约 40ms）。
 流体背景的光栅分辨率同样在该分组里调整：输出 = 显示区域 ÷
-`background_render_divisor`（1–20，默认 4）；除数越大越省 CPU、放大后越模糊。
+`background_render_divisor`（1–20，默认 2，更接近真实流体细节；光栅像素仍有
+20 万硬上限）；除数越大越省 CPU、放大后越模糊。
 动态歌词整行扫光的渐变带宽度（`lyric_sweep_fade_em`，0.1–4.0em，默认 0.6）
 在「设置 → 播放 → 歌词」中即时调整。
 

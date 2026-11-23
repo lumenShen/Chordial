@@ -8,6 +8,7 @@
 mod actions;
 mod app;
 mod autoeq;
+mod bubble;
 mod config;
 mod crash_log;
 mod downloads;
@@ -18,6 +19,8 @@ mod input;
 mod layout_morph;
 mod lyrics;
 mod main_state;
+mod perf_overlay;
+mod phone_gesture;
 mod player_page;
 mod responsive;
 mod settings;
@@ -41,6 +44,14 @@ use gpui::{
 };
 
 use crate::app::{ChordialApp, SourceBuilder};
+
+/// 运行内存观测：包装系统分配器，记录堆活跃/峰值与分配次数。
+///
+/// 采集数据由设置「存储」页的内存诊断区展示；`CHORDIAL_MEM_TRACE=1`
+/// 可把周期采样写入日志（见 [`chordal_core::mem`]）。
+#[global_allocator]
+static GLOBAL_ALLOCATOR: chordal_core::mem::TrackingAllocator =
+    chordal_core::mem::TrackingAllocator;
 
 /// 默认打开尺寸；小屏上会按显示器尺寸收缩。
 const DEFAULT_WINDOW_W: f32 = 1440.0;
@@ -68,6 +79,17 @@ fn main() {
     // 日志与崩溃兜底：stdout + 文件日志，panic/原生崩溃写报告。
     // RUST_LOG 优先，默认 info；perf 事件走 target=chordial::perf。
     crash_log::init();
+    // 内存观测线程：默认 2s 采样一次，环形账本容量固定，长期运行不增长。
+    // 采样失败/禁用（CHORDIAL_MEM_INTERVAL_MS=0）不影响主流程。
+    chordal_core::mem::start_sampler();
+    let baseline = chordal_core::mem::snapshot();
+    tracing::info!(
+        target: "chordial::mem",
+        rss_mb = baseline.rss_bytes.map(|b| b / (1024 * 1024)),
+        live_kb = baseline.live_bytes / 1024,
+        peak_live_kb = baseline.peak_live_bytes / 1024,
+        "memory baseline"
+    );
 
     let cfg = config::load_or_default();
 
@@ -178,6 +200,8 @@ fn main() {
     let player = Player::new(cfg.player_device.clone());
     let search_timeout = cfg.search_timeout_ms;
     let local_for_app = local.clone();
+    // 上次退出时性能浮窗是开着的，就在主窗口建好后恢复。
+    let startup_perf_overlay = cfg.perf_overlay;
 
     Application::new().run(move |cx: &mut App| {
         theme::Theme::for_mode(cfg.appearance).set_global(cx);
@@ -218,20 +242,28 @@ fn main() {
             ..Default::default()
         };
 
-        cx.open_window(options, |window, cx| {
-            cx.new(|cx| {
-                ChordialApp::new(
-                    registry.clone(),
-                    player.clone(),
-                    Some(local_for_app.clone()),
-                    cache.clone(),
-                    search_timeout,
-                    window,
-                    cx,
-                )
+        let main_window = cx
+            .open_window(options, |window, cx| {
+                cx.new(|cx| {
+                    ChordialApp::new(
+                        registry.clone(),
+                        player.clone(),
+                        Some(local_for_app.clone()),
+                        cache.clone(),
+                        search_timeout,
+                        window,
+                        cx,
+                    )
+                })
             })
-        })
-        .expect("open chordal window");
+            .expect("open chordal window");
+
+        // 主窗口完成首轮构建后再开浮窗，避免在根视图构造期间嵌套开窗。
+        if startup_perf_overlay {
+            cx.defer(move |cx| {
+                let _ = main_window.update(cx, |app, _window, cx| app.open_perf_overlay(cx));
+            });
+        }
     });
 }
 

@@ -13,6 +13,7 @@
 //!   tracing 中告警并记入 [`perf::CheckpointLedger`]，供测试阶段断言。
 
 pub mod error;
+pub mod mem;
 pub mod model;
 pub mod perf;
 pub mod registry;

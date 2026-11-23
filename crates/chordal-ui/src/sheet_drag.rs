@@ -44,14 +44,7 @@ pub struct SpringSettle {
 }
 
 impl SpringSettle {
-    pub fn new(
-        from: f32,
-        to: f32,
-        v0: f32,
-        start: Instant,
-        damping: f32,
-        stiffness: f32,
-    ) -> Self {
+    pub fn new(from: f32, to: f32, v0: f32, start: Instant, damping: f32, stiffness: f32) -> Self {
         Self {
             from,
             to,

@@ -1,0 +1,714 @@
+//! `ChordialApp` 的 render_menus 行为。
+//!
+//! 从 app.rs 拆分而来；仅做代码搬移，行为不变。
+
+use super::*;
+
+impl ChordialApp {
+    /// 曲目行右键 / 「⋮」菜单。窗口坐标进来，渲染时夹回视口。
+    pub(super) fn render_track_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let weak = cx.entity().downgrade();
+        let Some(menu) = &self.track_menu else {
+            return div().into_any_element();
+        };
+        let width = self.viewport_width;
+        let height = self.viewport_height;
+        let panel_w = 238.0;
+        let panel_h = 378.0;
+        let x = menu.x.min((width - panel_w - 8.0).max(8.0)).max(8.0);
+        let y = menu.y.min((height - panel_h - 12.0).max(44.0)).max(44.0);
+
+        let item =
+            |icon: crate::icons::Icon,
+             label: &'static str,
+             danger: bool,
+             on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
+                let color = if danger { theme.danger } else { theme.text_dim };
+                div()
+                    .id(SharedString::from(format!("track-menu-{label}")))
+                    .h(px(34.0))
+                    .w_full()
+                    .px(px(10.0))
+                    .rounded(px(7.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .cursor_pointer()
+                    .hover(|s| {
+                        s.bg(if danger {
+                            theme.danger.opacity(0.12)
+                        } else {
+                            theme.hover
+                        })
+                    })
+                    .child(crate::icons::icon(icon, 14.0, color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.0))
+                            .text_color(if danger { theme.danger } else { theme.text })
+                            .child(label),
+                    )
+                    .on_click(on_click)
+                    .into_any_element()
+            };
+
+        let title = menu.track.title.clone();
+        let artist = menu
+            .track
+            .artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let (list, index) = (menu.list, menu.index);
+        let menu_is_current = menu.is_current;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        {
+            let weak = weak.clone();
+            let playing = self.player_status.state == PlayerState::Playing;
+            let (icon, label) = if menu.is_current && playing {
+                (crate::icons::Icon::Pause, "暂停")
+            } else {
+                (crate::icons::Icon::Play, "播放")
+            };
+            rows.push(item(
+                icon,
+                label,
+                false,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.track_menu = None;
+                        if app.current_track.is_some() && menu_is_current {
+                            app.toggle_playback(cx);
+                        } else {
+                            app.play_from_list(list, index, cx);
+                        }
+                    });
+                }),
+            ));
+        }
+        {
+            let weak = weak.clone();
+            let track = menu.track.clone();
+            rows.push(item(
+                crate::icons::Icon::Forward,
+                "下一首播放",
+                false,
+                Box::new(move |_, _, cx| {
+                    let track = track.clone();
+                    let _ = weak.update(cx, |app, cx| {
+                        app.track_menu = None;
+                        app.queue_play_next(track, cx);
+                    });
+                }),
+            ));
+        }
+        {
+            let weak = weak.clone();
+            let track = menu.track.clone();
+            rows.push(item(
+                crate::icons::Icon::Plus,
+                "添加到播放队列",
+                false,
+                Box::new(move |_, _, cx| {
+                    let track = track.clone();
+                    let _ = weak.update(cx, |app, cx| {
+                        app.track_menu = None;
+                        app.queue_append(track, cx);
+                    });
+                }),
+            ));
+        }
+        if menu.has_album {
+            let weak = weak.clone();
+            let track = menu.track.clone();
+            rows.push(item(
+                crate::icons::Icon::Layers,
+                "查看专辑",
+                false,
+                Box::new(move |_, _, cx| {
+                    let track = track.clone();
+                    let _ = weak.update(cx, |app, cx| {
+                        app.track_menu = None;
+                        app.open_album_for_track(&track, cx);
+                    });
+                }),
+            ));
+        }
+        if menu.has_artist {
+            let weak = weak.clone();
+            let track = menu.track.clone();
+            rows.push(item(
+                crate::icons::Icon::Person,
+                "查看歌手",
+                false,
+                Box::new(move |_, _, cx| {
+                    let track = track.clone();
+                    let _ = weak.update(cx, |app, cx| {
+                        app.track_menu = None;
+                        app.open_artist_for_track(&track, cx);
+                    });
+                }),
+            ));
+        }
+        {
+            let weak = weak.clone();
+            rows.push(item(
+                crate::icons::Icon::Check,
+                "多选",
+                false,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.track_menu = None;
+                        app.enter_selection(list, index, cx);
+                    });
+                }),
+            ));
+        }
+        if menu.in_queue {
+            let weak = weak.clone();
+            let id = menu.track.id.clone();
+            rows.push(item(
+                crate::icons::Icon::Close,
+                "从播放队列移除",
+                true,
+                Box::new(move |_, _, cx| {
+                    let id = id.clone();
+                    let _ = weak.update(cx, |app, cx| {
+                        app.track_menu = None;
+                        app.remove_track_from_queue(&id, cx);
+                    });
+                }),
+            ));
+        }
+
+        div()
+            .id("track-menu-layer")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|app, _, _, cx| app.close_track_menu(cx)),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|app, _, _, cx| app.close_track_menu(cx)),
+            )
+            .child(
+                div()
+                    .id("track-menu-panel")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(panel_w))
+                    .rounded(px(12.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow(vec![BoxShadow {
+                        color: gpui::black().opacity(0.42),
+                        blur_radius: px(28.0),
+                        spread_radius: px(0.0),
+                        offset: point(px(0.0), px(10.0)),
+                    }])
+                    .p(px(6.0))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .px(px(6.0))
+                            .pt(px(4.0))
+                            .pb(px(8.0))
+                            .child(
+                                div()
+                                    .size(px(34.0))
+                                    .rounded(px(6.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(theme.surface_alt)
+                                    .child(crate::icons::icon(
+                                        crate::icons::Icon::Note,
+                                        14.0,
+                                        theme.text_faint,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .text_ellipsis()
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_faint)
+                                            .text_ellipsis()
+                                            .child(SharedString::from(artist)),
+                                    ),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).mx(px(4.0)).my(px(4.0)).bg(theme.border))
+                    .children(rows)
+                    .child(div().h(px(1.0)).mx(px(4.0)).my(px(4.0)).bg(theme.border))
+                    .child(item(
+                        crate::icons::Icon::Close,
+                        "取消",
+                        false,
+                        Box::new({
+                            let weak = weak.clone();
+                            move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| app.close_track_menu(cx));
+                            }
+                        }),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// 多选态的顶部栏：返回 / 已选数量 / 全选。保留红绿灯。
+    pub(super) fn render_phone_selection_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let weak = cx.entity().downgrade();
+        let count = self.selection.as_ref().map(|s| s.count()).unwrap_or(0);
+        let all = self
+            .selection
+            .as_ref()
+            .is_some_and(|s| !s.selected.is_empty() && s.selected.iter().all(|v| *v));
+        let back = {
+            let weak = weak.clone();
+            div()
+                .id("selection-back")
+                .size(px(28.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover))
+                .child(crate::icons::icon(
+                    crate::icons::Icon::ChevronLeft,
+                    16.0,
+                    theme.text_dim,
+                ))
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.exit_selection(cx));
+                })
+        };
+        let select_all = {
+            let weak = weak.clone();
+            div()
+                .id("selection-all")
+                .h(px(28.0))
+                .px(px(10.0))
+                .rounded(px(7.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_dim)
+                .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                .child(if all { "取消全选" } else { "全选" })
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.select_all_visible(cx));
+                })
+        };
+        div()
+            .h(px(40.0))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(14.0))
+            .bg(theme.sidebar)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(Self::traffic_lights())
+            .child(back)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from(format!("已选 {count} 首"))),
+            )
+            .child(select_all)
+            .into_any_element()
+    }
+
+    /// 多选态的底部批量操作条。
+    pub(super) fn render_phone_selection_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let weak = cx.entity().downgrade();
+        let empty = self.selection.as_ref().map(|s| s.count()).unwrap_or(0) == 0;
+        let action = |icon: crate::icons::Icon,
+                      label: &'static str,
+                      id: &'static str,
+                      action: SelectionAction| {
+            let weak = weak.clone();
+            div()
+                .id(id)
+                .flex_1()
+                .h_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(3.0))
+                .rounded(px(12.0))
+                .cursor_pointer()
+                .opacity(if empty { 0.35 } else { 1.0 })
+                .hover(|s| s.bg(theme.hover))
+                .child(crate::icons::icon(icon, 16.0, theme.text_dim))
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_faint)
+                        .child(label),
+                )
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        if app.selection.as_ref().is_some_and(|s| s.count() > 0) {
+                            app.apply_selection(action, cx);
+                        }
+                    });
+                })
+        };
+        div()
+            .id("phone-selection-actions")
+            .absolute()
+            .left(px(12.0))
+            .right(px(12.0))
+            .bottom(px(12.0))
+            .h(px(56.0))
+            .rounded(px(16.0))
+            .bg(theme.surface.opacity(0.97))
+            .border_1()
+            .border_color(theme.border)
+            .shadow(vec![BoxShadow {
+                color: gpui::black().opacity(0.32),
+                blur_radius: px(24.0),
+                spread_radius: px(0.0),
+                offset: point(px(0.0), px(-4.0)),
+            }])
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .px(px(4.0))
+            .child(action(
+                crate::icons::Icon::Play,
+                "播放",
+                "selection-play",
+                SelectionAction::Play,
+            ))
+            .child(action(
+                crate::icons::Icon::Forward,
+                "下一首",
+                "selection-next",
+                SelectionAction::PlayNext,
+            ))
+            .child(action(
+                crate::icons::Icon::Plus,
+                "加入队列",
+                "selection-append",
+                SelectionAction::Append,
+            ))
+            .child(action(
+                crate::icons::Icon::Close,
+                "移出队列",
+                "selection-remove",
+                SelectionAction::Remove,
+            ))
+            .into_any_element()
+    }
+
+    /// 手机标题栏：播放页/歌词页为透明覆盖层（顶部轻压暗），曲库页为
+    /// 实心 sidebar 色。红绿灯与拖拽区保留，否则无边框窗口会失去
+    /// 关闭/移动能力；歌词页额外提供返回播放。
+    pub(super) fn render_phone_titlebar(
+        &self,
+        overlay: bool,
+        back: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let weak = cx.entity().downgrade();
+        let fg = if overlay {
+            gpui::white().opacity(0.78)
+        } else {
+            theme.text_dim
+        };
+        let menu = {
+            let weak = weak.clone();
+            crate::widgets::icon_button(
+                &theme,
+                crate::icons::icon(crate::icons::Icon::Menu, 16.0, fg),
+                30.0,
+                "菜单",
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        if app.drawer_open {
+                            app.close_drawer(cx);
+                        } else {
+                            app.open_drawer(cx);
+                        }
+                    });
+                },
+            )
+        };
+        let back_btn = back.then(|| {
+            let weak = weak.clone();
+            crate::widgets::icon_button(
+                &theme,
+                crate::icons::icon(crate::icons::Icon::ChevronLeft, 16.0, fg),
+                30.0,
+                "返回播放",
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.open_phone_sheet(cx);
+                    });
+                },
+            )
+        });
+        let center = {
+            let pill = (overlay && !back).then(|| {
+                div()
+                    .w(px(50.0))
+                    .h(px(8.0))
+                    .rounded(px(4.0))
+                    .bg(gpui::white().opacity(0.176))
+                    .into_any_element()
+            });
+            let title = back.then(|| {
+                div()
+                    .max_w(px(210.0))
+                    .text_size(px(12.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(gpui::white().opacity(0.88))
+                    .text_ellipsis()
+                    .child(SharedString::from(self.current_title_text()))
+                    .into_any_element()
+            });
+            let brand = (!overlay).then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(crate::icons::icon(
+                        crate::icons::Icon::Note,
+                        12.0,
+                        theme.accent,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text_dim)
+                            .child("Chordial"),
+                    )
+                    .into_any_element()
+            });
+            let base = div()
+                .id(if overlay {
+                    "phone-titlebar-overlay"
+                } else {
+                    "phone-titlebar-drag"
+                })
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor(if overlay {
+                    CursorStyle::Arrow
+                } else {
+                    CursorStyle::OpenHand
+                });
+            // 播放页/歌词页的标题栏上叠加了把手、收起与返回按钮。Windows
+            // 的原生 HTCAPTION 命中会吞掉这些子元素，所以覆盖态不再把整条
+            // 标题栏注册成窗口拖动区，而是在两侧留出窄拖动带。
+            let center = if overlay {
+                base
+            } else {
+                Self::window_drag_area(base)
+            };
+            center.children(pill).children(title).children(brand)
+        };
+
+        let bar = div()
+            .h(px(40.0))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(14.0))
+            .when(overlay, |d| {
+                d.absolute().top_0().left_0().right_0().bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(gpui::black().opacity(0.30), 0.0),
+                    linear_color_stop(gpui::black().opacity(0.0), 1.0),
+                ))
+            })
+            .when(!overlay, |d| {
+                d.bg(theme.sidebar).border_b_1().border_color(theme.border)
+            })
+            .child(Self::traffic_lights())
+            .children(back_btn)
+            .child(center)
+            .child(menu);
+        bar.into_any_element()
+    }
+
+    /// 手机播放页底部：全屏 / 曲库 / 队列 / 歌词。
+    /// 抽屉仍由标题栏菜单与曲目信息「…」进入。
+    pub(super) fn phone_bottom_row(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let btn =
+            |icon: crate::icons::Icon,
+             id: &'static str,
+             active: bool,
+             on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
+                div()
+                    .id(id)
+                    .size(px(40.0))
+                    .rounded(px(20.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(if active { 1.0 } else { 0.45 })
+                    .hover(|s| s.opacity(1.0).bg(white.opacity(0.133)))
+                    .child(crate::icons::icon(icon, 18.0, white))
+                    .on_click(on_click)
+                    .into_any_element()
+            };
+
+        let fullscreen = btn(
+            crate::icons::Icon::Expand,
+            "phone-fullscreen",
+            false,
+            Box::new(|_, window, _| window.toggle_fullscreen()),
+        );
+        let library = {
+            let weak = weak.clone();
+            let active = self.phone_page == PhonePage::Browse
+                && self.view_tab == ViewTab::Library
+                && self.library_filter == LibraryFilter::All;
+            btn(
+                crate::icons::Icon::Note,
+                "phone-library",
+                active,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.view_tab = ViewTab::Library;
+                        app.library_filter = LibraryFilter::All;
+                        app.close_phone_sheet(cx);
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+        let queue = {
+            let weak = weak.clone();
+            let active = self.phone_page == PhonePage::Browse
+                && self.view_tab == ViewTab::Library
+                && self.library_filter == LibraryFilter::Queue;
+            btn(
+                crate::icons::Icon::Queue,
+                "phone-queue",
+                active,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.view_tab = ViewTab::Library;
+                        app.library_filter = LibraryFilter::Queue;
+                        app.close_phone_sheet(cx);
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+        let lyrics = {
+            let weak = weak.clone();
+            btn(
+                crate::icons::Icon::Lyrics,
+                "phone-lyrics",
+                false,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Lyrics;
+                        app.phone_sheet = None;
+                        app.phone_sheet_spring = None;
+                        app.phone_sheet_anchor = None;
+                        app.phone_edge_swipe = None;
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+
+        div()
+            .w(px(width))
+            .h(px(40.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .occlude()
+            .child(fullscreen)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    // 最小窗口时 cover 列只有 ~184px，4 个 40px 按钮需要
+                    // 收紧间距，否则会顶出封面列。
+                    .gap(px(if width < 240.0 { 8.0 } else { 14.0 }))
+                    .child(library)
+                    .child(queue)
+                    .child(lyrics),
+            )
+            .into_any_element()
+    }
+
+    /// 无边框窗口的三颗红绿灯。桌面标题栏与手机标题栏共用。
+    pub(super) fn traffic_lights() -> AnyElement {
+        let light = |id: &'static str, color: gpui::Hsla| {
+            div()
+                .id(id)
+                .size(px(12.0))
+                .rounded(px(6.0))
+                .bg(color)
+                .cursor_pointer()
+        };
+        let close = light("tl-close", crate::theme::hex(0xFF5F57)).on_click(|_, _, cx| cx.quit());
+        let minimize = light("tl-min", crate::theme::hex(0xFEBC2E))
+            .on_click(|_, window, _| window.minimize_window());
+        let maximize = light("tl-max", crate::theme::hex(0x28C840))
+            .on_click(|_, window, _| window.zoom_window());
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(close)
+            .child(minimize)
+            .child(maximize)
+            .into_any_element()
+    }
+}

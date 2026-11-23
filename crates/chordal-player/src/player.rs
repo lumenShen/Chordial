@@ -303,10 +303,20 @@ impl PlaybackThread {
         loop {
             let Ok(cmd) = self.rx.recv() else { return };
             match cmd {
-                Command::Play(req) => {
-                    let generation = self.generation + 1;
-                    self.generation = generation;
-                    self.play_item(req, generation);
+                Command::Play(mut req) => {
+                    // 用迭代而不是递归续播：`play_item` 在遇到新的 Play 命令时
+                    // 返回 `Some(next)`，当前帧随之结束，decoder 与它持有的
+                    // HttpMediaSource（整首已下载字节）立刻释放。旧实现递归
+                    // 调用会把每个历史曲目的完整缓冲都压在栈帧里，快速切歌
+                    // 时内存按“曲目数 × 文件大小”增长，直到最新一首结束。
+                    loop {
+                        let generation = self.generation + 1;
+                        self.generation = generation;
+                        match self.play_item(req, generation) {
+                            Some(next) => req = next,
+                            None => break,
+                        }
+                    }
                 }
                 Command::SetVolume(v) => {
                     self.volume = v;
@@ -343,7 +353,10 @@ impl PlaybackThread {
         }
     }
 
-    fn play_item(&mut self, req: PlayRequest, generation: u64) {
+    /// 播放一首曲目。正常结束/停止/失败返回 `None`；播放中收到新的 Play
+    /// 命令时返回 `Some(next)`，由 [`Self::run`] 迭代续播（不递归，避免旧
+    /// 曲目的 decoder/HTTP 缓冲滞留在栈帧里）。
+    fn play_item(&mut self, req: PlayRequest, generation: u64) -> Option<PlayRequest> {
         self.patch_status(|s| {
             s.generation = generation;
             s.state = PlayerState::Loading;
@@ -358,7 +371,7 @@ impl PlaybackThread {
                 self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
                 let _ = self.event_tx.send(Event::StreamError(e.to_string()));
                 let _ = self.event_tx.send(Event::TrackEnded(generation));
-                return;
+                return None;
             }
         };
         let duration_ms = decoder.duration_ms();
@@ -377,7 +390,7 @@ impl PlaybackThread {
                     self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
                     let _ = self.event_tx.send(Event::StreamError(e.to_string()));
                     let _ = self.event_tx.send(Event::TrackEnded(generation));
-                    return;
+                    return None;
                 }
             }
         }
@@ -390,7 +403,7 @@ impl PlaybackThread {
                 self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
                 let _ = self.event_tx.send(Event::SinkError(e.to_string()));
                 let _ = self.event_tx.send(Event::TrackEnded(generation));
-                return;
+                return None;
             }
         };
         warmup.finish(0);
@@ -462,17 +475,15 @@ impl PlaybackThread {
                             s.state = PlayerState::Stopped;
                             s.position_ms = 0;
                         });
-                        return; // 不发 TrackEnded：用户主动停止
+                        return None; // 不发 TrackEnded：用户主动停止
                     }
                     Ok(Command::Play(new_req)) => {
                         let _ = sink.flush();
                         beat_queue.clear();
                         self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
-                        drop(sink); // 旧输出句柄立即释放，不拖到递归返回
-                        let next_gen = self.generation + 1;
-                        self.generation = next_gen;
-                        self.play_item(new_req, next_gen);
-                        return;
+                        drop(sink); // 旧输出句柄立即释放
+                        // 交回外层迭代续播：本帧返回后 decoder/流缓冲即释放。
+                        return Some(new_req);
                     }
                     Ok(Command::SeekMs(ms)) => seek_req = Some(ms),
                     Ok(Command::SetVolume(v)) => {
@@ -515,19 +526,16 @@ impl PlaybackThread {
                                 s.state = PlayerState::Stopped;
                                 s.position_ms = 0;
                             });
-                            return;
+                            return None;
                         }
                         Ok(Command::Play(new_req)) => {
                             let _ = sink.flush();
                             beat_queue.clear();
                             self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
                             drop(sink);
-                            let next_gen = self.generation + 1;
-                            self.generation = next_gen;
-                            self.play_item(new_req, next_gen);
-                            return;
+                            return Some(new_req);
                         }
-                        Err(_) => return,
+                        Err(_) => return None,
                     }
                 }
                 continue 'play;
@@ -630,6 +638,7 @@ impl PlaybackThread {
             s.state = PlayerState::Stopped;
         });
         let _ = self.event_tx.send(Event::TrackEnded(generation));
+        None
     }
 }
 

@@ -276,3 +276,114 @@ fn seek_mid_track_advances_position() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 生成内存中的 16bit 立体声 WAV（左右声道不同频率的正弦波）。
+fn wav_bytes(seconds: f64, rate: u32) -> Vec<u8> {
+    let total_frames = (seconds * rate as f64) as u32;
+    let data_len = (total_frames as usize) * 2 * 2;
+    let mut out = Vec::with_capacity(44 + data_len);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&2u16.to_le_bytes()); // channels
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 2 * 2).to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for frame in 0..total_frames {
+        let t = frame as f64 / rate as f64;
+        for freq in [440.0, 550.0] {
+            let s = (t * freq * std::f64::consts::TAU).sin();
+            out.extend_from_slice(&((s * i16::MAX as f64 * 0.5) as i16).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// 极简 HTTP 服务：接受固定次数的连接，忽略请求内容，返回同一份 body。
+fn serve_wav(listener: std::net::TcpListener, body: Vec<u8>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        // 测试只会发起两次播放；收满两个连接就退出，避免 join 永久阻塞。
+        for stream in listener.incoming().take(2) {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 2048];
+            // 读取请求头即可；播放端只发一个 GET。
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(header.as_bytes()).is_err() {
+                continue;
+            }
+            // 断开的旧流写入失败是预期行为，直接继续处理下一个连接。
+            let _ = stream.write_all(&body);
+        }
+    })
+}
+
+/// 回归：播放中切歌必须立刻释放上一首的 HTTP 音频缓冲。
+///
+/// 旧实现从 `play_item` 内递归调用 `play_item`，旧 `decoder` 与
+/// `HttpMediaSource`（整首已下载字节）要到新曲目结束才随栈帧释放。
+/// 这里通过 `Gauge::AudioStream` 验证切歌后只剩一条流的占用。
+#[test]
+fn http_track_switch_releases_previous_stream_buffer() {
+    use chordal_core::mem::{self, Gauge};
+
+    let body = wav_bytes(12.0, 44_100);
+    let body_len = body.len();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = serve_wav(listener, body);
+
+    let player = Player::with_sink_factory(
+        Box::new(|rate, _| Ok(Box::new(chordal_player::RealtimeNullSink::new(rate)) as Box<_>)),
+        "realtime-null",
+    );
+    let wait_playing = |generation: u64| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let status = player.status();
+            if status.generation == generation && status.state == PlayerState::Playing {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    };
+
+    let url = format!("http://{addr}/track.wav");
+    player.play(StreamHandle::Url(url.clone()), "first", 0);
+    assert!(wait_playing(1), "first track did not start");
+    // 已知 Content-Length：打开时就会精确预留整首容量。
+    let one_stream = mem::gauge(Gauge::AudioStream);
+    assert!(
+        one_stream >= body_len,
+        "stream should reserve for content-length: gauge={one_stream}, body={body_len}"
+    );
+
+    player.play(StreamHandle::Url(url), "second", 0);
+    assert!(wait_playing(2), "second track did not start");
+
+    // 给旧 decoder 的 Drop 一点时间；旧实现会稳定停在 ~2×body。
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut gauge = mem::gauge(Gauge::AudioStream);
+    while Instant::now() < deadline && gauge >= body_len * 3 / 2 {
+        std::thread::sleep(Duration::from_millis(20));
+        gauge = mem::gauge(Gauge::AudioStream);
+    }
+    assert!(
+        gauge < body_len * 3 / 2,
+        "previous track buffer retained: gauge={gauge}, one stream={body_len}"
+    );
+
+    player.stop();
+    drop(player);
+    let _ = server.join();
+}

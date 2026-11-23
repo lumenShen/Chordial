@@ -12,6 +12,7 @@
 //!
 //! 网络请求是阻塞的，调用方必须放在后台执行器里跑（与下载/封面一致）。
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -93,6 +94,18 @@ impl AutoEqEntry {
 }
 
 #[derive(Debug, Clone, Default)]
+struct VisibleCache {
+    /// `entries` 的 Arc 指针；换索引/刷新后旧结果立即失效。
+    entries_ptr: usize,
+    category: String,
+    /// 用户输入的原始搜索词（缓存键）。
+    query_raw: String,
+    /// 归一化后的搜索词（过滤用）。
+    query: String,
+    indices: Arc<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct AutoEqLibrary {
     /// 用 `Arc` 共享给虚拟列表的渲染闭包，避免每帧克隆 6000 条索引。
     pub entries: Arc<Vec<AutoEqEntry>>,
@@ -103,6 +116,9 @@ pub struct AutoEqLibrary {
     pub index_loading: bool,
     /// 紧凑布局点按某个型号后，等曲线拉取完成再自动应用。
     pub pending_apply: Option<String>,
+    /// 分类 + 搜索过滤结果的派生缓存。EQ 面板每帧都会请求过滤后的索引；
+    /// 无缓存时是 6000 条扫描 + 一次 `String`/`Vec` 分配（300Hz 下明显超预算）。
+    visible_cache: RefCell<Option<VisibleCache>>,
 }
 
 impl AutoEqLibrary {
@@ -149,25 +165,48 @@ impl AutoEqLibrary {
             }
         }
         self.entries = Arc::new(entries);
+        // 指针变化会让缓存自动失效；这里直接释放旧索引，避免长期保留冗余 Vec。
+        self.visible_cache.borrow_mut().take();
     }
 
     /// 分类 + 搜索过滤后的索引；返回下标而不是克隆条目。
     ///
     /// 搜索忽略空白：`HD650` 也能匹配 `Sennheiser HD 650`。
-    pub fn visible_indices(&self, category: &str, query: &str) -> Vec<usize> {
+    /// 结果按 (entries 指针, 分类, 搜索词) 缓存，稳态帧只克隆一个 `Arc`。
+    pub fn visible_indices(&self, category: &str, query: &str) -> Arc<Vec<usize>> {
+        let ptr = Arc::as_ptr(&self.entries) as usize;
+        if let Some(cache) = self.visible_cache.borrow().as_ref()
+            && cache.entries_ptr == ptr
+            && cache.category == category
+            && cache.query_raw == query
+        {
+            return cache.indices.clone();
+        }
+
+        let query_raw = query;
         let query: String = query
             .trim()
             .to_lowercase()
             .chars()
             .filter(|ch| !ch.is_whitespace())
             .collect();
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| category == "全部" || entry.category == category)
-            .filter(|(_, entry)| query.is_empty() || entry.search.contains(&query))
-            .map(|(index, _)| index)
-            .collect()
+        let mut indices = Vec::with_capacity(self.entries.len());
+        for (index, entry) in self.entries.iter().enumerate() {
+            if (category == "全部" || entry.category == category)
+                && (query.is_empty() || entry.search.contains(&query))
+            {
+                indices.push(index);
+            }
+        }
+        let indices = Arc::new(indices);
+        *self.visible_cache.borrow_mut() = Some(VisibleCache {
+            entries_ptr: ptr,
+            category: category.to_string(),
+            query_raw: query_raw.to_string(),
+            query: query.to_string(),
+            indices: indices.clone(),
+        });
+        indices
     }
 }
 
@@ -605,9 +644,34 @@ Filter 3: ON HSC Fc 10000 Hz Gain -2.1 dB Q 0.70
         library.replace_entries(entries);
         assert_eq!(library.visible_indices("全部", "").len(), 4);
         assert_eq!(library.visible_indices("头戴式", "").len(), 2);
-        assert_eq!(library.visible_indices("全部", "hd 650"), vec![1]);
-        assert_eq!(library.visible_indices("全部", "hd650"), vec![1]);
+        assert_eq!(library.visible_indices("全部", "hd 650").as_slice(), &[1]);
+        assert_eq!(library.visible_indices("全部", "hd650").as_slice(), &[1]);
         assert_eq!(library.visible_indices("入耳式", "apple").len(), 0);
+    }
+
+    #[test]
+    fn visible_indices_reuses_cached_result_until_inputs_change() {
+        let entries = parse_index(INDEX_SAMPLE);
+        let mut library = AutoEqLibrary::default();
+        library.replace_entries(entries);
+
+        let first = library.visible_indices("全部", "");
+        let again = library.visible_indices("全部", "");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "steady-state frames must reuse the Arc instead of re-filtering"
+        );
+
+        let other_category = library.visible_indices("头戴式", "");
+        assert!(!Arc::ptr_eq(&first, &other_category));
+        assert_eq!(other_category.len(), 2);
+
+        library.replace_entries(parse_index(INDEX_SAMPLE));
+        let after_reload = library.visible_indices("全部", "");
+        assert!(
+            !Arc::ptr_eq(&first, &after_reload),
+            "new index must invalidate the derived cache"
+        );
     }
 
     /// 真实仓库联调：`cargo test -p chordal-ui live_repo -- --ignored`。
