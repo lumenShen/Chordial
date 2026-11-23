@@ -265,7 +265,8 @@ cargo run --release -p chordal-ui
   "source_preference": "auto",
   "beat_band_low_hz": 4000.0,
   "beat_band_high_hz": 10000.0,
-  "beat_strength": 0.5
+  "beat_strength": 0.5,
+  "lyric_sweep_fade_em": 0.6
 }
 ```
 
@@ -275,6 +276,8 @@ cargo run --release -p chordal-ui
 沉浸歌词背景的鼓点监听频段（默认 4000–10000 Hz）与视觉效果强度
 （`beat_strength`，0–150%，默认 50%）同样可在「设置 → 播放 → 背景律动」里调整，
 播放线程按该频段的瞬态能量驱动背景网格的呼吸缩放/旋转/提亮（响应延迟约 40ms）。
+动态歌词整行扫光的渐变带宽度（`lyric_sweep_fade_em`，0.1–4.0em，默认 0.6）
+在「设置 → 播放 → 歌词」中即时调整。
 
 ### 对象缓存与下载
 
@@ -336,6 +339,32 @@ Node 版本，把 api-enhanced 源码放到 `resources/netease-api/`（或配置
 快捷键：`Ctrl+K` 聚焦搜索 · `Enter` 搜索 · `Ctrl+Space` 播放/暂停 ·
 `Ctrl+←/→` 上一/下一首 · `Ctrl+R` 重扫本地库 · `Ctrl+B` 侧栏 · `Ctrl+Q` 退出 ·
 `F2` 沉浸/竖屏 · `F3` 均衡器 · `F5` 播放第一首 · `F9` 设置。
+
+## 日志与崩溃报告
+
+运行日志同时写入平台数据目录（`CHORDIAL_LOG_DIR` 可覆盖）：
+
+- Windows：`%LOCALAPPDATA%\chordial\logs\`
+- Linux：`~/.local/share/chordial/logs/`
+- macOS：`~/Library/Application Support/chordial/logs/`
+
+目录内文件：
+
+- `chordial.log`：本次运行日志（8 MiB 滚动）；
+- `chordial.1.log`：上一份/上一次运行的日志；
+- `crash-latest.log`：最近一次崩溃报告（panic 与原生崩溃都会写）；
+- `crash-*.log` / `fatal-*.log`：历史报告，各保留最新 20 份。
+
+发生 panic 或原生崩溃时，报告会带版本、平台、线程、panic 信息与位置、
+backtrace、最近日志尾部；登录 Cookie（`MUSIC_U` / `__csrf`）自动脱敏。
+panic（以及 Windows 原生异常）会弹系统对话框告知报告位置：Windows 用
+原生 MessageBox，Linux 依次尝试 zenity/kdialog/xmessage，macOS 用
+osascript；Unix 致命信号（如 SIGSEGV）只写报告与 stderr。可用
+`CHORDIAL_CRASH_DIALOG=0` 关闭弹窗（CI/自动化场景）。反馈问题时请附上
+`crash-latest.log` 和 `chordial.log`。
+
+`RUST_LOG` 同时控制终端与文件日志级别，例如
+`RUST_LOG=debug cargo run -p chordal-ui`。
 
 ## 测试
 

@@ -2,13 +2,14 @@
 
 //! Chordial 2.0 桌面入口。
 //!
-//! 装配流程：tracing → 配置 → registry 注册源描述符（预构建实例）→
+//! 装配流程：crash_log/tracing → 配置 → registry 注册源描述符（预构建实例）→
 //! gpui Application → 开窗渲染根视图。
 
 mod actions;
 mod app;
 mod autoeq;
 mod config;
+mod crash_log;
 mod downloads;
 mod eq;
 mod eq_page;
@@ -35,19 +36,38 @@ use chordal_local::LocalSource;
 use chordal_netease::NeteaseSource;
 use chordal_player::Player;
 use gpui::AppContext as _;
-use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, Application, Bounds, Pixels, Size, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+};
 
 use crate::app::{ChordialApp, SourceBuilder};
 
+/// 默认打开尺寸；小屏上会按显示器尺寸收缩。
+const DEFAULT_WINDOW_W: f32 = 1440.0;
+const DEFAULT_WINDOW_H: f32 = 920.0;
+/// 窗口与屏幕边缘之间预留的横向边距。
+const WINDOW_SCREEN_MARGIN_X: f32 = 48.0;
+/// 纵向额外让出标题栏与任务栏的高度。
+const WINDOW_SCREEN_MARGIN_Y: f32 = 88.0;
+
+/// 把期望的打开尺寸收缩到显示器范围内（至少保证最小窗口尺寸）。
+///
+/// `display.bounds()` 是含任务栏的整块屏幕，所以纵向多留一点边距；
+/// 居中后上下各占一半，仍能让窗口完整落在屏幕内。
+fn fit_window_to_screen(desired: Size<Pixels>, screen: Size<Pixels>) -> Size<Pixels> {
+    let screen_w: f32 = screen.width.into();
+    let screen_h: f32 = screen.height.into();
+    let max_size = size(
+        px((screen_w - WINDOW_SCREEN_MARGIN_X).max(responsive::MIN_WINDOW_W)),
+        px((screen_h - WINDOW_SCREEN_MARGIN_Y).max(responsive::MIN_WINDOW_H)),
+    );
+    desired.min(&max_size)
+}
+
 fn main() {
-    // 日志：RUST_LOG 优先，默认 info。perf 事件走 target=chordial::perf。
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,chordial=debug")),
-        )
-        .with_target(true)
-        .init();
+    // 日志与崩溃兜底：stdout + 文件日志，panic/原生崩溃写报告。
+    // RUST_LOG 优先，默认 info；perf 事件走 target=chordial::perf。
+    crash_log::init();
 
     let cfg = config::load_or_default();
 
@@ -165,14 +185,23 @@ fn main() {
         input::install_input_keybindings(cx);
         main_state::install(registry.clone(), player.clone(), builders, cx);
 
-        let display_size = std::env::var("CHORDIAL_SIZE")
+        let desired_size = std::env::var("CHORDIAL_SIZE")
             .ok()
             .and_then(|v| {
                 let (w, h) = v.split_once('x')?;
                 Some(size(px(w.parse().ok()?), px(h.parse().ok()?)))
             })
-            .unwrap_or_else(|| size(px(1440.0), px(920.0)));
-        let bounds = Bounds::centered(None, display_size, cx);
+            .unwrap_or_else(|| size(px(DEFAULT_WINDOW_W), px(DEFAULT_WINDOW_H)));
+
+        // 打开尺寸收敛到屏幕内：默认 1440×920，在 1366×768 等小屏上会超出
+        // 屏幕；这里按主显示器尺寸收缩，并留出边距避免贴边或被任务栏遮挡
+        // （gpui 的 display.bounds() 含任务栏区域，不扣边距会盖住任务栏）。
+        let screen_size = cx
+            .primary_display()
+            .map(|display| display.bounds().size)
+            .unwrap_or(desired_size);
+        let window_size = fit_window_to_screen(desired_size, screen_size);
+        let bounds = Bounds::centered(None, window_size, cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
@@ -204,4 +233,45 @@ fn main() {
         })
         .expect("open chordal window");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn size_of(w: f32, h: f32) -> Size<Pixels> {
+        size(px(w), px(h))
+    }
+
+    #[test]
+    fn keeps_default_size_on_large_screens() {
+        let fitted = fit_window_to_screen(
+            size_of(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H),
+            size_of(1920.0, 1080.0),
+        );
+        assert_eq!(fitted.width, px(DEFAULT_WINDOW_W));
+        assert_eq!(fitted.height, px(DEFAULT_WINDOW_H));
+    }
+
+    #[test]
+    fn shrinks_below_small_screen_resolution() {
+        let fitted = fit_window_to_screen(
+            size_of(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H),
+            size_of(1366.0, 768.0),
+        );
+        assert_eq!(fitted.width, px(1366.0 - WINDOW_SCREEN_MARGIN_X));
+        assert_eq!(fitted.height, px(768.0 - WINDOW_SCREEN_MARGIN_Y));
+        assert!(fitted.width < px(1366.0));
+        assert!(fitted.height < px(768.0));
+    }
+
+    #[test]
+    fn respects_min_window_size_on_tiny_screens() {
+        let fitted = fit_window_to_screen(
+            size_of(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H),
+            size_of(800.0, 540.0),
+        );
+        assert_eq!(fitted.width, px(800.0 - WINDOW_SCREEN_MARGIN_X));
+        assert_eq!(fitted.height, px(responsive::MIN_WINDOW_H));
+    }
 }

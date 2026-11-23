@@ -86,7 +86,8 @@ pub struct LyricTextStyle {
     ///
     /// 动态歌词的亮暗由**一条覆盖整行**的 mask 前沿推进：所有字形共用同一
     /// 组边界，渐变带会压在相邻的字/词之间。这个值决定软边能横跨多少相邻
-    /// 字形 —— 1.5 约等于 1–2 个 CJK 字、3 个左右拉丁字符。
+    /// 字形 —— 默认 0.6（与 AMLL 的 `wordFadeWidth` 一致）；调到 1.5 左右
+    /// 会明显跨 1–2 个 CJK 字。
     pub sweep_fade_em: f32,
     /// 容器顶部渐隐比例（AMLL 歌词容器 CSS mask 的 `transparent → black 10%`）。
     pub edge_fade_top: f32,
@@ -107,7 +108,7 @@ impl Default for LyricTextStyle {
             padding_x_em: 1.0,
             padding_y_ratio: 0.02,
             bg_line_scale: 0.7,
-            sweep_fade_em: 1.5,
+            sweep_fade_em: 0.6,
             edge_fade_top: 0.1,
             edge_fade_bottom: 0.1,
         }

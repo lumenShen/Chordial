@@ -59,7 +59,7 @@ impl SettingsTab {
     fn subtitle(self) -> &'static str {
         match self {
             Self::General => "外观与默认播放行为",
-            Self::Playback => "输出、律动与均衡器",
+            Self::Playback => "输出、律动、歌词与均衡器",
             Self::Sources => "网易云、搜索与本地音乐库",
             Self::Storage => "对象缓存与下载目录",
             Self::About => "版本、后端与路径",
@@ -101,6 +101,8 @@ pub enum SettingsAction {
     SetBeatBand(f32, f32),
     /// 鼓点视觉效果倍率（0..=1.5，1.0 = 原始幅度）。
     SetBeatStrength(f32),
+    /// 动态歌词整行扫光渐变带宽度（em，0.1..=4.0）。
+    SetLyricSweepFade(f32),
     SetEqEnabled(bool),
     OpenEqualizer,
     SetCacheDir(PathBuf),
@@ -167,6 +169,7 @@ pub struct SettingsView {
     smooth_scroll: bool,
     beat_band: (f32, f32),
     beat_strength: f32,
+    lyric_sweep_fade_em: f32,
     cache_dir: PathBuf,
     download_dir: PathBuf,
     local_roots: Vec<PathBuf>,
@@ -194,6 +197,7 @@ pub struct SettingsView {
     beat_low_field: TextField,
     beat_high_field: TextField,
     beat_strength_field: TextField,
+    lyric_sweep_field: TextField,
     search_timeout_field: TextField,
     netease_url_field: TextField,
     device_field: TextField,
@@ -211,6 +215,7 @@ impl SettingsView {
         let beat_band =
             chordal_player::normalize_band(cfg.beat_band_low_hz, cfg.beat_band_high_hz);
         let beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
+        let lyric_sweep_fade_em = crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
         let quality = cfg.netease.level.unwrap_or_default();
         let weak = cx.entity().downgrade();
 
@@ -270,6 +275,17 @@ impl SettingsView {
                 cx,
             )
         };
+        let lyric_sweep_field = {
+            let weak = weak.clone();
+            TextField::new(
+                "settings-lyric-sweep-fade",
+                "0.6",
+                move |text, window, cx| {
+                    let _ = weak.update(cx, |view, cx| view.submit_lyric_sweep(text, window, cx));
+                },
+                cx,
+            )
+        };
         let search_timeout_field = {
             let weak = weak.clone();
             TextField::new(
@@ -323,6 +339,7 @@ impl SettingsView {
             smooth_scroll: cfg.smooth_scroll,
             beat_band,
             beat_strength,
+            lyric_sweep_fade_em,
             cache_dir: cfg.cache_dir,
             download_dir: cfg.download_dir,
             local_roots: cfg.local_roots,
@@ -346,6 +363,7 @@ impl SettingsView {
             beat_low_field,
             beat_high_field,
             beat_strength_field,
+            lyric_sweep_field,
             search_timeout_field,
             netease_url_field,
             device_field,
@@ -365,6 +383,8 @@ impl SettingsView {
         self.beat_band =
             chordal_player::normalize_band(cfg.beat_band_low_hz, cfg.beat_band_high_hz);
         self.beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
+        self.lyric_sweep_fade_em =
+            crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
         self.cache_dir = cfg.cache_dir.clone();
         self.download_dir = cfg.download_dir.clone();
         self.local_roots = cfg.local_roots.clone();
@@ -428,6 +448,8 @@ impl SettingsView {
             .set(format!("{:.0}", self.beat_band.1), cx);
         self.beat_strength_field
             .set(format!("{:.0}", self.beat_strength * 100.0), cx);
+        self.lyric_sweep_field
+            .set(format!("{:.2}", self.lyric_sweep_fade_em), cx);
         self.search_timeout_field
             .set(self.search_timeout_ms.to_string(), cx);
         self.netease_url_field
@@ -542,6 +564,34 @@ impl SettingsView {
             .set(format!("{:.0}", value * 100.0), cx);
         self.emit(SettingsAction::SetBeatStrength(value), window, cx);
         self.notice_ok(format!("背景鼓点强度 {:.0}%", value * 100.0), cx);
+    }
+
+    /// 提交整行扫光渐变带宽度（em，0.1–4.0）。
+    fn submit_lyric_sweep(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.trim().trim_end_matches("em").trim();
+        let Ok(value) = text.parse::<f32>() else {
+            self.notice_error("扫光宽度需为 0.1–4.0 的数字（单位 em）", cx);
+            return;
+        };
+        if !(crate::config::LYRIC_SWEEP_FADE_EM_MIN..=crate::config::LYRIC_SWEEP_FADE_EM_MAX)
+            .contains(&value)
+        {
+            self.notice_error("扫光宽度范围 0.1–4.0 em", cx);
+            return;
+        }
+        self.apply_lyric_sweep(value, window, cx);
+    }
+
+    fn set_lyric_sweep_preset(&mut self, value: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_lyric_sweep(value, window, cx);
+    }
+
+    fn apply_lyric_sweep(&mut self, value: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let value = crate::config::clamp_lyric_sweep_fade_em(value);
+        self.lyric_sweep_fade_em = value;
+        self.lyric_sweep_field.set(format!("{value:.2}"), cx);
+        self.emit(SettingsAction::SetLyricSweepFade(value), window, cx);
+        self.notice_ok(format!("歌词扫光宽度 {value:.2}em"), cx);
     }
 
     fn submit_search_timeout(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1030,6 +1080,33 @@ impl SettingsView {
             .child(strength_preset("强烈 100%", 1.0))
             .into_any_element();
 
+        let sweep_preset = |label: &'static str, value: f32| {
+            let weak = weak.clone();
+            let active = (self.lyric_sweep_fade_em - value).abs() < 0.001;
+            chip(theme, label, active, move |_, window, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.set_lyric_sweep_preset(value, window, cx);
+                });
+            })
+        };
+
+        let sweep_controls = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .w(px(64.0))
+                    .child(self.lyric_sweep_field.view.clone()),
+            )
+            .child(hint(theme, "em"))
+            .child(div().w(px(8.0)))
+            .child(sweep_preset("0.6", 0.6))
+            .child(sweep_preset("1.0", 1.0))
+            .child(sweep_preset("1.5", 1.5))
+            .child(sweep_preset("2.0", 2.0))
+            .into_any_element();
+
         let eq_switch = {
             let weak = weak.clone();
             toggle(
@@ -1089,6 +1166,20 @@ impl SettingsView {
                 preset_row,
             ],
         )
+        .child(section(
+            theme,
+            "歌词",
+            Some("动态歌词的整行扫光是一条共享的渐变 mask 前沿；软边越宽，越容易跨过相邻的字/词。"),
+            vec![group(
+                theme,
+                vec![setting_row(
+                    theme,
+                    "扫光渐变宽度",
+                    Some("单位 em（相对主字号），默认 0.6，范围 0.1–4.0，回车应用".into()),
+                    sweep_controls,
+                )],
+            )],
+        ))
         .child(section(
             theme,
             "均衡器",

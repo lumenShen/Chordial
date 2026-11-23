@@ -33,7 +33,7 @@ use gpui::StatefulInteractiveElement;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Bounds, BoxShadow, Context, CursorStyle, Entity, FocusHandle, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, RenderImage, ResizeEdge, SharedString, Window, div,
+    MouseMoveEvent, MouseUpEvent, RenderImage, ResizeEdge, SharedString, TextRun, Window, div,
     linear_color_stop, linear_gradient, point, px, size, uniform_list,
 };
 
@@ -89,6 +89,36 @@ fn overlay_color(bg: gpui::Hsla, fg: gpui::Hsla) -> gpui::Hsla {
     .into()
 }
 
+/// 量一行文字的宽度（与 gpui 默认 `.SystemUIFont` 的排版一致），
+/// 用于判断 AMLL TextMarquee 是否需要滚动以及滚动距离。
+fn measure_text_width(
+    window: &mut Window,
+    text: &str,
+    font_size: f32,
+    weight: gpui::FontWeight,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let mut font = gpui::font(".SystemUIFont");
+    font.weight = weight;
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window.text_system().shape_line(
+        SharedString::from(text.to_string()),
+        px(font_size),
+        std::slice::from_ref(&run),
+        None,
+    );
+    f32::from(line.width)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewTab {
     Search,
@@ -122,8 +152,21 @@ enum DrawerPage {
 enum PhonePage {
     /// 播放页：封面 + 曲目信息 + 进度 + 传输 + 音量。
     Player,
+    /// 歌词页：封面驱动的 Mesh + 全屏滚动歌词。
+    Lyrics,
     /// 曲库页：复用桌面曲目板（本地库 / 队列 / 搜索结果 / 集合）。
     Browse,
+}
+
+/// 手机壳与 `lyric_view` 的共享状态。
+///
+/// 播放页把歌词视图当背景（隐藏文字）；歌词页显示文字。两者共用同一个
+/// 实体，必须显式区分，不能只用一个 bool 表示“占用”。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhoneBackdrop {
+    Off,
+    Player,
+    Lyrics,
 }
 
 /// 收窄到手机宽度时默认落在哪一页。
@@ -179,6 +222,37 @@ impl PlayMode {
 enum LoginTab {
     Qr,
     Phone,
+}
+
+/// AMLL `TextMarquee` 的悬停滚动状态。
+#[derive(Clone, Copy)]
+struct InfoMarquee {
+    /// 0 = 曲名，1 = 艺人。
+    line: u8,
+    start: Instant,
+    /// 需要滚动的距离（px）。
+    distance: f32,
+    /// 单程时长（ms）；AMLL 的公式是 distance*2/64*1000。
+    duration_ms: f32,
+}
+
+impl InfoMarquee {
+    fn active(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.start).as_secs_f32() * 1000.0
+            < self.duration_ms * 2.0
+    }
+
+    fn offset(self, now: Instant) -> f32 {
+        let dt = now.saturating_duration_since(self.start).as_secs_f32() * 1000.0;
+        let t = dt / self.duration_ms.max(1.0);
+        if t >= 2.0 {
+            0.0
+        } else if t <= 1.0 {
+            self.distance * t
+        } else {
+            self.distance * (2.0 - t)
+        }
+    }
 }
 
 /// 右栏歌词预览的一行（已压平成纯文本 + 译文）。
@@ -357,6 +431,8 @@ pub struct ChordialApp {
     source_preference: SourcePreference,
     /// 平滑滚动开关（配置项，默认 false）。EQ 页面等子模块也读取它。
     pub(crate) smooth_scroll: bool,
+    /// 动态歌词整行扫光的渐变带宽度（em）；设置 → 播放可调。
+    lyric_sweep_fade_em: f32,
     settings_open: bool,
     /// 新版设置中心（独立实体，见 `settings.rs`）。
     settings_view: Entity<SettingsView>,
@@ -407,6 +483,9 @@ pub struct ChordialApp {
     library_scanning: bool,
     library_filter: LibraryFilter,
     play_mode: PlayMode,
+    /// 关闭随机播放时恢复的循环模式（AMLL 的 shuffle 与 repeat 是两个
+    /// 独立按钮；Chordial 用单字段建模时靠它记住上一次的 repeat 档位）。
+    last_repeat_mode: PlayMode,
 
     queue: Arc<Vec<Track>>,
     queue_pos: Option<usize>,
@@ -439,9 +518,9 @@ pub struct ChordialApp {
     viewport_class: ViewportClass,
     /// 手机壳当前页；宽屏时保留但不参与渲染。
     phone_page: PhonePage,
-    /// 手机播放页是否已把歌词视图切换成 Mesh 背景。
+    /// 手机播放页/歌词页与 `lyric_view` 的共享状态。
     /// 与沉浸层共用同一个 `lyric_view`，必须显式跟踪才能正确交还样式。
-    phone_backdrop: bool,
+    phone_backdrop: PhoneBackdrop,
     /// 宽屏布局下缓存的歌词对齐比例（封面中心占比）。
     lyric_align: f32,
     /// 诊断开关：禁用歌词模糊（CHORDIAL_NO_BLUR=1，性能隔离用）。
@@ -466,6 +545,13 @@ pub struct ChordialApp {
     ui_anim_volume: Option<(Instant, bool)>,
     /// 上一次音量输入值（用于检测跨越 0/1 边界）。
     last_volume_input: f32,
+    /// AMLL 进度条右侧时间标签：true 显示剩余（默认），false 显示总时长。
+    show_remaining_time: bool,
+    /// 音质标签点击后的解码信息弹窗。
+    quality_dialog_open: bool,
+    /// 封面暂停缩放：AMLL Cover 在暂停时以 0.75 倍显示。
+    /// (开始时刻, 起始缩放, 目标缩放, 时长秒)。
+    cover_scale_anim: Option<(Instant, f32, f32, f32)>,
     /// 诊断：持续请求动画帧（CHORDIAL_BENCH_ANIM=1），用于 300Hz 压测。
     bench_anim: bool,
 
@@ -487,6 +573,8 @@ pub struct ChordialApp {
     drawer_page: DrawerPage,
     /// 宽屏沉浸层里用户主动关闭歌词的状态；无歌词或关闭歌词时使用布局 2。
     wide_lyrics_hidden: bool,
+    /// 曲名/艺人行的悬停滚动（AMLL TextMarquee）。
+    info_marquee: Option<InfoMarquee>,
     /// 共享元素（封面 / 曲名 / 艺人）的布局补间。
     /// 竖屏页面切换与宽屏歌词开/关共用同一套 First→Last 几何。
     stage_motion: Option<LayoutMotion>,
@@ -544,7 +632,7 @@ pub fn builder_map() -> HashMap<SourceId, SourceBuilder> {
 ///
 /// 构造、退出沉浸层、切换主题都必须用同一份样式；否则面板歌词的字重/
 /// 行高/padding 会在这些路径上被重置成 `Default`，视觉上像换了一套字体。
-fn compact_lyric_style(theme: &Theme) -> LyricTextStyle {
+fn compact_lyric_style(theme: &Theme, sweep_fade_em: f32) -> LyricTextStyle {
     LyricTextStyle {
         font_family: theme.font_family.clone(),
         font_weight: gpui::FontWeight::MEDIUM,
@@ -554,13 +642,40 @@ fn compact_lyric_style(theme: &Theme) -> LyricTextStyle {
         sub_line_height_ratio: 1.45,
         padding_x_em: 1.1,
         padding_y_ratio: 0.03,
+        sweep_fade_em,
+        ..Default::default()
+    }
+}
+
+/// 手机歌词页字号：按宽度缩放，上限 34px；字重与隐藏式播放页一致，
+/// 但使用主题字体栈，保证中文 fallback 正常。
+fn phone_lyric_style(
+    theme: &Theme,
+    width: f32,
+    height: f32,
+    sweep_fade_em: f32,
+) -> LyricTextStyle {
+    let font = (width * 0.075).clamp(18.0, 34.0);
+    let vertical = width < height;
+    LyricTextStyle {
+        font_family: theme.font_family.clone(),
+        font_weight: gpui::FontWeight::SEMIBOLD,
+        base_font_size: font,
+        line_height_ratio: 1.3,
+        sub_font_size_ratio: 0.55,
+        sub_line_height_ratio: 1.45,
+        padding_x_em: 1.0,
+        padding_y_ratio: 0.04,
+        edge_fade_top: 0.1,
+        edge_fade_bottom: if vertical { 0.08 } else { 0.1 },
+        sweep_fade_em,
         ..Default::default()
     }
 }
 
 /// AMLL 等价字号：Medium 档 `max(max(5vh, 2.5vw), 14px)`；宽 ≤768 用
 /// `max(8vw, 12px)`。是否竖向由宽高比决定（影响底部 mask 渐隐）。
-fn immersive_lyric_style(width: f32, height: f32) -> LyricTextStyle {
+fn immersive_lyric_style(width: f32, height: f32, sweep_fade_em: f32) -> LyricTextStyle {
     let font = if width <= 768.0 {
         (width * 0.08).max(12.0)
     } else {
@@ -579,6 +694,7 @@ fn immersive_lyric_style(width: f32, height: f32) -> LyricTextStyle {
         padding_y_ratio: 0.02,
         // AMLL 歌词容器 mask：横向上下各 10%，竖向只有顶部 10%。
         edge_fade_bottom: if vertical { 0.0 } else { 0.1 },
+        sweep_fade_em,
         ..Default::default()
     }
 }
@@ -741,7 +857,7 @@ impl ChordialApp {
                 fallback_background: theme.bg,
                 glow: theme.playing,
             });
-            view.set_text_style(compact_lyric_style(&theme));
+            view.set_text_style(compact_lyric_style(&theme, cfg.lyric_sweep_fade_em));
             view.set_player_config(LyricPlayerConfig {
                 align_position: 0.38,
                 base_font_size: 44.0,
@@ -788,6 +904,9 @@ impl ChordialApp {
             downloads: Arc::new(DownloadStore::open(cfg.download_dir.clone())),
             source_preference: cfg.source_preference,
             smooth_scroll: cfg.smooth_scroll,
+            lyric_sweep_fade_em: crate::config::clamp_lyric_sweep_fade_em(
+                cfg.lyric_sweep_fade_em,
+            ),
             settings_open: false,
             settings_view,
             settings_cache_view,
@@ -831,6 +950,7 @@ impl ChordialApp {
             library_scanning: false,
             library_filter: LibraryFilter::All,
             play_mode: PlayMode::Sequential,
+            last_repeat_mode: PlayMode::Sequential,
             queue: Arc::new(Vec::new()),
             queue_pos: None,
             player_status: chordal_player::Status::default(),
@@ -851,7 +971,7 @@ impl ChordialApp {
             viewport_height: 800.0,
             viewport_class: ViewportClass::Wide,
             phone_page: PhonePage::Browse,
-            phone_backdrop: false,
+            phone_backdrop: PhoneBackdrop::Off,
             lyric_align: 0.35,
             no_blur: std::env::var_os("CHORDIAL_NO_BLUR").is_some(),
             no_bg: std::env::var_os("CHORDIAL_NO_BG").is_some(),
@@ -864,6 +984,9 @@ impl ChordialApp {
             ui_anim_repeat: None,
             ui_anim_volume: None,
             last_volume_input: 0.9,
+            show_remaining_time: true,
+            quality_dialog_open: false,
+            cover_scale_anim: None,
             bench_anim: std::env::var_os("CHORDIAL_BENCH_ANIM").is_some(),
             force_portrait: false,
             portrait_page: PortraitPage::Art,
@@ -878,6 +1001,7 @@ impl ChordialApp {
             drawer_at: None,
             drawer_page: DrawerPage::Root,
             wide_lyrics_hidden: false,
+            info_marquee: None,
             stage_motion: None,
             queue_scroll: gpui::UniformListScrollHandle::new(),
             search_route_cache: RefCell::new(None),
@@ -985,11 +1109,15 @@ impl ChordialApp {
                         if status != app.player_status {
                             let was_playing = app.player_status.state == PlayerState::Playing;
                             let is_playing = status.state == PlayerState::Playing;
+                            let cover_from = app.cover_scale_now(Instant::now());
                             app.player_status = status;
                             // AMLL 的播放/暂停 SVG 在状态切换时重新挂载，因此
                             // pressed 回弹与图标交换必须同帧发生。
-                            if app.immersive && was_playing != is_playing {
-                                app.ui_anim_play = Some(Instant::now());
+                            if was_playing != is_playing {
+                                app.start_cover_scale_anim(cover_from, is_playing);
+                                if app.immersive {
+                                    app.ui_anim_play = Some(Instant::now());
+                                }
                                 app.ensure_ui_anim_ticker(cx);
                             }
                             changed = true;
@@ -1013,11 +1141,15 @@ impl ChordialApp {
         self.player.toggle();
         let status = self.player.status();
         let is_playing = status.state == PlayerState::Playing;
+        let cover_from = self.cover_scale_now(Instant::now());
         self.player_status = status;
-        if self.immersive && was_playing != is_playing {
-            // AMLL 的播放/暂停 SVG 在状态切换时重新挂载，pressed 回弹与
-            // 图标交换必须在同一帧发生。
-            self.ui_anim_play = Some(Instant::now());
+        if was_playing != is_playing {
+            self.start_cover_scale_anim(cover_from, is_playing);
+            if self.immersive {
+                // AMLL 的播放/暂停 SVG 在状态切换时重新挂载，pressed 回弹与
+                // 图标交换必须在同一帧发生。
+                self.ui_anim_play = Some(Instant::now());
+            }
         }
         cx.notify();
     }
@@ -1287,10 +1419,12 @@ impl ChordialApp {
         self.ui_anim_repeat = None;
         self.ui_anim_volume = None;
         self.last_volume_input = self.player_status.volume;
+        self.quality_dialog_open = false;
+        self.cover_scale_anim = None;
         self.ensure_ui_anim_ticker(cx);
         // 沉浸层会接管 `lyric_view` 的样式与背景；先撤销手机壳的 Mesh
         // 背景标记，退出沉浸后下一帧才能重新套用手机播放页样式。
-        self.phone_backdrop = false;
+        self.phone_backdrop = PhoneBackdrop::Off;
         let wide = !self.force_portrait
             && self.viewport_width >= self.viewport_height
             && self.viewport_width >= MIN_WIDE_SPLIT_W;
@@ -1562,25 +1696,49 @@ impl ChordialApp {
         cx.notify();
     }
 
-    /// 手机播放页的 Mesh 背景与沉浸层共用 `lyric_view`，用一次显式状态
-    /// 迁移避免每帧重复设置；离开手机壳/进入沉浸层时交还面板样式。
+    /// 手机壳与沉浸层共用 `lyric_view`。这里把「播放页背景 / 歌词页 /
+    /// 不占用」收敛成一次显式迁移，避免每帧重置或两个页面同时渲染。
     fn sync_phone_backdrop(&mut self, cx: &mut Context<Self>) {
-        let on = self.phone_shell_active()
-            && self.phone_page == PhonePage::Player
-            && self.current_track.is_some();
-        if on == self.phone_backdrop {
+        let mode = if self.phone_shell_active() && self.current_track.is_some() {
+            match self.phone_page {
+                PhonePage::Player => PhoneBackdrop::Player,
+                PhonePage::Lyrics => PhoneBackdrop::Lyrics,
+                PhonePage::Browse => PhoneBackdrop::Off,
+            }
+        } else {
+            PhoneBackdrop::Off
+        };
+        if mode == self.phone_backdrop {
             return;
         }
-        self.phone_backdrop = on;
-        if on {
+        self.phone_backdrop = mode;
+        if mode != PhoneBackdrop::Off {
             let (width, height) = (self.viewport_width, self.viewport_height);
             let scale = (200.0 / width.max(height).max(1.0)).clamp(0.04, 0.5);
             let no_bg = self.no_bg;
-            let style = immersive_lyric_style(width, height);
+            let no_blur = self.no_blur;
+            let sweep = self.lyric_sweep_fade_em;
+            let theme = Theme::get(cx).clone();
+            let show_text = mode == PhoneBackdrop::Lyrics;
+            let style = if show_text {
+                phone_lyric_style(&theme, width, height, sweep)
+            } else {
+                immersive_lyric_style(width, height, sweep)
+            };
             let white = gpui::white();
             self.lyric_view.update(cx, |view, _| {
-                view.set_text_visible(false);
-                view.set_click_seek_enabled(false);
+                view.set_text_visible(show_text);
+                view.set_click_seek_enabled(show_text);
+                view.set_player_config(LyricPlayerConfig {
+                    align_anchor: if show_text {
+                        AlignAnchor::Center
+                    } else {
+                        AlignAnchor::Top
+                    },
+                    align_position: if show_text { 0.5 } else { 0.1 },
+                    enable_blur: !no_blur,
+                    ..LyricPlayerConfig::default()
+                });
                 view.set_background_kind(BackgroundRendererKind::MeshGradient);
                 view.set_background_visible(!no_bg);
                 view.set_background_bounds(None);
@@ -1598,7 +1756,7 @@ impl ChordialApp {
                         a: 0.0,
                     },
                     interlude_dot: white,
-                    // 没有封面时 Mesh 会退化成纯黑；给手机播放页一个
+                    // 没有封面时 Mesh 会退化成纯黑；给手机壳一个
                     // 偏蓝的近黑底，至少和参考图的“暗色玻璃”一致。
                     fallback_background: gpui::rgb(0x171820).into(),
                     glow: white,
@@ -1625,7 +1783,7 @@ impl ChordialApp {
                     fallback_background: theme.bg,
                     glow: theme.playing,
                 });
-                view.set_text_style(compact_lyric_style(&theme));
+                view.set_text_style(compact_lyric_style(&theme, self.lyric_sweep_fade_em));
             });
         }
     }
@@ -1763,9 +1921,33 @@ impl ChordialApp {
 
     fn cycle_play_mode(&mut self, cx: &mut Context<Self>) {
         self.play_mode = self.play_mode.next();
+        if self.play_mode != PlayMode::Shuffle {
+            self.last_repeat_mode = self.play_mode;
+        }
         let text = self.play_mode.full_label();
         self.show_portrait_toast(text, cx);
         cx.notify();
+    }
+
+    /// AMLL 播放列的随机按钮：独立开关，关闭时回到上一次的循环档。
+    fn toggle_amll_shuffle(&mut self) {
+        if self.play_mode == PlayMode::Shuffle {
+            self.play_mode = self.last_repeat_mode;
+        } else {
+            self.last_repeat_mode = self.play_mode;
+            self.play_mode = PlayMode::Shuffle;
+        }
+    }
+
+    /// AMLL 播放列的循环按钮：Off → All → One → Off。
+    fn cycle_amll_repeat(&mut self) {
+        self.play_mode = match self.play_mode {
+            PlayMode::RepeatAll => PlayMode::RepeatOne,
+            PlayMode::RepeatOne => PlayMode::Sequential,
+            // Shuffle / Sequential 一律先进入列表循环，并把 shuffle 关掉。
+            PlayMode::Shuffle | PlayMode::Sequential => PlayMode::RepeatAll,
+        };
+        self.last_repeat_mode = self.play_mode;
     }
 
     fn set_sleep_minutes(&mut self, minutes: Option<u32>, cx: &mut Context<Self>) {
@@ -2183,6 +2365,47 @@ impl ChordialApp {
         }
     }
 
+    /// AMLL Cover：暂停时缩到 0.75，播放时回到 1。
+    fn cover_scale_target(&self) -> f32 {
+        if self.player_status.state == PlayerState::Playing {
+            1.0
+        } else {
+            0.75
+        }
+    }
+
+    fn cover_scale_now(&self, now: Instant) -> f32 {
+        let Some((start, from, to, duration)) = self.cover_scale_anim else {
+            return self.cover_scale_target();
+        };
+        let t = (now.saturating_duration_since(start).as_secs_f32() / duration.max(0.001))
+            .clamp(0.0, 1.0);
+        let eased = if to > from {
+            // 播放：AMLL 的 cubic-bezier(0.3, 0.2, 0.2, 1.4)，轻微过冲。
+            crate::icons::cubic_bezier(0.3, 0.2, 0.2, 1.4, t)
+        } else {
+            crate::icons::cubic_bezier(0.4, 0.2, 0.1, 1.0, t)
+        };
+        from + (to - from) * eased
+    }
+
+    /// 播放状态变化时启动封面缩放；`from` 必须在写入新状态之前采样。
+    fn start_cover_scale_anim(&mut self, from: f32, playing: bool) {
+        let target = if playing { 1.0 } else { 0.75 };
+        if (from - target).abs() < 0.001 {
+            self.cover_scale_anim = None;
+            return;
+        }
+        let duration = if playing { 0.5 } else { 0.6 };
+        self.cover_scale_anim = Some((Instant::now(), from, target, duration));
+    }
+
+    fn cover_scale_anim_active(&self, now: Instant) -> bool {
+        self.cover_scale_anim.is_some_and(|(start, _, _, duration)| {
+            now.saturating_duration_since(start).as_secs_f32() < duration
+        })
+    }
+
     fn ui_anim_active(&self) -> bool {
         if self.bench_anim {
             return true;
@@ -2200,6 +2423,10 @@ impl ChordialApp {
             || self
                 .stage_motion
                 .is_some_and(|motion| motion.active(Instant::now()))
+            || self.cover_scale_anim_active(Instant::now())
+            || self
+                .info_marquee
+                .is_some_and(|marquee| marquee.active(Instant::now()))
             || self.portrait_animating()
             || self.sheet_drag.is_some_and(|drag| drag.animating())
             || self.drawer_animating(Instant::now())
@@ -2224,6 +2451,17 @@ impl ChordialApp {
         }
         if self.stage_motion.is_some_and(|motion| motion.settled(now)) {
             self.stage_motion = None;
+        }
+        if let Some((start, _, _, duration)) = self.cover_scale_anim
+            && now.saturating_duration_since(start).as_secs_f32() >= duration
+        {
+            self.cover_scale_anim = None;
+        }
+        if self
+            .info_marquee
+            .is_some_and(|marquee| !marquee.active(now))
+        {
+            self.info_marquee = None;
         }
         // 抽屉开/合动画结束：清掉起点；关闭状态由 `drawer_visible` 判定隐藏。
         if self.drawer_at.is_some_and(|at| {
@@ -2359,7 +2597,7 @@ impl ChordialApp {
                 fallback_background: theme.bg,
                 glow: theme.playing,
             });
-            view.set_text_style(compact_lyric_style(&theme));
+            view.set_text_style(compact_lyric_style(&theme, self.lyric_sweep_fade_em));
         });
     }
 
@@ -2371,19 +2609,23 @@ impl ChordialApp {
         self.appearance = mode;
         Theme::for_mode(mode).set_global(cx);
         // 歌词 view 的颜色/字体在构造时缓存，切换主题后需要重放。
-        if self.phone_backdrop {
+        if self.phone_backdrop != PhoneBackdrop::Off {
             // 手机播放页的背景与文字是「封面驱动 + 白色」，不跟随明暗
             // 主题；重放主题样式会把它变回面板色，必须重新套用手机样式。
-            self.phone_backdrop = false;
+            self.phone_backdrop = PhoneBackdrop::Off;
             self.sync_phone_backdrop(cx);
         } else {
             let theme = Theme::get(cx).clone();
             // 沉浸层的字号/字重与面板不同；主题切换时必须按当前模式重放，
             // 否则沉浸层会被换成面板样式（字体高度/行高看起来会突然变化）。
             let style = if self.immersive {
-                immersive_lyric_style(self.viewport_width, self.viewport_height)
+                immersive_lyric_style(
+                    self.viewport_width,
+                    self.viewport_height,
+                    self.lyric_sweep_fade_em,
+                )
             } else {
-                compact_lyric_style(&theme)
+                compact_lyric_style(&theme, self.lyric_sweep_fade_em)
             };
             let view = self.lyric_view.clone();
             view.update(cx, |view, _| {
@@ -3504,6 +3746,7 @@ impl ChordialApp {
             }
             SettingsAction::SetBeatBand(low, high) => self.commit_beat_band(low, high, cx),
             SettingsAction::SetBeatStrength(value) => self.commit_beat_strength(value, cx),
+            SettingsAction::SetLyricSweepFade(value) => self.commit_lyric_sweep_fade(value, cx),
             SettingsAction::SetEqEnabled(on) => self.set_eq_enabled(on, cx),
             SettingsAction::OpenEqualizer => {
                 self.settings_open = false;
@@ -3730,6 +3973,36 @@ impl ChordialApp {
         cfg.beat_strength = value;
         crate::config::save(&cfg);
         self.info_message = Some(format!("背景鼓点强度：{:.0}%", value * 100.0));
+        cx.notify();
+    }
+
+    /// 应用歌词整行扫光的渐变带宽度（em），立即重放当前模式的歌词样式并持久化。
+    fn commit_lyric_sweep_fade(&mut self, value: f32, cx: &mut Context<Self>) {
+        let value = crate::config::clamp_lyric_sweep_fade_em(value);
+        self.lyric_sweep_fade_em = value;
+        let theme = Theme::get(cx).clone();
+        // 手机播放页把歌词视图当背景，使用沉浸样式；其余按当前是否沉浸选择。
+        let style = match self.phone_backdrop {
+            PhoneBackdrop::Lyrics => phone_lyric_style(
+                &theme,
+                self.viewport_width,
+                self.viewport_height,
+                value,
+            ),
+            PhoneBackdrop::Player => {
+                immersive_lyric_style(self.viewport_width, self.viewport_height, value)
+            }
+            PhoneBackdrop::Off if self.immersive => {
+                immersive_lyric_style(self.viewport_width, self.viewport_height, value)
+            }
+            PhoneBackdrop::Off => compact_lyric_style(&theme, value),
+        };
+        self.lyric_view
+            .update(cx, |view, _| view.set_text_style(style));
+        let mut cfg = crate::config::load_or_default();
+        cfg.lyric_sweep_fade_em = value;
+        crate::config::save(&cfg);
+        self.info_message = Some(format!("歌词扫光宽度：{value:.2}em"));
         cx.notify();
     }
 
@@ -7648,6 +7921,130 @@ impl ChordialApp {
         }
     }
 
+    /// 音质标签点击后的「音频解码信息」弹窗（AMLL `AudioQualityDialog`）。
+    fn render_quality_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let white = gpui::white();
+        let weak = cx.entity().downgrade();
+        let track = self.current_track.as_ref();
+        let quality = track.and_then(|t| t.quality_info.as_ref());
+        let codec = quality
+            .and_then(|q| q.codec.clone())
+            .unwrap_or_else(|| "未知".into());
+        let bitrate = quality
+            .and_then(|q| q.bitrate_kbps)
+            .map(|v| format!("{v} kbps"))
+            .unwrap_or_else(|| "—".into());
+        let sample_rate = quality
+            .and_then(|q| q.sample_rate_hz)
+            .map(|v| format!("{v} Hz"))
+            .unwrap_or_else(|| "—".into());
+        let tier = quality
+            .map(|q| match q.tier {
+                chordal_core::model::QualityTier::Unknown => "未知",
+                chordal_core::model::QualityTier::Standard => "标准",
+                chordal_core::model::QualityTier::High => "高品质",
+                chordal_core::model::QualityTier::Lossless => "无损",
+                chordal_core::model::QualityTier::HiRes => "高解析度",
+            })
+            .unwrap_or("—");
+        let lossless = quality
+            .map(|q| if q.lossless { "是" } else { "否" })
+            .unwrap_or("—");
+        let row = |label: &'static str, value: String| {
+            div()
+                .w_full()
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(white.opacity(0.5))
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(white.opacity(0.9))
+                        .child(SharedString::from(value)),
+                )
+        };
+        let close = {
+            let weak = weak.clone();
+            div()
+                .id("quality-dialog-close")
+                .h(px(30.0))
+                .px(px(14.0))
+                .rounded(px(7.0))
+                .bg(white.opacity(0.12))
+                .hover(|s| s.bg(white.opacity(0.18)))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_size(px(12.0))
+                .text_color(white)
+                .child("关闭")
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.quality_dialog_open = false;
+                        cx.notify();
+                    });
+                })
+        };
+        let backdrop = {
+            let weak = weak.clone();
+            div()
+                .id("quality-dialog-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::black().opacity(0.45))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.quality_dialog_open = false;
+                        cx.notify();
+                    });
+                })
+        };
+        let card = div()
+            .id("quality-dialog")
+            .w(px(340.0))
+            .rounded(px(12.0))
+            .bg(gpui::rgba(0x1C1C20F7))
+            .border_1()
+            .border_color(white.opacity(0.1))
+            .shadow(vec![BoxShadow {
+                color: gpui::black().opacity(0.35),
+                offset: point(px(0.0), px(16.0)),
+                blur_radius: px(40.0),
+                spread_radius: px(0.0),
+            }])
+            .p(px(20.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .text_size(px(16.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(white.opacity(0.95))
+                    .child("音频解码信息"),
+            )
+            .child(div().w_full().h(px(1.0)).my(px(10.0)).bg(white.opacity(0.1)))
+            .child(row("音频解码器", codec))
+            .child(row("码率", bitrate))
+            .child(row("采样率", sample_rate))
+            .child(row("品质", tier.to_string()))
+            .child(row("无损", lossless.to_string()))
+            .child(div().w_full().h(px(1.0)).my(px(10.0)).bg(white.opacity(0.1)))
+            .child(div().w_full().flex().justify_end().child(close));
+        backdrop.child(card).into_any_element()
+    }
+
     fn render_immersive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let bounds = window.bounds();
         let width = f32::from(bounds.size.width);
@@ -7714,9 +8111,9 @@ impl ChordialApp {
         let wide_layout = self.portrait_page == PortraitPage::Art
             && self.layout_one_active(cx, width, height);
         let page = if wide_layout {
-            self.render_immersive_wide(card_w, card_h, dock_shared, dock_opacity, cx)
+            self.render_immersive_wide(card_w, card_h, dock_shared, dock_opacity, window, cx)
         } else {
-            self.render_immersive_compact(card_w, card_h, dock_shared, dock_opacity, cx)
+            self.render_immersive_compact(card_w, card_h, dock_shared, dock_opacity, window, cx)
         };
 
         let mut card_el = div()
@@ -7811,8 +8208,19 @@ impl ChordialApp {
     // ---- AMLL 播放器控件（横向/竖向共用同一套写法） ----
 
     /// AMLL BouncingSlider 进度条 + 时间/音质标签行。
-    fn amll_progress_block(&self, width: f32, label_font: f32) -> AnyElement {
+    ///
+    /// 右侧时间默认显示剩余时长，点一下切到总时长（AMLL
+    /// `showRemainingTimeAtom` 的交互）。音质标签是 20% 白色圆角胶囊，
+    /// 点击打开解码信息弹窗。
+    fn amll_progress_block(
+        &self,
+        width: f32,
+        label_font: f32,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let white = gpui::white();
+        let weak = cx.entity().downgrade();
         let status = &self.player_status;
         let duration = status.duration_ms.unwrap_or(0);
         let position = self.display_position_ms().min(duration.max(1));
@@ -7836,23 +8244,60 @@ impl ChordialApp {
             }
         };
         let progress_bar = crate::widgets::amll_slider(progress, "seek", seek);
+
+        // AMLL `.qualityTag`：高 ≤1080 时 scale=1，否则 1.4。
+        let tag_scale = if height > 1080.0 { 1.4 } else { 1.0 };
         let quality_pill = if quality.is_empty() {
             div().into_any_element()
         } else {
+            let weak = weak.clone();
             div()
+                .id("amll-quality-tag")
                 .flex()
                 .items_center()
-                .rounded(px(3.0))
-                .border_1()
-                .border_color(white.opacity(0.2))
-                .px(px(6.66))
-                .py(px(2.0))
-                .text_size(px(label_font))
+                .rounded(px(5.0 * tag_scale))
+                .bg(white.opacity(0.2))
+                .pl(px(1.1 * tag_scale))
+                .pr(px(5.72 * tag_scale))
+                .py(px(2.0 * tag_scale))
+                .text_size(px(11.0 * tag_scale))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(white)
+                .cursor_pointer()
+                // AMLL whileHover/whileTap：scale 0.95 / 0.9。
+                .hover(|s| s.bg(white.opacity(0.26)))
                 .child(SharedString::from(quality.to_uppercase()))
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.quality_dialog_open = true;
+                        cx.notify();
+                    });
+                })
                 .into_any_element()
         };
+
+        let right_label = {
+            let weak = weak.clone();
+            let text = if self.show_remaining_time {
+                format!("-{}", fmt_ms(remaining))
+            } else {
+                fmt_ms(duration)
+            };
+            div()
+                .id("amll-time-toggle")
+                .flex_1()
+                .flex()
+                .justify_end()
+                .cursor_pointer()
+                .child(SharedString::from(text))
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.show_remaining_time = !app.show_remaining_time;
+                        cx.notify();
+                    });
+                })
+        };
+
         div()
             .w(px(width))
             .flex()
@@ -7867,15 +8312,21 @@ impl ChordialApp {
                     .text_size(px(label_font))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(white.opacity(0.5))
-                    .child(SharedString::from(fmt_ms(position)))
-                    .child(div().flex_1().flex().justify_center().child(quality_pill))
-                    .child(SharedString::from(format!("-{}", fmt_ms(remaining)))),
+                    .child(div().flex_1().child(SharedString::from(fmt_ms(position))))
+                    .child(div().flex_none().flex().justify_center().child(quality_pill))
+                    .child(right_label),
             )
             .into_any_element()
     }
 
     /// AMLL MediaButton 传输行：shuffle / prev / play / next / repeat。
-    fn amll_transport(&self, width: f32, btn: f32, cx: &mut Context<Self>) -> AnyElement {
+    fn amll_transport(
+        &self,
+        width: f32,
+        btn: f32,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let white = gpui::white();
         let weak = cx.entity().downgrade();
         let playing = self.player_status.state == PlayerState::Playing;
@@ -7893,11 +8344,43 @@ impl ChordialApp {
             Self::UI_ANIM_PRESS_MS,
         );
         let arrows = Self::anim_progress(self.ui_anim_enter, Self::UI_ANIM_ARROWS_MS);
-        let icon_side = (btn * 0.26).max(14.0);
-        let icon_skip = (btn * 0.32).max(16.0);
-        let icon_play = (btn * 0.37).max(18.0);
+        // AMLL `.songMediaButton > svg` / `.songMediaPlayButton > svg` 的
+        // 响应式 scale。svg intrinsic size 分别是 32 与 38；我们的 16 网格
+        // 已按同一 viewBox 比例归一，所以画布 = intrinsic × scale。
+        let media_scale = if height > 1080.0 {
+            3.0
+        } else if height > 768.0 {
+            2.0
+        } else if height > 512.0 {
+            1.5
+        } else {
+            1.0
+        };
+        let play_scale = if height > 1080.0 {
+            2.0
+        } else if height > 768.0 {
+            1.1
+        } else if height > 512.0 {
+            0.8
+        } else {
+            0.5
+        };
+        let icon_side = 20.8; // 1.3em
+        let icon_skip = 32.0 * media_scale;
+        let icon_play = 38.0 * play_scale;
         let shuffle_active = self.play_mode == PlayMode::Shuffle;
-        let repeat_active = self.play_mode == PlayMode::RepeatOne;
+        let repeat_active = matches!(self.play_mode, PlayMode::RepeatAll | PlayMode::RepeatOne);
+        // AMLL 的 shuffle/repeat 激活态是整块白色圆角图标；没有 knockout
+        // 能力时用 22% 白色底 + 白色字形近似，保持同样的尺寸与位置。
+        let icon_chip = |active: bool| {
+            div()
+                .size(px(icon_side))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(active, |d| d.bg(white.opacity(0.22)))
+        };
         let sp = || div().flex_1();
 
         let shuffle = {
@@ -7910,26 +8393,18 @@ impl ChordialApp {
                 .items_center()
                 .justify_center()
                 .hover(|s| s.bg(white.opacity(0.133)))
-                .child(crate::icons::icon_motion(
+                .child(icon_chip(shuffle_active).child(crate::icons::icon_motion(
                     crate::icons::Icon::Shuffle,
                     icon_side,
-                    if shuffle_active {
-                        white
-                    } else {
-                        white.opacity(0.55)
-                    },
+                    white,
                     crate::icons::IconMotion {
                         press: press_shuffle,
                         ..Default::default()
                     },
-                ))
+                )))
                 .on_click(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
-                        app.play_mode = if app.play_mode == PlayMode::Shuffle {
-                            PlayMode::Sequential
-                        } else {
-                            PlayMode::Shuffle
-                        };
+                        app.toggle_amll_shuffle();
                         app.ui_anim_shuffle = Some(Instant::now());
                         app.ensure_ui_anim_ticker(cx);
                         cx.notify();
@@ -7972,9 +8447,9 @@ impl ChordialApp {
                 .hover(|s| s.bg(white.opacity(0.133)))
                 .child(crate::icons::icon_motion(
                     if playing {
-                        crate::icons::Icon::Pause
+                        crate::icons::Icon::PauseMedia
                     } else {
-                        crate::icons::Icon::Play
+                        crate::icons::Icon::PlayMedia
                     },
                     icon_play,
                     white,
@@ -8021,26 +8496,22 @@ impl ChordialApp {
                 .items_center()
                 .justify_center()
                 .hover(|s| s.bg(white.opacity(0.133)))
-                .child(crate::icons::icon_motion(
-                    crate::icons::Icon::Repeat,
-                    icon_side,
-                    if repeat_active {
-                        white
+                .child(icon_chip(repeat_active).child(crate::icons::icon_motion(
+                    if self.play_mode == PlayMode::RepeatOne {
+                        crate::icons::Icon::RepeatOne
                     } else {
-                        white.opacity(0.55)
+                        crate::icons::Icon::Repeat
                     },
+                    icon_side,
+                    white,
                     crate::icons::IconMotion {
                         press: press_repeat,
                         ..Default::default()
                     },
-                ))
+                )))
                 .on_click(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
-                        app.play_mode = if app.play_mode == PlayMode::RepeatOne {
-                            PlayMode::Sequential
-                        } else {
-                            PlayMode::RepeatOne
-                        };
+                        app.cycle_amll_repeat();
                         app.ui_anim_repeat = Some(Instant::now());
                         app.ensure_ui_anim_ticker(cx);
                         cx.notify();
@@ -8078,7 +8549,7 @@ impl ChordialApp {
         };
         let volume_slider = {
             let player = self.player.clone();
-            crate::widgets::amll_slider(
+            crate::widgets::amll_live_slider(
                 self.player_status.volume.clamp(0.0, 1.0),
                 "volume",
                 move |fraction: f32, cx: &mut App| {
@@ -8089,29 +8560,42 @@ impl ChordialApp {
                 },
             )
         };
+        // AMLL VolumeControl：行高 40（svg 布局高度），左右负边距 -12 / -8，
+        // 喇叭的可见图形只占 svg 画布的一小部分。
         div()
-            .w(px(width))
+            .w(px(width + 20.0))
+            .ml(px(-12.0))
+            .mr(px(-8.0))
+            .h(px(40.0))
             .flex()
             .items_center()
-            .child(crate::icons::icon_motion(
-                crate::icons::Icon::VolumeLow,
-                16.0,
-                white.opacity(0.5),
-                crate::icons::IconMotion {
-                    speaker: speaker_low,
-                    ..Default::default()
-                },
-            ))
+            .child(
+                div().w(px(32.0)).h(px(40.0)).flex().items_center().justify_center().child(
+                    crate::icons::icon_motion(
+                        crate::icons::Icon::VolumeLow,
+                        26.7,
+                        white.opacity(0.5),
+                        crate::icons::IconMotion {
+                            speaker: speaker_low,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            )
             .child(div().flex_1().child(volume_slider))
-            .child(crate::icons::icon_motion(
-                crate::icons::Icon::VolumeHigh,
-                16.0,
-                white.opacity(0.5),
-                crate::icons::IconMotion {
-                    speaker: speaker_high,
-                    ..Default::default()
-                },
-            ))
+            .child(
+                div().w(px(43.0)).h(px(40.0)).flex().items_center().justify_center().child(
+                    crate::icons::icon_motion(
+                        crate::icons::Icon::VolumeHigh,
+                        33.4,
+                        white.opacity(0.5),
+                        crate::icons::IconMotion {
+                            speaker: speaker_high,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            )
             .into_any_element()
     }
 
@@ -8373,6 +8857,28 @@ impl ChordialApp {
                             }),
                         )
                     };
+                    let lyrics = self.current_track.is_some().then(|| {
+                        let weak = weak.clone();
+                        let has_lyrics = self.lyric_view.read(cx).has_lyrics();
+                        row(
+                            crate::icons::Icon::Lyrics,
+                            "drawer-phone-lyrics",
+                            "歌词",
+                            if has_lyrics {
+                                "全屏滚动歌词".into()
+                            } else {
+                                "暂无歌词".into()
+                            },
+                            self.phone_page == PhonePage::Lyrics,
+                            Box::new(move |_, _, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.phone_page = PhonePage::Lyrics;
+                                    app.close_drawer(cx);
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    });
                     let library = {
                         let weak = weak.clone();
                         let active = self.phone_page == PhonePage::Browse
@@ -8453,9 +8959,11 @@ impl ChordialApp {
                             }),
                         )
                     };
+                    body = body.child(section).child(player);
+                    if let Some(lyrics) = lyrics {
+                        body = body.child(lyrics);
+                    }
                     body = body
-                        .child(section)
-                        .child(player)
                         .child(library)
                         .child(search)
                         .child(settings)
@@ -8891,33 +9399,41 @@ impl ChordialApp {
         &self,
         width: f32,
         font: f32,
+        height: f32,
         back: bool,
         interactive: bool,
         hide_text: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let white = gpui::white();
         let weak = cx.entity().downgrade();
         let title = self.current_title_text();
         let artist = self.current_artist_text();
+        // AMLL MenuButton：width 3.5vh；窄屏改用 max(2em, min(5vw, 4vh))。
+        let action_side = if self.viewport_width <= 1000.0 {
+            ((self.viewport_width * 0.05).min(height * 0.04)).max(32.0)
+        } else {
+            height * 0.035
+        };
         let action = {
             let base = div()
                 .id("amll-info-action")
-                .size(px(35.0))
-                .rounded(px(17.5))
+                .size(px(action_side))
+                .rounded(px(action_side * 0.5))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(white.opacity(0.08))
-                .hover(|s| s.bg(white.opacity(0.133)))
+                .ml(px(16.0))
+                .bg(white.opacity(0.082))
                 .child(crate::icons::icon(
                     if back {
                         crate::icons::Icon::ChevronLeft
                     } else {
-                        crate::icons::Icon::More
+                        crate::icons::Icon::MoreDot
                     },
-                    16.0,
+                    action_side * 0.72,
                     white,
                 ));
             if interactive {
@@ -8936,6 +9452,77 @@ impl ChordialApp {
                 base.into_any_element()
             }
         };
+        let available = (width - action_side - 16.0).max(1.0);
+        let title_w = measure_text_width(window, &title, font, gpui::FontWeight::MEDIUM);
+        let artist_w = measure_text_width(window, &artist, font, gpui::FontWeight::NORMAL);
+        let now = Instant::now();
+        let marquee = self.info_marquee;
+        let make_line = |line: u8,
+                         text: String,
+                         measured: f32,
+                         weight: gpui::FontWeight,
+                         color: gpui::Hsla|
+         -> AnyElement {
+            // AMLL TextMarquee：只有当文字宽度超过容器 95% 时，悬停才滚动。
+            let overflowing = measured > available * 0.95;
+            let distance = (measured - available * 0.95).max(0.0);
+            let duration_ms = (distance * 2.0 / 64.0 * 1000.0).max(1.0);
+            let active = marquee.filter(|m| m.line == line);
+            let animating = active.is_some_and(|m| m.active(now));
+            let offset = active.map(|m| m.offset(now)).unwrap_or(0.0);
+            let hover_weak = weak.clone();
+            let mut outer = div()
+                .id(if line == 0 {
+                    "info-line-title"
+                } else {
+                    "info-line-artist"
+                })
+                .w_full()
+                .overflow_hidden()
+                .on_hover(move |hovered, _, cx| {
+                    if !overflowing {
+                        return;
+                    }
+                    let _ = hover_weak.update(cx, |app, cx| {
+                        if *hovered {
+                            app.info_marquee = Some(InfoMarquee {
+                                line,
+                                start: Instant::now(),
+                                distance,
+                                duration_ms,
+                            });
+                        } else if app.info_marquee.is_some_and(|m| m.line == line) {
+                            app.info_marquee = None;
+                        }
+                        cx.notify();
+                    });
+                });
+            if animating {
+                outer = outer.child(
+                    div()
+                        .w(px(measured + 2.0))
+                        .ml(px(-offset))
+                        .text_size(px(font))
+                        .line_height(px(font * INFO_LINE_RATIO))
+                        .font_weight(weight)
+                        .text_color(color)
+                        .whitespace_nowrap()
+                        .child(SharedString::from(text)),
+                );
+            } else {
+                outer = outer.child(
+                    div()
+                        .w_full()
+                        .text_size(px(font))
+                        .line_height(px(font * INFO_LINE_RATIO))
+                        .font_weight(weight)
+                        .text_color(color)
+                        .text_ellipsis()
+                        .child(SharedString::from(text)),
+                );
+            }
+            outer.into_any_element()
+        };
         div()
             .w(px(width))
             .flex()
@@ -8947,25 +9534,20 @@ impl ChordialApp {
                     .flex()
                     .flex_col()
                     .opacity(if hide_text { 0.0 } else { 1.0 })
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(font))
-                            .line_height(px(font * INFO_LINE_RATIO))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(white.opacity(0.9))
-                            .text_ellipsis()
-                            .child(SharedString::from(title)),
-                    )
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(font))
-                            .line_height(px(font * INFO_LINE_RATIO))
-                            .text_color(white.opacity(0.45))
-                            .text_ellipsis()
-                            .child(SharedString::from(artist)),
-                    ),
+                    .child(make_line(
+                        0,
+                        title,
+                        title_w,
+                        gpui::FontWeight::MEDIUM,
+                        white.opacity(0.9),
+                    ))
+                    .child(make_line(
+                        1,
+                        artist,
+                        artist_w,
+                        gpui::FontWeight::NORMAL,
+                        white.opacity(0.45),
+                    )),
             )
             .child(action)
             .into_any_element()
@@ -8983,21 +9565,46 @@ impl ChordialApp {
         chrome_o: f32,
         menu_interactive: bool,
         shared_hidden: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let white = gpui::white();
         let theme = Theme::dark();
-        let cover = crate::widgets::cover_plain(
-            &theme,
-            self.cover_image.clone(),
-            column_w,
-            0.0,
-            crate::icons::icon(
-                crate::icons::Icon::Note,
-                (column_w * 0.1).clamp(28.0, 40.0),
-                white.opacity(0.4),
-            ),
-        );
+        // AMLL Cover：半径 max(2%, 0.7vh)；整块带
+        // `0 1em 1.2em rgba(0,0,0,.19)` 投影。暂停时整体缩到 0.75。
+        let cover_scale = self
+            .cover_scale_now(Instant::now())
+            .clamp(0.5, 1.1);
+        let cover_side = column_w * cover_scale;
+        let cover_radius = (column_w * 0.02).max(height * 0.007) * cover_scale;
+        let cover = div()
+            .w(px(column_w))
+            .h(px(column_w))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .size(px(cover_side))
+                    .rounded(px(cover_radius))
+                    .shadow(vec![BoxShadow {
+                        color: gpui::black().opacity(0.19),
+                        offset: point(px(0.0), px(16.0 * cover_scale)),
+                        blur_radius: px(19.2 * cover_scale),
+                        spread_radius: px(0.0),
+                    }])
+                    .child(crate::widgets::cover_plain(
+                        &theme,
+                        self.cover_image.clone(),
+                        cover_side,
+                        cover_radius,
+                        crate::icons::icon(
+                            crate::icons::Icon::Note,
+                            (cover_side * 0.1).clamp(28.0, 40.0),
+                            white.opacity(0.4),
+                        ),
+                    )),
+            );
         let info_font = (height * 0.02).max(16.0);
         let info = div()
             .w(px(column_w))
@@ -9005,19 +9612,23 @@ impl ChordialApp {
             .child(self.amll_info_row(
                 column_w,
                 info_font,
+                height,
                 false,
                 menu_interactive,
                 shared_hidden,
+                window,
                 cx,
             ));
         let label_font = (height * 0.012).max(12.8);
         let progress = div()
             .w(px(column_w))
-            .h(px(46.0))
+            .h(px(45.2))
             .opacity(chrome_o)
-            .child(self.amll_progress_block(column_w, label_font));
-        let btn = (column_w * 0.18).clamp(40.0, 88.0);
-        let transport = self.amll_transport(column_w, btn, cx);
+            .child(self.amll_progress_block(column_w, label_font, height, cx));
+        // 手机最小宽度时封面列只有 ~184px；40px 的按钮会让 5 个传输键
+        // 互相挤压。低于 240 时收到 34px，图标仍保持可点击尺寸。
+        let btn = (column_w * 0.18).clamp(if column_w < 240.0 { 34.0 } else { 40.0 }, 88.0);
+        let transport = self.amll_transport(column_w, btn, height, cx);
         let volume = self.amll_volume_row(column_w, cx);
         let controls = div()
             .w(px(column_w))
@@ -9040,7 +9651,9 @@ impl ChordialApp {
                     .opacity(if shared_hidden { 0.0 } else { 1.0 })
                     .child(cover),
             )
-            .child(div().h(px(20.0)))
+            // AMLL：封面与 music-info 行之间是 8px grid gap，控件列再有
+            // `margin-top: calc(-8px + 1.75em)`，合起来 28px（1em = 16px）。
+            .child(div().h(px(28.0)))
             .child(controls)
             .into_any_element()
     }
@@ -9143,6 +9756,7 @@ impl ChordialApp {
         height: f32,
         dock_shared: bool,
         dock_opacity: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let white = gpui::white();
@@ -9245,7 +9859,9 @@ impl ChordialApp {
             .key_context("ChordialImmersive")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|app, _: &ExitImmersive, window, cx| {
-                if app.drawer_open {
+                if app.quality_dialog_open {
+                    app.quality_dialog_open = false;
+                } else if app.drawer_open {
                     app.close_drawer(cx);
                 } else if app.eq_open {
                     app.close_eq(cx);
@@ -9319,6 +9935,7 @@ impl ChordialApp {
                 chrome_o,
                 dock_opacity,
                 shared_hidden,
+                window,
                 cx,
             ));
             let to = gpui::batch_layer(self.render_compact_page(
@@ -9329,6 +9946,7 @@ impl ChordialApp {
                 chrome_o,
                 dock_opacity,
                 shared_hidden,
+                window,
                 cx,
             ));
             sheet = sheet
@@ -9363,6 +9981,7 @@ impl ChordialApp {
                 chrome_o,
                 dock_opacity,
                 shared_hidden,
+                window,
                 cx,
             )));
         }
@@ -9408,6 +10027,7 @@ impl ChordialApp {
         chrome_o: f32,
         dock_opacity: f32,
         shared_hidden: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match page {
@@ -9418,6 +10038,7 @@ impl ChordialApp {
                     chrome_o,
                     dock_opacity,
                     shared_hidden,
+                    window,
                     cx,
                 )
             }
@@ -9434,6 +10055,7 @@ impl ChordialApp {
         chrome_o: f32,
         dock_opacity: f32,
         shared_hidden: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let cover = compact_cover_size(width, height);
@@ -9468,6 +10090,7 @@ impl ChordialApp {
                         chrome_o,
                         true,
                         shared_hidden,
+                        window,
                         cx,
                     )),
             )
@@ -9496,6 +10119,7 @@ impl ChordialApp {
         height: f32,
         dock_shared: bool,
         dock_opacity: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let now = Instant::now();
@@ -9509,7 +10133,9 @@ impl ChordialApp {
         // ---- AMLL horizontal 几何 ----
         let cover = wide_cover_size(width, height);
         let gap = 8.0;
-        let fr = (height - 120.0 - cover).max(0.0);
+        // 剩余 fr 高度按 AMLL 的 6 行 grid 计算：thumb 2×2vh=36，
+        // 5 道 8px gap。
+        let fr = (height - cover - 76.0).max(0.0);
         let drag = fr * 0.12;
         let cover_top = wide_cover_top(width, height);
         // 底部控制行与布局 2 使用同一个底边距（16px）；音量行必须停在
@@ -9610,6 +10236,7 @@ impl ChordialApp {
                 1.0,
                 false,
                 shared_hidden,
+                window,
                 cx,
             ));
 
@@ -9667,7 +10294,9 @@ impl ChordialApp {
             .key_context("ChordialImmersive")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|app, _: &ExitImmersive, window, cx| {
-                if app.drawer_open {
+                if app.quality_dialog_open {
+                    app.quality_dialog_open = false;
+                } else if app.drawer_open {
                     app.close_drawer(cx);
                 } else if app.eq_open {
                     app.close_eq(cx);
@@ -9741,52 +10370,67 @@ impl Render for ChordialApp {
         // 避免布局切换的第一帧出现“桌面根节点 + 手机内容”的混合态。
         let class = ViewportClass::of(self.viewport_width);
         self.handle_viewport_class_change(class, cx);
-        if self.immersive {
+        let base: AnyElement = if self.immersive {
             let width = f32::from(viewport.width);
             let height = f32::from(viewport.height);
             // 每帧重算沉浸样式；视图内部按完整样式去重，只有字号/字重/行高
             // 真正变化时才重排。不能只比较字号：窗口高度恰好让沉浸字号落在
             // 44px 附近时，面板样式（MEDIUM 44 / 行高 1.35）会被误认为已应用。
-            let style = immersive_lyric_style(width, height);
+            let style = immersive_lyric_style(width, height, self.lyric_sweep_fade_em);
             self.lyric_view
                 .update(cx, |view, _| view.set_text_style(style));
             let scope = PerfScope::enter("ui.render.pass");
-            let base = self.render_immersive(window, cx);
+            let immersive = self.render_immersive(window, cx);
             scope.finish(1);
             if self.eq_open {
-                return div()
+                div()
                     .size_full()
                     .relative()
-                    .child(base)
+                    .child(immersive)
                     .child(gpui::batch_layer(self.render_eq(window, cx)))
-                    .into_any_element();
-            }
-            // Dock→全屏展开或下拉收起时，卡片没有铺满窗口：把主面板画在
-            // 背后，让露出的区域真的能看到列表与 Dock。手机宽度下背后
-            // 必须是手机壳，否则会露出被压扁的三栏。
-            let dock_p = self.immersive_dock_progress(now, height);
-            if dock_p > 0.0001 {
-                let main = if self.is_phone() {
-                    self.render_phone_main(window, cx, true)
+                    .into_any_element()
+            } else {
+                // Dock→全屏展开或下拉收起时，卡片没有铺满窗口：把主面板画在
+                // 背后，让露出的区域真的能看到列表与 Dock。手机宽度下背后
+                // 必须是手机壳，否则会露出被压扁的三栏。
+                let dock_p = self.immersive_dock_progress(now, height);
+                if dock_p > 0.0001 {
+                    let main = if self.is_phone() {
+                        self.render_phone_main(window, cx, true)
+                    } else {
+                        self.render_main(window, cx, true)
+                    };
+                    // 沉浸层必须绝对定位覆盖在主面板之上；作为普通 flex 子元素
+                    // 会被排到主面板后面/下方，拖拽时只剩主面板可见。
+                    div()
+                        .size_full()
+                        .relative()
+                        .child(main)
+                        .child(div().absolute().inset_0().child(immersive))
+                        .into_any_element()
                 } else {
-                    self.render_main(window, cx, true)
-                };
-                // 沉浸层必须绝对定位覆盖在主面板之上；作为普通 flex 子元素
-                // 会被排到主面板后面/下方，拖拽时只剩主面板可见。
-                return div()
-                    .size_full()
-                    .relative()
-                    .child(main)
-                    .child(div().absolute().inset_0().child(base))
-                    .into_any_element();
+                    immersive
+                }
             }
-            return base;
-        }
-        self.sync_phone_backdrop(cx);
-        if self.is_phone() {
-            self.render_phone_main(window, cx, false)
         } else {
-            self.render_main(window, cx, false)
+            self.sync_phone_backdrop(cx);
+            if self.is_phone() {
+                self.render_phone_main(window, cx, false)
+            } else {
+                self.render_main(window, cx, false)
+            }
+        };
+
+        // 音质解码信息弹窗盖在所有页面之上（宽屏/竖屏/手机播放页共用）。
+        if self.quality_dialog_open {
+            div()
+                .size_full()
+                .relative()
+                .child(base)
+                .child(self.render_quality_dialog(cx))
+                .into_any_element()
+        } else {
+            base
         }
     }
 }
@@ -9848,12 +10492,14 @@ impl ChordialApp {
         }))
         .on_action(cx.listener(|app, _: &CloseSettings, _, cx| {
             // Esc 在手机壳里兼作「关抽屉 / 返回播放」，与系统返回键同义。
-            if app.settings_open {
+            if app.quality_dialog_open {
+                app.quality_dialog_open = false;
+            } else if app.settings_open {
                 app.close_settings(cx);
             } else if app.drawer_open {
                 app.close_drawer(cx);
             } else if app.is_phone()
-                && app.phone_page == PhonePage::Browse
+                && matches!(app.phone_page, PhonePage::Browse | PhonePage::Lyrics)
                 && app.current_track.is_some()
             {
                 app.phone_page = PhonePage::Player;
@@ -9972,7 +10618,7 @@ impl ChordialApp {
 
     // ================= 手机壳（单列） =================
 
-    /// 手机壳：没有侧栏/右栏/Dock，播放页与曲库页二选一。
+    /// 手机壳：没有侧栏/右栏/Dock，播放页 / 歌词页 / 曲库页三选一。
     /// 抽屉是唯一的“全局面板”，承载曲库、队列、设置与均衡器入口。
     fn render_phone_main(
         &mut self,
@@ -9989,12 +10635,14 @@ impl ChordialApp {
         self.sync_phone_backdrop(cx);
         let width = self.viewport_width;
         let height = self.viewport_height;
-        let body: AnyElement = if self.phone_page == PhonePage::Player
-            && self.current_track.is_some()
-        {
-            self.render_phone_player(cx)
-        } else {
-            self.render_phone_browse(cx)
+        let body: AnyElement = match self.phone_page {
+            PhonePage::Player if self.current_track.is_some() => {
+                self.render_phone_player(window, cx)
+            }
+            PhonePage::Lyrics if self.current_track.is_some() => {
+                self.render_phone_lyrics(cx)
+            }
+            _ => self.render_phone_browse(cx),
         };
 
         let view = self
@@ -10019,7 +10667,8 @@ impl ChordialApp {
 
     /// 手机播放页：沿用竖屏沉浸层的 AMLL 几何（同一列宽、同一控件顺序），
     /// 只是把右上角的菜单入口换成手机壳抽屉，并保留窗口红绿灯。
-    fn render_phone_player(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_phone_player(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.sync_progress_clock();
         let width = self.viewport_width;
         let height = self.viewport_height;
         let cover = compact_cover_size(width, height);
@@ -10032,10 +10681,9 @@ impl ChordialApp {
             .max(0.0);
         let controls_h = (available - cover - COMPACT_COVER_GAP).max(0.0);
 
-        // 沉浸层展开/收起时主面板会作为“背后的页面”再渲染一次；此时
-        // `phone_backdrop` 为 false，绝不能再把同一个 lyric_view 塞进第二
+        // 不在手机播放/歌词态时，绝不能再把同一个 lyric_view 塞进第二
         // 棵树里。用静态渐变兜底，等沉浸层交还后再切回 Mesh。
-        let backdrop: AnyElement = if !self.no_bg && self.phone_backdrop {
+        let backdrop: AnyElement = if !self.no_bg && self.phone_backdrop != PhoneBackdrop::Off {
             div()
                 .absolute()
                 .inset_0()
@@ -10059,7 +10707,7 @@ impl ChordialApp {
             .relative()
             .overflow_hidden()
             .child(backdrop)
-            .child(self.render_phone_titlebar(true, cx))
+            .child(self.render_phone_titlebar(true, false, cx))
             .child(
                 div()
                     .absolute()
@@ -10073,8 +10721,24 @@ impl ChordialApp {
                         1.0,
                         true,
                         false,
+                        window,
                         cx,
                     )),
+            )
+            // 封面是手机播放页最自然的“打开歌词”入口。
+            .child(
+                div()
+                    .id("phone-cover-lyrics")
+                    .absolute()
+                    .left(px(left))
+                    .top(px(COMPACT_TOP))
+                    .w(px(cover))
+                    .h(px(cover))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|app, _, _, cx| {
+                        app.phone_page = PhonePage::Lyrics;
+                        cx.notify();
+                    })),
             )
             .child(
                 div()
@@ -10087,6 +10751,55 @@ impl ChordialApp {
             .into_any_element()
     }
 
+    /// 手机歌词页：同一个 Mesh 背景 + 可滚动/可点击 seek 的歌词。
+    /// 标题栏叠加在顶部，返回键回到播放页。
+    fn render_phone_lyrics(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let width = self.viewport_width;
+        let height = self.viewport_height;
+        let sweep = self.lyric_sweep_fade_em;
+        self.lyric_view.update(cx, |view, _| {
+            view.set_text_style(phone_lyric_style(&theme, width, height, sweep));
+        });
+        let has_lyrics = self.lyric_view.read(cx).has_lyrics();
+        let empty = (!has_lyrics).then(|| {
+            let message = self
+                .lyrics_status
+                .clone()
+                .unwrap_or_else(|| "暂无歌词".into());
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(40.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .line_height(px(20.0))
+                        .text_center()
+                        .text_color(gpui::white().opacity(0.60))
+                        .child(SharedString::from(message)),
+                )
+        });
+
+        div()
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(gpui::black())
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(self.lyric_view.clone()),
+            )
+            .child(self.render_phone_titlebar(true, true, cx))
+            .children(empty)
+            .into_any_element()
+    }
+
     /// 手机曲库页：桌面曲目板直接铺满，外层只负责标题栏与返回播放。
     fn render_phone_browse(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
@@ -10095,7 +10808,7 @@ impl ChordialApp {
             .flex()
             .flex_col()
             .bg(theme.surface)
-            .child(self.render_phone_titlebar(false, cx))
+            .child(self.render_phone_titlebar(false, false, cx))
             .child(
                 div()
                     .flex_1()
@@ -10106,17 +10819,27 @@ impl ChordialApp {
             .into_any_element()
     }
 
-    /// 手机标题栏：播放页为透明覆盖层（顶部轻压暗 + 居中 pill），
-    /// 曲库页为实心 sidebar 色。红绿灯与拖拽区保留，否则无边框窗口
-    /// 在手机宽度下会失去关闭/移动能力。
-    fn render_phone_titlebar(&self, overlay: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// 手机标题栏：播放页/歌词页为透明覆盖层（顶部轻压暗），曲库页为
+    /// 实心 sidebar 色。红绿灯与拖拽区保留，否则无边框窗口会失去
+    /// 关闭/移动能力；歌词页额外提供返回播放。
+    fn render_phone_titlebar(
+        &self,
+        overlay: bool,
+        back: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
+        let fg = if overlay {
+            gpui::white().opacity(0.78)
+        } else {
+            theme.text_dim
+        };
         let menu = {
             let weak = weak.clone();
             crate::widgets::icon_button(
                 &theme,
-                crate::icons::icon(crate::icons::Icon::Menu, 16.0, theme.text_dim),
+                crate::icons::icon(crate::icons::Icon::Menu, 16.0, fg),
                 30.0,
                 "菜单",
                 move |_, _, cx| {
@@ -10130,13 +10853,38 @@ impl ChordialApp {
                 },
             )
         };
+        let back_btn = back.then(|| {
+            let weak = weak.clone();
+            crate::widgets::icon_button(
+                &theme,
+                crate::icons::icon(crate::icons::Icon::ChevronLeft, 16.0, fg),
+                30.0,
+                "返回播放",
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Player;
+                        cx.notify();
+                    });
+                },
+            )
+        });
         let center = {
-            let pill = overlay.then(|| {
+            let pill = (overlay && !back).then(|| {
                 div()
                     .w(px(50.0))
                     .h(px(8.0))
                     .rounded(px(4.0))
                     .bg(gpui::white().opacity(0.176))
+                    .into_any_element()
+            });
+            let title = back.then(|| {
+                div()
+                    .max_w(px(210.0))
+                    .text_size(px(12.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(gpui::white().opacity(0.88))
+                    .text_ellipsis()
+                    .child(SharedString::from(self.current_title_text()))
                     .into_any_element()
             });
             let brand = (!overlay).then(|| {
@@ -10173,6 +10921,7 @@ impl ChordialApp {
                     .cursor(CursorStyle::OpenHand),
             )
             .children(pill)
+            .children(title)
             .children(brand)
         };
 
@@ -10201,13 +10950,14 @@ impl ChordialApp {
                     .border_color(theme.border)
             })
             .child(Self::traffic_lights())
+            .children(back_btn)
             .child(center)
             .child(menu);
         bar.into_any_element()
     }
 
-    /// 手机播放页底部：全屏 / 曲库 / 队列 / 更多。
-    /// 桌面 Dock 的内容不在这里重复，只保留手机最常用的出口。
+    /// 手机播放页底部：全屏 / 曲库 / 队列 / 歌词。
+    /// 抽屉仍由标题栏菜单与曲目信息「…」进入。
     fn phone_bottom_row(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let white = gpui::white();
         let weak = cx.entity().downgrade();
@@ -10273,19 +11023,16 @@ impl ChordialApp {
                 }),
             )
         };
-        let more = {
+        let lyrics = {
             let weak = weak.clone();
             btn(
-                crate::icons::Icon::More,
-                "phone-more",
-                self.drawer_open,
+                crate::icons::Icon::Lyrics,
+                "phone-lyrics",
+                false,
                 Box::new(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
-                        if app.drawer_open {
-                            app.close_drawer(cx);
-                        } else {
-                            app.open_drawer(cx);
-                        }
+                        app.phone_page = PhonePage::Lyrics;
+                        cx.notify();
                     });
                 }),
             )
@@ -10308,7 +11055,7 @@ impl ChordialApp {
                     .gap(px(if width < 240.0 { 8.0 } else { 14.0 }))
                     .child(library)
                     .child(queue)
-                    .child(more),
+                    .child(lyrics),
             )
             .into_any_element()
     }

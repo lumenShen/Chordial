@@ -910,6 +910,7 @@ dependencies = [
  "futures",
  "gpui",
  "image",
+ "libc",
  "lofty",
  "reqwest",
  "serde",
@@ -917,6 +918,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
+ "windows 0.58.0",
 ]
 
 [[package]]

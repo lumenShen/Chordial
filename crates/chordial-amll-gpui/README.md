@@ -60,7 +60,8 @@ delay、间奏判定（≥4s、下一行前 250ms）、对齐锚点、隐藏已�
 `max(1s, 词时长)`、`ease-out`、离场倒放）、强调词条件与缓动（含
 `chunkAndSplitLyricWords` 的非 CJK 合并语义）、强调词 `text-shadow` 辉光、
 Mesh 的 BHP 矩阵、UV 映射、旋转/音量/暗角/抖动公式、32×32 调色与滤镜顺序。
-扫光改为**整行一条 mask 前沿**（软边约 1.5em），不再按词各自重播。
+扫光改为**整行一条 mask 前沿**（软边默认 0.6em，设置 → 播放 → 歌词可调），
+不再按词各自重播。
 
 **背景的刻意差异**：鼓点包络在本实现里额外驱动网格顶点的整体呼吸（NDC
 向外扩张）与 RGB 提亮，让低分辨率、平滑封面上也能看清击打；AMLL 只做
@@ -116,8 +117,8 @@ UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0
   共享的水平渐变遮罩（`SpriteMask`）：`light_from` 左侧为亮层、`dark_from`
   右侧为暗层，中间按 fragment x 线性插值。前沿在一行的所有词之间**连续
   推进**（词开始时从上一词尾出发，词结束时到达本词尾），因此渐变带会压在
-  相邻的字/词之间，而不是每个词各自点亮一遍。软边宽度 = `1.5em`（约 1–2
-  个 CJK 字 / 3 个拉丁字符），让效果更像一整层 mask 扫过歌词行。遮罩在
+  相邻的字/词之间，而不是每个词各自点亮一遍。软边宽度默认 `0.6em`
+  （与 AMLL 一致），可在「设置 → 播放 → 歌词」调到 0.1–4.0em。遮罩在
   fragment shader 里计算，所以同一个宽字形内部也是连续渐变，并且同时作用
   于强调词的辉光 sprite。AMLL 非活跃行的亮/暗 mask alpha 都是 0.2（均匀
   暗层），活跃行是 1 / 0.4。
@@ -135,7 +136,7 @@ UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0
 | AMLL | 本 crate | 差异 |
 | --- | --- | --- |
 | CSS `filter: blur()` | 字形 alpha 掩码的可分离高斯 / 三次盒式卷积 | 逐字形而非整行；σ 量化 0.5 设备像素、上限 5px |
-| CSS `mask-image` 扫光 | `SpriteMask`：shader 内按 fragment x 的水平渐变 | 整行共享一条前沿（非逐词独立遮罩）；软边 1.5em 更宽，跨字/词更明显 |
+| CSS `mask-image` 扫光 | `SpriteMask`：shader 内按 fragment x 的水平渐变 | 整行共享一条前沿（非逐词独立遮罩）；软边默认 0.6em，设置内可调 |
 | 浏览器 CSS transition | 80ms 一阶平滑 | 过渡曲线略有不同 |
 | WebGL 三角形光栅（全分辨率） | 低分辨率 CPU 场 + GPU 上采样 | 同一公式；1/64 像素量，GPU 放大 |
 | `requestAnimationFrame` | gpui `request_animation_frame` | 与窗口刷新率一致 |

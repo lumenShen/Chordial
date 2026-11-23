@@ -313,6 +313,12 @@ pub struct Lyrics {
     /// 逐词时间行（可选；为空时按行级歌词渲染）。
     #[serde(default)]
     pub timed_lines: Vec<TimedLine>,
+    /// 制作信息（作词 / 作曲 / 编曲 / 制作人…），不参与歌词时间轴。
+    ///
+    /// YRC 的 JSON 元数据行、以及正文里混入的「作词: xxx」类行都会
+    /// 被截获到这里（已去重），由界面在歌词末尾作为补充信息展示。
+    #[serde(default)]
+    pub credits: Vec<String>,
 }
 
 impl Lyrics {
@@ -358,6 +364,7 @@ impl Lyrics {
             raw: raw.to_string(),
             translation: Vec::new(),
             timed_lines: Vec::new(),
+            credits: Vec::new(),
         }
     }
 
@@ -478,6 +485,7 @@ impl Lyrics {
             raw: raw.to_string(),
             translation: Vec::new(),
             timed_lines,
+            credits: Vec::new(),
         }
     }
 }

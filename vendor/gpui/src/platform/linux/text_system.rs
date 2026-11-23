@@ -337,7 +337,61 @@ impl CosmicTextSystemState {
                 }
             }
 
-            Ok((bitmap_size, image.data))
+            // `glyph_bounds` may be larger than the swash bitmap: the blurred
+            // path expands it by `3σ` on every side so the kernel has room to
+            // decay (`TextSystem::raster_bounds`). Swash always returns the
+            // tight bitmap, so blit it into a zero-filled rect at the right
+            // offset instead of handing back a short buffer (which would leave
+            // uninitialized rows in the glyph atlas).
+            let dst_width = bitmap_size.width.0.max(0) as usize;
+            let dst_height = bitmap_size.height.0.max(0) as usize;
+            let src_width = image.placement.width as usize;
+            let src_height = image.placement.height as usize;
+            if src_width == 0 || src_height == 0 {
+                return Ok((
+                    bitmap_size,
+                    vec![0u8; dst_width * dst_height * if params.is_emoji { 4 } else { 1 }],
+                ));
+            }
+            // Derive the pixel stride from the actual buffer (1 = alpha mask,
+            // 4 = color emoji) instead of trusting `is_emoji` alone.
+            let bytes_per_pixel = (image.data.len() / (src_width * src_height)).max(1);
+            let offset_x = image.placement.left - glyph_bounds.origin.x.0;
+            let offset_y = -image.placement.top - glyph_bounds.origin.y.0;
+
+            if offset_x == 0
+                && offset_y == 0
+                && src_width == dst_width
+                && src_height == dst_height
+            {
+                return Ok((bitmap_size, image.data));
+            }
+
+            let mut data = vec![0u8; dst_width * dst_height * bytes_per_pixel];
+            if src_width > 0 && src_height > 0 {
+                for src_y in 0..src_height {
+                    let dst_y = src_y as i32 + offset_y;
+                    if dst_y < 0 || dst_y as usize >= dst_height {
+                        continue;
+                    }
+                    let src_x_start = offset_x.min(0).unsigned_abs() as usize;
+                    if src_x_start >= src_width {
+                        continue;
+                    }
+                    let dst_x = offset_x + src_x_start as i32;
+                    if dst_x < 0 || dst_x as usize >= dst_width {
+                        continue;
+                    }
+                    let copy_pixels = (src_width - src_x_start).min(dst_width - dst_x as usize);
+                    let src_start = (src_y * src_width + src_x_start) * bytes_per_pixel;
+                    let src_end = src_start + copy_pixels * bytes_per_pixel;
+                    let dst_start = (dst_y as usize * dst_width + dst_x as usize) * bytes_per_pixel;
+                    let dst_end = dst_start + copy_pixels * bytes_per_pixel;
+                    data[dst_start..dst_end].copy_from_slice(&image.data[src_start..src_end]);
+                }
+            }
+
+            Ok((bitmap_size, data))
         }
     }
 

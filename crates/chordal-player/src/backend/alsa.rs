@@ -106,6 +106,9 @@ pub struct AlsaSink {
     pcm: PcmHandle,
     syms: AlsaSymbols,
     device: String,
+    /// 声道数：`snd_pcm_writei` 的单位是**帧**，而 [`AudioSink::write`]
+    /// 的契约是**样本**，两者必须显式换算。
+    channels: usize,
 }
 
 // SAFETY: snd_pcm_t 由独占线程使用；指针本身可移动（Send）。
@@ -143,8 +146,21 @@ impl AlsaSink {
                 "snd_pcm_set_params failed: {rc} (rate={sample_rate}, ch={channels})"
             )));
         }
-        Ok(Self { pcm, syms, device })
+        Ok(Self {
+            pcm,
+            syms,
+            device,
+            channels: channels.max(1),
+        })
     }
+}
+
+/// 交错样本数 → 帧数。`snd_pcm_writei` 的 `size` 参数是**帧**，而
+/// [`AudioSink::write`] 的入参与返回值都是**样本**；两者必须显式换算。
+/// 传样本数会让 alsa-lib 每次多读一倍缓冲（越过切片末尾），听感上是
+/// 周期性「呲呲」爆音。
+fn frames_from_samples(samples: usize, channels: usize) -> usize {
+    samples / channels.max(1)
 }
 
 impl AudioSink for AlsaSink {
@@ -153,27 +169,35 @@ impl AudioSink for AlsaSink {
         if samples == 0 {
             return Ok(0);
         }
-        let mut remaining = samples;
-        let mut offset = 0usize;
-        while remaining > 0 {
+        let channels = self.channels;
+        let frames = frames_from_samples(samples, channels);
+        if frames == 0 {
+            return Ok(0);
+        }
+        let mut written_frames = 0usize;
+        while written_frames < frames {
+            let offset_samples = written_frames * channels;
             let rc = unsafe {
                 (self.syms.writei)(
                     self.pcm,
-                    interleaved[offset..].as_ptr() as *const libc::c_void,
-                    remaining as libc::c_ulong,
+                    interleaved[offset_samples..].as_ptr() as *const libc::c_void,
+                    (frames - written_frames) as libc::c_ulong,
                 )
             };
-            if rc >= 0 {
-                let written = rc as usize;
-                offset += written;
-                remaining -= written;
+            if rc > 0 {
+                written_frames += rc as usize;
+                continue;
+            }
+            if rc == 0 {
+                // 阻塞模式下不应发生；避免忙等成死循环。
+                std::thread::sleep(std::time::Duration::from_micros(500));
                 continue;
             }
             let err = rc as i32;
             if err == -EPIPE || err == -ESTRPIPE {
-                // 欠载/流恢复：prepare 后重试。O(1) 系统调用。
+                // 欠载/流恢复：recover 成功后重试。O(1) 系统调用。
                 let r = unsafe { (self.syms.recover)(self.pcm, err, 1) };
-                if r != 0 {
+                if r < 0 {
                     let r2 = unsafe { (self.syms.prepare)(self.pcm) };
                     if r2 != 0 {
                         return Err(CoreError::Other(format!("alsa recover failed: {r2}")));
@@ -183,7 +207,7 @@ impl AudioSink for AlsaSink {
             }
             return Err(CoreError::Other(format!("snd_pcm_writei failed: {err}")));
         }
-        Ok(samples)
+        Ok(frames * channels)
     }
 
     fn flush(&mut self) -> CoreResult<()> {
@@ -232,6 +256,16 @@ impl Drop for AlsaSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writei_size_is_frames_not_samples() {
+        // 回归：曾把样本数直接当帧数传给 snd_pcm_writei，导致每次写多读一倍数据。
+        assert_eq!(frames_from_samples(8192, 2), 4096);
+        assert_eq!(frames_from_samples(8193, 2), 4096);
+        assert_eq!(frames_from_samples(1024, 1), 1024);
+        assert_eq!(frames_from_samples(6, 2), 3);
+        assert_eq!(frames_from_samples(1, 2), 0);
+    }
 
     #[test]
     fn alsa_load_gracefully_fails_without_lib() {

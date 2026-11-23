@@ -29,3 +29,15 @@ tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 unicode-segmentation = { workspace = true }
 dirs = { workspace = true }
+
+# 崩溃兜底：Unix 安装致命信号处理，Windows 安装 unhandled exception filter。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_UI_WindowsAndMessaging",
+] }

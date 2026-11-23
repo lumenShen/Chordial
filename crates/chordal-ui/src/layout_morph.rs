@@ -219,8 +219,9 @@ pub const INFO_ACTION_W: f32 = 35.0;
 pub const COMPACT_TOP: f32 = 56.0;
 pub const COMPACT_BOTTOM: f32 = 16.0;
 pub const COMPACT_DOCK_H: f32 = 40.0;
-/// 封面与信息区之间留 20px；窗口过矮时先缩封面，不缩控件。
-pub const COMPACT_COVER_GAP: f32 = 20.0;
+/// 封面与信息区之间留 28px：AMLL horizontal 的 8px grid gap 加上控件列的
+/// `margin-top: calc(-8px + 1.75em)`（1em = 16px）。
+pub const COMPACT_COVER_GAP: f32 = 28.0;
 pub const COMPACT_MIN_CONTROLS: f32 = 196.0;
 
 pub const QUEUE_TOP_PAD: f32 = 4.0;
@@ -250,12 +251,14 @@ pub fn wide_cover_size(width: f32, height: f32) -> f32 {
     }
 }
 
-/// 宽屏封面顶部 y（drag 0.12fr / 40px thumb / gap 8 / gap 8）。
+/// 宽屏封面顶部 y。AMLL grid：drag(.45fr) / thumb(auto=2×2vh=36) /
+/// cover / music-info(3fr) / bottom(0fr) / spacer(.3fr)，gap 8。
+/// 剩余 fr 高度 = H - cover - 36 - 5×8。
 pub fn wide_cover_top(width: f32, height: f32) -> f32 {
     let cover = wide_cover_size(width, height);
-    let fr = (height - 120.0 - cover).max(0.0);
+    let fr = (height - cover - 76.0).max(0.0);
     let drag = fr * 0.12;
-    drag + 8.0 + 40.0 + 8.0
+    drag + 8.0 + 36.0 + 8.0
 }
 
 /// 宽屏播放列的 x：定位在左侧 45% 歌词分栏的中心。

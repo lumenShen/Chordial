@@ -65,6 +65,10 @@ pub struct AppConfig {
     /// 平滑滚动（滚轮/触控板）。默认关闭，保留系统原生手感。
     #[serde(default)]
     pub smooth_scroll: bool,
+    /// 动态歌词整行扫光的渐变带宽度（em，相对主字号）。
+    /// 越大软边越宽、跨字/词越明显；默认 0.6。
+    #[serde(default = "default_lyric_sweep_fade_em")]
+    pub lyric_sweep_fade_em: f32,
     /// 背景鼓点监听频段下限（Hz）。
     #[serde(default = "default_beat_band_low_hz")]
     pub beat_band_low_hz: f32,
@@ -108,6 +112,26 @@ fn default_beat_band_high_hz() -> f32 {
 /// 背景鼓点视觉效果默认倍率（0..=1.5）。
 pub const DEFAULT_BEAT_STRENGTH: f32 = 0.5;
 
+/// 整行扫光渐变带默认宽度（em）：与 AMLL 的 `wordFadeWidth` 一致。
+pub const DEFAULT_LYRIC_SWEEP_FADE_EM: f32 = 0.6;
+
+/// 扫光宽度的合法范围（em）。过小会退化成硬边，过大则整行长期处于半亮。
+pub const LYRIC_SWEEP_FADE_EM_MIN: f32 = 0.1;
+pub const LYRIC_SWEEP_FADE_EM_MAX: f32 = 4.0;
+
+fn default_lyric_sweep_fade_em() -> f32 {
+    DEFAULT_LYRIC_SWEEP_FADE_EM
+}
+
+/// 把扫光宽度夹到可渲染范围；手改配置与设置输入框共用。
+pub fn clamp_lyric_sweep_fade_em(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(LYRIC_SWEEP_FADE_EM_MIN, LYRIC_SWEEP_FADE_EM_MAX)
+    } else {
+        DEFAULT_LYRIC_SWEEP_FADE_EM
+    }
+}
+
 fn default_beat_strength() -> f32 {
     DEFAULT_BEAT_STRENGTH
 }
@@ -126,6 +150,7 @@ impl Default for AppConfig {
             download_dir: default_download_dir(),
             source_preference: SourcePreference::Auto,
             smooth_scroll: false,
+            lyric_sweep_fade_em: DEFAULT_LYRIC_SWEEP_FADE_EM,
             beat_band_low_hz: chordal_player::DEFAULT_BEAT_BAND.0,
             beat_band_high_hz: chordal_player::DEFAULT_BEAT_BAND.1,
             beat_strength: DEFAULT_BEAT_STRENGTH,
@@ -157,6 +182,7 @@ pub fn load_or_default() -> AppConfig {
             Ok(mut cfg) => {
                 // 手改配置时也保证倍率落在可渲染范围。
                 cfg.beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
+                cfg.lyric_sweep_fade_em = clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
                 return cfg;
             }
             Err(e) => {
@@ -195,6 +221,21 @@ mod tests {
     }
 
     #[test]
+    fn lyric_sweep_fade_defaults_to_amll_width() {
+        assert!((AppConfig::default().lyric_sweep_fade_em - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lyric_sweep_fade_is_clamped() {
+        assert_eq!(clamp_lyric_sweep_fade_em(0.0), LYRIC_SWEEP_FADE_EM_MIN);
+        assert_eq!(clamp_lyric_sweep_fade_em(9.0), LYRIC_SWEEP_FADE_EM_MAX);
+        assert_eq!(
+            clamp_lyric_sweep_fade_em(f32::NAN),
+            DEFAULT_LYRIC_SWEEP_FADE_EM
+        );
+    }
+
+    #[test]
     fn smooth_scroll_roundtrips() {
         let mut cfg = AppConfig::default();
         cfg.smooth_scroll = true;
@@ -217,5 +258,6 @@ mod tests {
         }"#;
         let parsed: AppConfig = serde_json::from_str(json).unwrap();
         assert!(!parsed.smooth_scroll);
+        assert!((parsed.lyric_sweep_fade_em - 0.6).abs() < 1e-6);
     }
 }
