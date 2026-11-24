@@ -183,7 +183,7 @@ impl ChordialApp {
 
         let view = self
             .main_root(background, cx)
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(window, cx))
             .child(middle)
             .child(gpui::batch_layer(self.render_dock(cx)))
             .when(self.dock_menu.is_some(), |d| {
@@ -867,7 +867,7 @@ impl ChordialApp {
                         app.view_tab = ViewTab::Library;
                         app.library_filter = LibraryFilter::Queue;
                         app.phone_sheet = None;
-                        app.motion.phone_sheet = None;
+                        app.phone_sheet_spring = None;
                         cx.notify();
                     });
                 })

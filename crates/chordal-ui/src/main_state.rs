@@ -13,7 +13,6 @@ use chordal_player::Player;
 use gpui::{App, Global};
 
 use crate::app::SourceBuilder;
-use crate::motion::MotionTuning;
 
 #[allow(dead_code)]
 pub struct Globals {
@@ -25,8 +24,6 @@ pub struct Globals {
     /// 具体类型句柄：本地源需要触发扫描/读统计，NetEase 需要账号与推荐接口。
     pub local_sources: HashMap<SourceId, Arc<LocalSource>>,
     pub netease_sources: HashMap<SourceId, Arc<NeteaseSource>>,
-    /// 用户可调的动画手感：所有新动画从这里读取，进程范围一致。
-    pub motion_tuning: MotionTuning,
 }
 
 impl Global for Globals {}
@@ -37,7 +34,6 @@ pub fn install(
     builders: HashMap<SourceId, SourceBuilder>,
     local_sources: HashMap<SourceId, Arc<LocalSource>>,
     netease_sources: HashMap<SourceId, Arc<NeteaseSource>>,
-    motion_tuning: MotionTuning,
     cx: &mut App,
 ) {
     cx.set_global(Globals {
@@ -46,7 +42,6 @@ pub fn install(
         builders,
         local_sources,
         netease_sources,
-        motion_tuning,
     });
 }
 

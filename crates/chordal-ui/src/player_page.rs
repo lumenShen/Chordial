@@ -7,8 +7,6 @@
 
 use std::time::Instant;
 
-use crate::motion::{MotionSpring, MotionTuning, PROGRESS_TOL};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortraitPage {
     Art,
@@ -44,11 +42,12 @@ pub struct Transition {
     pub from: PortraitPage,
     pub to: PortraitPage,
     pub kind: TransitionKind,
-    spring: MotionSpring,
+    pub start: Instant,
+    pub duration_ms: f32,
 }
 
 impl Transition {
-    pub fn new(from: PortraitPage, to: PortraitPage, tuning: MotionTuning) -> Self {
+    pub fn new(from: PortraitPage, to: PortraitPage) -> Self {
         let kind = TransitionKind::between(from, to);
         let duration_ms = match kind {
             TransitionKind::Fade => 160.0,
@@ -58,25 +57,21 @@ impl Transition {
             from,
             to,
             kind,
-            spring: tuning.spring(
-                duration_ms,
-                0.0,
-                1.0,
-                0.0,
-                Instant::now(),
-                PROGRESS_TOL.0,
-                PROGRESS_TOL.1,
-            ),
+            start: Instant::now(),
+            duration_ms,
         }
     }
 
-    /// 0..1 的弹簧进度。
+    /// 0..1 的缓动进度（ease-out cubic）。
     pub fn progress(&self, now: Instant) -> f32 {
-        self.spring.value(now).clamp(0.0, 1.0)
+        let t = (now.saturating_duration_since(self.start).as_secs_f32() * 1000.0
+            / self.duration_ms)
+            .clamp(0.0, 1.0);
+        1.0 - (1.0 - t).powi(3)
     }
 
     pub fn done(&self, now: Instant) -> bool {
-        self.spring.done(now)
+        now.saturating_duration_since(self.start).as_secs_f32() * 1000.0 >= self.duration_ms
     }
 
     /// 返回 `(from_offset, from_opacity, to_offset, to_opacity)`。
@@ -108,19 +103,11 @@ mod tests {
 
     #[test]
     fn vertical_frames_start_and_end_cleanly() {
-        let tr = Transition::new(
-            PortraitPage::Art,
-            PortraitPage::Queue,
-            MotionTuning::default(),
-        );
-        let start = Instant::now();
-        let (from_y, _, to_y, _) = tr.frames(start, 800.0, 1000.0);
-        assert!(from_y.abs() < 1.0);
-        assert!((to_y - 1000.0).abs() < 1.0);
-
-        let end = start + std::time::Duration::from_secs(2);
-        assert!(tr.done(end));
-        let (from_y, _, to_y, _) = tr.frames(end, 800.0, 1000.0);
+        let mut tr = Transition::new(PortraitPage::Art, PortraitPage::Queue);
+        tr.duration_ms = 320.0;
+        let now = tr.start + std::time::Duration::from_millis(320);
+        assert!(tr.done(now));
+        let (from_y, _, to_y, _) = tr.frames(now, 800.0, 1000.0);
         assert!(from_y < -999.0);
         assert!(to_y.abs() < 1.0);
     }

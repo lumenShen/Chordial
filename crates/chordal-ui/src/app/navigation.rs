@@ -3,46 +3,23 @@
 //! 从 app.rs 拆分而来；仅做代码搬移，行为不变。
 
 use super::*;
-use crate::motion::PROGRESS_TOL;
 
 impl ChordialApp {
     pub(super) fn enter_immersive(&mut self, cx: &mut Context<Self>) {
         // 若上一次收起还没结束就再次进入，从当前画面位置接着展开，
         // 避免卡片先弹回满屏或先跳回 Dock 再重播一遍。
         let now = Instant::now();
-        // 若上一次收起还在跑，继承它的位置与速度，避免连续进出时倒退再重播。
-        let (p, velocity) = self
-            .motion
-            .dock
-            .as_ref()
-            .map(|s| {
-                let sample = s.sample(now);
-                (sample.value, sample.velocity)
-            })
-            .unwrap_or((0.0, 0.0));
-        let p = p.clamp(0.0, 1.0);
-        self.motion.dock_collapsing = false;
+        let p = self
+            .immersive_dock_progress(now, self.viewport_height)
+            .clamp(0.0, 1.0);
+        self.immersive_collapse = None;
+        self.immersive = true;
         self.immersive = true;
         self.sheet_drag = None;
         // 顶部把手先展开成「拖动/ESC 退出」文案，5s 后回收成小白条。
         // 展示期本身是静态画面，不逐帧重绘；只定时唤醒一次接上淡出动画。
         let hint_started = Instant::now();
         self.immersive_hint_at = Some(hint_started);
-        // 5s 静态保持期由上面的定时唤醒负责；弹簧起点放在保持期结束之后，
-        // 因此保持期既不采样弹簧也不请求动画帧。
-        self.motion.hint = Some(
-            self.motion_tuning
-                .spring(
-                    Self::IMMERSIVE_HINT_FADE_MS,
-                    1.0,
-                    0.0,
-                    0.0,
-                    hint_started,
-                    PROGRESS_TOL.0,
-                    PROGRESS_TOL.1,
-                )
-                .delayed(Self::IMMERSIVE_HINT_HOLD_MS / 1000.0),
-        );
         let weak = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             cx.background_executor()
@@ -59,26 +36,17 @@ impl ChordialApp {
         .detach();
         // Dock→全屏：第一帧就是（当前进度的）Dock 卡片，随后与共享封面/曲名
         // 一起放大到满窗。
-        self.motion.dock = Some(self.motion_tuning.spring(
-            Self::DOCK_EXPAND_MS,
+        self.immersive_expand = Some(SpringSettle::new(
             p,
             0.0,
-            velocity,
+            0.0,
             now,
-            PROGRESS_TOL.0,
-            PROGRESS_TOL.1,
+            Self::EXPAND_DAMPING,
+            Self::EXPAND_STIFFNESS,
         ));
         self.portrait_page = PortraitPage::Art;
         self.portrait_transition = None;
-        self.motion.portrait_enter = Some(self.motion_tuning.spring(
-            260.0,
-            0.0,
-            1.0,
-            0.0,
-            now,
-            PROGRESS_TOL.0,
-            PROGRESS_TOL.1,
-        ));
+        self.portrait_enter = Some(Instant::now());
         self.portrait_toast = None;
         self.hide_drawer_now();
         self.wide_lyrics_hidden = false;
@@ -88,8 +56,7 @@ impl ChordialApp {
         self.stage_chrome_hidden = false;
         self.stage_chrome_at = now;
         self.stage_last_input_at = now;
-        self.motion.stage = None;
-        self.motion.chrome = None;
+        self.stage_motion = None;
         // AMLL：页面打开时所有 MediaButton 的 SVG 内容重新挂载 → pressed 回弹；
         // 上一首/下一首的双箭头同时播放一次合并入场动画。
         self.ui_anim_enter = Some(Instant::now());
@@ -99,7 +66,7 @@ impl ChordialApp {
         self.ui_anim_volume = None;
         self.last_volume_input = self.player_status.volume;
         self.quality_dialog_open = false;
-        self.motion.cover = None;
+        self.cover_scale_anim = None;
         self.ensure_ui_anim_ticker(cx);
         // 沉浸层会接管 `lyric_view` 的样式与背景；先撤销手机壳的 Mesh
         // 背景标记，退出沉浸后下一帧才能重新套用手机播放页样式。
@@ -207,13 +174,9 @@ impl ChordialApp {
         // 队列是覆盖在播放页上的子页面，整页纵向位移。
         let moving_page = from != page;
         if moving_page {
-            let transition = Transition::new(from, page, self.motion_tuning);
-            self.stage_spring_to(
-                target_mode,
-                current_mode,
-                now,
-                self.motion_tuning.spec(320.0),
-            );
+            let transition = Transition::new(from, page);
+            self.stage_motion =
+                Some(self.layout_motion_to(target_mode, current_mode, now, transition.duration_ms));
             self.portrait_transition = Some(transition);
         } else {
             self.portrait_transition = None;
@@ -237,34 +200,28 @@ impl ChordialApp {
         }
     }
 
-    /// 构造/打断一段 First→Last 几何补间。`fallback` 是当前静止模态；若上一段
-    /// 补间尚未结束，就从它的当前几何与速度继续，避免连续点击时画面跳变。
-    pub(super) fn stage_spring_to(
-        &mut self,
+    /// 构造一段 First→Last 补间。`fallback` 是当前静止模态；若上一段补间
+    /// 尚未结束，则从它的当前插值几何继续，避免连续点击时画面跳变。
+    pub(super) fn layout_motion_to(
+        &self,
         to_mode: StageMode,
         fallback: StageMode,
         now: Instant,
-        spec: crate::motion::MotionSpec,
-    ) {
-        let to = immersive_geometry(to_mode, self.viewport_width, self.viewport_height);
-        if let Some(spring) = self.motion.stage.as_mut() {
-            spring.retarget(to, to_mode, now);
-            return;
-        }
+        duration_ms: f32,
+    ) -> LayoutMotion {
         let from = self.current_stage_geometry(fallback, now);
-        self.motion.stage = Some(crate::motion::StageSpring::new(
-            from, to, fallback, to_mode, now, spec,
-        ));
+        let to = immersive_geometry(to_mode, self.viewport_width, self.viewport_height);
+        LayoutMotion::starting_at(fallback, from, to_mode, to, now, duration_ms)
     }
 
-    /// 当前屏幕上的共享元素几何：补间进行中就用采样结果。
+    /// 当前屏幕上的共享元素几何：补间进行中就用插值结果。
     pub(super) fn current_stage_geometry(
         &self,
         fallback: StageMode,
         now: Instant,
     ) -> StageGeometry {
-        if let Some(spring) = self.motion.stage.as_ref().filter(|m| m.active(now)) {
-            return spring.sample(now);
+        if let Some(motion) = self.stage_motion.filter(|motion| motion.active(now)) {
+            return motion.geometry(now);
         }
         immersive_geometry(fallback, self.viewport_width, self.viewport_height)
     }
@@ -341,7 +298,7 @@ impl ChordialApp {
             } else {
                 StageMode::CompactArt
             };
-            self.stage_spring_to(to, from, now, self.motion_tuning.spec(320.0));
+            self.stage_motion = Some(self.layout_motion_to(to, from, now, 320.0));
             self.ensure_ui_anim_ticker(cx);
         }
         self.note_stage_interaction(cx);
@@ -405,7 +362,7 @@ impl ChordialApp {
         if self.is_phone() {
             self.phone_page = PhonePage::Browse;
             self.phone_sheet = None;
-            self.motion.phone_sheet = None;
+            self.phone_sheet_spring = None;
             self.phone_sheet_anchor = None;
             self.phone_edge_swipe = None;
             self.selection = None;
@@ -428,8 +385,8 @@ impl ChordialApp {
         if let Some(drag) = self.phone_sheet.as_ref() {
             return drag.progress(now);
         }
-        if let Some(spring) = self.motion.phone_sheet.as_ref() {
-            return spring.value(now).clamp(0.0, 1.0);
+        if let Some(spring) = self.phone_sheet_spring {
+            return spring.position(now).clamp(0.0, 1.0);
         }
         if self.phone_page == PhonePage::Player {
             1.0
@@ -439,14 +396,10 @@ impl ChordialApp {
     }
 
     pub(super) fn phone_sheet_animating(&self, now: Instant) -> bool {
-        self.phone_sheet
-            .as_ref()
-            .is_some_and(|drag| drag.animating(now))
+        self.phone_sheet.is_some_and(|drag| drag.animating(now))
             || self
-                .motion
-                .phone_sheet
-                .as_ref()
-                .is_some_and(|spring| spring.active(now))
+                .phone_sheet_spring
+                .is_some_and(|spring| !spring.settled(now))
     }
 
     /// 点击 mini player / 从曲库选歌：从当前位置弹性展开播放页。
@@ -462,15 +415,7 @@ impl ChordialApp {
         self.track_menu = None;
         self.selection = None;
         if from < 0.999 {
-            self.motion.phone_sheet = Some(self.motion_tuning.spring(
-                200.0,
-                from,
-                1.0,
-                0.0,
-                now,
-                PROGRESS_TOL.0,
-                PROGRESS_TOL.1,
-            ));
+            self.phone_sheet_spring = Some(SpringSettle::new(from, 1.0, 0.0, now, 25.0, 190.0));
             self.ensure_ui_anim_ticker(cx);
         }
         cx.notify();
@@ -484,15 +429,7 @@ impl ChordialApp {
         let now = Instant::now();
         let from = self.phone_sheet_progress(now);
         self.phone_sheet = None;
-        self.motion.phone_sheet = Some(self.motion_tuning.spring(
-            200.0,
-            from,
-            0.0,
-            0.0,
-            now,
-            PROGRESS_TOL.0,
-            PROGRESS_TOL.1,
-        ));
+        self.phone_sheet_spring = Some(SpringSettle::new(from, 0.0, 0.0, now, 26.0, 190.0));
         self.ensure_ui_anim_ticker(cx);
         cx.notify();
     }
@@ -503,7 +440,7 @@ impl ChordialApp {
         }
         let now = Instant::now();
         let start = self.phone_sheet_progress(now);
-        self.motion.phone_sheet = None;
+        self.phone_sheet_spring = None;
         self.phone_sheet = Some(SheetSwipe::begin(start, y, now));
         // 从 mini player 起手先把播放页挂出来，让第一帧就跟手；收起时
         // 页面会停在 Player，等 spring/手势落点决定是否回 Browse。
@@ -528,7 +465,7 @@ impl ChordialApp {
         let height = self.viewport_height.max(1.0);
         let now = Instant::now();
         if let Some(drag) = &mut self.phone_sheet {
-            if drag.release(height, now, self.motion_tuning) {
+            if drag.release(height, now) {
                 self.ensure_ui_anim_ticker(cx);
             } else if !drag.engaged() {
                 // 只是按住/轻点：按当前进度落在最近的一端，不留下一个
@@ -563,7 +500,7 @@ impl ChordialApp {
         }
         self.phone_sheet_anchor = None;
         let now = Instant::now();
-        self.motion.phone_sheet = None;
+        self.phone_sheet_spring = None;
         self.phone_page = PhonePage::Player;
         self.phone_sheet = Some(SheetSwipe::begin(0.0, start, now));
         self.update_phone_sheet_drag(y, cx);
@@ -683,26 +620,7 @@ impl ChordialApp {
             return;
         }
         self.row_click_suppress_until = Some(Instant::now() + Duration::from_millis(300));
-        let mut queue = self.queue.as_ref().clone();
-        if drag.from < queue.len() {
-            let track = queue.remove(drag.from);
-            let to = drag.to.min(queue.len());
-            queue.insert(to, track);
-            self.queue = Arc::new(queue);
-            self.queue_pos = self.queue_pos.map(|pos| {
-                if pos == drag.from {
-                    to
-                } else if drag.from < pos && to >= pos {
-                    pos - 1
-                } else if drag.from > pos && to <= pos {
-                    pos + 1
-                } else {
-                    pos
-                }
-            });
-            self.show_portrait_toast("已调整播放顺序", cx);
-        }
-        cx.notify();
+        self.queue_move(drag.from, drag.to, cx);
     }
 
     // ---- 封面 ⇄ 歌词 ----
@@ -734,7 +652,7 @@ impl ChordialApp {
             if swipe.engaged() {
                 self.phone_swipe_suppress_click = Some(now);
             }
-            if swipe.release(width, now, self.motion_tuning) {
+            if swipe.release(width, now) {
                 self.ensure_ui_anim_ticker(cx);
                 cx.notify();
             } else if !swipe.engaged() {
@@ -750,8 +668,9 @@ impl ChordialApp {
 
     // ---- 曲目菜单 / 多选 ----
 
-    /// 当前可见列表的快照（与 `play_from_list` 同源）。
-    pub(super) fn snapshot_list(&self, list: QueueList) -> Arc<Vec<Track>> {
+    /// 当前可见列表的快照。所有来源（搜索/曲库/队列/集合/歌单/推荐流）
+    /// 共用这一个解析器，`play_from_list` 与曲目菜单都走这里。
+    pub(super) fn snapshot_list(&self, list: &QueueList) -> Arc<Vec<Track>> {
         match list {
             QueueList::Search => match &self.source_route {
                 Some(route) => Arc::new(
@@ -770,6 +689,29 @@ impl ChordialApp {
                 .as_ref()
                 .map(|c| c.tracks.clone())
                 .unwrap_or_else(|| Arc::new(Vec::new())),
+            QueueList::Playlist(id) => self
+                .playlists
+                .get(id)
+                .map(|playlist| {
+                    Arc::new(
+                        playlist
+                            .entries
+                            .iter()
+                            .map(|entry| entry.track.clone())
+                            .collect(),
+                    )
+                })
+                .unwrap_or_else(|| Arc::new(Vec::new())),
+            QueueList::Feed { source, kind } => self
+                .source_feeds
+                .get(source)
+                .map(|feed| match kind {
+                    SourceFeedKind::Daily => Arc::new(feed.daily.clone()),
+                    SourceFeedKind::Fm => Arc::new(feed.fm.clone()),
+                    SourceFeedKind::Recommended | SourceFeedKind::Radar => Arc::new(Vec::new()),
+                })
+                .unwrap_or_else(|| Arc::new(Vec::new())),
+            QueueList::Snapshot(tracks) => tracks.clone(),
         }
     }
 
@@ -781,7 +723,7 @@ impl ChordialApp {
         y: f32,
         cx: &mut Context<Self>,
     ) {
-        let tracks = self.snapshot_list(list);
+        let tracks = self.snapshot_list(&list);
         let Some(track) = tracks.get(index).cloned() else {
             return;
         };
@@ -854,27 +796,37 @@ impl ChordialApp {
     }
 
     /// 下一首播放：插在当前曲目之后（没有当前曲目则排到队首）。
+    /// 按身份键去重，写入统一走 `set_queue`。
     pub(super) fn queue_play_next(&mut self, track: Track, cx: &mut Context<Self>) {
         let mut queue = self.queue.as_ref().clone();
         let insert_at = self
             .queue_pos
-            .map(|pos| (pos + 1).min(queue.len()))
-            .unwrap_or(0);
-        queue.insert(insert_at, track);
-        if self.queue_pos.is_none() {
-            // 未在播放时仅入队，不抢占播放。
-            self.queue_pos = None;
+            .map(|pos| pos + 1)
+            .unwrap_or(0)
+            .min(queue.len());
+        if queue
+            .iter()
+            .any(|existing| existing.identity_key() == track.identity_key())
+        {
+            self.info_message = Some("这首歌已经在播放队列里".into());
+            cx.notify();
+            return;
         }
-        self.queue = Arc::new(queue);
+        queue.insert(insert_at, track);
+        self.set_queue(Arc::new(queue), self.queue_refill.clone());
         self.show_portrait_toast("已设为下一首播放", cx);
         cx.notify();
     }
 
-    /// 追加到播放队列末尾。
+    /// 追加到播放队列末尾（按身份键去重）。
     pub(super) fn queue_append(&mut self, track: Track, cx: &mut Context<Self>) {
         let mut queue = self.queue.as_ref().clone();
-        queue.push(track);
-        self.queue = Arc::new(queue);
+        if Self::append_unique_tracks(&mut queue, vec![track]) == 0 {
+            self.info_message = Some("这首歌已经在播放队列里".into());
+            cx.notify();
+            return;
+        }
+        self.set_queue(Arc::new(queue), self.queue_refill.clone());
         self.show_portrait_toast("已添加到播放队列", cx);
         cx.notify();
     }
@@ -897,7 +849,7 @@ impl ChordialApp {
         index: usize,
         cx: &mut Context<Self>,
     ) {
-        let tracks = self.snapshot_list(list);
+        let tracks = self.snapshot_list(&list);
         if index >= tracks.len() {
             return;
         }
@@ -952,33 +904,33 @@ impl ChordialApp {
             }
             SelectionAction::PlayNext => {
                 let mut queue = self.queue.as_ref().clone();
-                let at = self
-                    .queue_pos
-                    .map(|pos| (pos + 1).min(queue.len()))
-                    .unwrap_or(0);
-                for (offset, track) in tracks.into_iter().enumerate() {
-                    queue.insert(at + offset, track);
-                }
-                self.queue = Arc::new(queue);
+                let mut seen: HashSet<String> = queue.iter().map(|t| t.identity_key()).collect();
+                let fresh: Vec<Track> = tracks
+                    .into_iter()
+                    .filter(|track| seen.insert(track.identity_key()))
+                    .collect();
+                let at = self.queue_pos.map(|pos| pos + 1).unwrap_or(0).min(queue.len());
+                queue.splice(at..at, fresh);
+                self.set_queue(Arc::new(queue), self.queue_refill.clone());
                 self.show_portrait_toast("已设为下一首播放", cx);
             }
             SelectionAction::Append => {
                 let mut queue = self.queue.as_ref().clone();
-                queue.extend(tracks);
-                self.queue = Arc::new(queue);
+                Self::append_unique_tracks(&mut queue, tracks);
+                self.set_queue(Arc::new(queue), self.queue_refill.clone());
                 self.show_portrait_toast("已添加到播放队列", cx);
             }
             SelectionAction::Remove => {
-                let ids = tracks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+                let keys: HashSet<String> = tracks.iter().map(|t| t.identity_key()).collect();
                 let mut queue = self.queue.as_ref().clone();
                 let current_id = self
                     .queue_pos
                     .and_then(|pos| queue.get(pos))
                     .map(|t| t.id.clone());
-                queue.retain(|t| !ids.contains(&t.id));
-                self.queue = Arc::new(queue);
-                self.queue_pos =
-                    current_id.and_then(|id| self.queue.iter().position(|t| t.id == id));
+                queue.retain(|t| !keys.contains(&t.identity_key()));
+                let pos = current_id.and_then(|id| queue.iter().position(|t| t.id == id));
+                self.set_queue(Arc::new(queue), self.queue_refill.clone());
+                self.queue_pos = pos;
                 self.show_portrait_toast("已从队列移除", cx);
             }
         }

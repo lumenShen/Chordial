@@ -35,11 +35,7 @@ fn guard_table_does_not_grow_without_bound() {
     for key in 0..(LOG_GUARD_MAX_CALLSITES as u64 * 4) {
         guard.allow_at(key, start + Duration::from_millis(key % 10));
     }
-    let entries = guard
-        .bursts
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .len();
+    let entries = guard.bursts.lock().unwrap_or_else(|e| e.into_inner()).len();
     assert!(
         entries <= LOG_GUARD_MAX_CALLSITES,
         "callsite table grew to {entries}"
@@ -78,13 +74,8 @@ fn repeated_events_are_dropped_before_hitting_the_writer() {
             tracing::error!(target: "chordial::test_storm", "同一个失败重复记录");
         }
     });
-    let text = String::from_utf8(
-        output
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone(),
-    )
-    .expect("utf8 log output");
+    let text = String::from_utf8(output.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .expect("utf8 log output");
     let lines = text.lines().count();
     assert!(lines >= 1, "第一条日志必须保留");
     assert!(

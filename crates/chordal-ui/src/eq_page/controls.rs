@@ -1,7 +1,7 @@
 //! EQ 页面支撑代码：controls（由 eq_page.rs 拆分，行为不变）。
 
-use super::*;
 use super::drawing::*;
+use super::*;
 
 // ================= 基础控件 =================
 
@@ -97,7 +97,10 @@ pub(super) fn eq_chip(
         .into_any_element()
 }
 
-pub(super) fn eq_search_box(pal: &EqPalette, view: gpui::Entity<crate::input::InputView>) -> AnyElement {
+pub(super) fn eq_search_box(
+    pal: &EqPalette,
+    view: gpui::Entity<crate::input::InputView>,
+) -> AnyElement {
     div()
         .h(px(38.0))
         .rounded(px(10.0))

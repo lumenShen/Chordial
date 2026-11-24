@@ -52,19 +52,18 @@ use crate::layout_morph::{
     DOCK_COVER_RADIUS, DOCK_GAP, DOCK_LINE_GAP, DOCK_PAD_BOTTOM, DOCK_PAD_TOP, DOCK_PAD_X,
     DOCK_PLAY_BTN, DOCK_TIMELINE_H, DOCK_TITLE_SIZE, DOCK_TRACK_PAD_X, DOCK_TRANSPORT_BTN,
     DOCK_TRANSPORT_GAP, DOCK_TRANSPORT_PAD_X, DOCK_UPPER_GAP, INFO_ACTION_GAP, INFO_LINE_RATIO,
-    StageGeometry, StageMode, StageRect, compact_content_w, compact_cover_size, dock_geometry,
-    dock_rect, immersive_geometry, info_action_side, info_text_width, stable_lyric_pad,
-    stage_bottom_rect, wide_column_x, wide_cover_size, wide_cover_top,
+    LayoutMotion, StageGeometry, StageMode, StageRect, compact_content_w, compact_cover_size,
+    dock_geometry, dock_rect, immersive_geometry, info_action_side, info_text_width, ramp,
+    stable_lyric_pad, stage_bottom_rect, wide_column_x, wide_cover_size, wide_cover_top,
 };
 use crate::lyrics::{cover_url, decode_data_url_image, fetch_cover_blocking, to_amll_lyrics};
 use crate::main_state::Globals;
-use crate::motion::{MotionSystem, MotionTuning, ramp};
 use crate::phone_gesture::{EdgeSwipe, SheetPage, SheetSwipe, SwipeOutcome};
 use crate::player_page::{PortraitPage, Transition};
 use crate::playlists::PlaylistStore;
 use crate::responsive::{MIN_WIDE_SPLIT_W, ViewportClass};
 use crate::settings::{SettingsAction, SettingsRuntime, SettingsView};
-use crate::sheet_drag::{SheetDrag, SheetDragOutcome};
+use crate::sheet_drag::{SheetDrag, SheetDragOutcome, SpringSettle};
 use crate::theme::{Appearance, Theme, fmt_ms};
 use types::*;
 
@@ -79,6 +78,7 @@ mod navigation;
 mod overlays;
 mod playback;
 mod playlist_ops;
+mod queue_ops;
 mod render_collection;
 mod render_dock;
 mod render_drawer;
@@ -246,6 +246,9 @@ pub struct ChordialApp {
     sidebar_open: bool,
     search_input: Entity<InputState>,
     search_input_view: Entity<InputView>,
+    /// 顶栏的全局搜索框：与面板搜索框共享同一个输入状态，但各自有独立的
+    /// 元素 id，避免两处同时挂载时 gpui 元素 id 冲突。
+    search_top_view: Entity<InputView>,
     search_kind: SearchKind,
     search_collections: Arc<Vec<CollectionSummary>>,
     search_gen: u64,
@@ -304,6 +307,8 @@ pub struct ChordialApp {
     phone_backdrop: PhoneBackdrop,
     /// 手机壳 mini player ⇄ 播放页的纵向跟手手势；None = 静止。
     phone_sheet: Option<SheetSwipe>,
+    /// 点击（非拖拽）展开/收起播放页时的弹簧；None = 静止。
+    phone_sheet_spring: Option<SpringSettle>,
     /// mini player 上按住但还没越过死区时的起点 y；渲染层据此铺一层
     /// 全窗捕获层，保证指针移出小条后手势仍然连续。
     phone_sheet_anchor: Option<f32>,
@@ -336,14 +341,13 @@ pub struct ChordialApp {
     immersive: bool,
     /// 沉浸页顶部拖拽条的下拉关闭手势；None = 当前没有手势。
     sheet_drag: Option<SheetDrag>,
+    /// 进入沉浸层时 Dock→全屏共享布局的展开弹簧。
+    immersive_expand: Option<SpringSettle>,
+    /// 离开沉浸层时全屏→Dock 的收起弹簧；与展开共用 `p` 语义（1=Dock，0=满屏）。
+    /// 只有收起结束才真正卸载沉浸子树，保证退出也有完整反向动画。
+    immersive_collapse: Option<SpringSettle>,
     /// 顶部把手文案提示的起点：进入沉浸页后展示 5s，再淡回小白条。
-    /// 文案的淡出曲线由 `motion.hint` 驱动，这里只保留一次性唤醒的时刻。
     immersive_hint_at: Option<Instant>,
-    /// 所有状态型动画的统一弹簧通道（Dock 展开/收起在其中共用 `dock`，
-    /// 1=Dock、0=满屏；只有收起结束才真正卸载沉浸子树）。
-    pub(crate) motion: MotionSystem,
-    /// 用户手感设置的进程内缓存；改动只影响此后新建的动画。
-    motion_tuning: MotionTuning,
 
     // ---- 沉浸层控件动画（AMLL MediaButton / VolumeControl 等价） ----
     /// 进入沉浸页的时刻：所有 MediaButton 播放 pressed 回弹，上一首/下一首
@@ -361,7 +365,9 @@ pub struct ChordialApp {
     show_remaining_time: bool,
     /// 音质标签点击后的解码信息弹窗。
     quality_dialog_open: bool,
-    /// 封面暂停缩放：AMLL Cover 在暂停时以 0.75 倍显示，走 `motion.cover` 弹簧。
+    /// 封面暂停缩放：AMLL Cover 在暂停时以 0.75 倍显示。
+    /// (开始时刻, 起始缩放, 目标缩放, 时长秒)。
+    cover_scale_anim: Option<(Instant, f32, f32, f32)>,
     /// 诊断：持续请求动画帧（CHORDIAL_BENCH_ANIM=1），用于 300Hz 压测。
     bench_anim: bool,
 
@@ -370,11 +376,15 @@ pub struct ChordialApp {
     pub(crate) force_portrait: bool,
     portrait_page: PortraitPage,
     portrait_transition: Option<Transition>,
+    portrait_enter: Option<Instant>,
     portrait_toast: Option<(String, Instant)>,
-    /// 底部「更多」抽屉：打开状态、当前二级页；显隐进度走 `motion.drawer`。
+    /// 底部「更多」抽屉：打开状态、动画起点、当前二级页。
     /// 布局 1 / 布局 2 共用同一只抽屉与同一组入口。
     drawer_open: bool,
+    drawer_at: Option<Instant>,
     drawer_page: DrawerPage,
+    /// 「添加到歌单」二级页内的一次性结果提示（新增 / 重复）。
+    drawer_add_message: Option<String>,
     /// 宽屏沉浸层里用户主动关闭歌词的状态；无歌词或关闭歌词时使用布局 2。
     wide_lyrics_hidden: bool,
     /// 布局 2（竖屏 / 窄窗 / 强制竖屏）里用户打开的全屏歌词。
@@ -392,6 +402,9 @@ pub struct ChordialApp {
     stage_chrome_at: Instant,
     /// 曲名/艺人行的悬停滚动（AMLL TextMarquee）。
     info_marquee: Option<InfoMarquee>,
+    /// 共享元素（封面 / 曲名 / 艺人）的布局补间。
+    /// 竖屏页面切换与宽屏歌词开/关共用同一套 First→Last 几何。
+    stage_motion: Option<LayoutMotion>,
     /// 竖屏播放队列的虚拟列表滚动句柄（进入队列时定位当前曲目）。
     queue_scroll: gpui::UniformListScrollHandle,
     /// 主曲目列表（曲库/搜索/集合/队列）的滚动句柄。
@@ -439,6 +452,7 @@ pub struct ChordialApp {
 
     // ---- 参数均衡器 ----
     eq_open: bool,
+    pub(crate) eq_open_at: Option<Instant>,
     pub(crate) eq: EqState,
     /// 持有输入框实体；视图通过 `eq_search_view` 使用。
     #[allow(dead_code)]
@@ -549,10 +563,11 @@ impl ChordialApp {
     const STAGE_IDLE_MS: f32 = 5000.0;
     /// 收起/恢复的淡入淡出与高度过渡时长。
     const STAGE_CHROME_FADE_MS: f32 = 260.0;
-    /// Dock→全屏展开：弹簧基准时长（实际手感再乘用户的时长/超伸倍率）。
-    const DOCK_EXPAND_MS: f32 = 320.0;
-    /// 全屏→Dock 收起：接近临界的阻尼由预设控制，这里只给基准时长。
-    const COLLAPSE_MS: f32 = 320.0;
+    /// Dock→全屏展开弹簧：轻微过冲后收敛。
+    const EXPAND_DAMPING: f32 = 21.0;
+    const EXPAND_STIFFNESS: f32 = 200.0;
+    /// 收起用接近临界的阻尼：不回弹到 Dock 之外，退出落点干净利落。
+    const COLLAPSE_DAMPING: f32 = 28.0;
 
     // ---------- 播放 ----------
 
@@ -603,8 +618,18 @@ impl Render for ChordialApp {
             // 真正变化时才重排。不能只比较字号：窗口高度恰好让沉浸字号落在
             // 44px 附近时，面板样式（MEDIUM 44 / 行高 1.35）会被误认为已应用。
             let style = immersive_lyric_style(width, height, self.lyric_sweep_fade_em);
-            self.lyric_view
-                .update(cx, |view, _| view.set_text_style(style));
+            // 竖屏歌词的底部控件遮罩用 CSS mask-image 语义：只淡化歌词字形，
+            // 不叠黑层；控件闲置收起时比例乘 chrome 一起归零，遮罩取消。
+            let bottom_mask = if self.compact_lyrics_visible(cx) {
+                render_stage::compact_lyric_bottom_mask(width, height)
+                    * self.stage_chrome_visibility(now)
+            } else {
+                -1.0
+            };
+            self.lyric_view.update(cx, |view, _| {
+                view.set_text_style(style);
+                view.set_bottom_mask(bottom_mask);
+            });
             let scope = PerfScope::enter("ui.render.pass");
             let immersive = self.render_immersive(window, cx);
             scope.finish(1);
@@ -639,6 +664,8 @@ impl Render for ChordialApp {
                 }
             }
         } else {
+            // 退出沉浸层后恢复样式自带的底部 mask，避免沿用它。
+            self.lyric_view.update(cx, |view, _| view.set_bottom_mask(-1.0));
             self.sync_phone_backdrop(cx);
             if self.is_phone() {
                 self.render_phone_main(window, cx, false)

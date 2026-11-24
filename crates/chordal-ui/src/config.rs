@@ -225,15 +225,6 @@ pub struct AppConfig {
     /// 默认 0.5，保持可感知但不过分剧烈。
     #[serde(default = "default_beat_strength")]
     pub beat_strength: f32,
-    /// 统一弹簧预设：决定基础角频率与阻尼比；缺省为均衡。
-    #[serde(default)]
-    pub motion_preset: crate::motion::MotionPreset,
-    /// 动画时长倍率：> 1 慢放、< 1 加速；默认 1.0，范围 0.25..=3.0。
-    #[serde(default = "default_animation_duration")]
-    pub animation_duration_multiplier: f32,
-    /// 动画回弹倍率：> 1 回弹更明显、< 1 更稳；默认 1.0，范围 0.25..=2.0。
-    #[serde(default = "default_animation_overshoot")]
-    pub animation_overshoot_multiplier: f32,
     /// 流体背景（Mesh Gradient）光栅分辨率除数：输出分辨率 = 显示区域 ÷ N。
     /// 越大越省性能、越模糊；默认 2（1/2 边长、1/4 像素量），更接近真实
     /// 场景的流体细节。光栅仍有 20 万像素硬上限，4K 下成本有界。
@@ -301,48 +292,6 @@ pub fn clamp_lyric_sweep_fade_em(value: f32) -> f32 {
 
 fn default_beat_strength() -> f32 {
     DEFAULT_BEAT_STRENGTH
-}
-
-/// 动画时长倍率默认值与合法范围（0.25–3.0）。
-pub const DEFAULT_ANIMATION_DURATION_MULTIPLIER: f32 = 1.0;
-pub const ANIMATION_DURATION_MULTIPLIER_MIN: f32 = 0.25;
-pub const ANIMATION_DURATION_MULTIPLIER_MAX: f32 = 3.0;
-
-/// 动画回弹倍率默认值与合法范围（0.25–2.0）。
-pub const DEFAULT_ANIMATION_OVERSHOOT_MULTIPLIER: f32 = 1.0;
-pub const ANIMATION_OVERSHOOT_MULTIPLIER_MIN: f32 = 0.25;
-pub const ANIMATION_OVERSHOOT_MULTIPLIER_MAX: f32 = 2.0;
-
-fn default_animation_duration() -> f32 {
-    DEFAULT_ANIMATION_DURATION_MULTIPLIER
-}
-
-fn default_animation_overshoot() -> f32 {
-    DEFAULT_ANIMATION_OVERSHOOT_MULTIPLIER
-}
-
-/// 把时长倍率夹到可渲染范围；手改配置与设置输入框共用。
-pub fn clamp_animation_duration_multiplier(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(
-            ANIMATION_DURATION_MULTIPLIER_MIN,
-            ANIMATION_DURATION_MULTIPLIER_MAX,
-        )
-    } else {
-        DEFAULT_ANIMATION_DURATION_MULTIPLIER
-    }
-}
-
-/// 把回弹倍率夹到可渲染范围；手改配置与设置输入框共用。
-pub fn clamp_animation_overshoot_multiplier(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(
-            ANIMATION_OVERSHOOT_MULTIPLIER_MIN,
-            ANIMATION_OVERSHOOT_MULTIPLIER_MAX,
-        )
-    } else {
-        DEFAULT_ANIMATION_OVERSHOOT_MULTIPLIER
-    }
 }
 
 /// 流体背景光栅分辨率默认除数：输出 = 显示区域 ÷ 2（硬上限仍生效）。
@@ -449,9 +398,6 @@ impl Default for AppConfig {
             beat_band_low_hz: chordal_player::DEFAULT_BEAT_BAND.0,
             beat_band_high_hz: chordal_player::DEFAULT_BEAT_BAND.1,
             beat_strength: DEFAULT_BEAT_STRENGTH,
-            motion_preset: crate::motion::MotionPreset::default(),
-            animation_duration_multiplier: DEFAULT_ANIMATION_DURATION_MULTIPLIER,
-            animation_overshoot_multiplier: DEFAULT_ANIMATION_OVERSHOOT_MULTIPLIER,
             background_render_divisor: DEFAULT_BACKGROUND_RENDER_DIVISOR,
             // 新配置直接用新默认值，无需迁移。
             bg_divisor_v2_migrated: true,
@@ -486,23 +432,6 @@ pub fn load_or_default() -> AppConfig {
                 // 手改配置时也保证倍率落在可渲染范围。
                 cfg.beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
                 cfg.lyric_sweep_fade_em = clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
-                // 动画倍率越界或非有限时回落到默认值，并落盘修正，避免下次启动重复纠正。
-                let duration =
-                    clamp_animation_duration_multiplier(cfg.animation_duration_multiplier);
-                if !cfg.animation_duration_multiplier.is_finite()
-                    || cfg.animation_duration_multiplier != duration
-                {
-                    cfg.animation_duration_multiplier = duration;
-                    dirty = true;
-                }
-                let overshoot =
-                    clamp_animation_overshoot_multiplier(cfg.animation_overshoot_multiplier);
-                if !cfg.animation_overshoot_multiplier.is_finite()
-                    || cfg.animation_overshoot_multiplier != overshoot
-                {
-                    cfg.animation_overshoot_multiplier = overshoot;
-                    dirty = true;
-                }
                 cfg.background_render_divisor =
                     clamp_background_render_divisor(cfg.background_render_divisor);
                 // 旧默认除数 4 一次性迁到 2；用户之后主动设回 4 不再被改写。
@@ -677,86 +606,5 @@ mod tests {
         let ids: std::collections::HashSet<_> =
             parsed.sources.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids.len(), parsed.sources.len());
-    }
-
-    #[test]
-    fn motion_settings_defaults_to_balanced_and_unit_multipliers() {
-        let cfg = AppConfig::default();
-        assert_eq!(cfg.motion_preset, crate::motion::MotionPreset::Balanced);
-        assert_eq!(
-            cfg.animation_duration_multiplier,
-            DEFAULT_ANIMATION_DURATION_MULTIPLIER
-        );
-        assert_eq!(
-            cfg.animation_overshoot_multiplier,
-            DEFAULT_ANIMATION_OVERSHOOT_MULTIPLIER
-        );
-    }
-
-    #[test]
-    fn motion_settings_roundtrip() {
-        let mut cfg = AppConfig::default();
-        cfg.motion_preset = crate::motion::MotionPreset::Bouncy;
-        cfg.animation_duration_multiplier = 1.5;
-        cfg.animation_overshoot_multiplier = 1.75;
-        let json = serde_json::to_string(&cfg).unwrap();
-        // 预设以小写字符串落盘，不依赖枚举顺序。
-        assert!(json.contains("\"motion_preset\":\"bouncy\""));
-        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.motion_preset, crate::motion::MotionPreset::Bouncy);
-        assert!((parsed.animation_duration_multiplier - 1.5).abs() < 1e-6);
-        assert!((parsed.animation_overshoot_multiplier - 1.75).abs() < 1e-6);
-    }
-
-    #[test]
-    fn legacy_config_without_motion_fields_defaults() {
-        let json = r#"{
-            "local_roots": [],
-            "netease": {
-                "base_url": "http://127.0.0.1:3000",
-                "cookie": null,
-                "level": null
-            },
-            "player_device": null,
-            "search_timeout_ms": 6000
-        }"#;
-        let parsed: AppConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.motion_preset, crate::motion::MotionPreset::Balanced);
-        assert_eq!(
-            parsed.animation_duration_multiplier,
-            DEFAULT_ANIMATION_DURATION_MULTIPLIER
-        );
-        assert_eq!(
-            parsed.animation_overshoot_multiplier,
-            DEFAULT_ANIMATION_OVERSHOOT_MULTIPLIER
-        );
-    }
-
-    #[test]
-    fn motion_multipliers_are_clamped() {
-        assert_eq!(
-            clamp_animation_duration_multiplier(0.0),
-            ANIMATION_DURATION_MULTIPLIER_MIN
-        );
-        assert_eq!(
-            clamp_animation_duration_multiplier(9.0),
-            ANIMATION_DURATION_MULTIPLIER_MAX
-        );
-        assert_eq!(
-            clamp_animation_duration_multiplier(f32::NAN),
-            DEFAULT_ANIMATION_DURATION_MULTIPLIER
-        );
-        assert_eq!(
-            clamp_animation_overshoot_multiplier(0.0),
-            ANIMATION_OVERSHOOT_MULTIPLIER_MIN
-        );
-        assert_eq!(
-            clamp_animation_overshoot_multiplier(9.0),
-            ANIMATION_OVERSHOOT_MULTIPLIER_MAX
-        );
-        assert_eq!(
-            clamp_animation_overshoot_multiplier(f32::NAN),
-            DEFAULT_ANIMATION_OVERSHOOT_MULTIPLIER
-        );
     }
 }

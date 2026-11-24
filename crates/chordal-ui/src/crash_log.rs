@@ -269,7 +269,11 @@ fn install_tracing() {
 
     let result = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_target(true).with_filter(LogStormGuard::new()))
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_filter(LogStormGuard::new()),
+        )
         .with(file_layer)
         .try_init();
     if result.is_err() {

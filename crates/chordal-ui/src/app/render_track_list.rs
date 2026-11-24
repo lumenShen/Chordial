@@ -126,6 +126,8 @@ impl ChordialApp {
         selected: bool,
         drag_from: Option<usize>,
         drag_to: Option<usize>,
+        style: &TrackRowStyle,
+        trailing: Option<AnyElement>,
     ) -> AnyElement {
         let is_current = queue_pos == Some(index) && queue_current_id == Some(&row.id);
         let drag_source = drag_from == Some(index);
@@ -163,10 +165,18 @@ impl ChordialApp {
                 .child(row.number.clone())
                 .into_any_element()
         };
-        let subtitle = match list {
+        let mut subtitle = match list {
             QueueList::Search => row.subtitle_search.clone(),
             _ => row.subtitle_default.clone(),
         };
+        if let Some(source) = &style.source_label {
+            subtitle = SharedString::from(format!("{subtitle}  ·  {source}"));
+        }
+        if style.unavailable {
+            subtitle = SharedString::from(format!("{subtitle}  ·  无法拉取"));
+        } else if style.local_substitute {
+            subtitle = SharedString::from(format!("{subtitle}  ·  本地替代"));
+        }
         // 只读取当前可见行的缓存图片；未加载/无封面时回落到音符占位。
         let cover_image = row.cover_key.as_ref().and_then(|key| {
             track_covers
@@ -200,8 +210,9 @@ impl ChordialApp {
                     });
         }
 
-        let more = (!select_mode).then(|| {
+        let more = (!select_mode && style.show_menu).then(|| {
             let weak = weak.clone();
+            let list = list.clone();
             div()
                 .id(gpui::ElementId::named_usize("track-more", index))
                 .size(px(24.0))
@@ -223,7 +234,7 @@ impl ChordialApp {
                         cx.stop_propagation();
                         let _ = weak.update(cx, |app, cx| {
                             app.open_track_menu(
-                                list,
+                                list.clone(),
                                 index,
                                 f32::from(event.position.x),
                                 f32::from(event.position.y),
@@ -234,7 +245,7 @@ impl ChordialApp {
                 )
                 .into_any_element()
         });
-        let add = (phone && !select_mode).then(|| {
+        let add = (phone && !select_mode && !style.compact).then(|| {
             let weak = weak.clone();
             let track = tracks.get(index).cloned();
             div()
@@ -264,8 +275,8 @@ impl ChordialApp {
         div()
             .id(gpui::ElementId::named_usize("track", index))
             .w_full()
-            .h(px(crate::theme::size::ROW))
-            .px(px(12.0))
+            .h(px(style.height))
+            .px(px(if style.compact { 8.0 } else { 12.0 }))
             .flex()
             .items_center()
             .gap(px(10.0))
@@ -285,11 +296,12 @@ impl ChordialApp {
             .hover(|s| s.bg(theme.hover))
             .on_mouse_down(gpui::MouseButton::Left, {
                 let weak = weak.clone();
+                let list = list.clone();
                 move |event: &MouseDownEvent, _, cx: &mut App| {
                     if phone && !select_mode {
                         let _ = weak.update(cx, |app, cx| {
                             app.start_long_press(
-                                list,
+                                list.clone(),
                                 index,
                                 f32::from(event.position.x),
                                 f32::from(event.position.y),
@@ -320,11 +332,12 @@ impl ChordialApp {
             })
             .on_mouse_down(gpui::MouseButton::Right, {
                 let weak = weak.clone();
+                let list = list.clone();
                 move |event: &MouseDownEvent, _, cx: &mut App| {
                     let _ = weak.update(cx, |app, cx| {
                         app.cancel_long_press();
                         app.open_track_menu(
-                            list,
+                            list.clone(),
                             index,
                             f32::from(event.position.x),
                             f32::from(event.position.y),
@@ -333,23 +346,26 @@ impl ChordialApp {
                     });
                 }
             })
-            .on_click(move |_, _, cx| {
-                let _ = weak.update(cx, |app, cx| {
-                    if app.row_click_suppressed() {
-                        return;
-                    }
-                    if app.selection.is_some() {
-                        app.toggle_selection(index, cx);
-                    } else {
-                        app.play_from_list(list, index, cx);
-                    }
-                });
+            .on_click({
+                let list = list.clone();
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        if app.row_click_suppressed() {
+                            return;
+                        }
+                        if app.selection.is_some() {
+                            app.toggle_selection(index, cx);
+                        } else {
+                            app.play_from_list(&list, index, cx);
+                        }
+                    });
+                }
             })
             .child(leading)
             .child(crate::widgets::cover_thumb(
                 theme,
                 cover_image,
-                34.0,
+                style.cover,
                 1.0,
                 crate::icons::icon(
                     crate::icons::Icon::Note,
@@ -389,7 +405,7 @@ impl ChordialApp {
                             .child(subtitle),
                     ),
             )
-            .when(!select_mode, |d| {
+            .when(!select_mode && style.show_duration, |d| {
                 d.child(
                     div()
                         .w(px(40.0))
@@ -399,6 +415,7 @@ impl ChordialApp {
                         .child(row.duration.clone()),
                 )
             })
+            .children(trailing)
             .children(add)
             .children(more)
             .into_any_element()
@@ -499,7 +516,7 @@ impl ChordialApp {
                             i,
                             row,
                             &covers,
-                            list,
+                            list.clone(),
                             queue_pos,
                             current_id.as_ref(),
                             weak.clone(),
@@ -509,6 +526,8 @@ impl ChordialApp {
                             selected,
                             drag.map(|d| d.from),
                             drag.map(|d| d.to),
+                            &TrackRowStyle::full(),
+                            None,
                         )
                     })
                 })

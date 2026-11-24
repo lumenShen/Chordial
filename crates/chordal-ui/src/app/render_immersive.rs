@@ -185,11 +185,7 @@ impl ChordialApp {
                     .on_mouse_move(cx.listener(move |app, event: &MouseMoveEvent, _, cx| {
                         if event.pressed_button == Some(gpui::MouseButton::Left) {
                             app.update_sheet_drag(f32::from(event.position.y), cx);
-                        } else if app
-                            .sheet_drag
-                            .as_ref()
-                            .is_some_and(|drag| !drag.animating(Instant::now()))
-                        {
+                        } else if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
                             app.release_sheet_drag(height, cx);
                         }
                     }))

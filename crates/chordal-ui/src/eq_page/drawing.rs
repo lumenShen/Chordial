@@ -454,7 +454,10 @@ pub(super) fn eq_band_fader(
         .into_any_element()
 }
 
-pub(super) fn fader_db_at(bounds: Bounds<gpui::Pixels>, position: gpui::Point<gpui::Pixels>) -> Option<f32> {
+pub(super) fn fader_db_at(
+    bounds: Bounds<gpui::Pixels>,
+    position: gpui::Point<gpui::Pixels>,
+) -> Option<f32> {
     let h = f32::from(bounds.size.height);
     if h <= 12.0 {
         return None;

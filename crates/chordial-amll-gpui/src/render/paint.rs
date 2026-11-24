@@ -14,6 +14,7 @@ pub(super) fn paint_lyric_line(
     time: u64,
     is_dynamic: bool,
     fade: LyricFade,
+    bottom_mask: f32,
 ) -> u64 {
     let scale = (line_frame.scale / 100.0).max(0.01);
     let line_top = bounds.top() + px(line_frame.top);
@@ -56,10 +57,17 @@ pub(super) fn paint_lyric_line(
     let opacity = line_frame.opacity * wrapper_alpha * fade.opacity;
     let blur = line_frame.blur;
 
-    // AMLL 歌词容器的 CSS mask：上下各按容器高度比例渐隐（竖向布局底部为 0）。
+    // AMLL 歌词容器的 CSS mask-image：上下各按容器高度比例渐隐。
+    // bottom_mask >= 0 时替换样式里的底部比例（运行期只改绘制 alpha，
+    // 不触发整形）；-1 表示沿用样式默认值。
     let container_h = f32::from(bounds.size.height);
     let fade_top = container_h * style.edge_fade_top.max(0.0);
-    let fade_bottom = container_h * style.edge_fade_bottom.max(0.0);
+    let bottom_fraction = if bottom_mask < 0.0 {
+        style.edge_fade_bottom
+    } else {
+        bottom_mask
+    };
+    let fade_bottom = container_h * bottom_fraction.max(0.0);
     let edge_for = |row_top: Pixels, row_h: f32| -> f32 {
         // 渐隐按字形在屏幕上的实际中心计算（行缩放围绕行框中心）。
         let center = f32::from(xform.y(row_top + px(row_h * 0.5)) - bounds.top());

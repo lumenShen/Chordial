@@ -1,10 +1,14 @@
 //! EQ 页面区块：compact_panels（由 eq_page.rs 拆分，行为不变）。
 
-use super::*;
 use super::controls::*;
+use super::*;
 
 impl ChordialApp {
-    pub(super) fn eq_inspector_compact(&self, pal: &EqPalette, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn eq_inspector_compact(
+        &self,
+        pal: &EqPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let weak = cx.entity().downgrade();
         let selected = self.eq.selected.and_then(|index| {
             self.eq

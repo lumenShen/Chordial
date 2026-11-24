@@ -163,30 +163,6 @@ impl ChordialApp {
                 self.commit_background_render_divisor(divisor, cx)
             }
             SettingsAction::SetLyricSweepFade(value) => self.commit_lyric_sweep_fade(value, cx),
-            SettingsAction::SetMotionPreset(preset) => self.commit_motion_tuning(
-                MotionTuning::new(
-                    preset,
-                    self.motion_tuning.duration,
-                    self.motion_tuning.overshoot,
-                ),
-                cx,
-            ),
-            SettingsAction::SetMotionDuration(value) => self.commit_motion_tuning(
-                MotionTuning::new(
-                    self.motion_tuning.preset,
-                    value,
-                    self.motion_tuning.overshoot,
-                ),
-                cx,
-            ),
-            SettingsAction::SetMotionOvershoot(value) => self.commit_motion_tuning(
-                MotionTuning::new(
-                    self.motion_tuning.preset,
-                    self.motion_tuning.duration,
-                    value,
-                ),
-                cx,
-            ),
             SettingsAction::SetEqEnabled(on) => self.set_eq_enabled(on, cx),
             SettingsAction::OpenEqualizer => {
                 self.settings_open = false;
@@ -259,24 +235,6 @@ impl ChordialApp {
                 self.spawn_library_scan_all(cx);
             }
         }
-    }
-
-    /// 动画手感：同步进程级全局、宿主快照与配置三处；改动只影响新动画。
-    pub(super) fn commit_motion_tuning(&mut self, tuning: MotionTuning, cx: &mut Context<Self>) {
-        // 动作可能来自输入框之外的调用方，这里再夹一次范围。
-        let tuning = MotionTuning::new(
-            tuning.preset,
-            crate::config::clamp_animation_duration_multiplier(tuning.duration),
-            crate::config::clamp_animation_overshoot_multiplier(tuning.overshoot),
-        );
-        cx.global_mut::<Globals>().motion_tuning = tuning;
-        self.motion_tuning = tuning;
-        let mut cfg = crate::config::load_or_default();
-        cfg.motion_preset = tuning.preset;
-        cfg.animation_duration_multiplier = tuning.duration;
-        cfg.animation_overshoot_multiplier = tuning.overshoot;
-        crate::config::save(&cfg);
-        cx.notify();
     }
 
     pub(super) fn apply_cache_dir(&mut self, text: String, cx: &mut Context<Self>) {

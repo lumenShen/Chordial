@@ -281,21 +281,27 @@ impl ChordialApp {
 
     /// 为虚拟列表当前可见的行请求封面。每张图只下载一次，失败也记下来，
     /// 否则来回滚动会对同一失效 URL 反复发起网络请求。
-    pub(super) fn request_track_covers(&mut self, indices: &[usize], tracks: &[Track], cx: &mut Context<Self>) {
+    pub(super) fn request_track_covers(
+        &mut self,
+        indices: &[usize],
+        tracks: &[Track],
+        cx: &mut Context<Self>,
+    ) {
         let mut to_load = Vec::new();
         {
-            let mut covers = self
-                .track_covers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut covers = self.track_covers.lock().unwrap_or_else(|e| e.into_inner());
             for &index in indices {
                 // 后台下载会阻塞执行器线程；限制在途数量，避免滚动时堆积
                 // 数百个阻塞线程把 Windows 线程池耗到配额上限。
                 if covers.pending.len() >= MAX_INFLIGHT_TRACK_COVERS {
                     break;
                 }
-                let Some(track) = tracks.get(index) else { continue };
-                let Some(url) = cover_url(track) else { continue };
+                let Some(track) = tracks.get(index) else {
+                    continue;
+                };
+                let Some(url) = cover_url(track) else {
+                    continue;
+                };
                 let key = track_cover_key(track).expect("cover URL present");
                 if covers.images.contains_key(&key)
                     || covers.pending.contains(&key)
@@ -335,10 +341,7 @@ impl ChordialApp {
     ) {
         let mut retired = None;
         {
-            let mut covers = self
-                .track_covers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut covers = self.track_covers.lock().unwrap_or_else(|e| e.into_inner());
             covers.pending.remove(&key);
             match result {
                 Some((w, h, rgba)) => {
@@ -347,7 +350,9 @@ impl ChordialApp {
                     covers.images.insert(key.clone(), image);
                     covers.order.push_back(key);
                     while covers.images.len() > MAX_TRACK_COVERS {
-                        let Some(old) = covers.order.pop_front() else { break };
+                        let Some(old) = covers.order.pop_front() else {
+                            break;
+                        };
                         retired = covers.images.remove(&old);
                         if retired.is_some() {
                             break;

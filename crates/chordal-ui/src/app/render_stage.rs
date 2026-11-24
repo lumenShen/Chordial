@@ -4,6 +4,82 @@
 
 use super::*;
 
+/// 竖屏「显示歌词」的 AMLL `VerticalLayout` 等价几何。
+///
+/// 顶栏 = 3em 左留白 + 6em（窄屏 4.5em）小封面 + 1em 间距 + 曲名/艺人/更多；
+/// 中部歌词沿用整窗容器，只把对齐位置压进顶栏与控件之间；
+/// 底部依次是进度、传输、音量、底栏。所有尺寸只依赖窗口大小，闲置隐藏
+/// 只改 alpha / 命中高度，绝不参与这套几何重算（歌词不重新整形）。
+struct VerticalLyricsGeometry {
+    content_w: f32,
+    left: f32,
+    cover_side: f32,
+    header_left: f32,
+    header_top: f32,
+    header_w: f32,
+    info_w: f32,
+    info_font: f32,
+    label_font: f32,
+    btn: f32,
+    progress_h: f32,
+    volume_h: f32,
+    controls_h: f32,
+    controls_top: f32,
+    lyric_top: f32,
+    lyric_bottom: f32,
+}
+
+fn vertical_lyrics_geometry(width: f32, height: f32) -> VerticalLyricsGeometry {
+    let em = 16.0_f32;
+    let content_w = compact_content_w(width, height);
+    // AMLL 竖向布局：小封面 6em，宽 ≤ 480 收到 4.5em；x = 3em。
+    let cover_side = if width <= 480.0 { em * 4.5 } else { em * 6.0 };
+    // drag 30 / thumb 30 / gap 2；封面再从主区顶部下移 1em。
+    let header_top = 30.0 + 30.0 + 2.0 + em;
+    let left = ((width - content_w) / 2.0).max(0.0);
+    // 封面贴左边距 1.75em，与用户的对齐标线一致（不再跟内容列一起居中）。
+    let header_left = (em * 1.75).min((width - cover_side).max(0.0));
+    let right_pad = em * 3.0;
+    let header_w = (width - header_left - right_pad).max(1.0);
+    let info_w = (header_w - cover_side - em).max(1.0);
+    let info_font = (height * 0.02).clamp(14.0, 20.0);
+    let label_font = (height * 0.012).max(12.8);
+    let btn = (content_w * 0.18).clamp(if content_w < 240.0 { 34.0 } else { 40.0 }, 88.0);
+    let progress_h = 45.2;
+    let volume_h = 40.0;
+    let controls_h = progress_h + btn + volume_h + 8.0;
+    let bottom_y =
+        height - crate::layout_morph::COMPACT_BOTTOM - crate::layout_morph::COMPACT_DOCK_H;
+    let controls_top = (bottom_y - 8.0 - controls_h).max(header_top + cover_side + 8.0);
+    let lyric_top = header_top + cover_side + 8.0;
+    let lyric_bottom = (controls_top - 8.0).max(lyric_top + 1.0);
+    VerticalLyricsGeometry {
+        content_w,
+        left,
+        cover_side,
+        header_left,
+        header_top,
+        header_w,
+        info_w,
+        info_font,
+        label_font,
+        btn,
+        progress_h,
+        volume_h,
+        controls_h,
+        controls_top,
+        lyric_top,
+        lyric_bottom,
+    }
+}
+
+/// 竖屏歌词底部 `mask-image` 的渐隐高度（相对歌词容器高度）。
+/// 控件可见时按此比例把字形淡出；控件收起后乘 0，遮罩随之取消。
+pub(super) fn compact_lyric_bottom_mask(width: f32, height: f32) -> f32 {
+    let g = vertical_lyrics_geometry(width, height);
+    ((height - g.controls_top + 8.0) / height.max(1.0)).clamp(0.0, 1.0)
+}
+
 impl ChordialApp {
     /// 沉浸层统一的曲名文案。共享元素与页面占位共用同一份文本，
     /// 保证补间结束交还静态布局时不会发生文字替换。
@@ -567,30 +643,38 @@ impl ChordialApp {
         // 同一列宽供封面、信息、进度、传输、音量与 Dock 使用。
         let content_w = compact_content_w(width, height);
         let enter = self
-            .motion
             .portrait_enter
-            .as_ref()
-            .map(|spring| spring.value(now).clamp(0.0, 1.0))
+            .map(|t| (t.elapsed().as_secs_f32() / 0.26).clamp(0.0, 1.0))
             .unwrap_or(1.0);
+        let enter = 1.0 - (1.0 - enter).powi(3);
         let page = self.portrait_page;
         let transition = self.portrait_transition.filter(|t| !t.done(now));
         // 共享元素补间：页面滑入/滑出时，封面与曲目信息走独立的 FLIP 路径，
         // 页面内的同名元素暂时透明，只保留占位。
         let stage = self
-            .motion
-            .stage
-            .as_ref()
+            .stage_motion
             .filter(|motion| motion.active(now) && motion.touches_compact())
-            .map(|motion| motion.sample(now))
+            .map(|motion| motion.geometry(now))
             .filter(|geometry| geometry.is_valid());
         let shared_hidden = stage.is_some() || dock_shared;
         // 布局 2 的歌词文字：用户在右下角/抽屉里打开后，歌词铺满整窗，
         // 播放列让位（与 AMLL 竖向布局「歌词打开时隐藏传输控件」一致）。
         // 页面切换期间先隐藏文字，避免歌词压在滑动中的队列页上。
         let lyrics_on = self.compact_lyrics_visible(cx) && transition.is_none() && !self.eq_open;
-        // 排版基准与歌词是否可见解耦：始终按 100vh 与 0.42 对齐，开关只
-        // 切换可见性。否则每次点开歌词都会带着新的对齐参数重排一次。
-        self.lyric_align = 0.42;
+        // 竖屏歌词把当前行放进小封面顶栏与底部控件之间，而不是整窗 42%。
+        // 这个位置只由窗口尺寸决定；闲置隐藏只淡出控件，不改容器/行高/
+        // 字号，也不改这里的值，歌词不会因此重新整形或跳动。
+        let target_align = if lyrics_on {
+            let g = vertical_lyrics_geometry(width, height);
+            ((g.lyric_top + (g.lyric_bottom - g.lyric_top) * 0.42) / height.max(1.0))
+                .clamp(0.02, 0.98)
+        } else {
+            0.42
+        };
+        if (target_align - self.lyric_align).abs() > 0.0005 {
+            self.lyric_align = target_align;
+        }
+        let lyric_align = self.lyric_align;
         self.lyric_view.update(cx, |view, _| {
             view.set_text_visible(lyrics_on);
             view.set_click_seek_enabled(lyrics_on);
@@ -598,7 +682,7 @@ impl ChordialApp {
             view.set_layout_when_hidden(true);
             view.set_player_config(LyricPlayerConfig {
                 align_anchor: AlignAnchor::Center,
-                align_position: 0.42,
+                align_position: lyric_align,
                 enable_blur: !self.no_blur,
                 ..LyricPlayerConfig::default()
             });
@@ -676,6 +760,29 @@ impl ChordialApp {
             .when_some(drag_band, |sheet, band| sheet.child(band))
             .when_some(dismiss_handle, |sheet, handle| sheet.child(handle));
 
+        // 控件收起时歌词仍可点，第一次点击/触摸应该只唤出控件，不能顺手
+        // 命中歌词行跳时间轴。透明 occlude 层挡住歌词命中区，并在这里
+        // 吃掉这次鼠标按下；控件恢复后的下一次点击才交给歌词。
+        if lyrics_on && self.stage_chrome_hidden {
+            sheet = sheet.child(
+                div()
+                    .id("lyrics-wake-capture")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|app, _, _, cx| {
+                            app.note_stage_interaction(cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|app, _, _, cx| {
+                        app.note_stage_interaction(cx);
+                    })),
+            );
+        }
+
         let overlay = div()
             .id("immersive-compact-overlay")
             .key_context("ChordialImmersive")
@@ -713,11 +820,7 @@ impl ChordialApp {
                 match event.pressed_button {
                     Some(gpui::MouseButton::Left) => app.update_sheet_drag(y, cx),
                     None => {
-                        if app
-                            .sheet_drag
-                            .as_ref()
-                            .is_some_and(|drag| !drag.animating(Instant::now()))
-                        {
+                        if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
                             app.release_sheet_drag(height, cx);
                         }
                     }
@@ -869,6 +972,103 @@ impl ChordialApp {
         }
     }
 
+    /// 竖屏「显示歌词」：小封面 + 标题/更多顶栏，歌词铺满中部，控件沉底。
+    ///
+    /// 几何全部来自 `vertical_lyrics_geometry`，`chrome` 只驱动透明度与命中
+    /// 高度；歌词视图仍是 100vw/100vh 的固定容器，淡出不改行高和字号。
+    pub(super) fn amll_vertical_lyrics_column(
+        &self,
+        width: f32,
+        height: f32,
+        chrome: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let g = vertical_lyrics_geometry(width, height);
+        let white = gpui::white();
+        let theme = Theme::dark();
+        let cover_scale = self.cover_scale_now(Instant::now()).clamp(0.5, 1.1);
+        let cover_side = g.cover_side * cover_scale;
+        // 底部控件的背景渐隐交给歌词视图的 mask-image（见
+        // `compact_lyric_bottom_mask`），这里不再叠任何黑色图层。
+        let wrap = |h: f32, el: AnyElement| {
+            div()
+                .w(px(g.content_w))
+                .h(px(h * chrome))
+                .overflow_hidden()
+                .opacity(chrome)
+                .child(el)
+        };
+        div()
+            .size_full()
+            .relative()
+            .child(
+                div()
+                    .id("vertical-lyrics-header")
+                    .absolute()
+                    .left(px(g.header_left))
+                    .top(px(g.header_top))
+                    .w(px(g.header_w))
+                    .h(px(g.cover_side))
+                    .flex()
+                    .items_center()
+                    .occlude()
+                    .child(
+                        div()
+                            .size(px(g.cover_side))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(crate::widgets::cover_plain(
+                                &theme,
+                                self.cover_image.clone(),
+                                cover_side,
+                                1.0,
+                                crate::icons::icon(
+                                    crate::icons::Icon::Note,
+                                    (cover_side * 0.1).clamp(28.0, 40.0),
+                                    white.opacity(0.4),
+                                ),
+                            )),
+                    )
+                    .child(div().ml(px(16.0)).w(px(g.info_w)).child(self.amll_info_row(
+                        g.info_w,
+                        g.info_font,
+                        height,
+                        false,
+                        true,
+                        false,
+                        chrome,
+                        window,
+                        cx,
+                    ))),
+            )
+            .child(
+                div()
+                    .id("vertical-lyrics-controls")
+                    .absolute()
+                    .left(px(g.left))
+                    .top(px(g.controls_top))
+                    .w(px(g.content_w))
+                    .h(px(g.controls_h))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_between()
+                    .child(wrap(
+                        g.progress_h,
+                        self.amll_progress_block(g.content_w, g.label_font, height, cx),
+                    ))
+                    .child(wrap(
+                        g.btn,
+                        self.amll_transport(g.content_w, g.btn, height, cx),
+                    ))
+                    .child(wrap(g.volume_h, self.amll_volume_row(g.content_w, cx))),
+            )
+            .into_any_element()
+    }
+
     /// 竖屏播放页：与桌面宽屏同一根 `amll_player_column`，只是把整列水平居中。
     /// 歌词打开时整列让位，只保留底栏控件与全窗歌词文字。
     #[allow(clippy::too_many_arguments)]
@@ -895,11 +1095,9 @@ impl ChordialApp {
         let now = Instant::now();
         let chrome = self.stage_chrome_visibility(now);
         let motion_x = self
-            .motion
-            .stage
-            .as_ref()
+            .stage_motion
             .filter(|motion| motion.active(now) && motion.touches_compact())
-            .map(|motion| motion.sample(now).cover.x);
+            .map(|motion| motion.geometry(now).cover.x);
         let left = motion_x.unwrap_or_else(|| ((width - cover) / 2.0).max(0.0));
         // 底栏与内容列同宽，左右边界与主沉浸区对齐；不再把按钮挂在窗口角上。
         let bottom_rect = stage_bottom_rect(
@@ -910,7 +1108,11 @@ impl ChordialApp {
         );
         let side_panel = matches!(self.stage_view, StageView::Queue | StageView::Audio);
         let mut root = div().size_full().relative();
-        if !lyrics_on && !side_panel {
+        if lyrics_on && !side_panel {
+            // 竖屏「显示歌词」：封面缩到顶栏左侧，标题/更多贴其右，
+            // 中部整块留给歌词，控件沉底并随闲置收起。
+            root = root.child(self.amll_vertical_lyrics_column(width, height, chrome, window, cx));
+        } else if !lyrics_on && !side_panel {
             root = root.child(
                 div()
                     .absolute()
@@ -962,7 +1164,9 @@ impl ChordialApp {
                 .top(px(bottom_rect.y))
                 .w(px(bottom_rect.w))
                 .h(px(bottom_rect.h))
-                .opacity(dock_opacity)
+                // 底栏在沉浸页常驻；只有向 Dock 收起时才淡出。
+                // 原先直接用 dock_opacity 会让满屏态（p=0）整个底栏不可见。
+                .opacity(1.0 - dock_opacity)
                 .child(self.immersive_bottom_row(bottom_rect.w, chrome, cx)),
         )
         .into_any_element()
@@ -1022,12 +1226,10 @@ impl ChordialApp {
         // 布局 2，因此这里不再维护居中分支。
         let split_x = wide_column_x(width, height);
         let wide_motion = self
-            .motion
-            .stage
-            .as_ref()
+            .stage_motion
             .filter(|motion| motion.active(now) && motion.touches_wide())
             .filter(|motion| motion.from.is_valid() && motion.to.is_valid());
-        let stage = wide_motion.map(|motion| motion.sample(now));
+        let stage = wide_motion.map(|motion| motion.geometry(now));
         let mut column_x = split_x;
         if let Some(geometry) = stage {
             column_x = geometry.cover.x;
@@ -1142,7 +1344,7 @@ impl ChordialApp {
             .top(px(bottom_rect.y))
             .w(px(bottom_rect.w))
             .h(px(bottom_rect.h))
-            .opacity(dock_opacity)
+            .opacity(1.0 - dock_opacity)
             .child(self.immersive_bottom_row(bottom_rect.w, chrome, cx));
 
         let stage_el = stage.map(|geometry| self.render_shared_stage(geometry));
@@ -1201,11 +1403,7 @@ impl ChordialApp {
                 match event.pressed_button {
                     Some(gpui::MouseButton::Left) => app.update_sheet_drag(y, cx),
                     None => {
-                        if app
-                            .sheet_drag
-                            .as_ref()
-                            .is_some_and(|drag| !drag.animating(Instant::now()))
-                        {
+                        if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
                             app.release_sheet_drag(height, cx);
                         }
                     }

@@ -18,7 +18,6 @@ use gpui::{
     Point, RenderOnce, SharedString, TextRun, Window, anchored, canvas, deferred, div, point, px,
 };
 
-use crate::motion::{MotionSpring, PROGRESS_TOL, current_tuning};
 use crate::theme::Theme;
 
 /// hover 后延迟出现，避免鼠标扫过一排图标时气泡乱闪。
@@ -38,8 +37,7 @@ const GAP: f32 = 3.0;
 const EDGE: f32 = 8.0;
 /// 按住后移动超过该距离视为拖动，取消长按。
 const MOVE_SLOP: f32 = 8.0;
-/// 出现/消失共用的淡入淡出基准时长；反方向直接打断同一条弹簧。
-const FADE_BASE_MS: f32 = 120.0;
+const FADE_IN_SECS: f32 = 0.12;
 
 /// 气泡配色。单独抽出来是因为均衡器页使用 `EqPalette`，
 /// 不直接沿用全局 `Theme`。
@@ -86,8 +84,7 @@ struct BubbleState {
     /// 触发元素在窗口坐标系中的 bounds。
     bounds: Cell<Option<Bounds<Pixels>>>,
     press_origin: Cell<Option<Point<Pixels>>>,
-    /// 0→1 淡入 / 1→0 淡出共用的弹簧；收起时元素会留到它收敛。
-    shown_at: Cell<Option<MotionSpring>>,
+    shown_at: Cell<Option<Instant>>,
 }
 
 impl BubbleState {
@@ -124,43 +121,13 @@ impl BubbleState {
     }
 }
 
-/// 换目标而不是重建弹簧：中途反打保留当前位置与速度。
-fn retarget_fade(state: &mut BubbleState, to: f32, cx: &mut App) {
-    let now = Instant::now();
-    if let Some(spring) = state.shown_at.get_mut() {
-        spring.retarget(to, now);
-    } else {
-        let from = if to > 0.0 { 0.0 } else { 1.0 };
-        let spring = current_tuning(cx).spring(
-            FADE_BASE_MS,
-            from,
-            to,
-            0.0,
-            now,
-            PROGRESS_TOL.0,
-            PROGRESS_TOL.1,
-        );
-        state.shown_at.set(Some(spring));
-    }
-}
-
-fn show(state: &Entity<BubbleState>, cx: &mut App) {
-    state.update(cx, |state, cx| {
-        state.visible.set(true);
-        retarget_fade(state, 1.0, cx);
-        cx.notify();
-    });
-}
-
 fn hide(state: &Entity<BubbleState>, cx: &mut App) {
     state.update(cx, |state, cx| {
-        if !state.visible.get() {
-            return;
+        if state.visible.get() {
+            state.visible.set(false);
+            state.shown_at.set(None);
+            cx.notify();
         }
-        // 不立刻撤掉元素：渲染层会按弹簧值淡出，收敛后才不再绘制。
-        state.visible.set(false);
-        retarget_fade(state, 0.0, cx);
-        cx.notify();
     });
 }
 
@@ -227,15 +194,16 @@ impl RenderOnce for Bubble {
                 if *hovered {
                     let state = state.clone();
                     after_delay(window, cx, HOVER_DELAY, move |cx| {
-                        // epoch 不匹配说明指针已经移开又回来，这次延迟展示作废。
-                        let should_show = state.update(cx, |state, _| {
-                            state.hovered.get()
+                        state.update(cx, |state, cx| {
+                            if state.hovered.get()
                                 && state.hover_epoch.get() == epoch
                                 && !state.visible.get()
+                            {
+                                state.visible.set(true);
+                                state.shown_at.set(Some(Instant::now()));
+                                cx.notify();
+                            }
                         });
-                        if should_show {
-                            show(&state, cx);
-                        }
                     });
                 } else {
                     state.update(cx, |state, _| state.cancel_press());
@@ -258,17 +226,16 @@ impl RenderOnce for Bubble {
                     });
                     let state = state.clone();
                     after_delay(window, cx, LONG_PRESS_DELAY, move |cx| {
-                        // epoch 不匹配说明手势已经取消，长按不再展示。
-                        let should_show = state.update(cx, |state, _| {
-                            if !state.pressed.get() || state.press_epoch.get() != epoch {
-                                return false;
+                        state.update(cx, |state, cx| {
+                            if state.pressed.get() && state.press_epoch.get() == epoch {
+                                state.suppress_click.set(true);
+                                if !state.visible.get() {
+                                    state.shown_at.set(Some(Instant::now()));
+                                }
+                                state.visible.set(true);
+                                cx.notify();
                             }
-                            state.suppress_click.set(true);
-                            !state.visible.get()
                         });
-                        if should_show {
-                            show(&state, cx);
-                        }
                     });
                 },
             );
@@ -335,7 +302,7 @@ impl RenderOnce for Bubble {
 
         wrapper = wrapper.child(trigger.take().expect("bubble trigger must be present"));
 
-        let (visible, trigger_bounds, fade) = {
+        let (visible, trigger_bounds, shown_at) = {
             let snapshot = state.read(cx);
             (
                 snapshot.visible.get(),
@@ -343,13 +310,8 @@ impl RenderOnce for Bubble {
                 snapshot.shown_at.get(),
             )
         };
-        let now = Instant::now();
-        // 收起时 visible 已经翻成 false，但弹簧还在跑，元素必须留到它收敛。
-        let fade_active = fade.is_some_and(|spring| spring.active(now));
 
-        if (visible || fade_active)
-            && let Some(trigger_bounds) = trigger_bounds
-        {
+        if visible && let Some(trigger_bounds) = trigger_bounds {
             let viewport = window.viewport_size();
             let text_w = measure_label(window, &style, &label);
             let width = (text_w + BUBBLE_PAD_X * 2.0).clamp(
@@ -366,14 +328,13 @@ impl RenderOnce for Bubble {
                 width,
             );
 
-            let progress = fade
-                .map(|spring| spring.value(now).clamp(0.0, 1.0))
-                .unwrap_or(if visible { 1.0 } else { 0.0 });
-            if fade_active {
+            let progress = shown_at
+                .map(|at| (at.elapsed().as_secs_f32() / FADE_IN_SECS).clamp(0.0, 1.0))
+                .unwrap_or(1.0);
+            if progress < 1.0 {
                 window.request_animation_frame();
             }
-            // 弹簧本身已给出观感曲线；不再叠加幂函数缓动，否则会出现二次加速。
-            let opacity = progress;
+            let opacity = 1.0 - (1.0 - progress).powi(3);
 
             let bubble = render_bubble(
                 &style,

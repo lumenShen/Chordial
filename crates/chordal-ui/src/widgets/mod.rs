@@ -443,11 +443,7 @@ fn paint_slider(
 mod tests {
     use super::*;
 
-    use std::time::Duration;
-
     use gpui::point;
-
-    use crate::motion::{MotionPreset, MotionTuning, PIXEL_TOL};
 
     #[test]
     fn fraction_maps_edges() {
@@ -459,28 +455,11 @@ mod tests {
 
     #[test]
     fn amll_spring_settles_at_target() {
-        // AMLL 收起弹簧：基准 200ms，超伸倍率 1.35。
-        let tuning = MotionTuning::new(MotionPreset::Balanced, 1.0, 1.35);
-        let now = Instant::now();
-        let spring = tuning.spring(
-            200.0,
-            AMLL_SLIDER_INSET,
-            0.0,
-            0.0,
-            now,
-            PIXEL_TOL.0,
-            PIXEL_TOL.1,
-        );
-        let settled = now + Duration::from_millis(1200);
-        assert!(
-            spring.value(settled).abs() < 0.05,
-            "x={}",
-            spring.value(settled)
-        );
-        assert!(spring.done(settled));
-        // 起止相同：采样始终停在目标上。
-        let still = tuning.spring(200.0, 0.0, 0.0, 0.0, now, PIXEL_TOL.0, PIXEL_TOL.1);
-        assert_eq!(still.value(now + Duration::from_millis(500)), 0.0);
+        // AMLL 收起弹簧：damping=12 / stiffness=200。
+        let (x, v) = spring_at(AMLL_SLIDER_INSET, 0.0, 12.0, 200.0, 1.2);
+        assert!(x.abs() < 0.05, "x={x}");
+        assert!(v.abs() < 1.0, "v={v}");
+        assert_eq!(spring_at(0.0, 0.0, 12.0, 200.0, 0.5), (0.0, 0.0));
     }
 
     #[test]

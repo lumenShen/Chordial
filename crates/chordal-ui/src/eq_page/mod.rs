@@ -9,7 +9,6 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Instant;
 
 use chordal_player::{
     EQ_MAX_BANDS, EQ_MAX_GAIN_DB, EQ_MIN_GAIN_DB, EqSettings, FilterKind, fmt_db, fmt_freq,
@@ -309,11 +308,10 @@ impl ChordialApp {
         let theme = Theme::get(cx).clone();
         let pal = EqPalette::new(&theme);
         let enter = self
-            .motion
-            .eq_enter
-            .as_ref()
-            .map(|spring| spring.value(Instant::now()).clamp(0.0, 1.0))
+            .eq_open_at
+            .map(|t| (t.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0))
             .unwrap_or(1.0);
+        let enter: f32 = 1.0 - (1.0 - enter).powi(3);
         match eq_layout(
             self.viewport_width,
             self.viewport_height,

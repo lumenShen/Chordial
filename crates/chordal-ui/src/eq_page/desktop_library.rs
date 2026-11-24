@@ -1,7 +1,7 @@
 //! EQ 页面区块：desktop_library（由 eq_page.rs 拆分，行为不变）。
 
-use super::*;
 use super::controls::*;
+use super::*;
 
 impl ChordialApp {
     pub(super) fn eq_library_desktop(
@@ -537,7 +537,12 @@ impl ChordialApp {
         body.into_any_element()
     }
 
-    pub(super) fn eq_saved_desktop(&self, pal: &EqPalette, main_h: f32, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn eq_saved_desktop(
+        &self,
+        pal: &EqPalette,
+        main_h: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let weak = cx.entity().downgrade();
         let (title, subtitle) = tab_meta(EqTab::Personal);
         let preview_index = self

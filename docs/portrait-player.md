@@ -133,13 +133,12 @@
 
 ### 队列与共享元素
 
-- 队列：纵向滑入（320ms 基准弹簧），顶部提示点击返回，行内可删除/切歌，
+- 队列：纵向滑入（320ms ease-out），顶部提示点击返回，行内可删除/切歌，
   底部胶囊循环切换播放模式；
 - 队列页始终使用布局 2 的列宽；从布局 1 进入队列时，封面/曲名走 FLIP
   缩放到队列页头，返回时再飞回左侧歌词分栏；
-- 共享元素补间使用 `motion::StageSpring`（14 个通道逐通道保速度），布局 1↔2
-  的歌词切换也复用同一条补间；`layout_morph` 只提供几何真值源。
-  节奏与回弹由「设置 → 通用 → 动画」的预设、时长/超伸倍率统一控制。
+- 共享元素补间使用 `layout_morph` 的 `ease_out_quint`，布局 1↔2 的歌词切换
+  也复用同一条补间。
 
 ### Dock⇄全屏共享布局
 
@@ -234,7 +233,6 @@
 | 布局选择 / 播放列 / 宽屏与竖屏渲染 | `crates/chordal-ui/src/app.rs`（`layout_one_active`、`amll_player_column`、`render_immersive_*`） |
 | 统一底栏 + 「…」抽屉 | `crates/chordal-ui/src/app.rs`（`immersive_bottom_row`、`render_drawer`） |
 | 页面切换语义（Fade/Vertical） | `crates/chordal-ui/src/player_page.rs` |
-| 状态型动画统一弹簧管线 | `crates/chordal-ui/src/motion.rs` |
 | mini player / 纵向 sheet / 横滑手势 | `crates/chordal-ui/src/phone_gesture.rs` |
 | 共享元素几何与 FLIP 补间 | `crates/chordal-ui/src/layout_morph.rs` |
 | 均衡器页面 | `crates/chordal-ui/src/eq_page.rs` |

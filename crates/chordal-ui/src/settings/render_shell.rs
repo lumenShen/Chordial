@@ -3,7 +3,11 @@
 use super::*;
 
 impl SettingsView {
-    pub(super) fn render_sidebar(&self, theme: &Theme, weak: &gpui::WeakEntity<Self>) -> AnyElement {
+    pub(super) fn render_sidebar(
+        &self,
+        theme: &Theme,
+        weak: &gpui::WeakEntity<Self>,
+    ) -> AnyElement {
         let mut nav = div().flex().flex_col().gap(px(3.0));
         for tab in SettingsTab::ALL {
             let weak = weak.clone();

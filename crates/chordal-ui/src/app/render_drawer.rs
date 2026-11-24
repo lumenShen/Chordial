@@ -25,62 +25,94 @@ impl ChordialApp {
         let left = ((width - panel_w) * 0.5).max(0.0);
         let top = height - panel_h * progress;
 
-        let row =
-            |icon: crate::icons::Icon,
-             id: &'static str,
-             title: &'static str,
-             detail: String,
-             active: bool,
-             on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
-                let mut labels = div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(white.opacity(0.88))
-                            .text_ellipsis()
-                            .child(title),
-                    );
-                if !detail.is_empty() {
-                    labels = labels.child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(11.0))
-                            .text_color(white.opacity(0.42))
-                            .text_ellipsis()
-                            .child(SharedString::from(detail)),
-                    );
-                }
-                div()
-                    .id(id)
-                    .h(px(46.0))
-                    .w_full()
-                    .flex_none()
-                    .rounded(px(10.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .px(px(10.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(white.opacity(0.06)))
-                    .child(crate::icons::icon(icon, 18.0, white.opacity(0.72)))
-                    .child(labels)
-                    .when(active, |d| {
-                        d.child(crate::icons::icon(
-                            crate::icons::Icon::Check,
-                            14.0,
-                            white.opacity(0.8),
-                        ))
-                    })
-                    .on_click(on_click)
-                    .into_any_element()
-            };
+        // 用嵌套函数而非闭包，让标题/元素 ID 既能传静态文案也能传歌单名。
+        fn row(
+            icon: crate::icons::Icon,
+            id: impl Into<SharedString>,
+            title: impl Into<SharedString>,
+            detail: String,
+            active: bool,
+            on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>,
+        ) -> AnyElement {
+            let white = gpui::white();
+            let mut labels = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .max_w_full()
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(white.opacity(0.88))
+                        .text_ellipsis()
+                        .child(title.into()),
+                );
+            if !detail.is_empty() {
+                labels = labels.child(
+                    div()
+                        .max_w_full()
+                        .text_size(px(11.0))
+                        .text_color(white.opacity(0.42))
+                        .text_ellipsis()
+                        .child(SharedString::from(detail)),
+                );
+            }
+            div()
+                .id(id.into())
+                .h(px(44.0))
+                .w_full()
+                .flex_none()
+                .rounded(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .px(px(10.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(white.opacity(0.06)))
+                .child(
+                    div()
+                        .w(px(20.0))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(crate::icons::icon(icon, 18.0, white.opacity(0.72))),
+                )
+                .child(labels)
+                .when(active, |d| {
+                    d.child(crate::icons::icon(
+                        crate::icons::Icon::Check,
+                        14.0,
+                        white.opacity(0.8),
+                    ))
+                })
+                .on_click(on_click)
+                .into_any_element()
+        }
+
+        // 分组标签与分隔线共用同一套缩进，避免和 12px 的滚动内边距错位。
+        fn caption(text: impl Into<SharedString>) -> AnyElement {
+            div()
+                .px(px(10.0))
+                .pt(px(9.0))
+                .pb(px(3.0))
+                .text_size(px(10.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(gpui::white().opacity(0.38))
+                .child(text.into())
+                .into_any_element()
+        }
+
+        fn divider() -> AnyElement {
+            div()
+                .h(px(1.0))
+                .mx(px(10.0))
+                .my(px(5.0))
+                .bg(gpui::white().opacity(0.07))
+                .into_any_element()
+        }
 
         let (panel_title, back_row) = match self.drawer_page {
             DrawerPage::Root => (if phone_main { "菜单" } else { "更多" }, None),
@@ -101,6 +133,24 @@ impl ChordialApp {
                 );
                 ("睡眠定时", Some(back))
             }
+            DrawerPage::AddToPlaylist => {
+                let weak = weak.clone();
+                let back = row(
+                    crate::icons::Icon::ChevronLeft,
+                    "drawer-back",
+                    "返回",
+                    String::new(),
+                    false,
+                    Box::new(move |_, _, cx| {
+                        let _ = weak.update(cx, |app, cx| {
+                            app.drawer_page = DrawerPage::Root;
+                            app.drawer_add_message = None;
+                            cx.notify();
+                        });
+                    }),
+                );
+                ("添加到歌单", Some(back))
+            }
         };
 
         let mut body = div().w_full().flex().flex_col().gap(px(2.0));
@@ -112,14 +162,6 @@ impl ChordialApp {
                 // 一级导航在曲库页底部常驻；抽屉负责播放页/歌词页上的
                 // 跳转，以及主题等次级入口。
                 if phone_main {
-                    let section = div()
-                        .px(px(10.0))
-                        .pt(px(4.0))
-                        .pb(px(2.0))
-                        .text_size(px(10.5))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(white.opacity(0.38))
-                        .child("导航");
                     let current = self
                         .current_track
                         .as_ref()
@@ -248,7 +290,7 @@ impl ChordialApp {
                             }),
                         )
                     };
-                    body = body.child(section).child(player);
+                    body = body.child(caption("导航")).child(player);
                     if let Some(lyrics) = lyrics {
                         body = body.child(lyrics);
                     }
@@ -257,8 +299,13 @@ impl ChordialApp {
                         .child(search)
                         .child(settings)
                         .child(theme_row)
-                        .child(div().h(px(1.0)).my(px(4.0)).bg(white.opacity(0.08)));
+                        .child(divider());
                 }
+                body = body.child(caption(if phone_main {
+                    "播放与队列"
+                } else {
+                    "播放"
+                }));
                 let sleep_detail = self
                     .sleep_minutes
                     .map(|m| format!("{m} 分钟后暂停"))
@@ -358,7 +405,27 @@ impl ChordialApp {
                         }),
                     ));
                 }
-                body = body.child(queue);
+                body = body.child(queue).child(divider()).child(caption("曲目"));
+
+                // 「添加到歌单」为当前曲目服务：没有在播曲目时不展示入口，
+                // 二级页直接列出本地歌单，沿用睡眠定时那一套抽屉内导航。
+                if let Some(track) = self.current_track.clone() {
+                    let weak = weak.clone();
+                    body = body.child(row(
+                        crate::icons::Icon::Layers,
+                        "drawer-add-playlist",
+                        "添加到歌单",
+                        track.title,
+                        false,
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.drawer_page = DrawerPage::AddToPlaylist;
+                                app.drawer_add_message = None;
+                                cx.notify();
+                            });
+                        }),
+                    ));
+                }
 
                 let quality = self
                     .current_track
@@ -384,10 +451,10 @@ impl ChordialApp {
                         .bg(white.opacity(0.05))
                         .border_1()
                         .border_color(white.opacity(0.06))
-                        .p(px(12.0))
+                        .p(px(10.0))
                         .flex()
                         .flex_col()
-                        .gap(px(4.0))
+                        .gap(px(5.0))
                         .child(
                             div()
                                 .text_size(px(12.0))
@@ -437,23 +504,6 @@ impl ChordialApp {
                         }),
                     ));
                 }
-                if self.phone_shell_active() {
-                    let weak = weak.clone();
-                    body = body.child(row(
-                        crate::icons::Icon::Expand,
-                        "drawer-immersive",
-                        "沉浸播放页",
-                        "全屏歌词与播放队列".into(),
-                        false,
-                        Box::new(move |_, _, cx| {
-                            let _ = weak.update(cx, |app, cx| {
-                                app.hide_drawer_now();
-                                app.open_portrait(cx);
-                            });
-                        }),
-                    ));
-                }
-
                 let artists = self
                     .current_track
                     .as_ref()
@@ -470,11 +520,11 @@ impl ChordialApp {
                         .p(px(10.0))
                         .flex()
                         .flex_col()
-                        .gap(px(2.0))
+                        .gap(px(4.0))
                         .child(
                             div()
                                 .px(px(2.0))
-                                .pb(px(2.0))
+                                .pb(px(3.0))
                                 .text_size(px(12.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(white.opacity(0.8))
@@ -486,7 +536,7 @@ impl ChordialApp {
                         card = card.child(
                             div()
                                 .id(SharedString::from(format!("drawer-artist-{}", artist.name)))
-                                .h(px(34.0))
+                                .h(px(32.0))
                                 .flex()
                                 .items_center()
                                 .gap(px(9.0))
@@ -533,6 +583,25 @@ impl ChordialApp {
                     body = body.child(card);
                 }
 
+                if self.phone_shell_active() || self.immersive {
+                    body = body.child(divider()).child(caption("页面"));
+                }
+                if self.phone_shell_active() {
+                    let weak = weak.clone();
+                    body = body.child(row(
+                        crate::icons::Icon::Expand,
+                        "drawer-immersive",
+                        "沉浸播放页",
+                        "全屏歌词与播放队列".into(),
+                        false,
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.hide_drawer_now();
+                                app.open_portrait(cx);
+                            });
+                        }),
+                    ));
+                }
                 // 「退出播放页」只属于沉浸模态；手机壳的曲库页由返回键
                 // 和底部曲库按钮处理，不能再出现一个名字不符的入口。
                 if self.immersive {
@@ -558,6 +627,7 @@ impl ChordialApp {
                 }
             }
             DrawerPage::Sleep => {
+                body = body.child(caption("选择时长"));
                 for (label, minutes) in [
                     ("15 分钟", Some(15u32)),
                     ("30 分钟", Some(30u32)),
@@ -576,7 +646,11 @@ impl ChordialApp {
                         },
                         label,
                         if active {
-                            "当前已启用".into()
+                            if minutes.is_some() {
+                                "当前已启用".into()
+                            } else {
+                                "定时已关闭".into()
+                            }
                         } else {
                             String::new()
                         },
@@ -588,6 +662,106 @@ impl ChordialApp {
                             });
                         }),
                     ));
+                }
+            }
+            DrawerPage::AddToPlaylist => {
+                body = body.child(caption("选择目标歌单"));
+                if let Some(track) = self.current_track.clone() {
+                    body = body.child(
+                        div()
+                            .px(px(10.0))
+                            .pb(px(5.0))
+                            .text_size(px(11.0))
+                            .text_color(white.opacity(0.45))
+                            .text_ellipsis()
+                            .child(SharedString::from(format!("当前歌曲：{}", track.title))),
+                    );
+                    if let Some(message) = self.drawer_add_message.as_ref() {
+                        body = body.child(
+                            div()
+                                .mx(px(10.0))
+                                .mb(px(6.0))
+                                .rounded(px(8.0))
+                                .bg(white.opacity(0.06))
+                                .px(px(10.0))
+                                .py(px(7.0))
+                                .text_size(px(11.5))
+                                .text_color(white.opacity(0.82))
+                                .child(SharedString::from(message.clone())),
+                        );
+                    }
+                    let weak_create = weak.clone();
+                    body = body.child(row(
+                        crate::icons::Icon::Plus,
+                        "drawer-playlist-new",
+                        "新建歌单并添加",
+                        String::new(),
+                        false,
+                        Box::new(move |_, _, cx| {
+                            let _ = weak_create.update(cx, |app, cx| {
+                                if let Some(title) = app.create_playlist_for_current(cx) {
+                                    app.drawer_add_message =
+                                        Some(format!("已新建「{title}」并添加"));
+                                }
+                            });
+                        }),
+                    ));
+
+                    let identity_key = track.identity_key();
+                    // 与曲目菜单里的歌单浮层保持一致：这里只列可写的本地歌单，
+                    // 订阅歌单的远端编辑仍由集合页/歌单页处理。
+                    let summaries: Vec<_> = self
+                        .playlists
+                        .summaries()
+                        .into_iter()
+                        .filter(|summary| !summary.is_subscribed())
+                        .collect();
+                    if summaries.is_empty() {
+                        body = body.child(
+                            div()
+                                .px(px(10.0))
+                                .py(px(12.0))
+                                .text_size(px(11.0))
+                                .text_color(white.opacity(0.4))
+                                .child("还没有本地歌单，选择上方「新建歌单并添加」"),
+                        );
+                    }
+                    for summary in summaries {
+                        let weak = weak.clone();
+                        let id = summary.id.clone();
+                        let title = summary.title.clone();
+                        let contains = self
+                            .playlists
+                            .get(&id)
+                            .is_some_and(|playlist| playlist.contains_identity(&identity_key));
+                        body = body.child(row(
+                            crate::icons::Icon::Layers,
+                            SharedString::from(format!("drawer-playlist-{}", id.0)),
+                            title.clone(),
+                            format!("{} 首", summary.count),
+                            contains,
+                            Box::new(move |_, _, cx| {
+                                let title = title.clone();
+                                let _ = weak.update(cx, |app, cx| {
+                                    let added = app.add_current_track_to_playlist(&id, cx);
+                                    app.drawer_add_message = Some(if added {
+                                        format!("已添加到「{title}」")
+                                    } else {
+                                        "这首歌已经在歌单里".into()
+                                    });
+                                });
+                            }),
+                        ));
+                    }
+                } else {
+                    body = body.child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(14.0))
+                            .text_size(px(12.0))
+                            .text_color(white.opacity(0.5))
+                            .child("当前没有正在播放的曲目"),
+                    );
                 }
             }
         }
@@ -639,7 +813,7 @@ impl ChordialApp {
             .child(
                 div()
                     .w_full()
-                    .px(px(16.0))
+                    .px(px(14.0))
                     .pt(px(4.0))
                     .pb(px(8.0))
                     .flex()
@@ -661,8 +835,8 @@ impl ChordialApp {
                     .min_h_0()
                     .overflow_y_scroll()
                     .when(self.smooth_scroll, |d| d.smooth_scroll())
-                    .px(px(10.0))
-                    .pb(px(12.0))
+                    .px(px(12.0))
+                    .pb(px(14.0))
                     .child(body),
             );
 

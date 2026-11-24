@@ -8,13 +8,15 @@
 //! ```
 //!
 //! 切换模态时记录 First（切换瞬间的插值几何）与 Last（目标模态几何），
-//! 渲染阶段用 [`crate::motion::StageSpring`] 插值一个覆盖层舞台。页面本身在动画期间把
+//! 渲染阶段用 `ease_out_quint` 插值一个覆盖层舞台。页面本身在动画期间把
 //! 自带的封面 / 曲名 / 艺人设为透明（只保留占位），结束后再由页面按同一份
 //! 几何函数绘制，保证「动画终点」与「静态布局」严格一致、不会跳动。
 //!
 //! 这对应 anime.js Layout 的 `layout.record()` + `layout.animate()`：
 //! 记录前态 → 改布局 → 在两者之间补间。区别只是这里共享的是封面与曲目文案，
 //! 而不是整个容器的 flex/grid 属性。
+
+use std::time::{Duration, Instant};
 
 /// 沉浸层里共享元素几何不同的布局模态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,10 +116,124 @@ impl StageGeometry {
     }
 }
 
+/// anime.js 默认的 `out(5)` 近似——起步快、收尾稳，适合位置/尺寸补间。
+pub fn ease_out_quint(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(5)
+}
+
+/// smoothstep（`3t² - 2t³`）：两端斜率都为 0，淡入淡出不会在起止帧突然
+/// 出现/消失。用于「只在某一段行程里存在」的控件。
+pub fn ease_smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 把 `value` 从 `[from, to]` 映射到 `0..=1` 并套 smoothstep。
+/// `from > to` 时表示反向区间（value 越小越接近 1），用于展开/收起共用。
+pub fn ramp(value: f32, from: f32, to: f32) -> f32 {
+    if (to - from).abs() < 1e-6 {
+        return if value >= to { 1.0 } else { 0.0 };
+    }
+    ease_smoothstep((value - from) / (to - from))
+}
+
+/// 一次布局补间：First / Last 两帧几何 + 起始时刻。
+#[derive(Clone, Copy, Debug)]
+pub struct LayoutMotion {
+    pub from: StageGeometry,
+    pub to: StageGeometry,
+    /// First / Last 对应的模态；用于判断这次补间接管的是宽屏列还是竖屏页面。
+    pub from_mode: StageMode,
+    pub to_mode: StageMode,
+    pub start: Instant,
+    pub duration: Duration,
+}
+
+impl LayoutMotion {
+    #[allow(dead_code)] // 测试与后续入场/退场复用
+    pub fn new(
+        from_mode: StageMode,
+        from: StageGeometry,
+        to_mode: StageMode,
+        to: StageGeometry,
+        duration_ms: f32,
+    ) -> Self {
+        Self::starting_at(from_mode, from, to_mode, to, Instant::now(), duration_ms)
+    }
+
+    /// 显式指定起始时刻，便于同一帧内先采样 First 再构造补间。
+    pub fn starting_at(
+        from_mode: StageMode,
+        from: StageGeometry,
+        to_mode: StageMode,
+        to: StageGeometry,
+        start: Instant,
+        duration_ms: f32,
+    ) -> Self {
+        Self {
+            from,
+            to,
+            from_mode,
+            to_mode,
+            start,
+            duration: Duration::from_secs_f32((duration_ms / 1000.0).max(0.001)),
+        }
+    }
+
+    /// 线性进度 0..=1（用于淡入淡出等不需要缓动的通道）。
+    pub fn progress(&self, now: Instant) -> f32 {
+        (now.saturating_duration_since(self.start).as_secs_f32() / self.duration.as_secs_f32())
+            .clamp(0.0, 1.0)
+    }
+
+    /// 缓动后的进度 0..=1（用于位置/尺寸通道）。
+    pub fn eased(&self, now: Instant) -> f32 {
+        ease_out_quint(self.progress(now))
+    }
+
+    pub fn geometry(&self, now: Instant) -> StageGeometry {
+        self.from.lerp(self.to, self.eased(now))
+    }
+
+    #[allow(dead_code)] // 测试使用；调用方通常用 settled() 判断是否交还静态布局
+    pub fn done(&self, now: Instant) -> bool {
+        self.progress(now) >= 1.0
+    }
+
+    /// 结束后再保留一小段「终点帧」，让静态页面接管前最后一帧确实画在目标位置。
+    pub fn settled(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.start) >= self.duration + SETTLE_GRACE
+    }
+
+    pub fn active(&self, now: Instant) -> bool {
+        !self.settled(now)
+    }
+
+    /// 目标模态是否是「宽屏」几何；用于判断一次补间是否接管宽屏播放列。
+    pub fn touches_wide(&self) -> bool {
+        matches!(self.to_mode, StageMode::WideSplit)
+            || matches!(self.from_mode, StageMode::WideSplit)
+    }
+
+    /// 目标模态是否是「竖屏」几何。
+    pub fn touches_compact(&self) -> bool {
+        matches!(
+            self.to_mode,
+            StageMode::CompactArt | StageMode::CompactQueue
+        ) || matches!(
+            self.from_mode,
+            StageMode::CompactArt | StageMode::CompactQueue
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 几何常量与纯函数：渲染层与动画层共用，避免两套公式漂移。
 // ---------------------------------------------------------------------------
 
+/// 动画结束后多留 ~3 帧再交还给静态布局，避免最后一帧被跳过。
+const SETTLE_GRACE: Duration = Duration::from_millis(48);
 /// 曲名 / 艺人行高比例（与 AMLL 播放器列一致）。
 pub const INFO_LINE_RATIO: f32 = 1.25;
 /// 圆钮与文案之间的固定间距（`amll_info_row` 里的 `ml(16)`）。
@@ -156,7 +272,7 @@ pub const QUEUE_COVER_GAP: f32 = 12.0;
 
 /// 竖屏内容列宽（封面、信息、进度、传输、音量、底栏共用）。
 pub fn compact_content_w(width: f32, height: f32) -> f32 {
-    (width * 0.82).min(height * 0.55).clamp(260.0, 560.0)
+    ((width * 0.82).min(height * 0.55).min(560.0)).max(260.0)
 }
 
 /// 竖屏封面态的大封面边长。
@@ -230,7 +346,7 @@ pub fn stage_bottom_rect(width: f32, height: f32, wide: bool, lyric_pad: f32) ->
 /// 底部悬浮 Dock 的宽度。渲染层和动画层必须调用同一个函数，避免任一端
 /// 改了尺寸后展开/收起动画停在错位的位置。
 pub fn dock_width(viewport_width: f32) -> f32 {
-    (viewport_width - 32.0).clamp(520.0, 880.0)
+    (viewport_width - 32.0).min(880.0).max(520.0)
 }
 
 /// 底部悬浮 Dock 的条状几何（与 `render_dock` 的绝对定位一致）。
@@ -413,8 +529,14 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::{MotionTuning, StageSpring, ramp};
-    use std::time::{Duration, Instant};
+
+    #[test]
+    fn easing_endpoints_are_exact() {
+        assert_eq!(ease_out_quint(0.0), 0.0);
+        assert_eq!(ease_out_quint(1.0), 1.0);
+        // 单调且起步快：中点已经走过大半。
+        assert!(ease_out_quint(0.5) > 0.9);
+    }
 
     #[test]
     fn geometry_endpoints_match_modes() {
@@ -434,52 +556,48 @@ mod tests {
     }
 
     #[test]
-    fn spring_starts_at_first_and_converges_to_last() {
+    fn motion_interpolates_and_finishes() {
         let from = immersive_geometry(StageMode::CompactArt, 800.0, 1000.0);
         let to = immersive_geometry(StageMode::CompactQueue, 800.0, 1000.0);
-        let start = Instant::now();
-        let motion = StageSpring::new(
-            from,
-            to,
+        let motion = LayoutMotion::new(
             StageMode::CompactArt,
+            from,
             StageMode::CompactQueue,
-            start,
-            MotionTuning::default().spec(320.0),
+            to,
+            320.0,
         );
 
-        assert_eq!(motion.sample(start), from);
-        assert!(!motion.done(start));
+        assert_eq!(motion.progress(motion.start), 0.0);
+        assert_eq!(motion.geometry(motion.start).cover.x, from.cover.x);
+        assert!(!motion.done(motion.start));
 
-        let end = start + Duration::from_secs(2);
-        let settled = motion.sample(end);
-        assert!((settled.cover.x - to.cover.x).abs() < 0.01);
-        assert!((settled.title_size - to.title_size).abs() < 0.01);
+        let end = motion.start + Duration::from_millis(320);
         assert!(motion.done(end));
+        assert!((motion.geometry(end).cover.x - to.cover.x).abs() < 0.01);
+        assert!((motion.geometry(end).title_size - to.title_size).abs() < 0.01);
     }
 
     #[test]
-    fn retarget_mid_flight_preserves_rect_and_velocity() {
+    fn retarget_mid_flight_preserves_current_rect() {
         let art = immersive_geometry(StageMode::CompactArt, 800.0, 1000.0);
         let queue = immersive_geometry(StageMode::CompactQueue, 800.0, 1000.0);
-        let start = Instant::now();
-        let mut motion = StageSpring::new(
-            art,
-            queue,
+        let motion = LayoutMotion::new(
             StageMode::CompactArt,
+            art,
             StageMode::CompactQueue,
-            start,
-            MotionTuning::default().spec(320.0),
+            queue,
+            320.0,
         );
-        let mid = start + Duration::from_millis(160);
-        let rect = motion.sample(mid);
-        let velocity = motion.velocity(mid);
-
-        motion.retarget(art, StageMode::CompactArt, mid);
-        // 位置与速度都必须连续；解析解重算会有浮点尾差，用像素/秒级容差。
-        assert!((motion.sample(mid).cover.x - rect.cover.x).abs() < 0.01);
-        assert!((motion.sample(mid).cover.w - rect.cover.w).abs() < 0.01);
-        assert!((motion.sample(mid).info.y - rect.info.y).abs() < 0.01);
-        assert!((motion.velocity(mid).cover.w - velocity.cover.w).abs() < 1.0);
+        let mid = motion.start + Duration::from_millis(160);
+        let current = motion.geometry(mid);
+        let next = LayoutMotion::new(
+            StageMode::CompactQueue,
+            current,
+            StageMode::CompactArt,
+            art,
+            320.0,
+        );
+        assert_eq!(next.geometry(next.start), current);
     }
 
     #[test]

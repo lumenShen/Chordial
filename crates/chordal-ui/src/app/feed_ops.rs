@@ -236,7 +236,9 @@ impl ChordialApp {
                     if let Some(refill) = self.queue_refill.as_mut() {
                         refill.last_empty_at = None;
                     }
-                    self.queue = Arc::new(queue);
+                    // 续接也走统一写入口，保持 queue_gen 递增。
+                    let refill = self.queue_refill.clone();
+                    self.set_queue(Arc::new(queue), refill);
                     if let Some(state) = self.source_feeds.get_mut(source) {
                         Self::append_unique_tracks(&mut state.fm, incoming);
                         state.fm_error = None;

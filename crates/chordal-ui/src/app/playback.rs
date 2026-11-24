@@ -170,60 +170,44 @@ impl ChordialApp {
     }
 
     /// 点击列表行：把当前可见列表设为队列并播放。
-    pub(super) fn play_from_list(&mut self, list: QueueList, index: usize, cx: &mut Context<Self>) {
-        let tracks: Arc<Vec<Track>> = match list {
-            QueueList::Search => match &self.source_route {
-                // 路由到单源时，"播放全部"与行点击都只在可见结果内流转。
-                Some(route) => Arc::new(
-                    self.search_tracks
-                        .iter()
-                        .filter(|t| &t.id.source == route)
-                        .cloned()
-                        .collect(),
-                ),
-                None => self.search_tracks.clone(),
-            },
-            QueueList::Library => self.library.clone(),
-            QueueList::Queue => self.queue.clone(),
-            QueueList::Collection => self
-                .collection
-                .as_ref()
-                .map(|c| c.tracks.clone())
-                .unwrap_or_else(|| Arc::new(Vec::new())),
-        };
+    /// 所有来源共用 [`Self::snapshot_list`] 解析曲目，私人 FM 保留续接追踪。
+    pub(super) fn play_from_list(
+        &mut self,
+        list: &QueueList,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let tracks = self.snapshot_list(list);
         if index >= tracks.len() {
             return;
         }
-        self.set_queue(tracks, None);
+        let refill = match list {
+            QueueList::Feed { source, kind: SourceFeedKind::Fm } => Some(QueueRefill {
+                source: source.clone(),
+                in_flight: false,
+                last_empty_at: None,
+            }),
+            _ => None,
+        };
+        let is_fm = refill.is_some();
+        self.set_queue(tracks, refill);
         self.queue_pos = Some(index);
         self.status_message = None;
+        self.dock_menu = None;
+        self.track_menu = None;
         self.resolve_and_play(cx);
         // 手机壳：选歌的最终目的是播放，直接回到播放页，避免用户还要
         // 再找一次返回入口。宽屏三栏同时可见，不需要这一步。
         self.show_phone_player(cx);
+        if is_fm {
+            self.maybe_refill_fm_queue(cx);
+        }
         cx.notify();
     }
 
-    /// 从播放队列移除一项；不打断当前播放，只修正 queue_pos。
+    /// 从播放队列移除一项；统一委托给 `queue_remove_index`。
     pub(super) fn remove_queue_at(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.queue.len() {
-            return;
-        }
-        let mut queue = self.queue.as_ref().clone();
-        queue.remove(index);
-        self.queue = Arc::new(queue);
-        self.queue_pos = match self.queue_pos {
-            Some(pos) if pos > index => Some(pos - 1),
-            Some(pos) if pos == index => {
-                if self.queue.is_empty() {
-                    None
-                } else {
-                    Some(pos.min(self.queue.len() - 1))
-                }
-            }
-            other => other,
-        };
-        cx.notify();
+        self.queue_remove_index(index, cx);
     }
 
     /// 私人 FM 接近末尾时向所追踪的音源再拉一批（同一时刻最多一个在途请求）。
@@ -265,7 +249,7 @@ impl ChordialApp {
     /// F5：没有当前曲目时从本地库第一首开始；否则等价于播放/暂停。
     pub fn play_first(&mut self, cx: &mut Context<Self>) {
         if self.queue_pos.is_none() && !self.library.is_empty() {
-            self.play_from_list(QueueList::Library, 0, cx);
+            self.play_from_list(&QueueList::Library, 0, cx);
         } else {
             self.toggle_playback(cx);
         }

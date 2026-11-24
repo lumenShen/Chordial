@@ -1,8 +1,8 @@
 //! EQ 页面区块：desktop_graph（由 eq_page.rs 拆分，行为不变）。
 
-use super::*;
 use super::controls::*;
 use super::drawing::*;
+use super::*;
 
 impl ChordialApp {
     pub(super) fn eq_graph(

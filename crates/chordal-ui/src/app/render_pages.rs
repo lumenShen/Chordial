@@ -555,6 +555,10 @@ fn feed_track_section(
     source: &SourceId,
     kind: SourceFeedKind,
     weak: &gpui::WeakEntity<ChordialApp>,
+    track_covers: &std::sync::Mutex<TrackCovers>,
+    queue_pos: Option<usize>,
+    current_id: Option<&chordal_core::model::TrackId>,
+    current_queue: Arc<Vec<Track>>,
 ) -> AnyElement {
     let mut block = div().flex().flex_col();
     block = block.child(section_title_flat(theme, title, Some(hint)));
@@ -573,81 +577,31 @@ fn feed_track_section(
             .child(feed_note(theme, empty_hint, false))
             .into_any_element();
     }
-    let all = Arc::new(tracks.to_vec());
+    // 推荐流行也复用完整队列的行渲染：封面懒加载、均衡器、时长与 ⋮ 菜单一致。
+    let feed_list = QueueList::Feed {
+        source: source.clone(),
+        kind,
+    };
     for (index, track) in tracks.iter().take(limit).enumerate() {
-        let weak = weak.clone();
-        let queue = all.clone();
-        let source = source.clone();
-        let artist = track
-            .artists
-            .iter()
-            .map(|artist| artist.name.as_str())
-            .collect::<Vec<_>>()
-            .join(" / ");
-        let duration = track
-            .duration_ms
-            .map(fmt_ms)
-            .unwrap_or_else(|| "--:--".into());
-        let seed = if track.title.is_empty() {
-            "♪"
-        } else {
-            track.title.as_str()
-        };
-        block = block.child(
-            div()
-                .id(SharedString::from(format!("feed-track-{title}-{index}")))
-                .h(px(46.0))
-                .px(px(6.0))
-                .rounded(px(7.0))
-                .flex()
-                .items_center()
-                .gap(px(11.0))
-                .hover(|s| s.bg(theme.hover))
-                .cursor_pointer()
-                .on_click(move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        app.play_feed_tracks(&source, kind, queue.clone(), index, cx);
-                    });
-                })
-                .child(
-                    div()
-                        .w(px(18.0))
-                        .flex_none()
-                        .text_size(px(9.5))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("{:02}", index + 1))),
-                )
-                .child(cover_thumb(theme, seed, 32.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.0))
-                        .child(
-                            div()
-                                .text_size(px(11.5))
-                                .text_color(theme.text)
-                                .text_ellipsis()
-                                .child(SharedString::from(track.title.clone())),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(9.5))
-                                .text_color(theme.text_faint)
-                                .text_ellipsis()
-                                .child(SharedString::from(artist)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(9.5))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(duration)),
-                ),
-        );
+        let row_text = TrackRowText::new(index, track);
+        block = block.child(ChordialApp::render_track_row(
+            theme,
+            index,
+            &row_text,
+            track_covers,
+            feed_list.clone(),
+            queue_pos,
+            current_id,
+            weak.clone(),
+            current_queue.clone(),
+            false,
+            false,
+            false,
+            None,
+            None,
+            &TrackRowStyle::full(),
+            None,
+        ));
     }
     block.into_any_element()
 }
@@ -1161,101 +1115,30 @@ impl ChordialApp {
                     ),
             );
         } else {
+            // 音源页曲目预览与完整队列共用同一行；行内 ⋮ 也能直接入队。
+            let source_list = QueueList::Snapshot(tracks.clone());
             for (index, track) in tracks.iter().take(40).enumerate() {
-                let weak = weak.clone();
-                let snapshot = tracks.clone();
-                let artist = track
-                    .artists
-                    .iter()
-                    .map(|artist| artist.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" / ");
-                let album = track
-                    .album
-                    .as_ref()
-                    .map(|album| album.name.as_str())
-                    .unwrap_or("");
-                let seed = if track.title.is_empty() {
-                    "♪"
-                } else {
-                    track.title.as_str()
-                };
-                tracks_rows = tracks_rows.child(
-                    div()
-                        .id(gpui::ElementId::named_usize("source-track", index))
-                        .h(px(50.0))
-                        .rounded(px(7.0))
-                        .px(px(8.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(11.0))
-                        .hover(|s| s.bg(theme.hover))
-                        .cursor_pointer()
-                        .on_click(move |_, _, cx| {
-                            let tracks = snapshot.clone();
-                            let _ = weak.update(cx, |app, cx| {
-                                app.play_tracks(tracks, index, cx);
-                            });
-                        })
-                        .child(
-                            div()
-                                .w(px(18.0))
-                                .flex_none()
-                                .text_size(px(9.5))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from((index + 1).to_string())),
-                        )
-                        .child(cover_thumb(theme, seed, 34.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(theme.text)
-                                        .text_ellipsis()
-                                        .child(SharedString::from(track.title.clone())),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(9.5))
-                                        .text_color(theme.text_faint)
-                                        .text_ellipsis()
-                                        .child(SharedString::from(format!(
-                                            "{}{}",
-                                            artist,
-                                            if album.is_empty() {
-                                                String::new()
-                                            } else {
-                                                format!(" · {album}")
-                                            }
-                                        ))),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w(px(44.0))
-                                .flex_none()
-                                .text_right()
-                                .text_size(px(9.5))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(
-                                    track
-                                        .duration_ms
-                                        .map(fmt_ms)
-                                        .unwrap_or_else(|| "--:--".into()),
-                                )),
-                        )
-                        .child(crate::icons::icon(
-                            crate::icons::Icon::Play,
-                            11.0,
-                            theme.text_faint,
-                        )),
-                );
+                let row_text = TrackRowText::new(index, track);
+                tracks_rows = tracks_rows.child(ChordialApp::render_track_row(
+                    theme,
+                    index,
+                    &row_text,
+                    &self.track_covers,
+                    source_list.clone(),
+                    self.queue_pos,
+                    self.queue_pos
+                        .and_then(|p| self.queue.get(p))
+                        .map(|t| &t.id),
+                    weak.clone(),
+                    tracks.clone(),
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                    &TrackRowStyle::full(),
+                    None,
+                ));
             }
         }
 
@@ -1449,12 +1332,13 @@ impl ChordialApp {
                 };
                 let play_all = {
                     let weak = weak.clone();
-                    let snapshot = Arc::new(tracks.to_vec());
-                    let source = source.clone();
+                    let feed_list = QueueList::Feed {
+                        source: source.clone(),
+                        kind,
+                    };
                     crate::widgets::text_button(theme, "播放全部", true, move |_, _, cx| {
-                        let tracks = snapshot.clone();
                         let _ = weak.update(cx, |app, cx| {
-                            app.play_feed_tracks(&source, kind, tracks, 0, cx)
+                            app.queue_play_all(&feed_list, cx)
                         });
                     })
                 };
@@ -1474,6 +1358,12 @@ impl ChordialApp {
                         &source,
                         kind,
                         &weak,
+                        &self.track_covers,
+                        self.queue_pos,
+                        self.queue_pos
+                            .and_then(|p| self.queue.get(p))
+                            .map(|t| &t.id),
+                        self.queue.clone(),
                     ))
                     .into_any_element()
             }
@@ -2591,12 +2481,9 @@ impl ChordialApp {
         let weak = cx.entity().downgrade();
         let width = self.viewport_width;
         let height = self.viewport_height;
-        let local: Vec<_> = self
-            .playlists
-            .summaries()
-            .into_iter()
-            .filter(|summary| !summary.is_subscribed())
-            .collect();
+        // 订阅歌单也列入：远端 AddTracks 由 PlaylistEditor 执行，
+        // 跨源曲目会被音源自身过滤并给出提示。
+        let local: Vec<_> = self.playlists.summaries();
         let panel_w = 248.0;
         let rows_h = (local.len().min(8) as f32) * 32.0;
         let panel_h = (74.0 + rows_h + 68.0).min(380.0);
@@ -2654,7 +2541,11 @@ impl ChordialApp {
             let weak = weak.clone();
             let id = summary.id.clone();
             rows.push(item_label(
-                crate::icons::Icon::Layers,
+                if summary.is_subscribed() {
+                    crate::icons::Icon::Cloud
+                } else {
+                    crate::icons::Icon::Layers
+                },
                 summary.title.clone().into(),
                 summary.count.to_string(),
                 Box::new(move |_, _, cx| {
@@ -2779,7 +2670,9 @@ impl ChordialApp {
             );
         };
         let weak = cx.entity().downgrade();
-        let editable = matches!(playlist.kind, PlaylistKind::Local);
+        // 订阅歌单只要源实现了 PlaylistEditor 就同样可编辑（网易云支持）。
+        let caps = self.playlist_capabilities(playlist);
+        let editable = caps.remove_tracks && caps.reorder;
         let subscribed = playlist.kind.is_subscribed();
         let kind_label = if subscribed {
             "订阅歌单"
@@ -2826,7 +2719,7 @@ impl ChordialApp {
                     },
                 ));
             }
-            if editable {
+            if caps.add_tracks {
                 let weak = weak.clone();
                 let id = id.clone();
                 row = row.child(crate::widgets::text_button(
@@ -2938,21 +2831,115 @@ impl ChordialApp {
         let list_weak = weak.clone();
         let list_rows = rows.clone();
         let playlist_id = id.clone();
-        let mut list = uniform_list("playlist-tracks", count, move |range, _window, cx| {
+        let list_ref = QueueList::Playlist(id.clone());
+        let tracks_snapshot: Arc<Vec<Track>> =
+            Arc::new(rows.iter().map(|row| row.track.clone()).collect());
+        let covers = self.track_covers.clone();
+        let queue_pos = self.queue_pos;
+        let current_id = queue_pos
+            .and_then(|pos| self.queue.get(pos))
+            .map(|t| t.id.clone());
+        let mut list = uniform_list("playlist-tracks", count, move |range, _window, _cx| {
             range
                 .filter_map(|index| {
                     let row = list_rows.get(index)?;
-                    let weak = list_weak.clone();
-                    let playlist_id = playlist_id.clone();
-                    let editable = editable;
-                    let row_theme = list_theme.clone();
-                    let unavailable = row.unavailable;
-                    let track = row.track.clone();
-                    let source_label = row.source_label.clone();
-                    let duration = row.duration.clone();
-                    let title = row.title.clone();
-                    let artist = row.artist.clone();
-                    let local_substitute = row.local_substitute;
+                    let row_text = TrackRowText::new(index, &row.track);
+                    let style = TrackRowStyle {
+                        source_label: Some(row.source_label.clone()),
+                        unavailable: row.unavailable,
+                        local_substitute: row.local_substitute,
+                        ..TrackRowStyle::full()
+                    };
+                    // 歌单编辑按钮作为行尾随操作交给统一行渲染器。
+                    let trailing = editable.then(|| {
+                        let weak_remove = list_weak.clone();
+                        let weak_up = list_weak.clone();
+                        let weak_down = list_weak.clone();
+                        let playlist_id_remove = playlist_id.clone();
+                        let playlist_id_up = playlist_id.clone();
+                        let playlist_id_down = playlist_id.clone();
+                        let track_remove = row.track.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .id(gpui::ElementId::named_usize("playlist-up", index))
+                                    .size(px(22.0))
+                                    .rounded(px(5.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .opacity(0.55)
+                                    .hover(|s| s.bg(list_theme.surface_alt).opacity(1.0))
+                                    .child(crate::icons::icon(
+                                        crate::icons::Icon::ChevronUp,
+                                        12.0,
+                                        list_theme.text_faint,
+                                    ))
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        if index == 0 {
+                                            return;
+                                        }
+                                        let _ = weak_up.update(cx, |app, cx| {
+                                            app.reorder_playlist(&playlist_id_up, index, index - 1, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id(gpui::ElementId::named_usize("playlist-down", index))
+                                    .size(px(22.0))
+                                    .rounded(px(5.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .opacity(0.55)
+                                    .hover(|s| s.bg(list_theme.surface_alt).opacity(1.0))
+                                    .child(crate::icons::icon(
+                                        crate::icons::Icon::ChevronDown,
+                                        12.0,
+                                        list_theme.text_faint,
+                                    ))
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        let _ = weak_down.update(cx, |app, cx| {
+                                            app.reorder_playlist(&playlist_id_down, index, index + 1, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id(gpui::ElementId::named_usize("playlist-remove", index))
+                                    .size(px(22.0))
+                                    .rounded(px(5.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .opacity(0.55)
+                                    .hover(|s| s.bg(list_theme.surface_alt).opacity(1.0))
+                                    .child(crate::icons::icon(
+                                        crate::icons::Icon::Close,
+                                        11.0,
+                                        list_theme.text_faint,
+                                    ))
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        let _ = weak_remove.update(cx, |app, cx| {
+                                            app.apply_playlist_mutation(
+                                                &playlist_id_remove,
+                                                PlaylistMutation::RemoveTracks {
+                                                    tracks: vec![track_remove.clone()],
+                                                },
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            )
+                            .into_any_element()
+                    });
                     Some(
                         div()
                             .w_full()
@@ -2962,249 +2949,24 @@ impl ChordialApp {
                                     .w_full()
                                     .max_w(px(PAGE_MAX_W))
                                     .mx_auto()
-                                    .h(px(54.0))
-                                    .rounded(px(7.0))
-                                    .px(px(10.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(12.0))
-                                    .opacity(if unavailable { 0.48 } else { 1.0 })
-                                    .id(gpui::ElementId::named_usize("playlist-track", index))
-                                    .hover(|s| s.bg(row_theme.hover))
-                                    .cursor_pointer()
-                                    .on_click({
-                                        let weak = weak.clone();
-                                        let playlist_id = playlist_id.clone();
-                                        move |_, _, cx| {
-                                            let _ = weak.update(cx, |app, cx| {
-                                                if unavailable {
-                                                    app.info_message = Some(
-                                                        "音源已关闭，且本地没有同身份副本".into(),
-                                                    );
-                                                } else {
-                                                    app.play_playlist_at(&playlist_id, index, cx);
-                                                }
-                                                cx.notify();
-                                            });
-                                        }
-                                    })
-                                    .child(
-                                        div()
-                                            .w(px(24.0))
-                                            .text_size(px(9.5))
-                                            .text_color(row_theme.text_faint)
-                                            .child(SharedString::from((index + 1).to_string())),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(2.0))
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.0))
-                                                    .text_color(if unavailable {
-                                                        row_theme.disabled_fg
-                                                    } else {
-                                                        row_theme.text
-                                                    })
-                                                    .text_ellipsis()
-                                                    .child(title),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(6.0))
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(10.0))
-                                                            .text_color(row_theme.text_faint)
-                                                            .text_ellipsis()
-                                                            .child(artist),
-                                                    )
-                                                    .when(unavailable, |d| {
-                                                        d.child(
-                                                            div()
-                                                                .text_size(px(9.0))
-                                                                .text_color(row_theme.danger)
-                                                                .child("无法拉取"),
-                                                        )
-                                                    })
-                                                    .when(local_substitute, |d| {
-                                                        d.child(
-                                                            div()
-                                                                .text_size(px(9.0))
-                                                                .text_color(row_theme.ok)
-                                                                .child("本地替代"),
-                                                        )
-                                                    }),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(124.0))
-                                            .text_size(px(9.5))
-                                            .text_color(row_theme.text_faint)
-                                            .text_ellipsis()
-                                            .child(source_label),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(44.0))
-                                            .text_size(px(9.5))
-                                            .text_color(row_theme.text_faint)
-                                            .child(duration),
-                                    )
-                                    .when(editable, |d| {
-                                        let weak_remove = weak.clone();
-                                        let weak_up = weak.clone();
-                                        let weak_down = weak.clone();
-                                        let playlist_id_remove = playlist_id.clone();
-                                        let playlist_id_up = playlist_id.clone();
-                                        let playlist_id_down = playlist_id.clone();
-                                        let track_remove = track.clone();
-                                        d.child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(2.0))
-                                                .child(
-                                                    div()
-                                                        .id(gpui::ElementId::named_usize(
-                                                            "playlist-up",
-                                                            index,
-                                                        ))
-                                                        .size(px(22.0))
-                                                        .rounded(px(5.0))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .opacity(0.55)
-                                                        .hover(|s| {
-                                                            s.bg(row_theme.surface_alt)
-                                                                .opacity(1.0)
-                                                        })
-                                                        .child(crate::icons::icon(
-                                                            crate::icons::Icon::ChevronUp,
-                                                            12.0,
-                                                            row_theme.text_faint,
-                                                        ))
-                                                        .on_click(move |_, _, cx| {
-                                                            cx.stop_propagation();
-                                                            if index == 0 {
-                                                                return;
-                                                            }
-                                                            let _ = weak_up.update(cx, |app, cx| {
-                                                                let ordered = app
-                                                                    .playlists
-                                                                    .get(&playlist_id_up)
-                                                                    .map(|playlist| {
-                                                                        playlist
-                                                                            .entries
-                                                                            .iter()
-                                                                            .map(|entry| entry.track.clone())
-                                                                            .collect()
-                                                                    })
-                                                                    .unwrap_or_default();
-                                                                app.apply_playlist_mutation(
-                                                                    &playlist_id_up,
-                                                                    PlaylistMutation::Reorder {
-                                                                        from: index,
-                                                                        to: index - 1,
-                                                                        ordered,
-                                                                    },
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id(gpui::ElementId::named_usize(
-                                                            "playlist-down",
-                                                            index,
-                                                        ))
-                                                        .size(px(22.0))
-                                                        .rounded(px(5.0))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .opacity(0.55)
-                                                        .hover(|s| {
-                                                            s.bg(row_theme.surface_alt)
-                                                                .opacity(1.0)
-                                                        })
-                                                        .child(crate::icons::icon(
-                                                            crate::icons::Icon::ChevronDown,
-                                                            12.0,
-                                                            row_theme.text_faint,
-                                                        ))
-                                                        .on_click(move |_, _, cx| {
-                                                            cx.stop_propagation();
-                                                            let _ = weak_down.update(cx, |app, cx| {
-                                                                let ordered = app
-                                                                    .playlists
-                                                                    .get(&playlist_id_down)
-                                                                    .map(|playlist| {
-                                                                        playlist
-                                                                            .entries
-                                                                            .iter()
-                                                                            .map(|entry| entry.track.clone())
-                                                                            .collect()
-                                                                    })
-                                                                    .unwrap_or_default();
-                                                                app.apply_playlist_mutation(
-                                                                    &playlist_id_down,
-                                                                    PlaylistMutation::Reorder {
-                                                                        from: index,
-                                                                        to: index + 1,
-                                                                        ordered,
-                                                                    },
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id(gpui::ElementId::named_usize(
-                                                            "playlist-remove",
-                                                            index,
-                                                        ))
-                                                        .size(px(22.0))
-                                                        .rounded(px(5.0))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .opacity(0.55)
-                                                        .hover(|s| {
-                                                            s.bg(row_theme.surface_alt)
-                                                                .opacity(1.0)
-                                                        })
-                                                        .child(crate::icons::icon(
-                                                            crate::icons::Icon::Close,
-                                                            11.0,
-                                                            row_theme.text_faint,
-                                                        ))
-                                                        .on_click(move |_, _, cx| {
-                                                            cx.stop_propagation();
-                                                            let _ = weak_remove.update(cx, |app, cx| {
-                                                                app.apply_playlist_mutation(
-                                                                    &playlist_id_remove,
-                                                                    PlaylistMutation::RemoveTracks {
-                                                                        tracks: vec![track_remove.clone()],
-                                                                    },
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        }),
-                                                ),
-                                        )
-                                    })
-                                    .into_any_element(),
+                                    .child(ChordialApp::render_track_row(
+                                        &list_theme,
+                                        index,
+                                        &row_text,
+                                        &covers,
+                                        list_ref.clone(),
+                                        queue_pos,
+                                        current_id.as_ref(),
+                                        list_weak.clone(),
+                                        tracks_snapshot.clone(),
+                                        false,
+                                        false,
+                                        false,
+                                        None,
+                                        None,
+                                        &style,
+                                        trailing,
+                                    )),
                             )
                             .into_any_element(),
                     )

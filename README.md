@@ -48,8 +48,7 @@ crates/
 └── chordal-ui          # gpui 前端
     ├── app.rs          #   三栏 / 悬浮 Dock / 共用 AMLL 播放器列 / 宽屏沉浸层
     ├── player_page.rs  #   竖屏页面模型与队列纵向过渡
-    ├── layout_morph.rs #   宽屏/竖屏共享元素 FLIP 几何真值源
-    ├── motion.rs       #   状态型动画的统一解析弹簧与帧事件
+    ├── layout_morph.rs #   宽屏/竖屏共享元素 FLIP 几何与补间
     ├── eq_page.rs      #   均衡器桌面控制台 / 紧凑布局
     ├── input.rs        #   支持中文 IME 的单行输入框（EntityInputHandler 全实现）
     ├── lyrics.rs       #   Lyrics → AMLL 模型、封面下载/解码（后台线程）
@@ -269,10 +268,7 @@ cargo run --release -p chordal-ui
   "beat_band_high_hz": 10000.0,
   "beat_strength": 0.5,
   "background_render_divisor": 4,
-  "lyric_sweep_fade_em": 0.6,
-  "motion_preset": "balanced",
-  "animation_duration_multiplier": 1.0,
-  "animation_overshoot_multiplier": 1.0
+  "lyric_sweep_fade_em": 0.6
 }
 ```
 
@@ -287,13 +283,6 @@ cargo run --release -p chordal-ui
 20 万硬上限）；除数越大越省 CPU、放大后越模糊。
 动态歌词整行扫光的渐变带宽度（`lyric_sweep_fade_em`，0.1–4.0em，默认 0.6）
 在「设置 → 播放 → 歌词」中即时调整。
-
-界面状态动画统一走解析弹簧（`motion.rs`）：`motion_preset` 取 `compact` /
-`balanced` / `soft` / `bouncy`（默认 `balanced`），`animation_duration_multiplier`
-（0.25–3，默认 1）用于整体慢放/加速，`animation_overshoot_multiplier`（0.25–2，
-默认 1）用于加强或抑制回弹；三者都在「设置 → 通用 → 动画」中即时调整，
-新动画生效，已在途的动画保持创建时的参数。手势交接与连续点击会继承当前
-位置与速度，不再重新起一条时间曲线。
 
 ### 对象缓存与下载
 

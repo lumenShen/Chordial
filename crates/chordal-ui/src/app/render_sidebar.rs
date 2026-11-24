@@ -28,13 +28,17 @@ impl ChordialApp {
 
     // ================= macOS 标题栏 =================
 
-    pub(super) fn render_titlebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_titlebar(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let dark = theme.is_dark();
-        // 中等宽度下状态消息最容易把标题栏挤爆；消息仍会通过列表/提示出现，
-        // 标题栏只保留品牌与窗口操作。
-        let show_messages = self.viewport_width >= 1180.0;
+        // 标题栏新增全局搜索框后，状态消息更容易挤压品牌区；中等宽度下
+        // 只保留品牌与窗口操作，消息仍会通过列表/提示出现。
+        let show_messages = self.viewport_width >= 1360.0;
 
         let theme_btn = {
             let weak = weak.clone();
@@ -107,6 +111,52 @@ impl ChordialApp {
                 ),
         );
 
+        // 顶栏全局搜索：与曲库搜索框共享输入状态，回车走 start_search
+        // 对所有已加载音源并发 fan-out。放在 drag area 之外，避免点击时被
+        // HTCAPTION 的窗口移动吞掉。
+        let search_focused = self.search_input.read(cx).focus_handle().is_focused(window);
+        let search_width = if self.viewport_width < 900.0 {
+            160.0
+        } else if self.viewport_width < 1180.0 {
+            210.0
+        } else {
+            260.0
+        };
+        let search_focus = self.search_input.read(cx).focus_handle().clone();
+        let search_box = div()
+            .w(px(search_width))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(9.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if search_focused {
+                theme.focus_ring
+            } else {
+                theme.border
+            })
+            .bg(theme.surface_alt)
+            .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
+                window.focus(&search_focus);
+            })
+            .child(crate::icons::icon(
+                crate::icons::Icon::Search,
+                13.0,
+                theme.text_faint,
+            ))
+            .child(div().flex_1().min_w_0().child(self.search_top_view.clone()))
+            .when(self.viewport_width >= 1180.0, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_faint)
+                        .child("Ctrl+K"),
+                )
+            });
+
         div()
             .h(px(crate::theme::size::TITLEBAR))
             .w_full()
@@ -120,6 +170,7 @@ impl ChordialApp {
             .border_color(theme.border)
             .child(Self::traffic_lights())
             .child(center)
+            .child(search_box)
             .when(show_messages, |d| {
                 d.children(self.status_message.as_ref().map(|msg| {
                     div()

@@ -62,11 +62,12 @@ impl ChordialApp {
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>()
             .join(" / ");
-        let (list, index) = (menu.list, menu.index);
+        let (list, index) = (menu.list.clone(), menu.index);
         let menu_is_current = menu.is_current;
         let mut rows: Vec<AnyElement> = Vec::new();
         {
             let weak = weak.clone();
+            let list = list.clone();
             let playing = self.player_status.state == PlayerState::Playing;
             let (icon, label) = if menu.is_current && playing {
                 (crate::icons::Icon::Pause, "暂停")
@@ -83,7 +84,7 @@ impl ChordialApp {
                         if app.current_track.is_some() && menu_is_current {
                             app.toggle_playback(cx);
                         } else {
-                            app.play_from_list(list, index, cx);
+                            app.play_from_list(&list, index, cx);
                         }
                     });
                 }),
@@ -171,6 +172,7 @@ impl ChordialApp {
         }
         {
             let weak = weak.clone();
+            let list = list.clone();
             rows.push(item(
                 crate::icons::Icon::Check,
                 "多选",
@@ -178,13 +180,14 @@ impl ChordialApp {
                 Box::new(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
                         app.track_menu = None;
-                        app.enter_selection(list, index, cx);
+                        app.enter_selection(list.clone(), index, cx);
                     });
                 }),
             ));
         }
         if menu.in_queue {
             let weak = weak.clone();
+            let sort_weak = weak.clone();
             let id = menu.track.id.clone();
             rows.push(item(
                 crate::icons::Icon::Close,
@@ -198,6 +201,37 @@ impl ChordialApp {
                     });
                 }),
             ));
+            // 队列排序放在 ⋮ 菜单里，保持截图中的页头按钮不变。
+            for (icon, label, key) in [
+                (
+                    crate::icons::Icon::Note,
+                    "按标题排序",
+                    queue_ops::QueueSortKey::Title,
+                ),
+                (
+                    crate::icons::Icon::Person,
+                    "按艺人排序",
+                    queue_ops::QueueSortKey::Artist,
+                ),
+                (
+                    crate::icons::Icon::Clock,
+                    "按时长排序",
+                    queue_ops::QueueSortKey::Duration,
+                ),
+            ] {
+                let weak = sort_weak.clone();
+                rows.push(item(
+                    icon,
+                    label,
+                    false,
+                    Box::new(move |_, _, cx| {
+                        let _ = weak.update(cx, |app, cx| {
+                            app.track_menu = None;
+                            app.queue_sort(key, cx);
+                        });
+                    }),
+                ));
+            }
         }
 
         div()
@@ -337,86 +371,32 @@ impl ChordialApp {
                             }),
                     );
                 }
+                // Dock 预览与完整队列共用同一行渲染器，只是密度更紧凑。
+                let covers = self.track_covers.clone();
+                let queue_snapshot = self.queue.clone();
                 for (index, track) in upcoming {
-                    let cover_image = track_cover_key(&track).and_then(|key| {
-                        self.track_covers
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .images
-                            .get(&key)
-                            .cloned()
-                    });
-                    let title = SharedString::from(track.title.clone());
-                    let artist = SharedString::from(
-                        track
-                            .artists
-                            .iter()
-                            .map(|a| a.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" / "),
-                    );
-                    let duration = SharedString::from(fmt_ms(track.duration_ms.unwrap_or(0)));
-                    let weak_row = weak.clone();
+                    let row_text = TrackRowText::new(index, &track);
                     rows = rows.child(
                         div()
                             .id(gpui::ElementId::named_usize("dock-queue-row", index))
-                            .h(px(38.0))
-                            .px(px(8.0))
-                            .rounded(px(7.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(9.0))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.hover))
-                            .child(crate::widgets::cover_thumb(
+                            .child(ChordialApp::render_track_row(
                                 &theme,
-                                cover_image,
-                                30.0,
-                                1.0,
-                                crate::icons::icon(
-                                    crate::icons::Icon::Note,
-                                    12.0,
-                                    theme.text_faint,
-                                ),
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(1.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(10.5))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(theme.text)
-                                            .text_ellipsis()
-                                            .child(title),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .text_color(theme.text_faint)
-                                            .text_ellipsis()
-                                            .child(artist),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w(px(30.0))
-                                    .flex_none()
-                                    .text_size(px(9.0))
-                                    .text_color(theme.text_faint)
-                                    .text_align(gpui::TextAlign::Right)
-                                    .child(duration),
-                            )
-                            .on_click(move |_, _, cx| {
-                                let _ = weak_row.update(cx, |app, cx| {
-                                    app.dock_menu = None;
-                                    app.play_from_list(QueueList::Queue, index, cx);
-                                });
-                            }),
+                                index,
+                                &row_text,
+                                &covers,
+                                QueueList::Queue,
+                                self.queue_pos,
+                                self.queue_pos.and_then(|p| queue_snapshot.get(p)).map(|t| &t.id),
+                                weak.clone(),
+                                queue_snapshot.clone(),
+                                false,
+                                false,
+                                false,
+                                None,
+                                None,
+                                &TrackRowStyle::compact(),
+                                None,
+                            )),
                     );
                 }
 
@@ -1003,7 +983,7 @@ impl ChordialApp {
                     let _ = weak.update(cx, |app, cx| {
                         app.phone_page = PhonePage::Lyrics;
                         app.phone_sheet = None;
-                        app.motion.phone_sheet = None;
+                        app.phone_sheet_spring = None;
                         app.phone_sheet_anchor = None;
                         app.phone_edge_swipe = None;
                         cx.notify();

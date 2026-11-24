@@ -13,10 +13,6 @@ impl SettingsView {
         let lyric_sweep_fade_em = crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
         let background_render_divisor =
             crate::config::clamp_background_render_divisor(cfg.background_render_divisor);
-        let animation_duration_multiplier =
-            crate::config::clamp_animation_duration_multiplier(cfg.animation_duration_multiplier);
-        let animation_overshoot_multiplier =
-            crate::config::clamp_animation_overshoot_multiplier(cfg.animation_overshoot_multiplier);
         let quality = cfg.netease.level.unwrap_or_default();
         let weak = cx.entity().downgrade();
 
@@ -99,31 +95,6 @@ impl SettingsView {
                 cx,
             )
         };
-        let motion_duration_field = {
-            let weak = weak.clone();
-            TextField::new(
-                "settings-motion-duration",
-                "1.00",
-                move |text, window, cx| {
-                    let _ =
-                        weak.update(cx, |view, cx| view.submit_motion_duration(text, window, cx));
-                },
-                cx,
-            )
-        };
-        let motion_overshoot_field = {
-            let weak = weak.clone();
-            TextField::new(
-                "settings-motion-overshoot",
-                "1.00",
-                move |text, window, cx| {
-                    let _ = weak.update(cx, |view, cx| {
-                        view.submit_motion_overshoot(text, window, cx)
-                    });
-                },
-                cx,
-            )
-        };
         let search_timeout_field = {
             let weak = weak.clone();
             TextField::new(
@@ -180,9 +151,6 @@ impl SettingsView {
             beat_strength,
             background_render_divisor,
             lyric_sweep_fade_em,
-            motion_preset: cfg.motion_preset,
-            animation_duration_multiplier,
-            animation_overshoot_multiplier,
             perf_overlay: cfg.perf_overlay,
             cache_dir: cfg.cache_dir,
             download_dir: cfg.download_dir,
@@ -210,8 +178,6 @@ impl SettingsView {
             beat_strength_field,
             background_divisor_field,
             lyric_sweep_field,
-            motion_duration_field,
-            motion_overshoot_field,
             search_timeout_field,
             netease_url_field,
             device_field,
@@ -235,11 +201,6 @@ impl SettingsView {
             crate::config::clamp_background_render_divisor(cfg.background_render_divisor);
         self.lyric_sweep_fade_em =
             crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
-        self.motion_preset = cfg.motion_preset;
-        self.animation_duration_multiplier =
-            crate::config::clamp_animation_duration_multiplier(cfg.animation_duration_multiplier);
-        self.animation_overshoot_multiplier =
-            crate::config::clamp_animation_overshoot_multiplier(cfg.animation_overshoot_multiplier);
         self.perf_overlay = cfg.perf_overlay;
         self.cache_dir = cfg.cache_dir.clone();
         self.download_dir = cfg.download_dir.clone();
@@ -323,10 +284,6 @@ impl SettingsView {
             .set(self.background_render_divisor.to_string(), cx);
         self.lyric_sweep_field
             .set(format!("{:.2}", self.lyric_sweep_fade_em), cx);
-        self.motion_duration_field
-            .set(format!("{:.2}", self.animation_duration_multiplier), cx);
-        self.motion_overshoot_field
-            .set(format!("{:.2}", self.animation_overshoot_multiplier), cx);
         self.search_timeout_field
             .set(self.search_timeout_ms.to_string(), cx);
         self.netease_url_field
@@ -547,106 +504,6 @@ impl SettingsView {
         self.lyric_sweep_field.set(format!("{value:.2}"), cx);
         self.emit(SettingsAction::SetLyricSweepFade(value), window, cx);
         self.notice_ok(format!("歌词扫光宽度 {value:.2}em"), cx);
-    }
-
-    /// 切换弹簧预设：即刻影响新动画，已开始的动画保持原参数。
-    pub(super) fn apply_motion_preset(
-        &mut self,
-        preset: MotionPreset,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.motion_preset = preset;
-        self.emit(SettingsAction::SetMotionPreset(preset), window, cx);
-        self.notice_ok(format!("动画预设 {}", preset.label()), cx);
-    }
-
-    /// 提交动画时长倍率（0.25–3.0，> 1 慢放）。
-    pub(super) fn submit_motion_duration(
-        &mut self,
-        text: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Ok(value) = text.trim().parse::<f32>() else {
-            self.notice_error("时长倍率需为 0.25–3.0 的数字", cx);
-            return;
-        };
-        if !value.is_finite()
-            || !(crate::config::ANIMATION_DURATION_MULTIPLIER_MIN
-                ..=crate::config::ANIMATION_DURATION_MULTIPLIER_MAX)
-                .contains(&value)
-        {
-            self.notice_error("时长倍率范围 0.25–3.0", cx);
-            return;
-        }
-        self.apply_motion_duration(value, window, cx);
-    }
-
-    pub(super) fn set_motion_duration_preset(
-        &mut self,
-        value: f32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.apply_motion_duration(value, window, cx);
-    }
-
-    pub(super) fn apply_motion_duration(
-        &mut self,
-        value: f32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let value = crate::config::clamp_animation_duration_multiplier(value);
-        self.animation_duration_multiplier = value;
-        self.motion_duration_field.set(format!("{value:.2}"), cx);
-        self.emit(SettingsAction::SetMotionDuration(value), window, cx);
-        self.notice_ok(format!("动画时长 {value:.2}×（越大越慢放）"), cx);
-    }
-
-    /// 提交动画回弹倍率（0.25–2.0，> 1 回弹更明显）。
-    pub(super) fn submit_motion_overshoot(
-        &mut self,
-        text: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Ok(value) = text.trim().parse::<f32>() else {
-            self.notice_error("回弹倍率需为 0.25–2.0 的数字", cx);
-            return;
-        };
-        if !value.is_finite()
-            || !(crate::config::ANIMATION_OVERSHOOT_MULTIPLIER_MIN
-                ..=crate::config::ANIMATION_OVERSHOOT_MULTIPLIER_MAX)
-                .contains(&value)
-        {
-            self.notice_error("回弹倍率范围 0.25–2.0", cx);
-            return;
-        }
-        self.apply_motion_overshoot(value, window, cx);
-    }
-
-    pub(super) fn set_motion_overshoot_preset(
-        &mut self,
-        value: f32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.apply_motion_overshoot(value, window, cx);
-    }
-
-    pub(super) fn apply_motion_overshoot(
-        &mut self,
-        value: f32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let value = crate::config::clamp_animation_overshoot_multiplier(value);
-        self.animation_overshoot_multiplier = value;
-        self.motion_overshoot_field.set(format!("{value:.2}"), cx);
-        self.emit(SettingsAction::SetMotionOvershoot(value), window, cx);
-        self.notice_ok(format!("动画回弹 {value:.2}×（越大回弹越明显）"), cx);
     }
 
     pub(super) fn submit_search_timeout(

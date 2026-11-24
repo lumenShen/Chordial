@@ -1,10 +1,15 @@
 //! EQ 页面区块：compact_shell（由 eq_page.rs 拆分，行为不变）。
 
-use super::*;
 use super::controls::*;
+use super::*;
 
 impl ChordialApp {
-    pub(super) fn eq_render_compact(&self, pal: &EqPalette, enter: f32, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn eq_render_compact(
+        &self,
+        pal: &EqPalette,
+        enter: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let side = if self.viewport_width < 560.0 {
             12.0
         } else {

@@ -19,7 +19,6 @@ mod input;
 mod layout_morph;
 mod lyrics;
 mod main_state;
-mod motion;
 mod perf_overlay;
 mod phone_gesture;
 mod player_page;
@@ -46,7 +45,6 @@ use gpui::{
 };
 
 use crate::app::{ChordialApp, SourceBuilder};
-use crate::motion::MotionTuning;
 
 /// 运行内存观测：包装系统分配器，记录堆活跃/峰值与分配次数。
 ///
@@ -194,11 +192,6 @@ fn main() {
             builders,
             local_sources,
             netease_sources,
-            MotionTuning::new(
-                cfg.motion_preset,
-                cfg.animation_duration_multiplier,
-                cfg.animation_overshoot_multiplier,
-            ),
             cx,
         );
 

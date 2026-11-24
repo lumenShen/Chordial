@@ -1,7 +1,7 @@
 //! 崩溃日志：panic_hook（由 crash_log.rs 拆分，行为不变）。
 
-use super::*;
 use super::report::*;
+use super::*;
 
 pub(super) fn install_panic_hook() {
     if PANIC_HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
@@ -174,4 +174,3 @@ pub(super) fn unix_dialog(body: &str) {
             || run("xmessage", &["-center", "-title", "Chordial 崩溃"], body);
     }
 }
-

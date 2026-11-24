@@ -32,6 +32,18 @@ impl ChordialApp {
             })
         });
 
+        // 顶栏的全局搜索入口复用同一个输入状态：两处输入内容永远同步，
+        // 但外框由标题栏绘制，所以这里用 bare + 独立元素 id。
+        let weak_top_search = weak_self.clone();
+        let search_top_view = cx.new(|cx| {
+            InputView::new(search_input.clone(), cx)
+                .with_id("topbar-search")
+                .bare()
+                .on_submit(move |text, _window, cx| {
+                    let _ = weak_top_search.update(cx, |app, cx| app.start_search(text, cx));
+                })
+        });
+
         // 设置面板的路径输入框：回车即应用。
         let settings_cache_input = cx.new(|cx| {
             let mut s = InputState::new(cx);
@@ -324,6 +336,7 @@ impl ChordialApp {
             sidebar_open: true,
             search_input,
             search_input_view,
+            search_top_view,
             search_kind: SearchKind::Track,
             search_collections: Arc::new(Vec::new()),
             search_gen: 0,
@@ -361,6 +374,7 @@ impl ChordialApp {
             phone_page: PhonePage::Browse,
             phone_backdrop: PhoneBackdrop::Off,
             phone_sheet: None,
+            phone_sheet_spring: None,
             phone_sheet_anchor: None,
             phone_edge_swipe: None,
             phone_swipe_suppress_click: None,
@@ -378,8 +392,8 @@ impl ChordialApp {
             no_bg: std::env::var_os("CHORDIAL_NO_BG").is_some(),
             immersive: false,
             sheet_drag: None,
-            motion: crate::motion::MotionSystem::default(),
-            motion_tuning: crate::motion::current_tuning(cx),
+            immersive_expand: None,
+            immersive_collapse: None,
             immersive_hint_at: None,
             ui_anim_enter: None,
             ui_anim_play: None,
@@ -389,13 +403,17 @@ impl ChordialApp {
             last_volume_input: 0.9,
             show_remaining_time: true,
             quality_dialog_open: false,
+            cover_scale_anim: None,
             bench_anim: std::env::var_os("CHORDIAL_BENCH_ANIM").is_some(),
             force_portrait: false,
             portrait_page: PortraitPage::Art,
             portrait_transition: None,
+            portrait_enter: None,
             portrait_toast: None,
             drawer_open: false,
+            drawer_at: None,
             drawer_page: DrawerPage::Root,
+            drawer_add_message: None,
             wide_lyrics_hidden: false,
             compact_lyrics_open: false,
             stage_view: StageView::Lyrics,
@@ -405,6 +423,7 @@ impl ChordialApp {
             // 起点放在过去，避免应用刚启动的 260ms 内控件误淡入。
             stage_chrome_at: Instant::now() - Duration::from_secs(1),
             info_marquee: None,
+            stage_motion: None,
             queue_scroll: gpui::UniformListScrollHandle::new(),
             track_list_scroll: gpui::UniformListScrollHandle::new(),
             playlist_scroll: gpui::UniformListScrollHandle::new(),
@@ -424,6 +443,7 @@ impl ChordialApp {
             sleep_until: None,
             sleep_gen: 0,
             eq_open: false,
+            eq_open_at: None,
             eq,
             eq_search_input,
             eq_search_view,
@@ -491,7 +511,7 @@ impl ChordialApp {
                     app.play_first(cx);
                     app.phone_page = PhonePage::Browse;
                     app.phone_sheet = None;
-                    app.motion.phone_sheet = None;
+                    app.phone_sheet_spring = None;
                     match view.as_str() {
                         "player" => app.phone_page = PhonePage::Player,
                         "lyrics" => app.phone_page = PhonePage::Lyrics,
@@ -605,6 +625,15 @@ impl ChordialApp {
         self.search_gen += 1;
         self.searching = true;
         self.view_tab = ViewTab::Search;
+        // 顶栏搜索在任何页面都能发起：关掉会遮住结果的浮层，回到曲库面板，
+        // 并清空单源路由，让本次搜索真正覆盖全部已加载音源。
+        self.page = None;
+        self.source_route = None;
+        self.close_settings(cx);
+        self.close_login(cx);
+        self.close_eq(cx);
+        self.dock_menu = None;
+        self.track_menu = None;
         self.show_phone_browse();
         cx.notify();
 

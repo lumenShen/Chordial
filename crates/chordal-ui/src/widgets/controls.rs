@@ -204,7 +204,10 @@ impl RenderOnce for VSlider {
     }
 }
 
-pub(super) fn vertical_fraction_at(bounds: Bounds<Pixels>, position: gpui::Point<Pixels>) -> Option<f32> {
+pub(super) fn vertical_fraction_at(
+    bounds: Bounds<Pixels>,
+    position: gpui::Point<Pixels>,
+) -> Option<f32> {
     let h = f32::from(bounds.size.height);
     if h <= 0.0 {
         return None;

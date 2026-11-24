@@ -11,12 +11,24 @@ pub enum ViewTab {
     Collection,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 曲目列表的来源标识。所有列表共用同一套队列操作与同一行渲染器。
+///
+/// 带数据的变体（歌单 / 推荐流）不能 `Copy`，调用方按需 `clone()`。
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum QueueList {
     Search,
     Library,
     Queue,
     Collection,
+    /// 本地/订阅歌单页。
+    Playlist(chordal_core::playlist::PlaylistId),
+    /// 音源推荐流（今日推荐 / 私人 FM）。
+    Feed {
+        source: SourceId,
+        kind: SourceFeedKind,
+    },
+    /// 页面内的一次性曲目快照（音源页预览等），无需在 App 上单独存状态。
+    Snapshot(Arc<Vec<chordal_core::model::Track>>),
 }
 
 /// 当前队列的续接追踪：私人 FM 播放时记录所追踪的音源与在途状态。
@@ -69,6 +81,8 @@ pub(super) enum DockMenu {
 pub(super) enum DrawerPage {
     Root,
     Sleep,
+    /// 把当前曲目加入本地歌单的二级页；歌单列表直接画在抽屉里。
+    AddToPlaylist,
 }
 
 /// 沉浸页右下角选择器的四种视图。
@@ -505,6 +519,52 @@ pub(super) const TRACK_COVER_SIDE: u32 = 72;
 /// 列表滚动时若每帧都无上限地追加请求，会堆积数百个阻塞线程，耗尽
 /// Windows 线程池并触发系统级配额失败。限制在途数量即可保持在 8 个线程。
 pub(super) const MAX_INFLIGHT_TRACK_COVERS: usize = 8;
+
+/// 所有音乐列表共用的一行样式。差异只体现在列与密度，行结构完全一致：
+/// 序号/均衡器 → 封面 → 标题/副标题 → 时长 → ⋮（截图版本）。
+#[derive(Clone)]
+pub(super) struct TrackRowStyle {
+    pub(super) height: f32,
+    pub(super) cover: f32,
+    pub(super) show_duration: bool,
+    pub(super) show_menu: bool,
+    /// Dock「接下来播放」的紧凑密度。
+    pub(super) compact: bool,
+    /// 歌单页用副标题尾部显示来源（替代原来的独立来源列）。
+    pub(super) source_label: Option<SharedString>,
+    pub(super) unavailable: bool,
+    pub(super) local_substitute: bool,
+}
+
+impl TrackRowStyle {
+    /// 截图中的完整行：52px 高、34px 封面、时长 + ⋮。
+    pub(super) fn full() -> Self {
+        Self {
+            height: crate::theme::size::ROW,
+            cover: 34.0,
+            show_duration: true,
+            show_menu: true,
+            compact: false,
+            source_label: None,
+            unavailable: false,
+            local_substitute: false,
+        }
+    }
+
+    /// Dock 预览：保留同样的列结构，只是更矮、更小。
+    pub(super) fn compact() -> Self {
+        Self {
+            height: 38.0,
+            cover: 30.0,
+            show_duration: true,
+            show_menu: false,
+            compact: true,
+            source_label: None,
+            unavailable: false,
+            local_substitute: false,
+        }
+    }
+}
 
 /// 曲目行的预计算显示文本。列表快照变化时一次性构建，render 期间只做
 /// `SharedString` 克隆（引用计数），不再 `format!`/`join`/`to_string`。

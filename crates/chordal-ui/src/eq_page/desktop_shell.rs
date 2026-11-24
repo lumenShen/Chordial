@@ -1,13 +1,18 @@
 //! EQ 页面区块：desktop_shell（由 eq_page.rs 拆分，行为不变）。
 
-use super::*;
 use super::controls::*;
 use super::drawing::*;
+use super::*;
 
 impl ChordialApp {
     // ---------- 桌面：Studio 控制台 ----------
 
-    pub(super) fn eq_render_desktop(&self, pal: &EqPalette, enter: f32, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn eq_render_desktop(
+        &self,
+        pal: &EqPalette,
+        enter: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let panel_w = (self.viewport_width - 56.0).clamp(700.0, 1180.0);
         let panel_h = (self.viewport_height - 56.0).clamp(520.0, 820.0);
         let main_h = panel_h - 60.0 - 30.0;

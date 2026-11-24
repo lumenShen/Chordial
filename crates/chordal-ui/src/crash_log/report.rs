@@ -1,7 +1,7 @@
 //! 崩溃日志：report（由 crash_log.rs 拆分，行为不变）。
 
-use super::*;
 use super::time_util::*;
+use super::*;
 
 pub(super) fn build_panic_report(
     ctx: &CrashContext,
@@ -138,7 +138,7 @@ pub(super) fn read_tail(path: &Path, max_bytes: u64, max_lines: usize) -> Option
     } else {
         &buf[..]
     };
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
     let text = String::from_utf8_lossy(slice);
     let lines: Vec<&str> = text.lines().collect();
     let start_line = lines.len().saturating_sub(max_lines);
@@ -182,4 +182,3 @@ pub(super) fn redact_secrets(input: &str) -> String {
 // ---------------------------------------------------------------------------
 // UTC 时间戳（不额外引入时间库）
 // ---------------------------------------------------------------------------
-

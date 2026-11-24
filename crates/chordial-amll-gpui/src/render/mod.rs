@@ -190,6 +190,9 @@ struct Inner {
     layout_when_hidden: bool,
     /// 是否响应「点击歌词行跳转」。背景层必须关闭，避免误 seek。
     click_seek_enabled: bool,
+    /// 容器底部 mask-image 渐隐比例（相对容器高度；`-1` = 用样式默认值）。
+    /// 只在绘制期乘到字形 alpha 上，不进入整形管线，闲置显隐不会重排歌词。
+    bottom_mask: f32,
     /// 背景光栅/绘制的覆盖区域。沉浸层里歌词视图只占一列，但背景要铺满
     /// 整个窗口：此时把该值设为窗口 bounds，光栅按全窗尺寸计算（低分辨率），
     /// 由 GPU 双线性上采样到屏幕。
@@ -248,6 +251,7 @@ impl Inner {
             text_visible: true,
             layout_when_hidden: false,
             click_seek_enabled: true,
+            bottom_mask: -1.0,
             background_bounds: None,
             last_bounds: Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(0.0), px(0.0))),
             seek_handler: None,
@@ -602,6 +606,21 @@ impl LyricPlayerView {
         if inner.click_seek_enabled != enabled {
             inner.click_seek_enabled = enabled;
         }
+    }
+
+    /// 覆盖歌词容器底部的 `mask-image` 渐隐比例（相对容器高度）。
+    ///
+    /// `-1.0` 表示沿用 `LyricTextStyle::edge_fade_bottom`。这是绘制期的
+    /// alpha 遮罩，不进入 `TextLayoutCache`：显隐动画期间逐帧改变它也不会
+    /// 重新整形、重排或改字号，只让字形按容器底部渐变淡出。
+    pub fn set_bottom_mask(&mut self, fraction: f32) {
+        let value = if fraction < 0.0 {
+            -1.0
+        } else {
+            fraction.clamp(0.0, 1.0)
+        };
+        let mut inner = self.inner.borrow_mut();
+        inner.bottom_mask = value;
     }
 
     /// 鼓点包络来源（0..1）。视图每帧读取一次，驱动 Mesh 背景的跳动；
@@ -1059,6 +1078,7 @@ impl LyricCanvas {
                     fade,
                     colors,
                     style,
+                    inner.bottom_mask,
                 );
             }
             glyphs += paint_lyric_layer(
@@ -1070,6 +1090,7 @@ impl LyricCanvas {
                 incoming,
                 colors,
                 style,
+                inner.bottom_mask,
             );
             scope.finish(glyphs);
         });
@@ -1086,6 +1107,7 @@ fn paint_lyric_layer(
     fade: LyricFade,
     colors: LyricRenderColors,
     style: &LyricTextStyle,
+    bottom_mask: f32,
 ) -> u64 {
     let doc = player.document();
     let frame = player.frame();
@@ -1114,6 +1136,7 @@ fn paint_lyric_layer(
             time,
             doc.is_dynamic,
             fade,
+            bottom_mask,
         );
     }
     if let Some(interlude) = frame.interlude {

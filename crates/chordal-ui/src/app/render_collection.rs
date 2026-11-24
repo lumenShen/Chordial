@@ -276,7 +276,7 @@ impl ChordialApp {
                                 collection.id.source, collection.id.kind, collection.id.id
                             )))
                             .w_full()
-                            .h(px(56.0))
+                            .h(px(crate::theme::size::ROW))
                             .px(px(12.0))
                             .flex()
                             .items_center()

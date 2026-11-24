@@ -193,13 +193,14 @@ impl ChordialApp {
         }
         if !tracks.is_empty() {
             let weak = weak.clone();
+            let list = list.clone();
             actions = actions.child(crate::widgets::icon_button(
                 &theme,
                 crate::icons::icon(crate::icons::Icon::Play, 13.0, theme.text_dim),
                 28.0,
                 "播放全部",
                 move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| app.play_from_list(list, 0, cx));
+                    let _ = weak.update(cx, |app, cx| app.queue_play_all(&list, cx));
                 },
             ));
         }
@@ -254,13 +255,7 @@ impl ChordialApp {
                         .hover(|s| s.bg(theme.surface_alt).text_color(theme.danger))
                         .child("清除")
                         .on_click(move |_, _, cx| {
-                            let _ = weak.update(cx, |app, cx| {
-                                app.stop_playback(cx);
-                                app.set_queue(Arc::new(Vec::new()), None);
-                                app.queue_pos = None;
-                                app.selection = None;
-                                cx.notify();
-                            });
+                            let _ = weak.update(cx, |app, cx| app.clear_queue(cx));
                         }),
                 );
             }
