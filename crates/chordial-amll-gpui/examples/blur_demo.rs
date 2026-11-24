@@ -81,7 +81,7 @@ fn main() {
                 sub_font_size_ratio: 0.54,
                 sub_line_height_ratio: 1.45,
                 padding_x_em: 1.1,
-                padding_y_ratio: 0.03,
+                padding_y_em: 0.6,
                 ..Default::default()
             });
             view.set_player_config(LyricPlayerConfig {

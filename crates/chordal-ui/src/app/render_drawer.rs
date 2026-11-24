@@ -109,8 +109,8 @@ impl ChordialApp {
         }
         match self.drawer_page {
             DrawerPage::Root => {
-                // 手机壳没有侧栏与标题栏按钮，抽屉就是唯一的导航面板：
-                // 播放页 / 全部音乐 / 搜索 / 设置 / 主题都从这里进出。
+                // 一级导航在曲库页底部常驻；抽屉负责播放页/歌词页上的
+                // 跳转，以及主题等次级入口。
                 if phone_main {
                     let section = div()
                         .px(px(10.0))
@@ -323,6 +323,9 @@ impl ChordialApp {
                                     app.phone_page = PhonePage::Browse;
                                     app.view_tab = ViewTab::Library;
                                     app.library_filter = LibraryFilter::Queue;
+                                } else if app.immersive {
+                                    // 队列与歌词共用右侧内容区，不再整页替换播放页。
+                                    app.set_stage_view(StageView::Queue, cx);
                                 } else {
                                     app.set_portrait_page(PortraitPage::Queue, cx);
                                 }
@@ -332,9 +335,11 @@ impl ChordialApp {
                     )
                 };
                 body = body.child(sleep).child(eq);
-                if self.layout_can_toggle_lyrics(cx) {
+                // 歌词入口与右下角按钮同源：只在沉浸层出现，窄窗/强制竖屏
+                // 也显示，确保抽屉不是「收起歌词后唯一的恢复入口」失效。
+                if self.immersive && self.lyric_view.read(cx).has_lyrics() {
                     let weak = weak.clone();
-                    let visible = !self.wide_lyrics_hidden;
+                    let visible = self.immersive_lyrics_visible(cx);
                     body = body.child(row(
                         crate::icons::Icon::Lyrics,
                         "drawer-lyrics",
@@ -348,7 +353,7 @@ impl ChordialApp {
                         Box::new(move |_, _, cx| {
                             let _ = weak.update(cx, |app, cx| {
                                 app.close_drawer(cx);
-                                app.toggle_wide_lyrics(cx);
+                                app.toggle_immersive_lyrics(cx);
                             });
                         }),
                     ));

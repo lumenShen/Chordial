@@ -34,8 +34,9 @@ use chordal_core::source::{AccountSource, CatalogSource, MusicSource, SourceInfo
 mod inner;
 mod inner_account;
 mod inner_collections;
-mod traits;
+mod inner_feeds;
 pub mod lru;
+mod traits;
 
 pub mod client;
 pub mod mapping;
@@ -46,7 +47,7 @@ pub use mapping::SongQualityLevel;
 pub use service::{Endpoint, ManagedConfig, NeteaseMode, NeteaseService};
 
 /// 适配器配置（UI 配置文件反序列化用）。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NeteaseConfig {
     /// api-enhanced 服务地址（External 模式 / Auto 回退）。
     pub base_url: String,
@@ -110,7 +111,6 @@ struct Inner {
     /// 登录/登出代数：异步结果回写前检查，避免旧账号数据污染新会话。
     session_epoch: AtomicU64,
 }
-
 
 /// 网易云源。
 pub struct NeteaseSource {
@@ -200,7 +200,6 @@ where
 fn join_error(source: &str, e: tokio::task::JoinError) -> CoreError {
     CoreError::source_err(source, format!("task join failed: {e}"))
 }
-
 
 #[cfg(test)]
 mod tests;

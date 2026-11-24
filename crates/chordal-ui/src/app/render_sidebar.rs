@@ -22,7 +22,8 @@ impl ChordialApp {
     }
 
     pub(super) fn dock_width(&self) -> f32 {
-        (self.viewport_width - 32.0).min(840.0).max(520.0)
+        // 与沉浸层展开/收起动画共用同一条宽度公式。
+        crate::layout_morph::dock_width(self.viewport_width)
     }
 
     // ================= macOS 标题栏 =================
@@ -145,195 +146,110 @@ impl ChordialApp {
     }
 
     // ================= 左侧边栏 =================
-
-    pub(super) fn playlist_rows(&self) -> Arc<Vec<PlaylistRowText>> {
-        let mut cache = self.playlist_rows.borrow_mut();
-        match cache.as_ref() {
-            Some((cached, rows)) if Arc::ptr_eq(cached, &self.user_playlists) => rows.clone(),
-            _ => {
-                let rows = Arc::new(
-                    self.user_playlists
-                        .iter()
-                        .map(PlaylistRowText::new)
-                        .collect::<Vec<_>>(),
-                );
-                *cache = Some((self.user_playlists.clone(), rows.clone()));
-                rows
-            }
-        }
-    }
-
-    pub(super) fn source_snapshot(&self) -> Arc<Vec<SourceSlotSnapshot>> {
-        let version = self.registry.version();
-        let mut cache = self.source_snapshot.borrow_mut();
-        match cache.as_ref() {
-            Some((cached, slots)) if *cached == version => slots.clone(),
-            _ => {
-                let slots = Arc::new(self.registry.snapshot());
-                *cache = Some((version, slots.clone()));
-                slots
-            }
-        }
-    }
-
-    /// 侧栏歌单保留缓存的输入版本。任何可能改变歌单行内容、位置或 hover
-    /// 状态的输入都必须进入哈希，否则缓存的绘制范围会过期。
-    pub(super) fn sidebar_playlist_version(&self, mouse: gpui::Point<gpui::Pixels>) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (matches!(self.appearance, crate::theme::Appearance::Dark) as u8).hash(&mut hasher);
-        self.user_playlists.as_ptr().hash(&mut hasher);
-        self.playlists_loading.hash(&mut hasher);
-        self.account_avatar
-            .as_ref()
-            .map(|image| Arc::as_ptr(image) as usize)
-            .hash(&mut hasher);
-        match &self.account_state {
-            chordal_core::model::AccountState::Unsupported => 0u8.hash(&mut hasher),
-            chordal_core::model::AccountState::LoggedOut => 1u8.hash(&mut hasher),
-            chordal_core::model::AccountState::Unknown => 3u8.hash(&mut hasher),
-            chordal_core::model::AccountState::LoggedIn(profile) => {
-                2u8.hash(&mut hasher);
-                profile.uid.hash(&mut hasher);
-                profile.nickname.hash(&mut hasher);
-                profile.avatar.hash(&mut hasher);
-                profile.vip.hash(&mut hasher);
-            }
-        }
-        if let Some(collection) = &self.collection {
-            collection.id.hash(&mut hasher);
-        }
-        self.viewport_width.to_bits().hash(&mut hasher);
-        self.viewport_height.to_bits().hash(&mut hasher);
-        self.sidebar_width().to_bits().hash(&mut hasher);
-        f32::from(self.sidebar_scroll.offset().y)
-            .to_bits()
-            .hash(&mut hasher);
-        f32::from(mouse.x).to_bits().hash(&mut hasher);
-        f32::from(mouse.y).to_bits().hash(&mut hasher);
-        hasher.finish()
-    }
-
     pub(super) fn render_sidebar(
         &self,
-        mouse: gpui::Point<gpui::Pixels>,
+        _mouse: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
-        let slots = self.source_snapshot();
-        let loaded = slots
-            .iter()
-            .filter(|s| s.status == SourceStatus::Loaded)
-            .count();
         let width = self.sidebar_width();
-        let netease_loaded = slots
-            .iter()
-            .any(|s| s.info.id.as_str() == "netease" && s.status == SourceStatus::Loaded);
         let dock_left = ((self.viewport_width - self.dock_width()) / 2.0).max(8.0);
-        let bottom_pad: f32 = if dock_left < width + 12.0 { 88.0 } else { 10.0 };
+        let bottom_pad: f32 = if dock_left < width + 12.0 {
+            crate::theme::size::DOCK + crate::theme::size::DOCK_BOTTOM + 8.0
+        } else {
+            10.0
+        };
 
-        let section = |label: &'static str| {
+        let active_source = match &self.page {
+            Some(MainPage::Source(id)) | Some(MainPage::EditSource(id)) => Some(id.clone()),
+            _ => None,
+        };
+        let active_playlist = match &self.page {
+            Some(MainPage::Playlist(id)) => Some(id.clone()),
+            _ => None,
+        };
+        let manage_active = matches!(
+            self.page,
+            Some(MainPage::ManageSources)
+                | Some(MainPage::NewSource)
+                | Some(MainPage::EditSource(_))
+        );
+
+        let section_label = |label: &'static str, meta: Option<String>| {
             div()
-                .h(px(28.0))
-                .px(px(10.0))
+                .h(px(27.0))
+                .px(px(9.0))
                 .pb(px(6.0))
                 .flex()
                 .items_end()
-                .text_size(px(10.5))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.text_faint)
-                .child(label)
-                .into_any_element()
-        };
-
-        let nav_row = |id: &'static str,
-                       label: &'static str,
-                       count: String,
-                       active: bool,
-                       icon: crate::icons::Icon,
-                       weak: gpui::WeakEntity<ChordialApp>,
-                       target: LibraryFilter| {
-            let fg = theme.text;
-            div()
-                .id(id)
-                .h(px(32.0))
-                .px(px(9.0))
-                .rounded(px(7.0))
-                .flex()
-                .items_center()
-                .gap(px(9.0))
-                .bg(if active {
-                    theme.active
-                } else {
-                    gpui::transparent_black()
-                })
-                .hover(|s| s.bg(theme.hover))
-                .child(crate::icons::icon(icon, 14.0, fg))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(px(12.5))
-                        .font_weight(if active {
-                            gpui::FontWeight::MEDIUM
-                        } else {
-                            gpui::FontWeight::NORMAL
-                        })
-                        .text_color(fg)
-                        .text_ellipsis()
-                        .child(label),
-                )
+                .justify_between()
                 .child(
                     div()
                         .text_size(px(10.5))
-                        .text_color(if active {
-                            theme.text_dim
-                        } else {
-                            theme.text_faint
-                        })
-                        .child(count),
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text_faint)
+                        .child(label),
+                )
+                .children(meta.map(|meta| {
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(meta))
+                }))
+                .into_any_element()
+        };
+
+        let switch = |on: bool, id: SourceId, weak: gpui::WeakEntity<ChordialApp>| {
+            let switch_bg = if on { theme.accent } else { theme.active };
+            let knob_bg = if on { theme.on_accent } else { theme.surface };
+            div()
+                .id(SharedString::from(format!("source-switch-{}", id.0)))
+                .w(px(30.0))
+                .h(px(17.0))
+                .flex_none()
+                .rounded(px(9.0))
+                .border_1()
+                .border_color(if on {
+                    theme.accent
+                } else {
+                    theme.border_strong
+                })
+                .bg(switch_bg)
+                .relative()
+                .cursor_pointer()
+                .hover(|s| s.border_color(theme.text_faint))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(1.0))
+                        .left(px(if on { 13.0 } else { 1.0 }))
+                        .size(px(13.0))
+                        .rounded(px(7.0))
+                        .bg(knob_bg),
                 )
                 .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let id = id.clone();
                     let _ = weak.update(cx, |app, cx| {
-                        app.library_filter = target;
-                        app.source_route = None;
-                        app.view_tab = ViewTab::Library;
-                        cx.notify();
+                        let enabled = app.source_is_enabled(&id);
+                        app.set_source_enabled(&id, !enabled, cx);
                     });
                 })
         };
 
-        let mut list = div().flex().flex_col().gap(px(2.0));
-        list = list
-            .child(section("音乐"))
-            .child(nav_row(
-                "nav-all",
-                "所有音乐",
-                self.library.len().to_string(),
-                self.library_filter == LibraryFilter::All && self.view_tab == ViewTab::Library,
-                crate::icons::Icon::Note,
-                weak.clone(),
-                LibraryFilter::All,
-            ))
-            .child(nav_row(
-                "nav-queue",
-                "播放队列",
-                self.queue.len().to_string(),
-                self.library_filter == LibraryFilter::Queue && self.view_tab == ViewTab::Library,
-                crate::icons::Icon::Queue,
-                weak.clone(),
-                LibraryFilter::Queue,
-            ))
-            .child(div().h(px(6.0)))
-            .child(section("音乐源"));
+        let mut list = div().flex().flex_col().gap(px(1.0));
 
-        // 全部音源路由。
-        {
-            let active = self.source_route.is_none() && self.view_tab == ViewTab::Search;
-            let weak = weak.clone();
-            list = list.child(
+        // ---------- 音乐 ----------
+        list = list
+            .child(section_label("音乐", None))
+            .child({
+                let active = self.page.is_none()
+                    && self.view_tab == ViewTab::Library
+                    && self.library_filter == LibraryFilter::All;
+                let weak = weak.clone();
                 div()
-                    .id("route-all")
+                    .id("nav-all")
                     .h(px(32.0))
                     .px(px(9.0))
                     .rounded(px(7.0))
@@ -346,10 +262,11 @@ impl ChordialApp {
                         gpui::transparent_black()
                     })
                     .hover(|s| s.bg(theme.hover))
+                    .cursor_pointer()
                     .child(crate::icons::icon(
-                        crate::icons::Icon::Search,
+                        crate::icons::Icon::Note,
                         14.0,
-                        if active { theme.text } else { theme.text_dim },
+                        theme.text,
                     ))
                     .child(
                         div()
@@ -363,454 +280,420 @@ impl ChordialApp {
                             })
                             .text_color(theme.text)
                             .text_ellipsis()
-                            .child("全部音源"),
+                            .child("所有音乐"),
                     )
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |app, cx| {
-                            app.source_route = None;
-                            app.view_tab = ViewTab::Search;
-                            focus_input(&app.search_input, window, cx);
-                            cx.notify();
-                        });
-                    }),
-            );
-        }
-
-        // 搜索结果的按源计数：只在 Arc 快照变化时重算一次。
-        // 旧实现在下面的音源循环里对每个源各扫一遍 search_tracks
-        // （O(源数 × 结果数)，每帧重复），搜索结果多时是确定性瓶颈。
-        let search_ptr = Arc::as_ptr(&self.search_tracks) as usize;
-        {
-            let mut cache = self.search_source_counts.borrow_mut();
-            let stale = cache.as_ref().is_none_or(|(ptr, _)| *ptr != search_ptr);
-            if stale {
-                let mut counts = HashMap::new();
-                for track in self.search_tracks.iter() {
-                    *counts.entry(track.id.source.clone()).or_insert(0usize) += 1;
-                }
-                *cache = Some((search_ptr, counts));
-            }
-        }
-        let source_counts = self.search_source_counts.borrow();
-        let source_counts = source_counts.as_ref().expect("initialized above");
-
-        for slot in slots.iter() {
-            let source_id = slot.info.id.clone();
-            let route_active =
-                self.view_tab == ViewTab::Search && self.source_route.as_ref() == Some(&source_id);
-            let loaded_now = slot.status == SourceStatus::Loaded;
-            let local = source_id.0 == "local";
-            let dot = match &slot.status {
-                SourceStatus::Loaded => theme.ok,
-                SourceStatus::Registered => theme.text_faint,
-                SourceStatus::Failed(_) => theme.danger,
-            };
-            let count = if local {
-                self.library.len()
-            } else {
-                *source_counts.1.get(&source_id).unwrap_or(&0)
-            };
-            let weak_route = weak.clone();
-            let weak_toggle = weak.clone();
-            let route_id = source_id.clone();
-            let toggle_id = source_id.clone();
-            let icon = if local {
-                crate::icons::Icon::Drive
-            } else {
-                crate::icons::Icon::Cloud
-            };
-
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("src-{}", source_id)))
-                    .h(px(32.0))
-                    .px(px(9.0))
-                    .rounded(px(7.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .bg(if route_active {
-                        theme.active
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .hover(|s| s.bg(theme.hover))
-                    .on_click(move |_, window, cx| {
-                        let id = route_id.clone();
-                        let _ = weak_route.update(cx, |app, cx| {
-                            app.source_route = Some(id);
-                            app.view_tab = ViewTab::Search;
-                            focus_input(&app.search_input, window, cx);
-                            cx.notify();
-                        });
-                    })
-                    .child(crate::icons::icon(
-                        icon,
-                        14.0,
-                        if route_active {
-                            theme.text
-                        } else {
-                            theme.text_dim
-                        },
-                    ))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(12.5))
-                            .font_weight(if route_active {
-                                gpui::FontWeight::MEDIUM
-                            } else {
-                                gpui::FontWeight::NORMAL
-                            })
-                            .text_color(theme.text)
-                            .text_ellipsis()
-                            .child(SharedString::from(slot.info.display_name.clone())),
-                    )
-                    .when(count > 0, |d| {
-                        d.child(
-                            div()
-                                .text_size(px(9.5))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(count.to_string())),
-                        )
-                    })
-                    .child(div().size(px(5.0)).rounded(px(3.0)).bg(dot))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("src-toggle-{}", toggle_id)))
-                            .h(px(18.0))
-                            .px(px(5.0))
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .flex()
-                            .items_center()
-                            .text_size(px(9.5))
-                            .text_color(theme.text_faint)
-                            .hover(|s| s.bg(theme.surface_alt).text_color(theme.text))
-                            .child(if loaded_now { "卸载" } else { "加载" })
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                let _ = weak_toggle
-                                    .update(cx, |app, cx| app.toggle_source(&toggle_id, cx));
-                            }),
-                    ),
-            );
-        }
-
-        // 账号 / 我的歌单（只在网易云源已加载时出现）。
-        if netease_loaded {
-            list = list.child(div().h(px(6.0))).child(section("网易云账号"));
-            match self.account_state.clone() {
-                AccountState::LoggedIn(profile) => {
-                    let weak_logout = weak.clone();
-                    let avatar_el: AnyElement = match &self.account_avatar {
-                        Some(image) => {
-                            let placeholder = div()
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(theme.surface_alt)
-                                .child(crate::icons::icon(
-                                    crate::icons::Icon::Cloud,
-                                    12.0,
-                                    theme.text_faint,
-                                ))
-                                .into_any_element();
-                            crate::widgets::cover_thumb(
-                                &theme,
-                                Some(image.clone()),
-                                28.0,
-                                14.0,
-                                placeholder,
-                            )
-                        }
-                        None => crate::icons::icon(crate::icons::Icon::Cloud, 14.0, theme.ok),
-                    };
-                    list = list.child(
-                        div()
-                            .id("account-row")
-                            .h(px(34.0))
-                            .px(px(9.0))
-                            .rounded(px(7.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(avatar_el)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(theme.text)
-                                            .text_ellipsis()
-                                            .child(SharedString::from(profile.nickname.clone())),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(9.5))
-                                            .text_color(theme.text_faint)
-                                            .child(SharedString::from(if profile.vip {
-                                                "VIP · 已登录"
-                                            } else {
-                                                "已登录"
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("account-logout")
-                                    .h(px(20.0))
-                                    .px(px(6.0))
-                                    .rounded(px(4.0))
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .flex()
-                                    .items_center()
-                                    .text_size(px(9.5))
-                                    .text_color(theme.text_faint)
-                                    .hover(|s| s.bg(theme.surface_alt).text_color(theme.text))
-                                    .child("退出")
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        let _ = weak_logout
-                                            .update(cx, |app, cx| app.logout_account(cx));
-                                    }),
-                            ),
-                    );
-                    list = list.child(div().h(px(4.0))).child(section("我的歌单"));
-                    if self.playlists_loading {
-                        list = list.child(
-                            div()
-                                .px(px(9.0))
-                                .py(px(4.0))
-                                .text_size(px(10.0))
-                                .text_color(theme.text_faint)
-                                .child("正在加载歌单…"),
-                        );
-                    } else if self.user_playlists.is_empty() {
-                        list = list.child(
-                            div()
-                                .px(px(9.0))
-                                .py(px(4.0))
-                                .text_size(px(10.0))
-                                .text_color(theme.text_faint)
-                                .child("暂无歌单"),
-                        );
-                    } else {
-                        let playlist_rows = self.playlist_rows();
-                        let row_count = playlist_rows.len().min(30);
-                        let mut style = gpui::Style::default();
-                        style.size.width = gpui::relative(1.0).into();
-                        style.size.height = px((row_count as f32) * 28.0).into();
-                        style.flex_shrink = 0.0;
-
-                        let version = self.sidebar_playlist_version(mouse);
-                        let rows = playlist_rows;
-                        let theme_rows = theme.clone();
-                        let weak_rows = weak.clone();
-                        let active_id = self
-                            .collection
-                            .as_ref()
-                            .map(|collection| collection.id.clone());
-                        list = list.child(gpui::Retained::new(
-                            "sidebar-playlists",
-                            version,
-                            style,
-                            move |_window, _cx| {
-                                let mut column = div().w_full().flex().flex_col();
-                                for row in rows.iter().take(row_count) {
-                                    let weak = weak_rows.clone();
-                                    let active = active_id.as_ref() == Some(&row.id);
-                                    column = column.child(
-                                        div()
-                                            .id(row.element_id.clone())
-                                            .h(px(28.0))
-                                            .px(px(9.0))
-                                            .rounded(px(6.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(7.0))
-                                            .bg(if active {
-                                                theme_rows.active
-                                            } else {
-                                                gpui::transparent_black()
-                                            })
-                                            .hover(|s| s.bg(theme_rows.hover))
-                                            .cursor_pointer()
-                                            .child(crate::icons::icon(
-                                                crate::icons::Icon::Layers,
-                                                12.0,
-                                                if active {
-                                                    theme_rows.text
-                                                } else {
-                                                    theme_rows.text_faint
-                                                },
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .text_size(px(11.5))
-                                                    .text_color(theme_rows.text)
-                                                    .text_ellipsis()
-                                                    .child(row.title.clone()),
-                                            )
-                                            .when(!row.count.is_empty(), |d| {
-                                                d.child(
-                                                    div()
-                                                        .text_size(px(9.5))
-                                                        .text_color(theme_rows.text_faint)
-                                                        .child(row.count.clone()),
-                                                )
-                                            })
-                                            .on_click({
-                                                let id = row.id.clone();
-                                                let title = row.title.to_string();
-                                                move |_, _, cx| {
-                                                    let _ = weak.update(cx, |app, cx| {
-                                                        app.open_collection(
-                                                            id.clone(),
-                                                            title.clone(),
-                                                            cx,
-                                                        );
-                                                    });
-                                                }
-                                            }),
-                                    );
-                                }
-                                column.into_any_element()
-                            },
-                        ));
-                    }
-                }
-                AccountState::Unknown => {
-                    let weak = weak.clone();
-                    list = list.child(
-                        div()
-                            .id("account-retry")
-                            .px(px(9.0))
-                            .py(px(4.0))
                             .text_size(px(10.0))
                             .text_color(theme.text_faint)
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(theme.text))
-                            .child("正在校验账号 · 点击重试")
-                            .on_click(move |_, _, cx| {
-                                let _ = weak.update(cx, |app, cx| {
-                                    app.spawn_account_bootstrap(cx);
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                }
-                _ => {
-                    let weak = weak.clone();
-                    list = list.child(
-                        div()
-                            .id("account-login")
-                            .h(px(32.0))
-                            .px(px(9.0))
-                            .rounded(px(7.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(9.0))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.hover))
-                            .child(crate::icons::icon(
-                                crate::icons::Icon::Cloud,
-                                14.0,
-                                theme.text_dim,
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(12.5))
-                                    .text_color(theme.text)
-                                    .child("登录网易云"),
-                            )
-                            .child(crate::icons::icon(
-                                crate::icons::Icon::ChevronDown,
-                                10.0,
-                                theme.text_faint,
-                            ))
-                            .on_click(move |_, _, cx| {
-                                let _ = weak.update(cx, |app, cx| app.open_login(cx));
-                            }),
-                    );
-                }
-            }
-        }
-
-        // 播放模式。
-        list = list.child(div().h(px(6.0))).child(section("播放模式"));
-        for (mode, label, icon) in [
-            (PlayMode::Sequential, "顺序播放", crate::icons::Icon::Menu),
-            (PlayMode::RepeatAll, "列表循环", crate::icons::Icon::Repeat),
-            (PlayMode::Shuffle, "随机播放", crate::icons::Icon::Shuffle),
-            (PlayMode::RepeatOne, "单曲循环", crate::icons::Icon::Repeat),
-        ] {
-            let active = self.play_mode == mode;
-            let weak = weak.clone();
-            list = list.child(
+                            .child(SharedString::from(self.library.len().to_string())),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |app, cx| {
+                            app.page = None;
+                            app.view_tab = ViewTab::Library;
+                            app.library_filter = LibraryFilter::All;
+                            app.source_route = None;
+                            cx.notify();
+                        });
+                    })
+            })
+            .child({
+                let active = self.page.is_none()
+                    && self.view_tab == ViewTab::Library
+                    && self.library_filter == LibraryFilter::Queue;
+                let weak = weak.clone();
                 div()
-                    .id(SharedString::from(format!("mode-{label}")))
+                    .id("nav-queue")
                     .h(px(32.0))
                     .px(px(9.0))
                     .rounded(px(7.0))
                     .flex()
                     .items_center()
                     .gap(px(9.0))
+                    .bg(if active {
+                        theme.active
+                    } else {
+                        gpui::transparent_black()
+                    })
                     .hover(|s| s.bg(theme.hover))
+                    .cursor_pointer()
                     .child(crate::icons::icon(
-                        icon,
+                        crate::icons::Icon::Queue,
                         14.0,
-                        if active {
-                            theme.text_dim
-                        } else {
-                            theme.text_faint
-                        },
+                        theme.text_dim,
                     ))
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .text_size(px(12.5))
                             .font_weight(if active {
                                 gpui::FontWeight::MEDIUM
                             } else {
                                 gpui::FontWeight::NORMAL
                             })
-                            .text_color(if active { theme.text } else { theme.text_dim })
-                            .child(label),
+                            .text_color(theme.text)
+                            .text_ellipsis()
+                            .child("播放队列"),
                     )
-                    .when(active, |d| {
-                        d.child(crate::icons::icon(
-                            crate::icons::Icon::Check,
-                            11.0,
-                            theme.text_dim,
-                        ))
-                    })
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(self.queue.len().to_string())),
+                    )
                     .on_click(move |_, _, cx| {
                         let _ = weak.update(cx, |app, cx| {
-                            app.play_mode = mode;
+                            app.page = None;
+                            app.view_tab = ViewTab::Library;
+                            app.library_filter = LibraryFilter::Queue;
+                            app.source_route = None;
                             cx.notify();
                         });
+                    })
+            });
+
+        // ---------- 音源 ----------
+        let enabled_sources = self.source_configs.iter().filter(|s| s.enabled).count();
+        list = list.child(div().h(px(10.0))).child(section_label(
+            "音源",
+            Some(format!(
+                "{enabled_sources} / {} 开启",
+                self.source_configs.len()
+            )),
+        ));
+
+        if self.source_configs.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(9.0))
+                    .py(px(5.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.text_faint)
+                    .child("还没有音源，点下方「管理音源」添加"),
+            );
+        }
+
+        for config in &self.source_configs {
+            let id = SourceId::new(config.id.clone());
+            let enabled = config.enabled;
+            let loaded = self.registry.get(&id).is_some();
+            let failed = matches!(self.registry.status(&id), Some(SourceStatus::Failed(_)));
+            let active = active_source.as_ref() == Some(&id);
+            let is_local = config.is_local();
+            let icon = if is_local {
+                crate::icons::Icon::Drive
+            } else {
+                crate::icons::Icon::Cloud
+            };
+            let dot = if !enabled {
+                theme.text_faint
+            } else if failed {
+                theme.danger
+            } else if loaded {
+                theme.ok
+            } else {
+                theme.warn
+            };
+
+            let status_text = if !enabled {
+                "已关闭 · 配置保留".to_string()
+            } else if failed {
+                "加载失败 · 打开查看".to_string()
+            } else if is_local {
+                let tracks = cx
+                    .global::<Globals>()
+                    .local_sources
+                    .get(&id)
+                    .map(|local| local.stats().tracks)
+                    .unwrap_or(0);
+                if loaded {
+                    format!("已就绪 · {tracks} 首")
+                } else {
+                    "未加载".to_string()
+                }
+            } else if loaded {
+                let account = cx
+                    .global::<Globals>()
+                    .netease_sources
+                    .get(&id)
+                    .and_then(|source| source.account().map(|account| account.account_state()));
+                match account {
+                    Some(AccountState::LoggedIn(profile)) => {
+                        format!("已连接 · {}", profile.nickname)
+                    }
+                    Some(AccountState::LoggedOut) => "已连接 · 未登录".to_string(),
+                    Some(AccountState::Unknown) => "已连接 · 校验中".to_string(),
+                    _ => "已连接".to_string(),
+                }
+            } else {
+                "未加载".to_string()
+            };
+
+            let weak_row = weak.clone();
+            let weak_switch = weak.clone();
+            let row_switch = switch(enabled, id.clone(), weak_switch);
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("source-{}", config.id)))
+                    .h(px(45.0))
+                    .px(px(9.0))
+                    .rounded(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .bg(if active {
+                        theme.active
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .hover(|s| s.bg(theme.hover))
+                    .cursor_pointer()
+                    .on_click({
+                        let id = id.clone();
+                        move |_, _, cx| {
+                            let _ = weak_row.update(cx, |app, cx| {
+                                app.open_source_page(id.clone(), cx);
+                            });
+                        }
+                    })
+                    .child(
+                        div()
+                            .size(px(28.0))
+                            .flex_none()
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.surface_alt)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .opacity(if enabled { 1.0 } else { 0.55 })
+                            .child(crate::icons::icon(
+                                icon,
+                                14.0,
+                                if active { theme.text } else { theme.text_dim },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(if active {
+                                        gpui::FontWeight::MEDIUM
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(if enabled {
+                                        theme.text
+                                    } else {
+                                        theme.text_faint
+                                    })
+                                    .text_ellipsis()
+                                    .child(SharedString::from(config.name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(div().size(px(5.0)).rounded(px(3.0)).bg(dot))
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(theme.text_faint)
+                                            .text_ellipsis()
+                                            .child(SharedString::from(status_text)),
+                                    ),
+                            ),
+                    )
+                    .child(row_switch),
+            );
+        }
+
+        // 管理音源：端点状态 → 二级编辑。
+        {
+            let weak = weak.clone();
+            list = list.child(
+                div()
+                    .id("manage-sources")
+                    .h(px(32.0))
+                    .px(px(9.0))
+                    .mt(px(2.0))
+                    .rounded(px(7.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .bg(if manage_active {
+                        theme.active
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .hover(|s| s.bg(theme.hover))
+                    .cursor_pointer()
+                    .child(crate::icons::icon(
+                        crate::icons::Icon::Sliders,
+                        14.0,
+                        theme.text_dim,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_dim)
+                            .child("管理音源"),
+                    )
+                    .child(crate::icons::icon(
+                        crate::icons::Icon::ChevronRight,
+                        11.0,
+                        theme.text_faint,
+                    ))
+                    .on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |app, cx| app.open_source_manager(cx));
                     }),
             );
         }
 
-        let footer_note = if self.library_scanning {
-            "正在扫描本地库…".to_string()
-        } else {
-            format!("{loaded} 个音源已加载 · Ctrl K 搜索")
-        };
+        // ---------- 我的歌单（本地 + 订阅） ----------
+        {
+            let weak_plus = weak.clone();
+            list = list.child(div().h(px(12.0))).child(
+                div()
+                    .h(px(27.0))
+                    .px(px(9.0))
+                    .pb(px(6.0))
+                    .flex()
+                    .items_end()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text_faint)
+                            .child("我的歌单"),
+                    )
+                    .child(
+                        div()
+                            .id("playlist-create")
+                            .size(px(19.0))
+                            .rounded(px(5.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.hover))
+                            .child(crate::icons::icon(
+                                crate::icons::Icon::Plus,
+                                12.0,
+                                theme.text_faint,
+                            ))
+                            .on_click(move |_, _, cx| {
+                                let _ =
+                                    weak_plus.update(cx, |app, cx| app.create_local_playlist(cx));
+                            }),
+                    ),
+            );
+        }
+
+        let summaries = self.playlists.summaries();
+        if summaries.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(9.0))
+                    .py(px(5.0))
+                    .text_size(px(10.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_faint)
+                    .child("还没有本地歌单；也可以在歌单页订阅来源歌单"),
+            );
+        }
+        for summary in &summaries {
+            let active = active_playlist.as_ref() == Some(&summary.id);
+            let subscribed = summary.is_subscribed();
+            let weak = weak.clone();
+            let id = summary.id.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("playlist-{}", summary.id.0)))
+                    .h(px(30.0))
+                    .px(px(9.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .bg(if active {
+                        theme.active
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .hover(|s| s.bg(theme.hover))
+                    .cursor_pointer()
+                    .child(crate::icons::icon(
+                        if subscribed {
+                            crate::icons::Icon::Cloud
+                        } else {
+                            crate::icons::Icon::Layers
+                        },
+                        13.0,
+                        if active { theme.text } else { theme.text_faint },
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .text_color(theme.text)
+                            .text_ellipsis()
+                            .child(SharedString::from(summary.title.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(summary.count.to_string())),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let id = id.clone();
+                        let _ = weak.update(cx, |app, cx| app.open_playlist_page(id.clone(), cx));
+                    }),
+            );
+        }
+        {
+            let weak = weak.clone();
+            list = list.child(
+                div()
+                    .id("playlist-create-row")
+                    .h(px(30.0))
+                    .px(px(9.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .child(crate::icons::icon(
+                        crate::icons::Icon::Plus,
+                        13.0,
+                        theme.text_faint,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(theme.text_faint)
+                            .child("新建歌单"),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |app, cx| app.create_local_playlist(cx));
+                    }),
+            );
+        }
 
         div()
             .w(px(width))
@@ -830,69 +713,8 @@ impl ChordialApp {
                     .overflow_y_scroll()
                     .when(self.smooth_scroll, |d| d.smooth_scroll())
                     .p(px(10.0))
+                    .pb(px(bottom_pad.max(10.0)))
                     .child(list),
-            )
-            .child(
-                div()
-                    .mx(px(10.0))
-                    .mb(px(bottom_pad.max(10.0)))
-                    .p(px(10.0))
-                    .rounded(px(9.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.surface_alt)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .child(crate::icons::icon(
-                                crate::icons::Icon::Drive,
-                                13.0,
-                                theme.text_dim,
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(11.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child("本地库"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from(format!(
-                                        "{} 首",
-                                        self.library.len()
-                                    ))),
-                            )
-                            .child({
-                                let weak = weak.clone();
-                                crate::widgets::icon_button(
-                                    &theme,
-                                    crate::icons::icon(
-                                        crate::icons::Icon::Settings,
-                                        13.0,
-                                        theme.text_dim,
-                                    ),
-                                    22.0,
-                                    "设置",
-                                    move |_, _, cx| {
-                                        let _ = weak.update(cx, |app, cx| app.open_settings(cx));
-                                    },
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt(px(5.0))
-                            .text_size(px(10.0))
-                            .text_color(theme.text_faint)
-                            .text_ellipsis()
-                            .child(SharedString::from(footer_note)),
-                    ),
             )
             .into_any_element()
     }

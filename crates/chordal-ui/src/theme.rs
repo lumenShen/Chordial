@@ -221,9 +221,9 @@ pub mod size {
     pub const SIDEBAR: f32 = 232.0;
     /// 中间曲目板：macOS Music 的固定窄列表。
     pub const LIST: f32 = 352.0;
-    /// 悬浮底栏（Dock）的高度与离底距离。
-    pub const DOCK: f32 = 72.0;
-    pub const DOCK_BOTTOM: f32 = 14.0;
+    /// 悬浮底栏（Dock）的高度与离底距离。时间轴独占下层，因此比旧版高 16px。
+    pub const DOCK: f32 = 88.0;
+    pub const DOCK_BOTTOM: f32 = 18.0;
     pub const ROW: f32 = 52.0;
     pub const CONTROL: f32 = 30.0;
     pub const PAGE_PAD: f32 = 18.0;

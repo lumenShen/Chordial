@@ -121,22 +121,28 @@ pub(super) fn paint_interlude_dots(
     bounds: Bounds<Pixels>,
     dots: InterludeDotsFrame,
     color: Hsla,
+    fade: LyricFade,
 ) {
-    if dots.scale <= 0.001 {
+    if dots.scale <= 0.001 || fade.opacity <= 0.001 {
         return;
     }
-    let scale = dots.scale;
+    let scale = dots.scale * fade.content_scale;
     let diameter = px(dots.dot_size.max(1.0) * scale);
     // AMLL `.interludeDots` 的 `transform-origin: center`：缩放围绕点组中心，
-    // 间距也随 scale 一起缩放（flex 布局先完成，再整体缩放）。
+    // 间距也随 scale 一起缩放（flex 布局先完成，再整体缩放）。切换动画的
+    // 内容缩放则围绕歌词容器中心施加，与歌词字形保持一致。
     let group_w = px(dots.width.max(0.0));
-    let center_x = bounds.left() + px(dots.x) + group_w * 0.5;
+    let raw_cx = bounds.left() + px(dots.x) + group_w * 0.5;
+    let raw_cy = bounds.top() + px(dots.y) + px(dots.height * 0.5);
+    let content_cx = bounds.left() + bounds.size.width * 0.5;
+    let content_cy = bounds.top() + bounds.size.height * 0.5;
+    let center_x = content_cx + (raw_cx - content_cx) * fade.content_scale;
+    let center_y = content_cy + (raw_cy - content_cy) * fade.content_scale;
     let step = px((dots.dot_size + dots.gap) * scale);
     let mut x = center_x - group_w * scale * 0.5;
-    let center_y = bounds.top() + px(dots.y) + px(dots.height * 0.5);
     let y = center_y - diameter * 0.5;
     for opacity in dots.dot_opacity {
-        let alpha = (opacity * color.a).clamp(0.0, 1.0);
+        let alpha = (opacity * color.a * fade.opacity).clamp(0.0, 1.0);
         if alpha > 0.001 {
             let mut quad = fill(
                 Bounds::new(point(x, y), gpui::size(diameter, diameter)),

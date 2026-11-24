@@ -1,6 +1,9 @@
 //! 网易云源 trait 实现（由 lib.rs 拆分，行为不变）。
 
 use super::*;
+use chordal_core::playlist::{
+    PlaylistEditCapabilities, PlaylistEditResult, PlaylistEditor, PlaylistMutation,
+};
 
 #[async_trait]
 impl MusicSource for NeteaseSource {
@@ -17,6 +20,10 @@ impl MusicSource for NeteaseSource {
     }
 
     fn account(&self) -> Option<&dyn AccountSource> {
+        Some(self)
+    }
+
+    fn playlist_editor(&self) -> Option<&dyn PlaylistEditor> {
         Some(self)
     }
 
@@ -212,7 +219,221 @@ impl AccountSource for NeteaseSource {
             .map_err(|e| join_error(self.info.id.as_str(), e))?
     }
 
+    async fn daily_recommendations(&self) -> CoreResult<Vec<Track>> {
+        let inner = self.inner.clone();
+        spawn_inner(move || async move { inner.daily_songs_inner().await })
+            .await
+            .map_err(|e| join_error(self.info.id.as_str(), e))?
+    }
+
+    async fn personal_fm(&self) -> CoreResult<Vec<Track>> {
+        let inner = self.inner.clone();
+        spawn_inner(move || async move { inner.personal_fm_inner().await })
+            .await
+            .map_err(|e| join_error(self.info.id.as_str(), e))?
+    }
+
+    async fn recommended_playlists(&self) -> CoreResult<Vec<CollectionSummary>> {
+        let inner = self.inner.clone();
+        spawn_inner(move || async move { inner.recommended_playlists_inner().await })
+            .await
+            .map_err(|e| join_error(self.info.id.as_str(), e))?
+    }
+
+    async fn private_radar(&self) -> CoreResult<Vec<CollectionSummary>> {
+        let inner = self.inner.clone();
+        spawn_inner(move || async move { inner.private_radar_inner().await })
+            .await
+            .map_err(|e| join_error(self.info.id.as_str(), e))?
+    }
+
     fn cookie(&self) -> Option<String> {
         self.inner.client.cookie()
+    }
+}
+
+/// 从 `/playlist/create` 响应里取源内歌单 ID。
+fn created_playlist_id(body: &serde_json::Value) -> Option<String> {
+    body.get("id")
+        .or_else(|| body.get("playlist").and_then(|playlist| playlist.get("id")))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .map(|id| id.to_string())
+                .or_else(|| value.as_str().map(str::to_string))
+        })
+}
+
+/// 只保留本实例的曲目 ID（远端歌单无法写入其它源的曲目）。
+fn own_track_ids(source: &SourceId, tracks: &[Track]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tracks
+        .iter()
+        .filter(|track| &track.id.source == source)
+        .map(|track| track.id.id.clone())
+        .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+/// 网易云远端歌单编辑：统一 `PlaylistMutation` → api-enhanced 路由。
+///
+/// 能力边界：
+/// - 只能编辑账号自己的歌单（服务端会拒绝他人歌单）；
+/// - 曲目集合只接受本实例的源内 ID，其它源的曲目会被忽略；
+/// - 新建歌单时先创建空歌单，再批量写入本实例曲目。
+#[async_trait]
+impl PlaylistEditor for NeteaseSource {
+    fn playlist_edit_capabilities(&self, kind: CollectionKind) -> PlaylistEditCapabilities {
+        if kind == CollectionKind::Playlist {
+            PlaylistEditCapabilities::local()
+        } else {
+            PlaylistEditCapabilities::read_only()
+        }
+    }
+
+    async fn apply_playlist_mutation(
+        &self,
+        playlist: Option<&CollectionId>,
+        mutation: &PlaylistMutation,
+    ) -> CoreResult<PlaylistEditResult> {
+        let require_id =
+            || playlist.ok_or_else(|| CoreError::Config("远端歌单编辑需要歌单 ID".into()));
+        match mutation {
+            PlaylistMutation::Create { title, tracks } => {
+                let body = self
+                    .inner
+                    .client
+                    .get_json("/playlist/create", &[("name", title.as_str())])
+                    .await?;
+                let id = created_playlist_id(&body)
+                    .ok_or_else(|| CoreError::source_err("netease", "新建歌单响应缺少歌单 ID"))?;
+                let ids = own_track_ids(&self.info.id, tracks);
+                let mut changed = 0usize;
+                if !ids.is_empty() {
+                    let joined = ids.join(",");
+                    match self
+                        .inner
+                        .client
+                        .get_json(
+                            "/playlist/tracks",
+                            &[
+                                ("op", "add"),
+                                ("pid", id.as_str()),
+                                ("tracks", joined.as_str()),
+                            ],
+                        )
+                        .await
+                    {
+                        Ok(_) => changed = ids.len(),
+                        Err(e) => tracing::warn!(
+                            target: "chordial::netease",
+                            playlist = %id,
+                            error = %e,
+                            "playlist created but initial tracks failed"
+                        ),
+                    }
+                }
+                Ok(PlaylistEditResult {
+                    playlist_id: Some(CollectionId::new(
+                        self.info.id.clone(),
+                        CollectionKind::Playlist,
+                        id,
+                    )),
+                    changed,
+                })
+            }
+            PlaylistMutation::Rename { title } => {
+                let collection = require_id()?;
+                self.inner
+                    .client
+                    .get_json(
+                        "/playlist/name/update",
+                        &[("id", collection.id.as_str()), ("name", title.as_str())],
+                    )
+                    .await?;
+                Ok(PlaylistEditResult {
+                    changed: 1,
+                    ..Default::default()
+                })
+            }
+            PlaylistMutation::Delete => {
+                let collection = require_id()?;
+                self.inner
+                    .client
+                    .get_json("/playlist/delete", &[("id", collection.id.as_str())])
+                    .await?;
+                Ok(PlaylistEditResult {
+                    changed: 1,
+                    ..Default::default()
+                })
+            }
+            PlaylistMutation::AddTracks { tracks } => {
+                let collection = require_id()?;
+                let ids = own_track_ids(&self.info.id, tracks);
+                if ids.is_empty() {
+                    return Ok(PlaylistEditResult::default());
+                }
+                let joined = ids.join(",");
+                self.inner
+                    .client
+                    .get_json(
+                        "/playlist/tracks",
+                        &[
+                            ("op", "add"),
+                            ("pid", collection.id.as_str()),
+                            ("tracks", joined.as_str()),
+                        ],
+                    )
+                    .await?;
+                Ok(PlaylistEditResult {
+                    changed: ids.len(),
+                    ..Default::default()
+                })
+            }
+            PlaylistMutation::RemoveTracks { tracks } => {
+                let collection = require_id()?;
+                let ids = own_track_ids(&self.info.id, tracks);
+                if ids.is_empty() {
+                    return Ok(PlaylistEditResult::default());
+                }
+                let joined = ids.join(",");
+                self.inner
+                    .client
+                    .get_json(
+                        "/playlist/tracks",
+                        &[
+                            ("op", "del"),
+                            ("pid", collection.id.as_str()),
+                            ("tracks", joined.as_str()),
+                        ],
+                    )
+                    .await?;
+                Ok(PlaylistEditResult {
+                    changed: ids.len(),
+                    ..Default::default()
+                })
+            }
+            PlaylistMutation::Reorder { ordered, .. } => {
+                let collection = require_id()?;
+                let ids = own_track_ids(&self.info.id, ordered);
+                if ids.len() < 2 {
+                    return Ok(PlaylistEditResult::default());
+                }
+                let encoded = serde_json::to_string(&ids)
+                    .map_err(|e| CoreError::source_err("netease", e.to_string()))?;
+                self.inner
+                    .client
+                    .get_json(
+                        "/playlist/order/update",
+                        &[("id", collection.id.as_str()), ("ids", encoded.as_str())],
+                    )
+                    .await?;
+                Ok(PlaylistEditResult {
+                    changed: ids.len(),
+                    ..Default::default()
+                })
+            }
+        }
     }
 }

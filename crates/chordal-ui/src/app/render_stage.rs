@@ -48,6 +48,7 @@ impl ChordialApp {
         back: bool,
         interactive: bool,
         hide_text: bool,
+        chrome: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -56,11 +57,8 @@ impl ChordialApp {
         let title = self.current_title_text();
         let artist = self.current_artist_text();
         // AMLL MenuButton：width 3.5vh；窄屏改用 max(2em, min(5vw, 4vh))。
-        let action_side = if self.viewport_width <= 1000.0 {
-            ((self.viewport_width * 0.05).min(height * 0.04)).max(32.0)
-        } else {
-            height * 0.035
-        };
+        // 与共享舞台 info 宽度共用同一公式，交还静态布局那一帧不会跳字。
+        let action_side = info_action_side(self.viewport_width, height);
         let action = {
             let trigger = div()
                 .id("amll-info-action")
@@ -70,7 +68,6 @@ impl ChordialApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .ml(px(16.0))
                 .bg(white.opacity(0.082))
                 .child(crate::icons::icon(
                     if back {
@@ -107,7 +104,17 @@ impl ChordialApp {
                 trigger
             }
         };
-        let available = (width - action_side - 16.0).max(1.0);
+        // 闲置隐藏时圆钮连同留白一起收起，曲名/艺人获得整行宽度。
+        let action = div()
+            .ml(px(INFO_ACTION_GAP * chrome))
+            .w(px(action_side * chrome))
+            .h(px(action_side))
+            .overflow_hidden()
+            .opacity(chrome)
+            .child(action);
+        let available = (info_text_width(width, self.viewport_width, height)
+            + (action_side + INFO_ACTION_GAP) * (1.0 - chrome))
+            .max(1.0);
         let title_w = measure_text_width(window, &title, font, gpui::FontWeight::MEDIUM);
         let artist_w = measure_text_width(window, &artist, font, gpui::FontWeight::NORMAL);
         let now = Instant::now();
@@ -212,30 +219,42 @@ impl ChordialApp {
     ///
     /// 封面、信息、进度、传输、音量共用同一个列宽；歌词关闭/无歌词时由调用方
     /// 把这整列水平居中。这样两端只有定位不同，控件本身不再各写一套。
+    ///
+    /// `cover_drag` 为 true 时，整块封面和顶部小白条一样响应下拉关闭手势
+    /// （手机壳播放页有自己的横滑/点击手势，传 false）。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn amll_player_column(
         &self,
         column_w: f32,
         height: f32,
         controls_h: f32,
-        chrome_o: f32,
         menu_interactive: bool,
+        chrome: f32,
         shared_hidden: bool,
+        cover_drag: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let white = gpui::white();
         let theme = Theme::dark();
-        // AMLL Cover：半径 max(2%, 0.7vh)；整块带
-        // `0 1em 1.2em rgba(0,0,0,.19)` 投影。暂停时整体缩到 0.75。
+        // 专辑封面统一 1px 圆角，保留 AMLL 的大投影与暂停缩放。
         let cover_scale = self.cover_scale_now(Instant::now()).clamp(0.5, 1.1);
         let cover_side = column_w * cover_scale;
-        let cover_radius = (column_w * 0.02).max(height * 0.007) * cover_scale;
+        let cover_radius = 1.0;
         let cover = div()
             .w(px(column_w))
             .h(px(column_w))
             .flex()
             .items_center()
             .justify_center()
+            .when(cover_drag, |cover| {
+                cover.cursor(CursorStyle::OpenHand).occlude().on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|app, event: &MouseDownEvent, _, cx| {
+                        app.begin_sheet_drag(f32::from(event.position.y), cx);
+                    }),
+                )
+            })
             .child(
                 div()
                     .size(px(cover_side))
@@ -259,30 +278,39 @@ impl ChordialApp {
                     )),
             );
         let info_font = (height * 0.02).max(16.0);
-        let info = div()
-            .w(px(column_w))
-            .opacity(chrome_o)
-            .child(self.amll_info_row(
-                column_w,
-                info_font,
-                height,
-                false,
-                menu_interactive,
-                shared_hidden,
-                window,
-                cx,
-            ));
+        let info = div().w(px(column_w)).child(self.amll_info_row(
+            column_w,
+            info_font,
+            height,
+            false,
+            menu_interactive,
+            shared_hidden,
+            chrome,
+            window,
+            cx,
+        ));
         let label_font = (height * 0.012).max(12.8);
         let progress = div()
             .w(px(column_w))
             .h(px(45.2))
-            .opacity(chrome_o)
             .child(self.amll_progress_block(column_w, label_font, height, cx));
         // 手机最小宽度时封面列只有 ~184px；40px 的按钮会让 5 个传输键
         // 互相挤压。低于 240 时收到 34px，图标仍保持可点击尺寸。
         let btn = (column_w * 0.18).clamp(if column_w < 240.0 { 34.0 } else { 40.0 }, 88.0);
-        let transport = self.amll_transport(column_w, btn, height, cx);
-        let volume = self.amll_volume_row(column_w, cx);
+        // 闲置时传输键与音量行淡出并把高度让给 space-between 的剩余分布，
+        // 信息行和进度条不隐藏（对齐用户要求的关键元素）。
+        let transport = div()
+            .w(px(column_w))
+            .h(px(btn * chrome))
+            .overflow_hidden()
+            .opacity(chrome)
+            .child(self.amll_transport(column_w, btn, height, cx));
+        let volume = div()
+            .w(px(column_w))
+            .h(px(40.0 * chrome))
+            .overflow_hidden()
+            .opacity(chrome)
+            .child(self.amll_volume_row(column_w, cx));
         let controls = div()
             .w(px(column_w))
             .h(px(controls_h.max(0.0)))
@@ -320,19 +348,11 @@ impl ChordialApp {
         self.render_shared_stage_colored(geometry, white.opacity(0.9), white.opacity(0.45))
     }
 
-    /// 带文字的共享舞台；Dock 收尾时文字颜色会过渡回主面板主题色。
-    pub(super) fn render_shared_stage_colored(
-        &self,
-        geometry: StageGeometry,
-        title_color: gpui::Hsla,
-        artist_color: gpui::Hsla,
-    ) -> AnyElement {
+    fn shared_stage_cover(&self, geometry: StageGeometry) -> AnyElement {
         let white = gpui::white();
         let theme = Theme::dark();
-        let title = self.current_title_text();
-        let artist = self.current_artist_text();
         let cover_size = geometry.cover.w.max(1.0);
-        let cover = crate::widgets::cover_plain(
+        crate::widgets::cover_plain(
             &theme,
             self.cover_image.clone(),
             cover_size,
@@ -342,6 +362,62 @@ impl ChordialApp {
                 (cover_size * 0.22).clamp(14.0, 40.0),
                 white.opacity(0.35),
             ),
+        )
+    }
+
+    /// 共享舞台的文案块：字号、行高、间距与字重都由插值几何决定。
+    ///
+    /// GPUI 的 `FontWeight` 内部就是 f32，可以直接连续插值。两端文案若是
+    /// 两层交叉淡化，也必须使用同一个插值字重，否则会看到两种笔画粗细
+    /// 叠在一起「抖动」，而不是一次平滑加粗。
+    fn shared_stage_text(
+        geometry: StageGeometry,
+        title: SharedString,
+        artist: SharedString,
+        title_color: gpui::Hsla,
+        artist_color: gpui::Hsla,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(geometry.line_gap))
+            .child(
+                div()
+                    .max_w_full()
+                    .text_size(px(geometry.title_size))
+                    .line_height(px(geometry.title_size * INFO_LINE_RATIO))
+                    .font_weight(gpui::FontWeight(geometry.title_weight))
+                    .text_color(title_color)
+                    .text_ellipsis()
+                    .child(title),
+            )
+            .child(
+                div()
+                    .max_w_full()
+                    .text_size(px(geometry.artist_size))
+                    .line_height(px(geometry.artist_size * INFO_LINE_RATIO))
+                    .font_weight(gpui::FontWeight(geometry.artist_weight))
+                    .text_color(artist_color)
+                    .text_ellipsis()
+                    .child(artist),
+            )
+            .into_any_element()
+    }
+
+    /// 带文字的共享舞台；Dock 收尾时文字颜色会过渡回主面板主题色。
+    pub(super) fn render_shared_stage_colored(
+        &self,
+        geometry: StageGeometry,
+        title_color: gpui::Hsla,
+        artist_color: gpui::Hsla,
+    ) -> AnyElement {
+        let cover = self.shared_stage_cover(geometry);
+        let text = Self::shared_stage_text(
+            geometry,
+            SharedString::from(self.current_title_text()),
+            SharedString::from(self.current_artist_text()),
+            title_color,
+            artist_color,
         );
         div()
             .absolute()
@@ -359,47 +435,121 @@ impl ChordialApp {
                     .left(px(geometry.info.x))
                     .top(px(geometry.info.y))
                     .w(px(geometry.info.w.max(1.0)))
-                    .flex()
-                    .flex_col()
-                    .gap(px(geometry.line_gap))
+                    .child(text),
+            )
+            .into_any_element()
+    }
+
+    /// Dock↔全屏专用共享舞台：`p = 1` 时文案、字重与 Dock 完全一致，
+    /// `p = 0` 时与静态沉浸页一致。
+    ///
+    /// 只有「文案内容」不同的两行（副标题多了 `· 来源`）才交叉淡化；
+    /// 字重、字号、行高与颜色全部走插值后的同一份几何，避免出现两层
+    /// 不同粗细的文字互相透出。
+    pub(super) fn render_dock_shared_stage(
+        &self,
+        geometry: StageGeometry,
+        title_color: gpui::Hsla,
+        artist_color: gpui::Hsla,
+        dock_p: f32,
+    ) -> AnyElement {
+        let cover = self.shared_stage_cover(geometry);
+        let (dock_title, dock_artist) = self.dock_track_text();
+        let page_text = Self::shared_stage_text(
+            geometry,
+            SharedString::from(self.current_title_text()),
+            SharedString::from(self.current_artist_text()),
+            title_color,
+            artist_color,
+        );
+        let dock_text =
+            Self::shared_stage_text(geometry, dock_title, dock_artist, title_color, artist_color);
+        div()
+            .absolute()
+            .inset_0()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(geometry.cover.x))
+                    .top(px(geometry.cover.y))
+                    .child(cover),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(geometry.info.x))
+                    .top(px(geometry.info.y))
+                    .w(px(geometry.info.w.max(1.0)))
+                    .h(px(geometry.info.h.max(1.0)))
+                    .relative()
                     .child(
                         div()
-                            .max_w_full()
-                            .text_size(px(geometry.title_size))
-                            .line_height(px(geometry.title_size * INFO_LINE_RATIO))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(title_color)
-                            .text_ellipsis()
-                            .child(SharedString::from(title)),
+                            .absolute()
+                            .inset_0()
+                            .opacity(1.0 - dock_p)
+                            .child(page_text),
                     )
-                    .child(
-                        div()
-                            .max_w_full()
-                            .text_size(px(geometry.artist_size))
-                            .line_height(px(geometry.artist_size * INFO_LINE_RATIO))
-                            .text_color(artist_color)
-                            .text_ellipsis()
-                            .child(SharedString::from(artist)),
-                    ),
+                    .child(div().absolute().inset_0().opacity(dock_p).child(dock_text)),
             )
             .into_any_element()
     }
 
     /// AMLL 顶部拖拽 pill（50×8，白 17.6%）。
     ///
-    /// 它只是把手的视觉标识；按下命中区由外层 dismiss-handle 承担，
-    /// 拖动是「下拉关闭沉浸页」而不是移动窗口。
-    pub(super) fn amll_pill(&self, left: f32, top: f32, id: &'static str) -> AnyElement {
-        div()
+    /// 进入沉浸页后的前 5 秒，pill 会展开成一条提示文案（拖动/ESC 退出），
+    /// 随后用 320ms 收回原来的小白条。按下命中区由外层 dismiss-handle
+    /// 承担，拖动是「下拉关闭沉浸页」而不是移动窗口。
+    ///
+    /// `center` 是把手中心（相对页面），`max_text_w` 限定提示胶囊宽度，
+    /// 窄窗里文案会省略而不是撑出封面。
+    pub(super) fn amll_pill(
+        &self,
+        center: f32,
+        top: f32,
+        id: &'static str,
+        max_text_w: f32,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let expand = self.immersive_hint_expand(Instant::now());
+        let hint_w = 300.0_f32.min(max_text_w.max(120.0));
+        // 高度 8→24、宽度 50→hint_w：展开时像「白条长成胶囊」，
+        // 收回时再连续变回原来的小白条。
+        let w = 50.0 + (hint_w - 50.0) * expand;
+        let h = 8.0 + 16.0 * expand;
+        // 胶囊还没长到能容纳文字时先不显示字，避免窄条里挤出残字。
+        let text_alpha = ((expand - 0.15) / 0.85).clamp(0.0, 1.0);
+        let mut pill = div()
             .id(id)
             .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(50.0))
-            .h(px(8.0))
-            .rounded(px(4.0))
-            .bg(gpui::white().opacity(0.176))
-            .into_any_element()
+            .left(px(center - w * 0.5))
+            .top(px(top + 4.0 - h * 0.5))
+            .w(px(w))
+            .h(px(h))
+            .rounded(px(h * 0.5))
+            .bg(white.opacity(0.176))
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden();
+        if expand > 0.02 {
+            // 文字宽度固定为展开态宽度：收起过程中只被父级裁切，
+            // 不会逐帧重新换行/测量。
+            pill = pill.child(
+                div()
+                    .flex_none()
+                    .w(px((hint_w - 20.0).max(1.0)))
+                    .opacity(text_alpha)
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(white.opacity(0.92))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(SharedString::from(
+                        "拖动此处退出沉浸模式或者ESC键退出沉浸模式",
+                    )),
+            );
+        }
+        pill.into_any_element()
     }
 
     /// 竖屏播放页：AMLL 竖向布局 + Salt Player 的子页面/自动隐藏逻辑。
@@ -416,39 +566,52 @@ impl ChordialApp {
         let now = Instant::now();
         // 同一列宽供封面、信息、进度、传输、音量与 Dock 使用。
         let content_w = compact_content_w(width, height);
-        // AMLL 竖向布局的控件常驻：红框内的信息/进度与 Dock 不再淡出，
-        // 避免停手 3.2 秒后中间留下一大片空白。
-        let chrome_o = 1.0;
         let enter = self
+            .motion
             .portrait_enter
-            .map(|t| (t.elapsed().as_secs_f32() / 0.26).clamp(0.0, 1.0))
+            .as_ref()
+            .map(|spring| spring.value(now).clamp(0.0, 1.0))
             .unwrap_or(1.0);
-        let enter = 1.0 - (1.0 - enter).powi(3);
         let page = self.portrait_page;
         let transition = self.portrait_transition.filter(|t| !t.done(now));
         // 共享元素补间：页面滑入/滑出时，封面与曲目信息走独立的 FLIP 路径，
         // 页面内的同名元素暂时透明，只保留占位。
         let stage = self
-            .stage_motion
+            .motion
+            .stage
+            .as_ref()
             .filter(|motion| motion.active(now) && motion.touches_compact())
-            .map(|motion| motion.geometry(now))
+            .map(|motion| motion.sample(now))
             .filter(|geometry| geometry.is_valid());
         let shared_hidden = stage.is_some() || dock_shared;
-        // 竖屏页不显示歌词：歌词视图退化为全窗 Mesh 背景。
-        self.lyric_align = 0.1;
+        // 布局 2 的歌词文字：用户在右下角/抽屉里打开后，歌词铺满整窗，
+        // 播放列让位（与 AMLL 竖向布局「歌词打开时隐藏传输控件」一致）。
+        // 页面切换期间先隐藏文字，避免歌词压在滑动中的队列页上。
+        let lyrics_on = self.compact_lyrics_visible(cx) && transition.is_none() && !self.eq_open;
+        // 排版基准与歌词是否可见解耦：始终按 100vh 与 0.42 对齐，开关只
+        // 切换可见性。否则每次点开歌词都会带着新的对齐参数重排一次。
+        self.lyric_align = 0.42;
         self.lyric_view.update(cx, |view, _| {
-            view.set_text_visible(false);
-            view.set_click_seek_enabled(false);
+            view.set_text_visible(lyrics_on);
+            view.set_click_seek_enabled(lyrics_on);
+            // 隐藏时仍保持测量：点开歌词直接复用当前行高与滚动位置。
+            view.set_layout_when_hidden(true);
             view.set_player_config(LyricPlayerConfig {
-                align_anchor: AlignAnchor::Top,
-                align_position: 0.1,
+                align_anchor: AlignAnchor::Center,
+                align_position: 0.42,
                 enable_blur: !self.no_blur,
                 ..LyricPlayerConfig::default()
             });
         });
-        self.ensure_portrait_idle_ticker(cx);
-
-        let lyric_view_el = div().absolute().inset_0().child(self.lyric_view.clone());
+        // 歌词容器固定为窗口尺寸（100vh / 100vw）：下拉收起时卡片变矮，
+        // 歌词只被裁剪，不改变排版视口，因此不会逐帧重排/重绘。
+        let lyric_view_el = div()
+            .absolute()
+            .left_0()
+            .top_0()
+            .w(px(self.viewport_width.max(1.0)))
+            .h(px(self.viewport_height.max(1.0)))
+            .child(self.lyric_view.clone());
 
         // 顶部拖动带：播放页的整条页头都可拖动窗口；pill 附近保留
         // 下拉关闭手势。队列/更多页的页头有自己的可点元素，不铺拖动带。
@@ -467,14 +630,19 @@ impl ChordialApp {
                     .cursor(CursorStyle::OpenHand),
             )
         });
-        let handle_w = 120.0_f32.min(width);
+        // 顶部把手命中区与封面同宽：蓝色封面区域整块都能下拉关闭，
+        // 而不是只有中间 120px 的小白条。
+        let handle_w = compact_cover_size(width, height)
+            .min(width)
+            .max(120.0_f32.min(width));
+        let handle_left = ((width - handle_w) / 2.0).max(0.0);
         let handle_top = 0.0;
         let dismiss_handle = art_page.then(|| {
             div()
                 .id("immersive-dismiss-handle-compact")
                 .absolute()
                 .top(px(handle_top))
-                .left(px((width - handle_w) / 2.0))
+                .left(px(handle_left))
                 .w(px(handle_w))
                 .h(px(56.0))
                 .cursor(CursorStyle::OpenHand)
@@ -486,9 +654,10 @@ impl ChordialApp {
                     }),
                 )
                 .child(self.amll_pill(
-                    handle_w / 2.0 - 25.0,
+                    handle_w / 2.0,
                     20.0 - handle_top,
                     "immersive-pill-compact",
+                    width - 32.0,
                 ))
         });
 
@@ -540,12 +709,15 @@ impl ChordialApp {
             .on_action(cx.listener(|app, _: &PrevTrack, _, cx| app.play_prev(cx)))
             .on_action(cx.listener(|app, _: &PlayFirst, _, cx| app.play_first(cx)))
             .on_mouse_move(cx.listener(move |app, event: &MouseMoveEvent, _, cx| {
-                app.bump_portrait(cx);
                 let y = f32::from(event.position.y);
                 match event.pressed_button {
                     Some(gpui::MouseButton::Left) => app.update_sheet_drag(y, cx),
                     None => {
-                        if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
+                        if app
+                            .sheet_drag
+                            .as_ref()
+                            .is_some_and(|drag| !drag.animating(Instant::now()))
+                        {
                             app.release_sheet_drag(height, cx);
                         }
                     }
@@ -560,7 +732,6 @@ impl ChordialApp {
                     }
                 }),
             )
-            .on_click(cx.listener(|app, _, _, cx| app.bump_portrait(cx)))
             .size_full()
             .relative()
             .overflow_hidden();
@@ -585,9 +756,9 @@ impl ChordialApp {
                 content_w,
                 height,
                 width,
-                chrome_o,
                 dock_opacity,
                 shared_hidden,
+                lyrics_on,
                 window,
                 cx,
             ));
@@ -596,9 +767,9 @@ impl ChordialApp {
                 content_w,
                 height,
                 width,
-                chrome_o,
                 dock_opacity,
                 shared_hidden,
+                lyrics_on,
                 window,
                 cx,
             ));
@@ -631,9 +802,9 @@ impl ChordialApp {
                 content_w,
                 height,
                 width,
-                chrome_o,
                 dock_opacity,
                 shared_hidden,
+                lyrics_on,
                 window,
                 cx,
             )));
@@ -671,15 +842,16 @@ impl ChordialApp {
         overlay.child(sheet).into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_compact_page(
         &self,
         page: PortraitPage,
         content_w: f32,
         height: f32,
         width: f32,
-        chrome_o: f32,
         dock_opacity: f32,
         shared_hidden: bool,
+        lyrics_on: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -687,25 +859,26 @@ impl ChordialApp {
             PortraitPage::Art => self.render_compact_art(
                 width,
                 height,
-                chrome_o,
                 dock_opacity,
                 shared_hidden,
+                lyrics_on,
                 window,
                 cx,
             ),
-            PortraitPage::Queue => self.render_portrait_queue(content_w, shared_hidden, cx),
+            PortraitPage::Queue => self.render_portrait_queue(content_w, shared_hidden, false, cx),
         }
     }
 
     /// 竖屏播放页：与桌面宽屏同一根 `amll_player_column`，只是把整列水平居中。
-    /// 页面不渲染歌词文本；歌词视图仅作为全窗 Mesh 背景。
+    /// 歌词打开时整列让位，只保留底栏控件与全窗歌词文字。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_compact_art(
         &self,
         width: f32,
         height: f32,
-        chrome_o: f32,
         dock_opacity: f32,
         shared_hidden: bool,
+        lyrics_on: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -720,15 +893,25 @@ impl ChordialApp {
         // 从布局 1 / 队列页切换过来时，播放列跟随共享封面的 x 一起滑动，
         // 而不是整列硬切到居中位置。
         let now = Instant::now();
+        let chrome = self.stage_chrome_visibility(now);
         let motion_x = self
-            .stage_motion
+            .motion
+            .stage
+            .as_ref()
             .filter(|motion| motion.active(now) && motion.touches_compact())
-            .map(|motion| motion.geometry(now).cover.x);
+            .map(|motion| motion.sample(now).cover.x);
         let left = motion_x.unwrap_or_else(|| ((width - cover) / 2.0).max(0.0));
-        div()
-            .size_full()
-            .relative()
-            .child(
+        // 底栏与内容列同宽，左右边界与主沉浸区对齐；不再把按钮挂在窗口角上。
+        let bottom_rect = stage_bottom_rect(
+            width,
+            height,
+            false,
+            stable_lyric_pad(self.viewport_width, self.viewport_height),
+        );
+        let side_panel = matches!(self.stage_view, StageView::Queue | StageView::Audio);
+        let mut root = div().size_full().relative();
+        if !lyrics_on && !side_panel {
+            root = root.child(
                 div()
                     .absolute()
                     .left(px(left))
@@ -738,23 +921,51 @@ impl ChordialApp {
                         cover,
                         height,
                         controls_h,
-                        chrome_o,
                         true,
+                        chrome,
                         shared_hidden,
+                        !shared_hidden,
                         window,
                         cx,
                     )),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .bottom(px(crate::layout_morph::COMPACT_BOTTOM))
-                    .w(px(cover))
-                    .opacity(dock_opacity)
-                    .child(self.immersive_bottom_row(cover, false, false, cx)),
-            )
-            .into_any_element()
+            );
+        }
+        if side_panel {
+            // 窄窗没有宽屏右列：把同一份内容放在右侧区域，播放列让位。
+            let inner_w = (bottom_rect.w - 24.0).max(1.0);
+            let panel_h = (bottom_rect.y - COMPACT_TOP - 12.0).max(1.0);
+            let panel = div()
+                .absolute()
+                .left(px(bottom_rect.x))
+                .top(px(COMPACT_TOP))
+                .w(px(bottom_rect.w))
+                .h(px(panel_h))
+                .p(px(12.0))
+                .rounded(px(12.0))
+                .bg(gpui::black().opacity(0.62))
+                .border_1()
+                .border_color(gpui::white().opacity(0.08))
+                .overflow_hidden()
+                .child(match self.stage_view {
+                    StageView::Queue => {
+                        self.render_portrait_queue(inner_w, shared_hidden, true, cx)
+                    }
+                    StageView::Audio => self.render_audio_details_panel(inner_w, cx),
+                    _ => div().into_any_element(),
+                });
+            root = root.child(panel);
+        }
+        root.child(
+            div()
+                .absolute()
+                .left(px(bottom_rect.x))
+                .top(px(bottom_rect.y))
+                .w(px(bottom_rect.w))
+                .h(px(bottom_rect.h))
+                .opacity(dock_opacity)
+                .child(self.immersive_bottom_row(bottom_rect.w, chrome, cx)),
+        )
+        .into_any_element()
     }
 
     /// 宽屏沉浸：AMLL react-full `HorizontalLayout` 的等价几何。
@@ -774,11 +985,13 @@ impl ChordialApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let now = Instant::now();
-        // 布局 1 只在歌词可见时启用；这里仍读一次状态，避免未来入口漂移。
-        let lyrics_on = self.lyric_view.read(cx).has_lyrics() && !self.wide_lyrics_hidden;
+        let chrome = self.stage_chrome_visibility(now);
+        // 右侧内容列只在「显示歌词」时承载歌词文字；队列/音频详情模式下
+        // 同一块区域改画对应内容，歌词退回纯背景。
+        let lyrics_in_view = self.stage_view == StageView::Lyrics;
         self.lyric_view.update(cx, |view, _| {
-            view.set_text_visible(lyrics_on);
-            view.set_click_seek_enabled(lyrics_on);
+            view.set_text_visible(lyrics_in_view);
+            view.set_click_seek_enabled(lyrics_in_view);
         });
 
         // ---- AMLL horizontal 几何 ----
@@ -789,36 +1002,44 @@ impl ChordialApp {
         let fr = (height - cover - 76.0).max(0.0);
         let drag = fr * 0.12;
         let cover_top = wide_cover_top(width, height);
-        // 底部控制行与布局 2 使用同一个底边距（16px）；音量行必须停在
-        // 控制行上方，信息区用剩余高度做 space-between。
-        let bottom_row_top = height - 16.0 - 40.0;
+        // 歌词容器固定按窗口几何（100vh）计算，而不是随下拉手势收缩的
+        // 卡片：卡片只负责裁剪，内容视口在拖动期间保持不变。
+        let stable_w = self.viewport_width.max(1.0);
+        let stable_h = self.viewport_height.max(1.0);
+        let stable_info_w = stable_w * 0.45;
+        let stable_lyric_col_w = (stable_w - stable_info_w - gap).max(1.0);
+        let stable_lyric_pad = stable_lyric_pad(stable_w, stable_h);
+        // 底栏左右边界与主沉浸区对齐；音量行停在控制行上方，
+        // 信息区用剩余高度做 space-between。
+        let bottom_rect = stage_bottom_rect(width, height, true, stable_lyric_pad);
+        let bottom_row_top = bottom_rect.y;
         let controls_top = cover_top + cover + COMPACT_COVER_GAP;
         let controls_h = (bottom_row_top - gap - controls_top).max(0.0);
         let info_w = width * 0.45;
         let lyric_left = info_w + gap;
-        let lyric_col_w = (width - lyric_left).max(0.0);
-        let lyric_pad_right = if height <= 1000.0 {
-            lyric_col_w * 0.08
-        } else {
-            lyric_col_w * 0.15
-        };
 
         // 布局 1 固定为「左播放列 + 右歌词」；歌词开关切换时会立即落到
         // 布局 2，因此这里不再维护居中分支。
         let split_x = wide_column_x(width, height);
         let wide_motion = self
-            .stage_motion
+            .motion
+            .stage
+            .as_ref()
             .filter(|motion| motion.active(now) && motion.touches_wide())
             .filter(|motion| motion.from.is_valid() && motion.to.is_valid());
-        let stage = wide_motion.map(|motion| motion.geometry(now));
+        let stage = wide_motion.map(|motion| motion.sample(now));
         let mut column_x = split_x;
         if let Some(geometry) = stage {
             column_x = geometry.cover.x;
         }
         let shared_hidden = stage.is_some() || dock_shared;
 
-        let align = ((cover_top + cover * 0.5) / height).clamp(0.05, 0.95);
-        if lyrics_on && (self.lyric_align - align).abs() > 0.0005 {
+        // 对齐位置同样按 100vh 的封面中线计算：下拉手势只改变卡片可见
+        // 区域，不应每帧改写 alignPosition（那会触发整段歌词重新布局）。
+        let stable_cover = wide_cover_size(stable_w, stable_h);
+        let stable_cover_top = wide_cover_top(stable_w, stable_h);
+        let align = ((stable_cover_top + stable_cover * 0.5) / stable_h).clamp(0.05, 0.95);
+        if (self.lyric_align - align).abs() > 0.0005 {
             self.lyric_align = align;
             self.lyric_view.update(cx, |view, _| {
                 view.set_player_config(LyricPlayerConfig {
@@ -830,7 +1051,7 @@ impl ChordialApp {
             });
         }
         // —— 顶部窗口拖动带：整条空白头部都可拖动窗口（AMLL drag-area）。
-        //    pill 只保留一个小的下拉关闭命中区，其余宽度全部用来移动窗口。
+        //    中间与封面同宽的区域是下拉关闭把手，其余宽度用来移动窗口。
         // Dock→全屏的位移由外层卡片承担，页面内部不再二次偏移。
         let sheet_offset = 0.0;
         let pill_top = drag + gap + 16.0;
@@ -847,16 +1068,19 @@ impl ChordialApp {
             )
         });
 
-        // 下拉关闭把手：与 pill 等宽的窄条，occlude 掉下层的窗口拖动带。
-        // EQ 覆盖层打开时不启用，避免顶部的 EQ 控件被手势抢走。
-        let handle_w = 160.0_f32.min(width);
+        // 下拉关闭把手：与封面同宽的整块区域（含 pill 所在的顶部），
+        // occlude 掉下层的窗口拖动带。封面区域不再只响应小白条，
+        // 而是像拖动小白条一样整块下拉关闭。EQ 覆盖层打开时不启用，
+        // 避免顶部的 EQ 控件被手势抢走。
+        let handle_w = cover.max(120.0).min(width);
         let handle_top = (pill_top - 20.0).max(0.0);
+        let handle_left = (column_x + cover * 0.5 - handle_w / 2.0).max(0.0);
         let dismiss_handle = (!self.eq_open).then(|| {
             div()
                 .id("immersive-dismiss-handle")
                 .absolute()
                 .top(px(handle_top))
-                .left(px(column_x + cover * 0.5 - handle_w / 2.0))
+                .left(px(handle_left))
                 .w(px(handle_w))
                 .h(px(56.0))
                 .cursor(CursorStyle::OpenHand)
@@ -868,9 +1092,10 @@ impl ChordialApp {
                     }),
                 )
                 .child(self.amll_pill(
-                    handle_w / 2.0 - 25.0,
+                    handle_w / 2.0,
                     pill_top - handle_top,
                     "immersive-pill",
+                    cover,
                 ))
         });
 
@@ -884,37 +1109,41 @@ impl ChordialApp {
                 cover,
                 height,
                 controls_h,
-                1.0,
-                false,
+                !dock_shared,
+                chrome,
                 shared_hidden,
+                !shared_hidden,
                 window,
                 cx,
             ));
 
-        // —— 歌词开启时占右列；关闭/无歌词时整窗只保留 Mesh 背景 ——
-        let lyric_area = if lyrics_on {
-            div()
-                .absolute()
-                .left(px(lyric_left))
-                .top_0()
-                .bottom_0()
-                .right_0()
-                .pr(px(lyric_pad_right))
-                .child(self.lyric_view.clone())
-        } else {
-            div().absolute().inset_0().child(self.lyric_view.clone())
+        // —— 与宽屏「显示歌词」完全相同的右侧内容区：歌词 / 队列 /
+        // 音频详情共用这一块矩形，只有「仅显示主内容」走紧凑布局收起它。
+        // 左端跟随卡片移动，宽高固定为窗口几何，拖动时不重新排版内容。
+        let panel_w = (stable_lyric_col_w - stable_lyric_pad).max(1.0);
+        let side_content = match self.stage_view {
+            StageView::Queue => self.render_portrait_queue(panel_w, shared_hidden, true, cx),
+            StageView::Audio => self.render_audio_details_panel(panel_w, cx),
+            _ => self.lyric_view.clone().into_any_element(),
         };
+        let right_area = div()
+            .absolute()
+            .left(px(lyric_left))
+            .top_0()
+            .w(px(stable_lyric_col_w))
+            .h(px(stable_h))
+            .pr(px(stable_lyric_pad))
+            .child(side_content);
 
         // —— 统一的底部控制行：与布局 2 共用同一个构建函数 ——
         let bottom_row = div()
             .absolute()
-            .left_0()
-            .right_0()
-            .top(px(bottom_row_top))
-            .h(px(40.0))
-            .px(px(32.0))
+            .left(px(bottom_rect.x))
+            .top(px(bottom_rect.y))
+            .w(px(bottom_rect.w))
+            .h(px(bottom_rect.h))
             .opacity(dock_opacity)
-            .child(self.immersive_bottom_row((width - 64.0).max(1.0), true, lyrics_on, cx));
+            .child(self.immersive_bottom_row(bottom_rect.w, chrome, cx));
 
         let stage_el = stage.map(|geometry| self.render_shared_stage(geometry));
 
@@ -929,7 +1158,7 @@ impl ChordialApp {
             .h(px(height))
             .overflow_hidden()
             .bg(gpui::black())
-            .child(lyric_area)
+            .child(right_area)
             .child(gpui::batch_layer(info_column))
             .when_some(stage_el, |sheet, stage| sheet.child(stage))
             .child(gpui::batch_layer(bottom_row))
@@ -972,7 +1201,11 @@ impl ChordialApp {
                 match event.pressed_button {
                     Some(gpui::MouseButton::Left) => app.update_sheet_drag(y, cx),
                     None => {
-                        if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
+                        if app
+                            .sheet_drag
+                            .as_ref()
+                            .is_some_and(|drag| !drag.animating(Instant::now()))
+                        {
                             app.release_sheet_drag(height, cx);
                         }
                     }

@@ -61,6 +61,8 @@ struct Index {
     by_id: HashMap<String, u32>,
     /// `dedup_key` → tracks 下标。用于“在线播放时找本地同曲”。
     by_dedup: HashMap<String, Vec<u32>>,
+    /// 跨源身份键 → tracks 下标。用于歌单引用失效时找本地替代副本。
+    by_identity: HashMap<String, Vec<u32>>,
     /// 合成专辑 id → 聚合。扫描期 O(n) 派生，不额外持久化。
     albums: HashMap<String, LocalAlbumAgg>,
     /// 合成歌手 id → 聚合。
@@ -113,6 +115,16 @@ fn default_music_dir() -> PathBuf {
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ScanSummary {
     pub tracks: u64,
+    pub scan_generation: u64,
+}
+
+/// 本地源状态页展示的库统计。
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct LocalLibraryStats {
+    pub tracks: u64,
+    pub artists: u64,
+    pub albums: u64,
+    pub roots: u64,
     pub scan_generation: u64,
 }
 
@@ -244,6 +256,7 @@ impl LocalSource {
         let mut tracks: Vec<Track> = Vec::with_capacity(files.len());
         let mut by_id: HashMap<String, u32> = HashMap::with_capacity(files.len());
         let mut by_dedup: HashMap<String, Vec<u32>> = HashMap::with_capacity(files.len());
+        let mut by_identity: HashMap<String, Vec<u32>> = HashMap::with_capacity(files.len());
         let mut fingerprints: Fingerprints = HashMap::with_capacity(files.len());
         let mut tag_reads = 0u64;
         let mut reused = 0u64;
@@ -313,6 +326,10 @@ impl LocalSource {
                 .entry(track.dedup_key.clone())
                 .or_default()
                 .push(tracks.len() as u32);
+            by_identity
+                .entry(track.identity_key())
+                .or_default()
+                .push(tracks.len() as u32);
             tracks.push(track);
         }
         drop(old_index);
@@ -323,6 +340,7 @@ impl LocalSource {
             index.tracks = tracks;
             index.by_id = by_id;
             index.by_dedup = by_dedup;
+            index.by_identity = by_identity;
             index.albums = albums;
             index.artists = artists;
             index.fingerprints = fingerprints;
@@ -354,11 +372,16 @@ impl LocalSource {
     pub fn inject_index_for_tests(&self, tracks: Vec<Track>) {
         let mut by_id = HashMap::with_capacity(tracks.len());
         let mut by_dedup: HashMap<String, Vec<u32>> = HashMap::with_capacity(tracks.len());
+        let mut by_identity: HashMap<String, Vec<u32>> = HashMap::with_capacity(tracks.len());
         let mut fingerprints = Fingerprints::with_capacity(tracks.len());
         for (i, t) in tracks.iter().enumerate() {
             by_id.insert(t.id.id.clone(), i as u32);
             by_dedup
                 .entry(t.dedup_key.clone())
+                .or_default()
+                .push(i as u32);
+            by_identity
+                .entry(t.identity_key())
                 .or_default()
                 .push(i as u32);
             if let TrackOrigin::Local { path } = &t.origin {
@@ -370,6 +393,7 @@ impl LocalSource {
         index.tracks = tracks;
         index.by_id = by_id;
         index.by_dedup = by_dedup;
+        index.by_identity = by_identity;
         index.albums = albums;
         index.artists = artists;
         index.fingerprints = fingerprints;
@@ -386,6 +410,36 @@ impl LocalSource {
             .expect("local index lock poisoned")
             .tracks
             .clone()
+    }
+
+    /// 源页面用的库统计。O(1)：直接读扫描期派生的聚合数量。
+    pub fn stats(&self) -> LocalLibraryStats {
+        let index = self.index.read().expect("local index lock poisoned");
+        LocalLibraryStats {
+            tracks: index.tracks.len() as u64,
+            artists: index.artists.len() as u64,
+            albums: index.albums.len() as u64,
+            roots: self
+                .config
+                .read()
+                .expect("local config lock poisoned")
+                .roots
+                .len() as u64,
+            scan_generation: self.scan_generation.load(Ordering::Acquire),
+        }
+    }
+
+    /// 严格按跨源身份键查找本地副本。歌单引用的源被关闭/卸载时，
+    /// 用它在本地库中找可继续播放的替代文件。
+    pub fn find_by_identity(&self, track: &Track) -> Option<Track> {
+        let key = track.identity_key();
+        let index = self.index.read().expect("local index lock poisoned");
+        let candidates = index.by_identity.get(&key)?;
+        candidates
+            .iter()
+            .filter_map(|&i| index.tracks.get(i as usize))
+            .max_by_key(|candidate| candidate.quality_score())
+            .cloned()
     }
 
     /// 查找与给定在线曲目“同名同主艺人同专辑”的本地文件。
@@ -697,6 +751,68 @@ mod tests {
             },
         );
         assert!(src.find_equivalent(&live).is_none());
+    }
+
+    #[test]
+    fn finds_local_copy_by_strict_identity() {
+        let src = LocalSource::new(
+            SourceId::new("local-test"),
+            LocalSourceConfig {
+                roots: vec![std::env::temp_dir()],
+            },
+            "test",
+        );
+        let mut local = Track::new(
+            TrackId::new(SourceId::new("local-test"), "/music/a.flac"),
+            "Hype (feat. Such)",
+            vec![ArtistRef {
+                id: None,
+                name: "Such & PSYQUI".into(),
+            }],
+            Some(AlbumRef {
+                id: None,
+                name: "FÛGENE 02".into(),
+                cover: None,
+            }),
+            Some(303_000),
+            TrackOrigin::Local {
+                path: PathBuf::from("/music/a.flac"),
+            },
+        );
+        local.track_no = Some(3);
+        local.rebuild_identity_key();
+        src.inject_index_for_tests(vec![local.clone()]);
+
+        let mut remote = Track::new(
+            TrackId::new(SourceId::new("netease"), "42"),
+            "Hype (feat. Such)",
+            vec![
+                ArtistRef {
+                    id: Some("1".into()),
+                    name: "PSYQUI".into(),
+                },
+                ArtistRef {
+                    id: Some("2".into()),
+                    name: "Such".into(),
+                },
+            ],
+            Some(AlbumRef {
+                id: Some("9".into()),
+                name: "FÛGENE 02".into(),
+                cover: None,
+            }),
+            Some(303_000),
+            TrackOrigin::Remote {
+                source: SourceId::new("netease"),
+            },
+        );
+        remote.track_no = Some(3);
+        remote.rebuild_identity_key();
+        assert_eq!(src.find_by_identity(&remote).unwrap().id, local.id);
+
+        remote.track_no = Some(4);
+        remote.rebuild_identity_key();
+        assert!(src.find_by_identity(&remote).is_none());
     }
 
     /// 极简 async 测试驱动：本 crate 的 async 方法从不开 await 挂起，

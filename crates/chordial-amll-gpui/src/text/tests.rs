@@ -160,9 +160,9 @@ fn metrics_follow_amll_ratios() {
         roman_chars: 0,
         is_bg: false,
     };
-    let height = estimate_height(&style, 1280.0, 720.0, false, &hint);
-    // 2 * padding + 1 行主歌词 + 1 行副歌词。
-    let expected = 2.0 * 720.0 * 0.02 + 24.0 * 1.2 + 12.0 * 1.5;
+    let height = estimate_height(&style, 1280.0, false, &hint);
+    // 2 * padding（0.4em × 基准字号）+ 1 行主歌词 + 1 行副歌词。
+    let expected = 2.0 * 24.0 * 0.4 + 24.0 * 1.2 + 12.0 * 1.5;
     assert!((height - expected).abs() < 0.01, "{height} vs {expected}");
 }
 

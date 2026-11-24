@@ -137,6 +137,65 @@ fn output_pixels_are_capped() {
 }
 
 #[test]
+fn slow_raster_shrinks_divisor_one_output() {
+    let mut renderer = MeshGradientRenderer::with_seed(3);
+    renderer.set_viewport(682, 480);
+    renderer.set_render_scale(1.0);
+    // 模拟 debug 构建：200k 像素光栅耗时 40ms（0.2us/px）。
+    renderer.adapt_pixel_budget(40_000.0, 200_000);
+    assert_eq!(renderer.debug_pixel_budget(), 50_000);
+    renderer.ensure_output();
+    let (rw, rh) = renderer.debug_raster_size();
+    let pixels = rw * rh;
+    assert!(
+        (MIN_ADAPTIVE_PIXELS..=50_000).contains(&pixels),
+        "adaptive raster should be ~50k px, got {pixels}"
+    );
+    assert!(pixels < MAX_OUTPUT_PIXELS);
+}
+
+#[test]
+fn fast_raster_keeps_hard_cap() {
+    let mut renderer = MeshGradientRenderer::new();
+    renderer.set_viewport(682, 480);
+    renderer.set_render_scale(1.0);
+    // release 级速度：5ns/px，预算远大于硬上限，不应降低画质。
+    renderer.adapt_pixel_budget(1_000.0, 200_000);
+    assert_eq!(renderer.debug_pixel_budget(), MAX_OUTPUT_PIXELS);
+    renderer.ensure_output();
+    let (rw, rh) = renderer.debug_raster_size();
+    assert_eq!(rw * rh, 199_875);
+}
+
+#[test]
+fn crossfade_budget_accounts_for_both_layers() {
+    let mut renderer = MeshGradientRenderer::with_seed(3);
+    let (w, h, data) = test_album();
+    renderer.set_album_rgba(w, h, data.clone());
+    renderer.set_album_rgba(w, h, data);
+    assert_eq!(renderer.layers.len(), 2);
+    // 光栅 50k 像素 × 两层，总耗时 40ms；预算应只剩 12.5k 光栅像素。
+    renderer.adapt_pixel_budget(40_000.0, 50_000);
+    assert_eq!(renderer.debug_pixel_budget(), 12_500);
+}
+
+#[test]
+fn small_estimate_changes_do_not_thrash_output_size() {
+    let mut renderer = MeshGradientRenderer::new();
+    renderer.set_viewport(682, 480);
+    renderer.set_render_scale(1.0);
+    renderer.pixel_budget = 50_000;
+    // 新预算约 54k，仅比当前高 8%，应被滞回拦住。
+    renderer.adapt_pixel_budget(18_520.0, 100_000);
+    assert_eq!(renderer.debug_pixel_budget(), 50_000);
+    renderer.ensure_output();
+    let first = renderer.debug_raster_size();
+    renderer.adapt_pixel_budget(18_520.0, 100_000);
+    renderer.ensure_output();
+    assert_eq!(renderer.debug_raster_size(), first);
+}
+
+#[test]
 fn no_cover_returns_transparent_frame() {
     let mut renderer = MeshGradientRenderer::new();
     renderer.set_viewport(100, 100);
@@ -363,4 +422,106 @@ fn recycled_frame_buffer_is_reused_by_next_render() {
     assert_eq!(renderer.debug_recycled(), 0);
     assert_eq!(renderer.output.len(), len);
     assert_eq!(renderer.output.capacity(), len);
+}
+
+#[test]
+fn upscale_keeps_linear_ramp_linear() {
+    // 双线性放大在源像素边界处斜率突变；Cubic 重建必须保持线性斜坡平滑。
+    const SW: usize = 32;
+    const SH: usize = 8;
+    const F: usize = 4;
+    let mut src = vec![0u8; SW * SH * 4];
+    for y in 0..SH {
+        for x in 0..SW {
+            let v = (24 + x * 6) as u8;
+            let o = (y * SW + x) * 4;
+            src[o..o + 4].copy_from_slice(&[v, v, v, 255]);
+        }
+    }
+    let (dw, dh) = (SW * F, SH * F);
+    let mut dst = vec![0u8; dw * dh * 4];
+    let mut scratch = UpscaleScratch::new();
+    upscale_catmull_rom(&src, &mut dst, &mut scratch, SW, SH, dw, dh);
+
+    // Cubic 重建必须保持线性（双线性会在每个源像素处出现平台）。
+    // 末端抖动只有 ±0.35 LSB，逐像素偏差应远小于一个量化台阶造成的折线。
+    for y in [0, dh / 2, dh - 1] {
+        for x in 0..dw {
+            let v = dst[(y * dw + x) * 4] as f32;
+            let expected = 24.0 + x as f32 * (210.0 - 24.0) / (dw - 1) as f32;
+            assert!(
+                (v - expected).abs() <= 4.0,
+                "ramp bent at ({x},{y}): {v} vs {expected:.1}"
+            );
+        }
+    }
+}
+
+#[test]
+fn upscale_has_no_black_border() {
+    let (sw, sh, f) = (9usize, 7usize, 3usize);
+    let color = [120u8, 80, 60, 255];
+    let src = color.repeat(sw * sh);
+    // 边缘钳位取样：纯色源放大后不能出现来自相邻图块的黑边。
+    let (dw, dh) = (sw * f, sh * f);
+    let mut dst = vec![0u8; dw * dh * 4];
+    let mut scratch = UpscaleScratch::new();
+    upscale_catmull_rom(&src, &mut dst, &mut scratch, sw, sh, dw, dh);
+    for y in 0..dh {
+        for x in 0..dw {
+            let o = (y * dw + x) * 4;
+            for c in 0..4 {
+                assert!(
+                    dst[o + c].abs_diff(color[c]) <= 1,
+                    "border artifact at ({x},{y}) channel {c}: {} vs {}",
+                    dst[o + c],
+                    color[c]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn large_divisor_upscales_to_capped_resolution() {
+    for (divisor, want) in [(8u32, 2.0f32), (12, 3.0)] {
+        let mut renderer = MeshGradientRenderer::new();
+        renderer.set_viewport(1920, 1080);
+        renderer.set_render_scale(1.0 / divisor as f32);
+        renderer.ensure_output();
+        let (rw, rh) = renderer.debug_raster_size();
+        let (pw, ph) = renderer.debug_size();
+        let factor = renderer.debug_upscale();
+        assert!(
+            (factor - want).abs() < 0.35,
+            "divisor {divisor}: upscale {factor} (raster {rw}x{rh}, present {pw}x{ph})"
+        );
+        assert!(pw * ph <= MAX_PRESENT_PIXELS + 1_000);
+        assert!(pw * ph >= MAX_PRESENT_PIXELS / 2);
+    }
+}
+
+#[test]
+fn upscale_cost_stays_bounded() {
+    let (w, h, data) = test_album();
+    let mut renderer = MeshGradientRenderer::with_seed(3);
+    renderer.set_viewport(1920, 1080);
+    renderer.set_render_scale(1.0 / 12.0);
+    renderer.set_fps(60);
+    renderer.set_album_rgba(w, h, data);
+    for _ in 0..4 {
+        renderer.render(100.0);
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..20 {
+        renderer.render(20.0);
+    }
+    let per_frame = start.elapsed().as_secs_f64() * 1e6 / 20.0;
+    // debug 构建未开优化，这里只做 O(n²) 退化护栏，不作为真机帧率承诺；
+    // 真机耗时用 scale_probe / perf 浮窗测量。
+    assert!(
+        per_frame < 50_000.0,
+        "large-divisor background too slow: {per_frame:.0}us/frame"
+    );
+    assert!(renderer.debug_upscale() > 1.0);
 }

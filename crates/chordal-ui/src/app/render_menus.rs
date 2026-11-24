@@ -15,7 +15,7 @@ impl ChordialApp {
         let width = self.viewport_width;
         let height = self.viewport_height;
         let panel_w = 238.0;
-        let panel_h = 378.0;
+        let panel_h = 414.0;
         let x = menu.x.min((width - panel_w - 8.0).max(8.0)).max(8.0);
         let y = menu.y.min((height - panel_h - 12.0).max(44.0)).max(44.0);
 
@@ -117,6 +117,22 @@ impl ChordialApp {
                     let _ = weak.update(cx, |app, cx| {
                         app.track_menu = None;
                         app.queue_append(track, cx);
+                    });
+                }),
+            ));
+        }
+        {
+            let weak = weak.clone();
+            let track = menu.track.clone();
+            let (x, y) = (menu.x, menu.y);
+            rows.push(item(
+                crate::icons::Icon::Layers,
+                "添加到歌单",
+                false,
+                Box::new(move |_, _, cx| {
+                    let track = track.clone();
+                    let _ = weak.update(cx, |app, cx| {
+                        app.open_playlist_picker(track, x, y, cx);
                     });
                 }),
             ));
@@ -276,6 +292,337 @@ impl ChordialApp {
                             }
                         }),
                     )),
+            )
+            .into_any_element()
+    }
+
+    /// Dock 上方的队列概览 / 更多操作。歌词没有浮层，曲目区直接进沉浸页。
+    pub(super) fn render_dock_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let weak = cx.entity().downgrade();
+        let Some(menu) = self.dock_menu else {
+            return div().into_any_element();
+        };
+        let width = self.viewport_width;
+        let dock_w = self.dock_width();
+        let dock_left = ((width - dock_w) / 2.0).max(8.0);
+        let dock_right = (dock_left + dock_w).min(width);
+        // 右缘对齐 Dock 的 18px 内边距，和右下角按钮同一列。
+        let anchor_right = (width - dock_right + 18.0).max(8.0);
+        let bottom = crate::theme::size::DOCK_BOTTOM + crate::theme::size::DOCK + 10.0;
+
+        let (panel_w, panel): (f32, AnyElement) = match menu {
+            DockMenu::Queue => {
+                let start = self.queue_pos.map(|pos| pos + 1).unwrap_or(0);
+                let upcoming: Vec<(usize, Track)> = self
+                    .queue
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(3)
+                    .map(|(index, track)| (index, track.clone()))
+                    .collect();
+                let mut rows = div().flex().flex_col().gap(px(1.0));
+                if upcoming.is_empty() {
+                    rows = rows.child(
+                        div()
+                            .px(px(9.0))
+                            .py(px(14.0))
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(if self.queue.is_empty() {
+                                "播放队列为空"
+                            } else {
+                                "已经是队列最后一首"
+                            }),
+                    );
+                }
+                for (index, track) in upcoming {
+                    let cover_image = track_cover_key(&track).and_then(|key| {
+                        self.track_covers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .images
+                            .get(&key)
+                            .cloned()
+                    });
+                    let title = SharedString::from(track.title.clone());
+                    let artist = SharedString::from(
+                        track
+                            .artists
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" / "),
+                    );
+                    let duration = SharedString::from(fmt_ms(track.duration_ms.unwrap_or(0)));
+                    let weak_row = weak.clone();
+                    rows = rows.child(
+                        div()
+                            .id(gpui::ElementId::named_usize("dock-queue-row", index))
+                            .h(px(38.0))
+                            .px(px(8.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(9.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.hover))
+                            .child(crate::widgets::cover_thumb(
+                                &theme,
+                                cover_image,
+                                30.0,
+                                1.0,
+                                crate::icons::icon(
+                                    crate::icons::Icon::Note,
+                                    12.0,
+                                    theme.text_faint,
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .text_ellipsis()
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(theme.text_faint)
+                                            .text_ellipsis()
+                                            .child(artist),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(30.0))
+                                    .flex_none()
+                                    .text_size(px(9.0))
+                                    .text_color(theme.text_faint)
+                                    .text_align(gpui::TextAlign::Right)
+                                    .child(duration),
+                            )
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_row.update(cx, |app, cx| {
+                                    app.dock_menu = None;
+                                    app.play_from_list(QueueList::Queue, index, cx);
+                                });
+                            }),
+                    );
+                }
+
+                let open_queue = {
+                    let weak = weak.clone();
+                    div()
+                        .id("dock-open-queue")
+                        .flex()
+                        .items_center()
+                        .gap(px(3.0))
+                        .cursor_pointer()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_dim)
+                        .hover(|s| s.text_color(theme.text))
+                        .child("打开播放队列")
+                        .child(crate::icons::icon(
+                            crate::icons::Icon::ChevronRight,
+                            10.0,
+                            theme.text_faint,
+                        ))
+                        .on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| app.open_queue_list(cx));
+                        })
+                };
+                let body = div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .pt(px(5.0))
+                            .pb(px(7.0))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child("接下来播放"),
+                            )
+                            .child(
+                                div().text_size(px(9.5)).text_color(theme.text_faint).child(
+                                    SharedString::from(format!("队列 · {}", self.queue.len())),
+                                ),
+                            ),
+                    )
+                    .child(rows)
+                    .child(
+                        div()
+                            .mt(px(4.0))
+                            .pt(px(8.0))
+                            .pb(px(5.0))
+                            .px(px(8.0))
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(theme.text_faint)
+                                    .child("按顺序播放"),
+                            )
+                            .child(open_queue),
+                    )
+                    .into_any_element();
+                (320.0, body)
+            }
+            DockMenu::More => {
+                let item = |icon: crate::icons::Icon,
+                            label: &'static str,
+                            meta: Option<&'static str>,
+                            id: &'static str,
+                            on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
+                    div()
+                        .id(SharedString::from(format!("dock-more-{id}")))
+                        .h(px(34.0))
+                        .px(px(9.0))
+                        .rounded(px(7.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(9.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.hover))
+                        .child(crate::icons::icon(icon, 15.0, theme.text_dim))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(11.5))
+                                .text_color(theme.text)
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                        .when_some(meta, |d, meta| {
+                            d.child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(theme.text_faint)
+                                    .child(meta),
+                            )
+                        })
+                        .on_click(on_click)
+                };
+
+                let preference = {
+                    let weak = weak.clone();
+                    item(
+                        crate::icons::Icon::Sliders,
+                        self.source_preference.label(),
+                        Some("切换"),
+                        "preference",
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| app.cycle_source_preference(cx));
+                        }),
+                    )
+                };
+                let download = {
+                    let weak = weak.clone();
+                    item(
+                        crate::icons::Icon::Download,
+                        "下载当前曲目",
+                        None,
+                        "download",
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.dock_menu = None;
+                                app.download_current(cx);
+                            });
+                        }),
+                    )
+                };
+                let equalizer = {
+                    let weak = weak.clone();
+                    item(
+                        crate::icons::Icon::Equalizer,
+                        "打开均衡器",
+                        None,
+                        "eq",
+                        Box::new(move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| {
+                                app.dock_menu = None;
+                                app.open_eq(cx);
+                            });
+                        }),
+                    )
+                };
+
+                let body = div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .px(px(9.0))
+                            .pt(px(6.0))
+                            .pb(px(6.0))
+                            .text_size(px(9.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_faint)
+                            .child("播放来源"),
+                    )
+                    .child(preference)
+                    .child(div().h(px(1.0)).mx(px(7.0)).my(px(4.0)).bg(theme.border))
+                    .child(download)
+                    .child(equalizer)
+                    .into_any_element();
+                (232.0, body)
+            }
+        };
+
+        div()
+            .id("dock-menu-layer")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|app, _, _, cx| app.close_dock_menu(cx)),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|app, _, _, cx| app.close_dock_menu(cx)),
+            )
+            .child(
+                div()
+                    .id("dock-menu-panel")
+                    .absolute()
+                    .right(px(anchor_right))
+                    .bottom(px(bottom))
+                    .w(px(panel_w))
+                    .rounded(px(12.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow(vec![BoxShadow {
+                        color: theme.shadow_strong,
+                        offset: point(px(0.0), px(12.0)),
+                        blur_radius: px(30.0),
+                        spread_radius: px(0.0),
+                    }])
+                    .p(px(6.0))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(panel),
             )
             .into_any_element()
     }
@@ -656,7 +1003,7 @@ impl ChordialApp {
                     let _ = weak.update(cx, |app, cx| {
                         app.phone_page = PhonePage::Lyrics;
                         app.phone_sheet = None;
-                        app.phone_sheet_spring = None;
+                        app.motion.phone_sheet = None;
                         app.phone_sheet_anchor = None;
                         app.phone_edge_swipe = None;
                         cx.notify();
@@ -684,6 +1031,148 @@ impl ChordialApp {
                     .child(queue)
                     .child(lyrics),
             )
+            .into_any_element()
+    }
+
+    /// 手机壳底部导航高度。曲库页常驻一条，mini player 悬浮在它上方。
+    pub(super) const PHONE_NAV_H: f32 = 54.0;
+
+    /// 手机壳底部导航：曲库 / 队列 / 搜索 / 设置。
+    ///
+    /// 一级导航必须常驻可见，不能只藏在标题栏的汉堡菜单里；抽屉保留给
+    /// 睡眠定时、均衡器、音频信息等次级操作，以及播放页/歌词页的跳转。
+    pub(super) fn render_phone_bottom_nav(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let weak = cx.entity().downgrade();
+
+        let browsing = self.phone_page == PhonePage::Browse;
+        let library_active = browsing
+            && (self.view_tab == ViewTab::Collection
+                || (self.view_tab == ViewTab::Library
+                    && self.library_filter == LibraryFilter::All));
+        let queue_active = browsing
+            && self.view_tab == ViewTab::Library
+            && self.library_filter == LibraryFilter::Queue;
+        let search_active = browsing && self.view_tab == ViewTab::Search;
+        let settings_active = self.settings_open;
+
+        let tab =
+            |icon: crate::icons::Icon,
+             label: &'static str,
+             id: &'static str,
+             active: bool,
+             on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
+                let fg = if active { theme.text } else { theme.text_faint };
+                div()
+                    .id(id)
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(3.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .child(crate::icons::icon(icon, 18.0, fg))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(if active {
+                                gpui::FontWeight::MEDIUM
+                            } else {
+                                gpui::FontWeight::NORMAL
+                            })
+                            .text_color(fg)
+                            .child(label),
+                    )
+                    .on_click(on_click)
+            };
+
+        let library = {
+            let weak = weak.clone();
+            tab(
+                crate::icons::Icon::Note,
+                "曲库",
+                "phone-nav-library",
+                library_active,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Browse;
+                        app.view_tab = ViewTab::Library;
+                        app.library_filter = LibraryFilter::All;
+                        app.source_route = None;
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+        let queue = {
+            let weak = weak.clone();
+            tab(
+                crate::icons::Icon::Queue,
+                "队列",
+                "phone-nav-queue",
+                queue_active,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Browse;
+                        app.view_tab = ViewTab::Library;
+                        app.library_filter = LibraryFilter::Queue;
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+        let search = {
+            let weak = weak.clone();
+            tab(
+                crate::icons::Icon::Search,
+                "搜索",
+                "phone-nav-search",
+                search_active,
+                Box::new(move |_, window, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Browse;
+                        app.view_tab = ViewTab::Search;
+                        app.source_route = None;
+                        // 搜索框在切页后的下一帧才挂载，聚焦必须延后一拍。
+                        let input = app.search_input.clone();
+                        cx.defer_in(window, move |_, window, cx| {
+                            focus_input(&input, window, cx);
+                        });
+                        cx.notify();
+                    });
+                }),
+            )
+        };
+        let settings = {
+            let weak = weak.clone();
+            tab(
+                crate::icons::Icon::Settings,
+                "设置",
+                "phone-nav-settings",
+                settings_active,
+                Box::new(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.open_settings(cx));
+                }),
+            )
+        };
+
+        div()
+            .id("phone-bottom-nav")
+            .h(px(Self::PHONE_NAV_H))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(library)
+            .child(queue)
+            .child(search)
+            .child(settings)
             .into_any_element()
     }
 

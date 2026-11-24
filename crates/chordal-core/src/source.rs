@@ -12,6 +12,7 @@ use crate::model::{
     LoginChallenge, LoginMethod, LoginProgress, Lyrics, ResolvedStream, SearchQuery, SearchResults,
     SourceId, SourceKind, StreamHandle, Track, TrackId, TrackPage,
 };
+use crate::playlist::PlaylistEditor;
 
 /// 源的静态元信息（注册时即确定，不随加载状态变化）。
 #[derive(Debug, Clone)]
@@ -82,6 +83,12 @@ pub trait MusicSource: Send + Sync {
     fn account(&self) -> Option<&dyn AccountSource> {
         None
     }
+
+    /// 可选：歌单编辑能力。UI 通过统一 [`PlaylistMutation`] 调用，
+    /// 不为每个音源单独写一套编辑界面。
+    fn playlist_editor(&self) -> Option<&dyn PlaylistEditor> {
+        None
+    }
 }
 
 /// 可浏览目录：专辑 / 歌单 / 歌手。
@@ -126,6 +133,27 @@ pub trait AccountSource: Send + Sync {
     async fn logout(&self) -> CoreResult<()>;
 
     async fn user_playlists(&self) -> CoreResult<Vec<CollectionSummary>>;
+
+    /// 今日推荐（每日推荐歌曲）。不支持的源返回 Err。
+    async fn daily_recommendations(&self) -> CoreResult<Vec<Track>> {
+        Err(CoreError::Config("该音源不支持今日推荐".into()))
+    }
+
+    /// 私人 FM。不支持的源返回 Err。
+    async fn personal_fm(&self) -> CoreResult<Vec<Track>> {
+        Err(CoreError::Config("该音源不支持私人 FM".into()))
+    }
+
+    /// 每日推荐歌单（账号个性化歌单列表）。
+    async fn recommended_playlists(&self) -> CoreResult<Vec<CollectionSummary>> {
+        Err(CoreError::Config("该音源不支持推荐歌单".into()))
+    }
+
+    /// 私人雷达：按账号每日生成的歌单集合。接口不支持时返回 Err，
+    /// UI 以提示形式降级，不影响其它推荐区块。
+    async fn private_radar(&self) -> CoreResult<Vec<CollectionSummary>> {
+        Err(CoreError::Config("该音源不支持私人雷达".into()))
+    }
 
     /// 当前 Cookie（用于 UI 持久化；不要写入日志）。
     fn cookie(&self) -> Option<String>;

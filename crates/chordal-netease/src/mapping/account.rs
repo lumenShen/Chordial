@@ -121,3 +121,36 @@ pub fn map_user_playlists(source: &SourceId, body: &serde_json::Value) -> Vec<Co
         .filter_map(|p| playlist_summary(source, p, CollectionKind::Playlist))
         .collect()
 }
+
+/// 推荐类接口 → 歌单摘要列表。
+///
+/// 推荐接口的包装层历史上出现过 `recommend` / `playlist` / `playlists` /
+/// `result` / `data` 多种形态（私人雷达若由自建服务实现也可能不同），
+/// 因此按优先级逐个尝试，单条解析失败只跳过该条。
+pub fn map_playlist_list(
+    source: &SourceId,
+    body: &serde_json::Value,
+    kind: CollectionKind,
+) -> Vec<CollectionSummary> {
+    fn array_at<'a>(body: &'a serde_json::Value, key: &str) -> Option<&'a Vec<serde_json::Value>> {
+        body.get(key).and_then(serde_json::Value::as_array)
+    }
+    let data = body.get("data");
+    let items = array_at(body, "recommend")
+        .or_else(|| array_at(body, "playlists"))
+        .or_else(|| array_at(body, "playlist"))
+        .or_else(|| array_at(body, "result"))
+        .or_else(|| data.and_then(serde_json::Value::as_array))
+        .or_else(|| data.and_then(|data| array_at(data, "playlists")))
+        .or_else(|| data.and_then(|data| array_at(data, "playlist")))
+        .or_else(|| data.and_then(|data| array_at(data, "list")))
+        .or_else(|| data.and_then(|data| array_at(data, "recommend")));
+    let Some(items) = items else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| serde_json::from_value::<PlaylistBrief>(item.clone()).ok())
+        .filter_map(|playlist| playlist_summary(source, playlist, kind))
+        .collect()
+}

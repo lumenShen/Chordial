@@ -5,7 +5,7 @@
 //! 绘制时只做 `paint_glyph`，不再触发任何布局查询。
 //!
 //! 与 AMLL 的排版语义对应关系：
-//! - 行上下 padding = 视口高度 × [`LyricTextStyle::padding_y_ratio`]（dom-slim 的 2vh）；
+//! - 行上下 padding = 基准字号 × [`LyricTextStyle::padding_y_em`]（AMLL `.lyricLineWrapper` 的 0.4em）；
 //! - 左右 padding = 主字号 × [`LyricTextStyle::padding_x_em`]（1em）；
 //! - 主行行高 = 主字号 × [`LyricTextStyle::line_height_ratio`]（1.2em）；
 //! - 译文/音译字号 = 主字号 × [`LyricTextStyle::sub_font_size_ratio`]，且不低于 10px，
@@ -82,8 +82,11 @@ pub struct LyricTextStyle {
     pub sub_line_height_ratio: f32,
     /// 左右内边距，单位是「主字号」。
     pub padding_x_em: f32,
-    /// 上下内边距，相对视口高度。
-    pub padding_y_ratio: f32,
+    /// 上下内边距，单位是「基准字号」（AMLL `.lyricLineWrapper` 的 0.4em）。
+    ///
+    /// 不能按视口高度取比例：竖屏/手机壳的高度远大于宽度、字号又被宽度
+    /// 上限卡住时，视口比例会把行距撑到字号的数倍。
+    pub padding_y_em: f32,
     /// 歌词可用宽度占视口的比例（与 [`crate::player::LyricPlayerConfig`] 对齐；
     /// 布局宽度本身按视口宽度计算，此字段供渲染层/配置保持一致）。
     /// 背景行字号相对主字号的倍数。
@@ -112,7 +115,7 @@ impl Default for LyricTextStyle {
             sub_font_size_ratio: 0.5,
             sub_line_height_ratio: 1.5,
             padding_x_em: 1.0,
-            padding_y_ratio: 0.02,
+            padding_y_em: 0.4,
             bg_line_scale: 0.7,
             sweep_fade_em: 0.6,
             edge_fade_top: 0.1,
@@ -597,7 +600,6 @@ impl TextLayoutCache {
             let height = estimate_height(
                 &self.style,
                 self.viewport_width,
-                self.viewport_height,
                 self.has_duet,
                 &self.hints[i],
             );
@@ -640,7 +642,6 @@ impl TextLayoutCache {
         let shape = Arc::new(build_line_shape(
             &self.style,
             self.viewport_width,
-            self.viewport_height,
             self.has_duet,
             index,
             &doc.lines[index],
@@ -719,7 +720,6 @@ impl TextLayoutCache {
             let height = estimate_height(
                 &self.style,
                 self.viewport_width,
-                self.viewport_height,
                 self.has_duet,
                 &self.hints[i],
             );
@@ -736,10 +736,8 @@ impl TextLayoutCache {
         let prev = self.lru_prev[index];
         let next = self.lru_next[index];
         // 已被淘汰的行 prev/next 都是 NONE，且不在 head/tail 上。
-        let linked = prev != LRU_NONE
-            || next != LRU_NONE
-            || self.lru_head == i
-            || self.lru_tail == i;
+        let linked =
+            prev != LRU_NONE || next != LRU_NONE || self.lru_head == i || self.lru_tail == i;
         if linked {
             if prev != LRU_NONE {
                 self.lru_next[prev as usize] = next;
@@ -773,7 +771,10 @@ impl TextLayoutCache {
 
     fn evict_to_cap(&mut self) {
         while self.shaped_count > self.max_shaped_lines {
-            debug_assert!(self.lru_head != LRU_NONE, "LRU list shorter than shaped_count");
+            debug_assert!(
+                self.lru_head != LRU_NONE,
+                "LRU list shorter than shaped_count"
+            );
             if self.lru_head == LRU_NONE {
                 break;
             }
@@ -794,7 +795,6 @@ impl TextLayoutCache {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests;

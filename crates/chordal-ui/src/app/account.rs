@@ -210,9 +210,40 @@ impl ChordialApp {
     }
 
     pub(super) fn open_login(&mut self, cx: &mut Context<Self>) {
+        if self.login_source_id().is_none() {
+            self.login_source = self.primary_netease_id();
+        }
         self.login_open = true;
         self.login_tab = LoginTab::Qr;
         self.start_login(cx);
+    }
+
+    /// 从某个网易云实例的页面打开登录：浮层绑定到该实例，而不是默认实例。
+    pub(super) fn open_login_for(&mut self, id: SourceId, cx: &mut Context<Self>) {
+        self.login_source = Some(id);
+        self.open_login(cx);
+    }
+
+    /// 登录成功后的实例级收尾：Cookie 写回该实例配置、清空快照并重新拉取。
+    pub(super) fn finish_source_login(
+        &mut self,
+        source_id: &SourceId,
+        profile: chordal_core::model::AccountProfile,
+        cookie: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_source_cookie(source_id, cookie);
+        self.source_user_playlists.remove(source_id);
+        self.source_user_playlists_loading.remove(source_id);
+        self.clear_source_feeds(source_id);
+        // 全局账号态/头像只服务旧界面；以首个实例为准。
+        if self.primary_netease_id().as_ref() == Some(source_id) {
+            self.account_state = AccountState::LoggedIn(profile);
+            self.load_account_avatar(cx);
+            self.load_user_playlists(cx);
+        }
+        self.load_source_user_playlists(source_id, cx);
+        self.ensure_source_feeds(source_id, cx);
     }
 
     pub(super) fn close_login(&mut self, cx: &mut Context<Self>) {
@@ -265,7 +296,7 @@ impl ChordialApp {
             cx.notify();
             return;
         }
-        let Some(source) = self.netease_source() else {
+        let Some(source) = self.login_source() else {
             self.login_status = Some("网易云源未加载".into());
             cx.notify();
             return;
@@ -315,7 +346,12 @@ impl ChordialApp {
             cx.notify();
             return;
         }
-        let Some(source) = self.netease_source() else {
+        let Some(source_id) = self.login_source_id() else {
+            self.login_status = Some("网易云源未加载".into());
+            cx.notify();
+            return;
+        };
+        let Some(source) = self.registry.get(&source_id) else {
             self.login_status = Some("网易云源未加载".into());
             cx.notify();
             return;
@@ -334,8 +370,7 @@ impl ChordialApp {
                         if app.login_gen != generation || !app.login_open {
                             return;
                         }
-                        app.account_state = AccountState::LoggedIn(profile);
-                        app.save_cookie(cookie);
+                        app.finish_source_login(&source_id, profile, cookie, cx);
                         app.login_open = false;
                         app.login_gen = app.login_gen.wrapping_add(1);
                         app.login_status = None;
@@ -345,8 +380,6 @@ impl ChordialApp {
                         app.login_captcha_input
                             .update(cx, |state, cx| state.clear(cx));
                         app.info_message = Some("已登录网易云，正在加载用户歌单".into());
-                        app.load_account_avatar(cx);
-                        app.load_user_playlists(cx);
                         cx.notify();
                     });
                 }
@@ -400,7 +433,12 @@ impl ChordialApp {
         self.login_status = Some("正在获取二维码…".into());
         cx.notify();
 
-        let Some(source) = self.netease_source() else {
+        let Some(source_id) = self.login_source_id() else {
+            self.login_status = Some("网易云源未加载".into());
+            cx.notify();
+            return;
+        };
+        let Some(source) = self.registry.get(&source_id) else {
             self.login_status = Some("网易云源未加载".into());
             cx.notify();
             return;
@@ -494,8 +532,7 @@ impl ChordialApp {
                             if app.login_gen != generation || !app.login_open {
                                 return;
                             }
-                            app.account_state = AccountState::LoggedIn(profile);
-                            app.save_cookie(cookie);
+                            app.finish_source_login(&source_id, profile, cookie, cx);
                             app.login_open = false;
                             app.login_gen = app.login_gen.wrapping_add(1);
                             app.login_status = None;
@@ -503,8 +540,6 @@ impl ChordialApp {
                             app.retire_image(old_qr);
                             app.login_challenge = None;
                             app.info_message = Some("已登录网易云，正在加载用户歌单".into());
-                            app.load_account_avatar(cx);
-                            app.load_user_playlists(cx);
                             cx.notify();
                         });
                         return;
@@ -562,7 +597,12 @@ impl ChordialApp {
         .detach();
     }
 
-    pub(super) fn open_collection(&mut self, id: CollectionId, title: String, cx: &mut Context<Self>) {
+    pub(super) fn open_collection(
+        &mut self,
+        id: CollectionId,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
         self.collection_gen = self.collection_gen.wrapping_add(1);
         let generation = self.collection_gen;
         self.view_tab = ViewTab::Collection;

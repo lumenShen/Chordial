@@ -162,6 +162,15 @@ pub struct Track {
     /// 搜索时每首只有一次 `contains`，无每查询分配。
     #[serde(skip)]
     pub search_key: String,
+    /// 跨源“同一首歌”判定键：歌名 + 分列后的全部艺人（排序去重）+
+    /// 专辑名 + 专辑 orderIndex。构造期预计算；旧缓存反序列化后可能为空，
+    /// 读取时用 [`Track::identity_key`] 兜底重算。
+    ///
+    /// 与 `dedup_key` 的区别：`dedup_key` 只用于聚合搜索的跨源去重，
+    /// 刻意保持宽松（歌名 + 主艺人）；`identity_key` 用于歌单引用、
+    /// 本地替代与播放降级，需要严格到专辑与曲序。
+    #[serde(default)]
+    pub identity_key: String,
 }
 
 impl Track {
@@ -185,6 +194,7 @@ impl Track {
             search_key.push('\u{1}');
             search_key.push_str(&normalize(&album.name));
         }
+        let identity_key = identity_key_for(&title, &artists, album.as_ref(), None);
         Self {
             id,
             title,
@@ -198,7 +208,36 @@ impl Track {
             quality_info: None,
             dedup_key,
             search_key,
+            identity_key,
         }
+    }
+
+    /// 跨源同一首歌的判定键。`track_no` 在构造后才被适配器填充，
+    /// 因而在读取时用当前字段重算一次（旧缓存/适配器补全都能覆盖）。
+    ///
+    /// 艺人先按本地元数据常见的 `/`、`&`、`;` 分列，再归一化、排序去重，
+    /// 因此 `"A & B"` 与 `["A", "B"]` 等价，艺人顺序不影响判定。
+    pub fn identity_key(&self) -> String {
+        if self.identity_key.is_empty() {
+            identity_key_for(
+                &self.title,
+                &self.artists,
+                self.album.as_ref(),
+                self.track_no,
+            )
+        } else {
+            self.identity_key.clone()
+        }
+    }
+
+    /// 以当前 `track_no` 为准重建并缓存身份键。适配器在构造后补曲序时调用。
+    pub fn rebuild_identity_key(&mut self) {
+        self.identity_key = identity_key_for(
+            &self.title,
+            &self.artists,
+            self.album.as_ref(),
+            self.track_no,
+        );
     }
 
     pub fn primary_artist(&self) -> &str {
@@ -224,6 +263,44 @@ impl Track {
             100
         }
     }
+}
+
+/// 把本地/在线元数据里常见的“多艺人”字符串拆成单个艺人名。
+///
+/// 只做分隔符切分，不做名称归一化；调用方按需 `normalize`。
+/// 空片段会被丢弃。
+pub fn split_artist_names(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(['/', '&', ';'])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// 构造跨源身份键。艺人集合排序去重，顺序不影响结果。
+pub fn identity_key_for(
+    title: &str,
+    artists: &[ArtistRef],
+    album: Option<&AlbumRef>,
+    track_no: Option<u32>,
+) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for artist in artists {
+        for part in split_artist_names(&artist.name) {
+            let name = normalize(part);
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    let album = album.map(|a| normalize(&a.name)).unwrap_or_default();
+    format!(
+        "{}\u{1}{}\u{1}{}\u{1}{}",
+        normalize(title),
+        names.join("\u{2}"),
+        album,
+        track_no.unwrap_or(0)
+    )
 }
 
 /// 小写 + 压缩空白。O(len)，单遍。
@@ -859,6 +936,76 @@ mod tests {
         assert_eq!(lyrics.timed_lines[0].start_ms, 1000);
         assert_eq!(lyrics.timed_lines[0].end_ms, 3000);
         assert_eq!(lyrics.lines[0].time_ms, 1000);
+    }
+
+    #[test]
+    fn artist_metadata_splits_common_separators() {
+        let names: Vec<&str> = split_artist_names("A & B / C; D").collect();
+        assert_eq!(names, vec!["A", "B", "C", "D"]);
+        assert_eq!(split_artist_names("  ").count(), 0);
+    }
+
+    #[test]
+    fn identity_key_matches_across_sources_and_artist_order() {
+        let album = Some(AlbumRef {
+            id: None,
+            name: "FÛGENE 02".into(),
+            cover: None,
+        });
+        let mut a = Track::new(
+            TrackId::new(SourceId::new("local"), "1"),
+            "Hype (feat. Such)",
+            vec![ArtistRef {
+                id: None,
+                name: "Such & PSYQUI".into(),
+            }],
+            album.clone(),
+            None,
+            TrackOrigin::Local {
+                path: PathBuf::from("/a.flac"),
+            },
+        );
+        let mut b = Track::new(
+            TrackId::new(SourceId::new("netease"), "99"),
+            "hype (feat. such)",
+            vec![
+                ArtistRef {
+                    id: None,
+                    name: "PSYQUI".into(),
+                },
+                ArtistRef {
+                    id: None,
+                    name: "Such".into(),
+                },
+            ],
+            album,
+            None,
+            TrackOrigin::Remote {
+                source: SourceId::new("netease"),
+            },
+        );
+        assert_eq!(a.identity_key(), b.identity_key());
+
+        // 曲序参与判定：适配器构造后补写 track_no 必须重建。
+        a.track_no = Some(3);
+        a.rebuild_identity_key();
+        b.track_no = Some(3);
+        b.rebuild_identity_key();
+        assert_eq!(a.identity_key(), b.identity_key());
+
+        let mut other_album = b.clone();
+        other_album.album = Some(AlbumRef {
+            id: None,
+            name: "other".into(),
+            cover: None,
+        });
+        other_album.rebuild_identity_key();
+        assert_ne!(a.identity_key(), other_album.identity_key());
+
+        let mut other_order = b.clone();
+        other_order.track_no = Some(4);
+        other_order.rebuild_identity_key();
+        assert_ne!(a.identity_key(), other_order.identity_key());
     }
 
     #[test]

@@ -21,16 +21,17 @@ use gpui::{
 use crate::config::SourcePreference;
 use crate::icons::{self, Icon};
 use crate::input::{InputState, InputView};
+use crate::motion::MotionPreset;
 use crate::theme::{Appearance, Theme};
 
 // ---- 按职责拆分出的子模块（纯代码搬移） ----
 mod actions;
-mod render_shell;
+mod render_about;
 mod render_general_playback;
+mod render_responsive;
+mod render_shell;
 mod render_sources;
 mod render_storage;
-mod render_about;
-mod render_responsive;
 
 const CARD_W: f32 = 800.0;
 const CARD_H: f32 = 600.0;
@@ -115,6 +116,12 @@ pub enum SettingsAction {
     SetBackgroundRenderDivisor(u32),
     /// 动态歌词整行扫光渐变带宽度（em，0.1..=4.0）。
     SetLyricSweepFade(f32),
+    /// 统一弹簧预设（紧凑/均衡/柔和/弹性）。
+    SetMotionPreset(MotionPreset),
+    /// 动画时长倍率（0.25..=3.0，> 1 慢放）。
+    SetMotionDuration(f32),
+    /// 动画回弹倍率（0.25..=2.0，> 1 回弹更明显）。
+    SetMotionOvershoot(f32),
     /// 画面性能诊断浮窗开关。
     SetPerfOverlay(bool),
     SetEqEnabled(bool),
@@ -185,6 +192,9 @@ pub struct SettingsView {
     beat_strength: f32,
     background_render_divisor: u32,
     lyric_sweep_fade_em: f32,
+    motion_preset: MotionPreset,
+    animation_duration_multiplier: f32,
+    animation_overshoot_multiplier: f32,
     perf_overlay: bool,
     cache_dir: PathBuf,
     download_dir: PathBuf,
@@ -217,6 +227,8 @@ pub struct SettingsView {
     beat_strength_field: TextField,
     background_divisor_field: TextField,
     lyric_sweep_field: TextField,
+    motion_duration_field: TextField,
+    motion_overshoot_field: TextField,
     search_timeout_field: TextField,
     netease_url_field: TextField,
     device_field: TextField,
@@ -226,13 +238,7 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-
     // ================= 渲染 =================
-
-
-
-
-
 }
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -253,8 +259,7 @@ impl Render for SettingsView {
     }
 }
 
-impl SettingsView {
-}
+impl SettingsView {}
 // ================= 基础控件 =================
 
 fn section(

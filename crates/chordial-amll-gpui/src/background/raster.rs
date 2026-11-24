@@ -176,3 +176,168 @@ pub(super) fn blend_over(dst: &mut [u8], src: &[u8]) {
         d[3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
     }
 }
+
+/// 高分分辨率放大用的常驻中间缓冲。由渲染器持有，跨帧复用，
+/// 避免 30fps 背景每帧分配几百 KiB 的临时图像。
+pub(super) struct UpscaleScratch {
+    /// 水平 pass 的 f32 结果（Cubic 允许轻微过冲，保留精度到垂直 pass）。
+    tmp: Vec<f32>,
+    base_x: Vec<i32>,
+    weight_x: Vec<[f32; 4]>,
+    base_y: Vec<i32>,
+    weight_y: Vec<[f32; 4]>,
+}
+
+impl UpscaleScratch {
+    pub(super) fn new() -> Self {
+        Self {
+            tmp: Vec::new(),
+            base_x: Vec::new(),
+            weight_x: Vec::new(),
+            base_y: Vec::new(),
+            weight_y: Vec::new(),
+        }
+    }
+
+    pub(super) fn ensure(&mut self, dst_w: usize, dst_h: usize) {
+        let len = dst_w * dst_h * 4;
+        if self.tmp.len() != len {
+            self.tmp.resize(len, 0.0);
+        }
+        if self.base_x.len() != dst_w {
+            self.base_x.resize(dst_w, 0);
+            self.weight_x.resize(dst_w, [0.0; 4]);
+        }
+        if self.base_y.len() != dst_h {
+            self.base_y.resize(dst_h, 0);
+            self.weight_y.resize(dst_h, [0.0; 4]);
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.tmp.clear();
+        self.tmp.shrink_to_fit();
+        self.base_x.clear();
+        self.weight_x.clear();
+        self.base_y.clear();
+        self.weight_y.clear();
+    }
+
+    /// 登记在 `Gauge::Background` 里的常驻字节数。
+    pub(super) fn memory_bytes(&self) -> usize {
+        self.tmp.len() * std::mem::size_of::<f32>()
+            + self.base_x.len() * std::mem::size_of::<i32>()
+            + self.weight_x.len() * std::mem::size_of::<[f32; 4]>()
+            + self.base_y.len() * std::mem::size_of::<i32>()
+            + self.weight_y.len() * std::mem::size_of::<[f32; 4]>()
+    }
+}
+
+/// Catmull-Rom（a = -0.5）四个抽头的权重。保持线性斜坡不变形，
+/// 且一阶导数连续——这正是双线性放大所缺的“丝滑”性质。
+#[inline(always)]
+fn catmull_rom_weights(t: f32, out: &mut [f32; 4]) {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    out[0] = -0.5 * t3 + t2 - 0.5 * t;
+    out[1] = 1.5 * t3 - 2.5 * t2 + 1.0;
+    out[2] = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
+    out[3] = 0.5 * t3 - 0.5 * t2;
+}
+
+fn build_axis_lut(
+    dst: usize,
+    src: usize,
+    base: &mut [i32],
+    weights: &mut [[f32; 4]],
+) {
+    let scale = dst as f32 / src as f32;
+    for i in 0..dst {
+        // 中心对齐的采样坐标；左边缘钳到 0（放大时 src > 0.5，仅 i=0 可能 < 0）。
+        let s = ((i as f32 + 0.5) / scale - 0.5).max(0.0);
+        let b = s.floor() as i32;
+        base[i] = b;
+        catmull_rom_weights(s - b as f32, &mut weights[i]);
+    }
+}
+
+#[inline(always)]
+fn clamp_index(i: i32, max: usize) -> usize {
+    (i as isize).clamp(0, max as isize) as usize
+}
+
+/// 极轻的确定性抖动，打散 8bit 量化在平滑渐变上的条带。
+/// RGB 共用同一个值，避免放大后颜色噪点。
+#[inline(always)]
+fn upscale_dither(x: usize, y: usize) -> f32 {
+    let mut h = (x as u32)
+        .wrapping_mul(374_761_393)
+        .wrapping_add((y as u32).wrapping_mul(668_265_263));
+    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+    ((h >> 24) as f32 / 255.0 - 0.5) * 0.7
+}
+
+/// 把低分辨率 BGRA 光栅用可分离 Catmull-Rom 放大到展示分辨率。
+///
+/// GPU 侧仍然是廉价双线性拉伸；这里先把源重建为 C1 连续的图像，
+/// 消除大除数时双线性在每个源像素边界处的斜率突变（锯齿/不丝滑渐变）。
+/// 边缘钳位取样，不会采到图集相邻图块，因此不需要额外的 padding。
+pub(super) fn upscale_catmull_rom(
+    src: &[u8],
+    dst: &mut [u8],
+    scratch: &mut UpscaleScratch,
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) {
+    debug_assert_eq!(src.len(), src_w * src_h * 4);
+    debug_assert_eq!(dst.len(), dst_w * dst_h * 4);
+    scratch.ensure(dst_w, dst_h);
+    build_axis_lut(dst_w, src_w, &mut scratch.base_x, &mut scratch.weight_x);
+    build_axis_lut(dst_h, src_h, &mut scratch.base_y, &mut scratch.weight_y);
+
+    let max_x = src_w - 1;
+    let tmp = &mut scratch.tmp;
+    for y in 0..src_h {
+        let row = &src[y * src_w * 4..];
+        for x in 0..dst_w {
+            let b = scratch.base_x[x];
+            let w = scratch.weight_x[x];
+            let i0 = clamp_index(b - 1, max_x) * 4;
+            let i1 = clamp_index(b, max_x) * 4;
+            let i2 = clamp_index(b + 1, max_x) * 4;
+            let i3 = clamp_index(b + 2, max_x) * 4;
+            let o = (y * dst_w + x) * 4;
+            for c in 0..4 {
+                tmp[o + c] = row[i0 + c] as f32 * w[0]
+                    + row[i1 + c] as f32 * w[1]
+                    + row[i2 + c] as f32 * w[2]
+                    + row[i3 + c] as f32 * w[3];
+            }
+        }
+    }
+
+    let max_y = src_h - 1;
+    let stride = dst_w * 4;
+    for y in 0..dst_h {
+        let b = scratch.base_y[y];
+        let w = scratch.weight_y[y];
+        let r0 = clamp_index(b - 1, max_y) * stride;
+        let r1 = clamp_index(b, max_y) * stride;
+        let r2 = clamp_index(b + 1, max_y) * stride;
+        let r3 = clamp_index(b + 2, max_y) * stride;
+        for x in 0..dst_w {
+            let o = x * 4;
+            let d = upscale_dither(x, y);
+            for c in 0..4 {
+                let v = tmp[r0 + o + c] * w[0]
+                    + tmp[r1 + o + c] * w[1]
+                    + tmp[r2 + o + c] * w[2]
+                    + tmp[r3 + o + c] * w[3]
+                    + d;
+                dst[y * stride + o + c] = v.clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}

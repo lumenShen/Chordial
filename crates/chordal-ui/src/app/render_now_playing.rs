@@ -90,11 +90,11 @@ impl ChordialApp {
                 &theme,
                 self.cover_image.clone(),
                 art,
-                12.0,
+                1.0,
                 placeholder,
             );
             let wrapper = div()
-                .rounded(px(12.0))
+                .rounded(px(1.0))
                 .shadow(vec![BoxShadow {
                     color: theme.shadow_strong,
                     offset: point(px(0.0), px(14.0)),
@@ -432,6 +432,7 @@ impl ChordialApp {
                     .id("now-scroll")
                     .flex_1()
                     .min_h_0()
+                    .track_scroll(&self.now_scroll)
                     .overflow_y_scroll()
                     .when(self.smooth_scroll, |d| d.smooth_scroll())
                     .child(
@@ -442,7 +443,9 @@ impl ChordialApp {
                             .items_center()
                             .px(px(28.0))
                             .pt(px(18.0))
-                            .pb(px(100.0))
+                            .pb(px(crate::theme::size::DOCK
+                                + crate::theme::size::DOCK_BOTTOM
+                                + 14.0))
                             .child(artwork)
                             .child(info)
                             .child(lyrics_block),

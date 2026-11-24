@@ -9,6 +9,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use chordal_player::{
     EQ_MAX_BANDS, EQ_MAX_GAIN_DB, EQ_MIN_GAIN_DB, EqSettings, FilterKind, fmt_db, fmt_freq,
@@ -32,14 +33,13 @@ use crate::theme::Theme;
 use crate::widgets::{self, SliderColors};
 
 // ---- 按职责拆分出的子模块（纯代码搬移） ----
-mod drawing;
+mod compact_panels;
+mod compact_shell;
 mod controls;
-mod desktop_shell;
 mod desktop_graph;
 mod desktop_library;
-mod compact_shell;
-mod compact_panels;
-
+mod desktop_shell;
+mod drawing;
 
 const RAIL_W: f32 = 196.0;
 const INSPECTOR_W: f32 = 286.0;
@@ -302,8 +302,6 @@ fn tab_icon(tab: EqTab) -> Option<Icon> {
     }
 }
 
-
-
 // ================= 页面 =================
 
 impl ChordialApp {
@@ -311,10 +309,11 @@ impl ChordialApp {
         let theme = Theme::get(cx).clone();
         let pal = EqPalette::new(&theme);
         let enter = self
-            .eq_open_at
-            .map(|t| (t.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0))
+            .motion
+            .eq_enter
+            .as_ref()
+            .map(|spring| spring.value(Instant::now()).clamp(0.0, 1.0))
             .unwrap_or(1.0);
-        let enter: f32 = 1.0 - (1.0 - enter).powi(3);
         match eq_layout(
             self.viewport_width,
             self.viewport_height,
@@ -325,13 +324,7 @@ impl ChordialApp {
         }
     }
 
-
-
     // ---------- 桌面：预设库 ----------
 
-
     // ---------- 紧凑：触控主界面 ----------
-
-
 }
-

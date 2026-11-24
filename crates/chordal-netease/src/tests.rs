@@ -174,8 +174,7 @@ fn cellphone_login_sets_cookie_and_profile() {
 /// 单曲详情缓存：第一次请求落盘，服务关闭后第二次仍能返回。
 #[test]
 fn track_cache_serves_after_server_stops() {
-    let root =
-        std::env::temp_dir().join(format!("chordial-netease-cache-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("chordial-netease-cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = Arc::new(
         ObjectCache::open(CacheConfig {
@@ -226,4 +225,117 @@ fn track_cache_serves_after_server_stops() {
 
     drop(source);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 从请求行里取查询参数（`?a=1&b=2`）。
+fn query_value(path: &str, key: &str) -> Option<usize> {
+    path.split_once('?')?.1.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| v.parse().ok()).flatten()
+    })
+}
+
+/// 歌单超过 1000 首：`/playlist/track/all` 必须按 offset 分页续拉，
+/// 直到取满 `/playlist/detail` 的 trackCount，而不是只留第一页 1000 首。
+#[test]
+fn playlist_collection_paginates_past_1000_tracks() {
+    use std::time::{Duration, Instant};
+
+    const TOTAL: usize = 2500;
+    const PAGE: usize = 1000;
+    fn song(id: usize) -> String {
+        format!(
+            r#"{{"id":{id},"name":"song {id}","ar":[{{"id":1,"name":"artist"}}],"al":{{"id":2,"name":"album","picUrl":null}},"dt":180000,"no":{id}}}"#
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut requests: Vec<(usize, usize)> = Vec::new();
+        // 最多等 5 秒：即使被测代码少发/多发了请求，服务线程也能退出。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(conn) => conn,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            let body = if path.starts_with("/playlist/detail") {
+                format!(
+                    r#"{{"code":200,"playlist":{{"id":7,"name":"大歌单","trackCount":{TOTAL},"subscribed":false}}}}"#
+                )
+            } else if path.starts_with("/playlist/track/all") {
+                let offset = query_value(&path, "offset").unwrap_or(0);
+                let limit = query_value(&path, "limit").unwrap_or(0);
+                requests.push((offset, limit));
+                let end = (offset + limit).min(TOTAL);
+                let songs: Vec<String> = (offset..end).map(|i| song(i + 1)).collect();
+                format!(r#"{{"code":200,"songs":[{}]}}"#, songs.join(","))
+            } else {
+                r#"{"code":404}"#.to_string()
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            // 三页曲目取完后 detail 已先行返回；再多等一轮空 accept 只会
+            // 让测试变慢，这里直接结束。
+            if requests.len() == TOTAL.div_ceil(PAGE) {
+                break;
+            }
+        }
+        requests
+    });
+
+    let source = NeteaseSource::new(
+        SourceId::new("netease"),
+        NeteaseConfig {
+            base_url: format!("http://{addr}"),
+            cookie: None,
+            level: None,
+            mode: NeteaseMode::External,
+            ..Default::default()
+        },
+        "test",
+    );
+    let catalog = source.catalog().expect("catalog source");
+    let id = CollectionId::new(SourceId::new("netease"), CollectionKind::Playlist, "7");
+    let page = shared_runtime().block_on(catalog.collection(&id)).unwrap();
+
+    assert_eq!(page.total, TOTAL as u64);
+    assert_eq!(page.tracks.len(), TOTAL);
+    assert_eq!(
+        page.tracks.first().map(|t| t.title.as_str()),
+        Some("song 1")
+    );
+    assert_eq!(
+        page.tracks.last().map(|t| t.title.as_str()),
+        Some("song 2500")
+    );
+    assert!(!page.has_more);
+
+    let requests = server.join().unwrap();
+    assert_eq!(
+        requests,
+        vec![(0, PAGE), (1000, 1000), (2000, 500)],
+        "detail 应把 trackCount 作为续拉依据，短页后停止"
+    );
 }

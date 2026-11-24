@@ -68,8 +68,11 @@ pub(super) fn padding_x(style: &LyricTextStyle, main: f32) -> f32 {
 }
 
 #[inline]
-pub(super) fn padding_top(style: &LyricTextStyle, viewport_height: f32) -> f32 {
-    (viewport_height.max(0.0) * style.padding_y_ratio.max(0.0)).max(0.0)
+pub(super) fn padding_top(style: &LyricTextStyle) -> f32 {
+    // AMLL `.lyricLineWrapper { padding: 0.4em }`：em 相对播放器基准字号，
+    // 与视口高度无关。按视口取比例会在竖屏（高 >> 宽、字号被宽度卡住）
+    // 时把行距撑到字号的数倍。
+    (main_font_size(style, false) * style.padding_y_em.max(0.0)).max(0.0)
 }
 
 #[inline]
@@ -97,7 +100,6 @@ pub(super) fn estimate_rows(chars: u32, wide: u32, font_size: f32, width: f32) -
 pub(super) fn estimate_height(
     style: &LyricTextStyle,
     viewport_width: f32,
-    viewport_height: f32,
     has_duet: bool,
     hint: &LineHint,
 ) -> f32 {
@@ -105,7 +107,7 @@ pub(super) fn estimate_height(
     let sub = sub_font_size(style, main);
     let pad_x = padding_x(style, main);
     let width = content_width(viewport_width, pad_x, has_duet);
-    let pad_y = padding_top(style, viewport_height);
+    let pad_y = padding_top(style);
 
     let main_rows = estimate_rows(hint.main_chars, hint.main_wide, main, width).max(1);
     let sub_rows = estimate_rows(hint.trans_chars, 0, sub, width)
@@ -135,7 +137,6 @@ pub(super) fn font_for(style: &LyricTextStyle) -> Font {
 pub(super) fn build_line_shape(
     style: &LyricTextStyle,
     viewport_width: f32,
-    viewport_height: f32,
     has_duet: bool,
     index: usize,
     line: &LyricLine,
@@ -144,7 +145,7 @@ pub(super) fn build_line_shape(
     let main_size = main_font_size(style, line.is_bg);
     let sub_size = sub_font_size(style, main_size);
     let pad_x = padding_x(style, main_size);
-    let pad_y = padding_top(style, viewport_height);
+    let pad_y = padding_top(style);
     let width = content_width(viewport_width, pad_x, has_duet);
     let font = font_for(style);
 
@@ -343,7 +344,12 @@ pub(super) fn should_emphasize_group_word(word: &crate::model::LyricWord) -> boo
 }
 
 /// 整形单个视觉行。空文本绝不进入 gpui（见模块文档）。
-pub(super) fn shape_one(window: &Window, text: SharedString, font: &Font, font_size: f32) -> ShapedLine {
+pub(super) fn shape_one(
+    window: &Window,
+    text: SharedString,
+    font: &Font,
+    font_size: f32,
+) -> ShapedLine {
     let scope = PerfScope::enter(SHAPE_CHECKPOINT);
     let len = text.len();
     let run = TextRun {
@@ -436,7 +442,11 @@ pub(super) fn row_byte_range(row: &Range<usize>, fragments: &[MeasuredFragment])
     }
 }
 
-pub(super) fn word_index_at(word_ranges: Option<&[Range<usize>]>, cursor: &mut usize, byte: usize) -> usize {
+pub(super) fn word_index_at(
+    word_ranges: Option<&[Range<usize>]>,
+    cursor: &mut usize,
+    byte: usize,
+) -> usize {
     let Some(ranges) = word_ranges else {
         return 0;
     };
@@ -723,4 +733,3 @@ pub(super) fn shape_sub_rows(
     }
     out
 }
-

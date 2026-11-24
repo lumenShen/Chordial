@@ -50,7 +50,7 @@ pub enum NeteaseMode {
 }
 
 /// 托管模式配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedConfig {
     /// 显式 Node 可执行文件；None = 随包 node / PATH 上的 node。
     #[serde(default)]
@@ -186,7 +186,6 @@ impl Drop for NeteaseService {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests;

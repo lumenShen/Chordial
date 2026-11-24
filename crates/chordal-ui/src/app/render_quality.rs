@@ -140,4 +140,117 @@ impl ChordialApp {
             .child(div().w_full().flex().justify_end().child(close));
         backdrop.child(card).into_any_element()
     }
+
+    /// 「音频详情」视图：与右侧歌词列共用同一块容器，不弹模态框。
+    pub(super) fn render_audio_details_panel(
+        &self,
+        width: f32,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let white = gpui::white();
+        let track = self.current_track.as_ref();
+        let quality = track.and_then(|t| t.quality_info.as_ref());
+        let field = |label: &'static str, value: String| {
+            div()
+                .w_full()
+                .min_h(px(34.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .border_b_1()
+                .border_color(white.opacity(0.07))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(white.opacity(0.5))
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(white.opacity(0.92))
+                        .text_right()
+                        .child(SharedString::from(value)),
+                )
+        };
+        let tier = quality
+            .map(|q| match q.tier {
+                chordal_core::model::QualityTier::Unknown => "未知",
+                chordal_core::model::QualityTier::Standard => "标准",
+                chordal_core::model::QualityTier::High => "高品质",
+                chordal_core::model::QualityTier::Lossless => "无损",
+                chordal_core::model::QualityTier::HiRes => "高解析度",
+            })
+            .unwrap_or("—")
+            .to_string();
+        let source = track
+            .map(|t| match &t.origin {
+                TrackOrigin::Local { .. } => "本地音乐".to_string(),
+                TrackOrigin::Remote { source } => match source.0.as_str() {
+                    "netease" => "网易云音乐".to_string(),
+                    other => other.to_string(),
+                },
+            })
+            .unwrap_or_else(|| "—".into());
+        let badge = track.and_then(|t| t.quality.clone()).unwrap_or_default();
+
+        div()
+            .w(px(width))
+            .h_full()
+            .flex()
+            .flex_col()
+            .pt(px(28.0))
+            .child(
+                div()
+                    .text_size(px(19.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(white.opacity(0.95))
+                    .child("音频详情"),
+            )
+            .child(
+                div()
+                    .mt(px(6.0))
+                    .mb(px(14.0))
+                    .h(px(1.0))
+                    .bg(white.opacity(0.12)),
+            )
+            .child(field(
+                "音质",
+                if badge.is_empty() {
+                    tier
+                } else {
+                    format!("{} · {}", badge, tier)
+                },
+            ))
+            .child(field(
+                "解码器",
+                quality
+                    .and_then(|q| q.codec.clone())
+                    .unwrap_or_else(|| "未知".into()),
+            ))
+            .child(field(
+                "码率",
+                quality
+                    .and_then(|q| q.bitrate_kbps)
+                    .map(|v| format!("{v} kbps"))
+                    .unwrap_or_else(|| "—".into()),
+            ))
+            .child(field(
+                "采样率",
+                quality
+                    .and_then(|q| q.sample_rate_hz)
+                    .map(|v| format!("{v} Hz"))
+                    .unwrap_or_else(|| "—".into()),
+            ))
+            .child(field(
+                "无损",
+                quality
+                    .map(|q| if q.lossless { "是" } else { "否" })
+                    .unwrap_or("—")
+                    .to_string(),
+            ))
+            .child(field("音源", source))
+            .into_any_element()
+    }
 }

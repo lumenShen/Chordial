@@ -4,8 +4,13 @@
 //! 跟手位移，露出背后的主面板；松手后按位移与甩动速度决定回弹还是继续
 //! 下滑退出。手势本身不依赖定时器，帧节奏由 `Render` 中的
 //! `request_animation_frame` 驱动（与 `player_page::Transition` 一致）。
+//!
+//! 松手后的弹簧统一走 [`MotionSpring`]（见 `motion` 模块）：解析解采样，
+//! 掉帧不改变轨迹；本模块只保留「回弹还是关闭」的判定阈值。
 
 use std::time::Instant;
+
+use crate::motion::{MotionSpring, MotionTuning, PIXEL_TOL, VelocityTracker};
 
 /// 位移超过窗口高度的该比例时判定为关闭。
 const DISMISS_HEIGHT_RATIO: f32 = 0.18;
@@ -14,14 +19,14 @@ const DISMISS_FLING_VELOCITY: f32 = 720.0;
 const DISMISS_FLING_OFFSET: f32 = 48.0;
 /// 起手死区：小于该位移视为点击而不是拖拽。
 const DRAG_SLOP: f32 = 3.0;
-/// 松手回弹：欠阻尼弹簧，轻微过冲。
-const RETURN_DAMPING: f32 = 14.0;
-const RETURN_STIFFNESS: f32 = 170.0;
-/// 关闭：接近临界阻尼，直接收进 Dock，不回弹。
-const DISMISS_DAMPING: f32 = 24.0;
-const DISMISS_STIFFNESS: f32 = 170.0;
-/// 弹簧最长收敛时间（秒），超过后强制结束。
-const SPRING_MAX_SECS: f32 = 0.9;
+/// 回弹基准时长：对应原先 (damping 14, stiffness 170) 的 ζ≈0.54。
+const RETURN_BASE_MS: f32 = 260.0;
+/// 回弹超伸倍率：把均衡预设压到欠阻尼，保留轻微过冲。
+const RETURN_OVERSHOOT: f32 = 1.35;
+/// 关闭基准时长：对应原先 (damping 24, stiffness 170) 的近临界阻尼。
+const DISMISS_BASE_MS: f32 = 200.0;
+/// 关闭不需要过冲，直接收进 Dock。
+const DISMISS_OVERSHOOT: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SheetDragOutcome {
@@ -29,107 +34,32 @@ pub enum SheetDragOutcome {
     Dismissed,
 }
 
-/// 一维解析弹簧（单位与调用方一致）。`from` → `to`，带初速度 `v0`。
-///
-/// 用解析解而不是逐帧积分：任意时刻 O(1) 求值，掉帧不改变轨迹；
-/// 与项目里的 AMLL `spring.rs` 使用同一套物理语义。
-#[derive(Debug, Clone, Copy)]
-pub struct SpringSettle {
-    from: f32,
-    to: f32,
-    v0: f32,
-    start: Instant,
-    damping: f32,
-    stiffness: f32,
-}
-
-impl SpringSettle {
-    pub fn new(from: f32, to: f32, v0: f32, start: Instant, damping: f32, stiffness: f32) -> Self {
-        Self {
-            from,
-            to,
-            v0,
-            start,
-            damping,
-            stiffness,
-        }
-    }
-
-    fn coeffs(&self) -> (f32, f32, f32) {
-        // mass = 1
-        let w0 = self.stiffness.max(0.001).sqrt();
-        let zeta = self.damping / (2.0 * w0.max(0.001));
-        (w0, zeta, self.from - self.to)
-    }
-
-    pub fn position(&self, now: Instant) -> f32 {
-        let t = now.saturating_duration_since(self.start).as_secs_f32();
-        let (w0, zeta, x0) = self.coeffs();
-        if zeta < 1.0 {
-            let wd = w0 * (1.0 - zeta * zeta).max(0.0).sqrt();
-            let e = (-zeta * w0 * t).exp();
-            let (sin, cos) = (wd * t).sin_cos();
-            let b = (self.v0 + zeta * w0 * x0) / wd.max(0.001);
-            self.to + e * (x0 * cos + b * sin)
-        } else {
-            let e = (-w0 * t).exp();
-            self.to + (x0 + (self.v0 + w0 * x0) * t) * e
-        }
-    }
-
-    pub fn velocity(&self, now: Instant) -> f32 {
-        let t = now.saturating_duration_since(self.start).as_secs_f32();
-        let (w0, zeta, x0) = self.coeffs();
-        if zeta < 1.0 {
-            let wd = w0 * (1.0 - zeta * zeta).max(0.0).sqrt();
-            let e = (-zeta * w0 * t).exp();
-            let (sin, cos) = (wd * t).sin_cos();
-            let a = x0;
-            let b = (self.v0 + zeta * w0 * x0) / wd.max(0.001);
-            e * ((-zeta * w0) * (a * cos + b * sin) + (-a * wd * sin + b * wd * cos))
-        } else {
-            let e = (-w0 * t).exp();
-            let b = self.v0 + w0 * x0;
-            e * (b - w0 * (x0 + b * t))
-        }
-    }
-
-    /// 弹簧已收敛（位移 < 0.5 且速度 < 12）或超过最大时长。
-    pub fn settled(&self, now: Instant) -> bool {
-        if now.saturating_duration_since(self.start).as_secs_f32() >= SPRING_MAX_SECS {
-            return true;
-        }
-        (self.position(now) - self.to).abs() < 0.5 && self.velocity(now).abs() < 12.0
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum Phase {
     Tracking,
-    Settling { spring: SpringSettle, dismiss: bool },
+    Settling { spring: MotionSpring, dismiss: bool },
 }
 
 /// 一次下拉关闭手势。`None` 表示没有手势；进入 `Settling` 后由 render
 /// 每帧读取 `offset`，直到 `settled` 返回结果。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SheetDrag {
     start_y: f32,
     offset: f32,
-    last_y: f32,
-    last_at: Instant,
-    velocity: f32,
+    tracker: VelocityTracker,
     engaged: bool,
     phase: Phase,
 }
 
 impl SheetDrag {
     pub fn begin(y: f32, now: Instant) -> Self {
+        let mut tracker = VelocityTracker::default();
+        // 用按下点给追踪器打底，第一帧的位移即可算出速度（与旧实现的 last_y 一致）。
+        tracker.push(y, now);
         Self {
             start_y: y,
             offset: 0.0,
-            last_y: y,
-            last_at: now,
-            velocity: 0.0,
+            tracker,
             engaged: false,
             phase: Phase::Tracking,
         }
@@ -143,16 +73,9 @@ impl SheetDrag {
         if !matches!(self.phase, Phase::Tracking) {
             return false;
         }
+        // 速度由统一的追踪器平滑；松手时再按最后一点时间决定是否算甩动。
+        self.tracker.push(y, now);
         let dy = y - self.start_y;
-        let dt = now
-            .saturating_duration_since(self.last_at)
-            .as_secs_f32()
-            .max(0.001);
-        let instant_velocity = (y - self.last_y) / dt;
-        // 平滑速度：松手前的最后一次抖动不应该决定去留。
-        self.velocity = self.velocity * 0.55 + instant_velocity * 0.45;
-        self.last_y = y;
-        self.last_at = now;
         if dy.abs() > DRAG_SLOP {
             self.engaged = true;
         }
@@ -171,17 +94,22 @@ impl SheetDrag {
     /// （不进入动画）。
     ///
     /// `height` 只用于判定距离阈值；`dismiss_target` 是关闭动画的终点
-    /// （沉浸页收进 Dock 时传入 Dock 的顶边 y）。
-    pub fn release(&mut self, height: f32, dismiss_target: f32, now: Instant) {
+    /// （沉浸页收进 Dock 时传入 Dock 的顶边 y）。`tuning` 决定新弹簧的手感，
+    /// 已开始的弹簧不受后续设置改动影响。
+    pub fn release(
+        &mut self,
+        height: f32,
+        dismiss_target: f32,
+        now: Instant,
+        tuning: MotionTuning,
+    ) {
         if !matches!(self.phase, Phase::Tracking) || !self.engaged {
             return;
         }
-        // 松手前手指已停住时，速度不再代表甩动。
-        if now.saturating_duration_since(self.last_at).as_secs_f32() > 0.08 {
-            self.velocity = 0.0;
-        }
+        // 追踪器会把静止超过 100ms 的旧速度清零，避免停住后松手仍被当成甩动。
+        let velocity = self.tracker.velocity_at(now);
         let dismiss = self.offset > height * DISMISS_HEIGHT_RATIO
-            || (self.velocity > DISMISS_FLING_VELOCITY && self.offset > DISMISS_FLING_OFFSET);
+            || (velocity > DISMISS_FLING_VELOCITY && self.offset > DISMISS_FLING_OFFSET);
         if !dismiss && self.offset <= 0.5 {
             return;
         }
@@ -192,13 +120,27 @@ impl SheetDrag {
         } else {
             0.0
         };
-        let (damping, stiffness) = if dismiss {
-            (DISMISS_DAMPING, DISMISS_STIFFNESS)
+        let (base_ms, overshoot_factor) = if dismiss {
+            (DISMISS_BASE_MS, DISMISS_OVERSHOOT)
         } else {
-            (RETURN_DAMPING, RETURN_STIFFNESS)
+            (RETURN_BASE_MS, RETURN_OVERSHOOT)
         };
+        // 手感的超伸倍率只放大这一条弹簧的回弹，不改动全局设置。
+        let tuned = MotionTuning::new(
+            tuning.preset,
+            tuning.duration,
+            tuning.overshoot * overshoot_factor,
+        );
         self.phase = Phase::Settling {
-            spring: SpringSettle::new(self.offset, to, self.velocity, now, damping, stiffness),
+            spring: tuned.spring(
+                base_ms,
+                self.offset,
+                to,
+                velocity,
+                now,
+                PIXEL_TOL.0,
+                PIXEL_TOL.1,
+            ),
             dismiss,
         };
     }
@@ -207,7 +149,7 @@ impl SheetDrag {
     pub fn offset(&self, now: Instant) -> f32 {
         match self.phase {
             Phase::Tracking => self.offset,
-            Phase::Settling { spring, .. } => spring.position(now),
+            Phase::Settling { spring, .. } => spring.value(now),
         }
     }
 
@@ -216,8 +158,11 @@ impl SheetDrag {
     }
 
     /// 是否处于松手后的回弹/关闭动画。
-    pub fn animating(&self) -> bool {
-        matches!(self.phase, Phase::Settling { .. })
+    pub fn animating(&self, now: Instant) -> bool {
+        match self.phase {
+            Phase::Settling { spring, .. } => spring.active(now),
+            Phase::Tracking => false,
+        }
     }
 
     /// 动画结束后的结果；仍在进行中返回 `None`。
@@ -225,7 +170,7 @@ impl SheetDrag {
         let Phase::Settling { spring, dismiss } = self.phase else {
             return None;
         };
-        if !spring.settled(now) {
+        if !spring.done(now) {
             return None;
         }
         Some(if dismiss {
@@ -241,6 +186,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// 新弹簧的硬超时由 6 个时间常数推导（最长约 0.6s），留足余量再看落点。
+    const WAIT_MS: u64 = 1200;
+
     fn at(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
     }
@@ -251,8 +199,8 @@ mod tests {
         let mut drag = SheetDrag::begin(200.0, now);
         assert!(!drag.update(201.0, at(now, 16)));
         assert!(!drag.engaged());
-        drag.release(1000.0, 1000.0, at(now, 32));
-        assert!(!drag.animating());
+        drag.release(1000.0, 1000.0, at(now, 32), MotionTuning::default());
+        assert!(!drag.animating(at(now, 32)));
     }
 
     #[test]
@@ -271,15 +219,14 @@ mod tests {
         let now = Instant::now();
         let mut drag = SheetDrag::begin(200.0, now);
         drag.update(240.0, at(now, 16));
-        drag.release(1000.0, 1000.0, at(now, 32));
-        assert!(drag.animating());
+        drag.release(1000.0, 1000.0, at(now, 32), MotionTuning::default());
+        assert!(drag.animating(at(now, 32)));
         assert_eq!(drag.settled(at(now, 40)), None);
-        let end_ms = 32 + (SPRING_MAX_SECS * 1000.0) as u64;
         assert_eq!(
-            drag.settled(at(now, end_ms)),
+            drag.settled(at(now, 32 + WAIT_MS)),
             Some(SheetDragOutcome::Returned)
         );
-        let end = drag.offset(at(now, end_ms));
+        let end = drag.offset(at(now, 32 + WAIT_MS));
         assert!(end.abs() < 0.5, "回弹结束后应回到 0，实际 {end}");
     }
 
@@ -288,14 +235,13 @@ mod tests {
         let now = Instant::now();
         let mut drag = SheetDrag::begin(0.0, now);
         drag.update(300.0, at(now, 16));
-        drag.release(1000.0, 1000.0, at(now, 32));
-        assert!(drag.animating());
-        let end_ms = 32 + (SPRING_MAX_SECS * 1000.0) as u64;
+        drag.release(1000.0, 1000.0, at(now, 32), MotionTuning::default());
+        assert!(drag.animating(at(now, 32)));
         assert_eq!(
-            drag.settled(at(now, end_ms)),
+            drag.settled(at(now, 32 + WAIT_MS)),
             Some(SheetDragOutcome::Dismissed)
         );
-        let end = drag.offset(at(now, end_ms));
+        let end = drag.offset(at(now, 32 + WAIT_MS));
         assert!(end > 990.0, "关闭结束后页面应到达目标位置，实际 {end}");
     }
 
@@ -305,9 +251,9 @@ mod tests {
         let mut drag = SheetDrag::begin(0.0, now);
         // 16ms 内下移 120px ≈ 7500px/s。
         drag.update(120.0, at(now, 2));
-        drag.release(1000.0, 1000.0, at(now, 3));
+        drag.release(1000.0, 1000.0, at(now, 3), MotionTuning::default());
         assert_eq!(
-            drag.settled(at(now, 3 + (SPRING_MAX_SECS * 1000.0) as u64)),
+            drag.settled(at(now, 3 + WAIT_MS)),
             Some(SheetDragOutcome::Dismissed)
         );
     }

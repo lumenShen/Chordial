@@ -8,7 +8,7 @@
 //! - 渲染 pass 带 `ui.render.pass` 检查点（300Hz 预算 3ms，超预算告警）。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,50 +43,60 @@ use crate::actions::{
     PrevTrack, Quit, RescanLibrary, ToggleEqualizer, TogglePortrait, ToggleSidebar,
 };
 use crate::autoeq::{self, AutoEqStatus};
-use crate::config::SourcePreference;
+use crate::config::{SourceInstanceConfig, SourcePreference};
 use crate::downloads::{DownloadExtras, DownloadStore, lyrics_to_lrc};
 use crate::eq::{EqState, EqTab, PresetEntry};
 use crate::input::{InputState, InputView, focus_input};
 use crate::layout_morph::{
-    COMPACT_COVER_GAP, COMPACT_TOP, INFO_LINE_RATIO, LayoutMotion, StageGeometry, StageMode,
-    StageRect, compact_content_w, compact_cover_size, dock_geometry, dock_rect, immersive_geometry,
-    wide_column_x, wide_cover_size, wide_cover_top,
+    COMPACT_COVER_GAP, COMPACT_TOP, DOCK_ARTIST_SIZE, DOCK_COVER, DOCK_COVER_GAP,
+    DOCK_COVER_RADIUS, DOCK_GAP, DOCK_LINE_GAP, DOCK_PAD_BOTTOM, DOCK_PAD_TOP, DOCK_PAD_X,
+    DOCK_PLAY_BTN, DOCK_TIMELINE_H, DOCK_TITLE_SIZE, DOCK_TRACK_PAD_X, DOCK_TRANSPORT_BTN,
+    DOCK_TRANSPORT_GAP, DOCK_TRANSPORT_PAD_X, DOCK_UPPER_GAP, INFO_ACTION_GAP, INFO_LINE_RATIO,
+    StageGeometry, StageMode, StageRect, compact_content_w, compact_cover_size, dock_geometry,
+    dock_rect, immersive_geometry, info_action_side, info_text_width, stable_lyric_pad,
+    stage_bottom_rect, wide_column_x, wide_cover_size, wide_cover_top,
 };
 use crate::lyrics::{cover_url, decode_data_url_image, fetch_cover_blocking, to_amll_lyrics};
 use crate::main_state::Globals;
+use crate::motion::{MotionSystem, MotionTuning, ramp};
 use crate::phone_gesture::{EdgeSwipe, SheetPage, SheetSwipe, SwipeOutcome};
 use crate::player_page::{PortraitPage, Transition};
+use crate::playlists::PlaylistStore;
 use crate::responsive::{MIN_WIDE_SPLIT_W, ViewportClass};
 use crate::settings::{SettingsAction, SettingsRuntime, SettingsView};
-use crate::sheet_drag::{SheetDrag, SheetDragOutcome, SpringSettle};
+use crate::sheet_drag::{SheetDrag, SheetDragOutcome};
 use crate::theme::{Appearance, Theme, fmt_ms};
 use types::*;
 
 // ---- 按职责拆分出的子模块（纯代码搬移） ----
+mod account;
+mod animations;
+mod eq_actions;
+mod feed_ops;
 mod lifecycle;
-mod types;
+mod media;
 mod navigation;
 mod overlays;
-mod eq_actions;
-mod animations;
 mod playback;
-mod account;
-mod settings_ops;
-mod media;
-mod render_sidebar;
-mod render_track_list;
+mod playlist_ops;
 mod render_collection;
-mod render_list_panel;
-mod render_now_playing;
-mod render_settings_login;
-mod render_portrait_queue;
 mod render_dock;
-mod render_quality;
-mod render_immersive;
 mod render_drawer;
-mod render_stage;
-mod render_phone;
+mod render_immersive;
+mod render_list_panel;
 mod render_menus;
+mod render_now_playing;
+mod render_pages;
+mod render_phone;
+mod render_portrait_queue;
+mod render_quality;
+mod render_settings_login;
+mod render_sidebar;
+mod render_stage;
+mod render_track_list;
+mod settings_ops;
+mod source_ops;
+mod types;
 
 /// 线性混合两个颜色（RGB + alpha）；用于 Dock↔沉浸页收尾阶段的
 /// 背景/文字配色过渡（黑底白字 → Dock 的玻璃底与主题文字）。
@@ -148,7 +158,6 @@ fn measure_text_width(
     f32::from(line.width)
 }
 
-
 pub struct ChordialApp {
     registry: Arc<SourceRegistry>,
     player: Arc<Player>,
@@ -159,6 +168,27 @@ pub struct ChordialApp {
     /// 显式下载目录，独立于缓存配额。
     downloads: Arc<DownloadStore>,
     source_preference: SourcePreference,
+    /// 所有音源实例（含未启用的）；注册表负责活跃实例，这里负责管理与展示。
+    pub(crate) source_configs: Vec<SourceInstanceConfig>,
+    /// 本地 + 订阅歌单存储（`playlists.json`）。
+    pub(crate) playlists: PlaylistStore,
+    /// 主内容区整页视图；None = 曲库/搜索/集合。
+    pub(crate) page: Option<MainPage>,
+    /// 每个网易云实例的用户歌单（源页面按需加载）。
+    pub(crate) source_user_playlists: HashMap<SourceId, Arc<Vec<CollectionSummary>>>,
+    pub(crate) source_user_playlists_loading: HashSet<SourceId>,
+    /// 每个账号源的推荐流快照（每日推荐 / 私人 FM / 推荐歌单 / 私人雷达）。
+    pub(crate) source_feeds: HashMap<SourceId, SourceFeedState>,
+    /// 从推荐入口卡片点开的详情（在源页面内展开，非独立路由）。
+    pub(crate) source_feed_detail: Option<SourceFeedDetail>,
+    /// 歌单页重命名输入框。
+    source_playlist_rename_input: Entity<InputState>,
+    source_playlist_rename_view: Entity<InputView>,
+    /// 删除源/歌单的二次确认。
+    pub(crate) source_delete_confirm: Option<SourceId>,
+    pub(crate) playlist_delete_confirm: Option<chordal_core::playlist::PlaylistId>,
+    /// 歌单页行缓存（playlist 更新代数, registry version, 本地库指针）。
+    pub(crate) playlist_page_cache: RefCell<Option<PlaylistPageCache>>,
     /// 平滑滚动开关（配置项，默认 false）。EQ 页面等子模块也读取它。
     pub(crate) smooth_scroll: bool,
     /// 动态歌词整行扫光的渐变带宽度（em）；设置 → 播放可调。
@@ -180,6 +210,13 @@ pub struct ChordialApp {
     settings_beat_low_view: Entity<InputView>,
     settings_beat_high_input: Entity<InputState>,
     settings_beat_high_view: Entity<InputView>,
+    /// 音源管理二级编辑页的输入框。
+    source_edit_name_input: Entity<InputState>,
+    source_edit_name_view: Entity<InputView>,
+    source_edit_url_input: Entity<InputState>,
+    source_edit_url_view: Entity<InputView>,
+    source_edit_root_input: Entity<InputState>,
+    source_edit_root_view: Entity<InputView>,
     /// 当前背景鼓点监听频段（Hz）；与播放器/配置保持一致。
     beat_band: (f32, f32),
 
@@ -189,6 +226,8 @@ pub struct ChordialApp {
     user_playlists: Arc<Vec<CollectionSummary>>,
     playlists_loading: bool,
     login_open: bool,
+    /// 当前登录浮层绑定的音源实例；None = 使用首个网易云实例。
+    pub(crate) login_source: Option<SourceId>,
     login_tab: LoginTab,
     login_gen: u64,
     login_challenge: Option<LoginChallenge>,
@@ -227,6 +266,10 @@ pub struct ChordialApp {
 
     queue: Arc<Vec<Track>>,
     queue_pos: Option<usize>,
+    /// 私人 FM 队列的续接追踪；None = 普通有限列表。
+    queue_refill: Option<QueueRefill>,
+    /// 队列代数：替换队列时递增，用于丢弃过期的续接结果。
+    queue_gen: u64,
     player_status: chordal_player::Status,
     status_message: Option<String>,
     /// 非错误提示（下载完成、音质选择说明等）。
@@ -261,8 +304,6 @@ pub struct ChordialApp {
     phone_backdrop: PhoneBackdrop,
     /// 手机壳 mini player ⇄ 播放页的纵向跟手手势；None = 静止。
     phone_sheet: Option<SheetSwipe>,
-    /// 点击（非拖拽）展开/收起播放页时的弹簧；None = 静止。
-    phone_sheet_spring: Option<SpringSettle>,
     /// mini player 上按住但还没越过死区时的起点 y；渲染层据此铺一层
     /// 全窗捕获层，保证指针移出小条后手势仍然连续。
     phone_sheet_anchor: Option<f32>,
@@ -272,6 +313,10 @@ pub struct ChordialApp {
     phone_swipe_suppress_click: Option<Instant>,
     /// 曲目行右键 / 「⋮」菜单。
     track_menu: Option<TrackMenuState>,
+    /// “添加到歌单”选择浮层。
+    pub(crate) playlist_picker: Option<PlaylistPickerState>,
+    /// 底部 Dock 的队列概览 / 更多操作。None = 关闭。
+    dock_menu: Option<DockMenu>,
     /// 多选模式；None = 普通浏览。
     selection: Option<SelectionState>,
     /// 长按起手（列表, 行号, 代号）。480ms 内没有抬起就进入多选。
@@ -291,8 +336,14 @@ pub struct ChordialApp {
     immersive: bool,
     /// 沉浸页顶部拖拽条的下拉关闭手势；None = 当前没有手势。
     sheet_drag: Option<SheetDrag>,
-    /// 进入沉浸层时 Dock→全屏共享布局的展开弹簧。
-    immersive_expand: Option<SpringSettle>,
+    /// 顶部把手文案提示的起点：进入沉浸页后展示 5s，再淡回小白条。
+    /// 文案的淡出曲线由 `motion.hint` 驱动，这里只保留一次性唤醒的时刻。
+    immersive_hint_at: Option<Instant>,
+    /// 所有状态型动画的统一弹簧通道（Dock 展开/收起在其中共用 `dock`，
+    /// 1=Dock、0=满屏；只有收起结束才真正卸载沉浸子树）。
+    pub(crate) motion: MotionSystem,
+    /// 用户手感设置的进程内缓存；改动只影响此后新建的动画。
+    motion_tuning: MotionTuning,
 
     // ---- 沉浸层控件动画（AMLL MediaButton / VolumeControl 等价） ----
     /// 进入沉浸页的时刻：所有 MediaButton 播放 pressed 回弹，上一首/下一首
@@ -310,9 +361,7 @@ pub struct ChordialApp {
     show_remaining_time: bool,
     /// 音质标签点击后的解码信息弹窗。
     quality_dialog_open: bool,
-    /// 封面暂停缩放：AMLL Cover 在暂停时以 0.75 倍显示。
-    /// (开始时刻, 起始缩放, 目标缩放, 时长秒)。
-    cover_scale_anim: Option<(Instant, f32, f32, f32)>,
+    /// 封面暂停缩放：AMLL Cover 在暂停时以 0.75 倍显示，走 `motion.cover` 弹簧。
     /// 诊断：持续请求动画帧（CHORDIAL_BENCH_ANIM=1），用于 300Hz 压测。
     bench_anim: bool,
 
@@ -321,26 +370,42 @@ pub struct ChordialApp {
     pub(crate) force_portrait: bool,
     portrait_page: PortraitPage,
     portrait_transition: Option<Transition>,
-    portrait_enter: Option<Instant>,
-    portrait_last_input: Instant,
-    portrait_chrome_hidden: bool,
-    portrait_chrome_at: Option<Instant>,
-    portrait_idle_ticker: bool,
     portrait_toast: Option<(String, Instant)>,
-    /// 底部「更多」抽屉：打开状态、动画起点、当前二级页。
+    /// 底部「更多」抽屉：打开状态、当前二级页；显隐进度走 `motion.drawer`。
     /// 布局 1 / 布局 2 共用同一只抽屉与同一组入口。
     drawer_open: bool,
-    drawer_at: Option<Instant>,
     drawer_page: DrawerPage,
     /// 宽屏沉浸层里用户主动关闭歌词的状态；无歌词或关闭歌词时使用布局 2。
     wide_lyrics_hidden: bool,
+    /// 布局 2（竖屏 / 窄窗 / 强制竖屏）里用户打开的全屏歌词。
+    /// 默认关闭（显示封面播放页）；窗口支持布局 1 时该状态不参与渲染。
+    compact_lyrics_open: bool,
+    /// 沉浸页右下角选择器的当前视图；歌词 / 队列 / 音频详情共用右侧内容区。
+    stage_view: StageView,
+    /// 右下角视图选择器是否展开。
+    stage_view_menu_open: bool,
+    /// 最近一次指针/键盘交互时刻；闲置 5s 后收起次要控件。
+    stage_last_input_at: Instant,
+    /// 次要控件是否已因闲置收起；只在歌词 / 仅主内容模式生效。
+    stage_chrome_hidden: bool,
+    /// 最近一次控件显隐切换时刻，用于淡入淡出与高度过渡。
+    stage_chrome_at: Instant,
     /// 曲名/艺人行的悬停滚动（AMLL TextMarquee）。
     info_marquee: Option<InfoMarquee>,
-    /// 共享元素（封面 / 曲名 / 艺人）的布局补间。
-    /// 竖屏页面切换与宽屏歌词开/关共用同一套 First→Last 几何。
-    stage_motion: Option<LayoutMotion>,
     /// 竖屏播放队列的虚拟列表滚动句柄（进入队列时定位当前曲目）。
     queue_scroll: gpui::UniformListScrollHandle,
+    /// 主曲目列表（曲库/搜索/集合/队列）的滚动句柄。
+    /// 滚动偏移必须存在 App 里：进入沉浸层时主页面整棵子树被卸载，
+    /// 只靠元素状态保存的偏移会随元素一起销毁，退出后回到顶部。
+    track_list_scroll: gpui::UniformListScrollHandle,
+    /// 歌单页曲目列表的滚动句柄（同上，页面被沉浸层覆盖后仍保留位置）。
+    playlist_scroll: gpui::UniformListScrollHandle,
+    /// 集合搜索结果列表的滚动句柄（同上）。
+    collection_scroll: gpui::UniformListScrollHandle,
+    /// 整页滚动容器（音源页/管理页等）的滚动句柄（同上）。
+    main_page_scroll: gpui::ScrollHandle,
+    /// 右栏「正在播放」信息流的滚动句柄（同上）。
+    now_scroll: gpui::ScrollHandle,
     /// 搜索路由过滤结果缓存：避免每帧对搜索结果做 O(n) 克隆。
     search_route_cache: RefCell<Option<(Arc<Vec<Track>>, Option<SourceId>, Arc<Vec<Track>>)>>,
     /// 按音源聚合的搜索结果计数：原实现每个音源都全量扫一遍 search_tracks。
@@ -374,7 +439,6 @@ pub struct ChordialApp {
 
     // ---- 参数均衡器 ----
     eq_open: bool,
-    pub(crate) eq_open_at: Option<Instant>,
     pub(crate) eq: EqState,
     /// 持有输入框实体；视图通过 `eq_search_view` 使用。
     #[allow(dead_code)]
@@ -415,7 +479,9 @@ fn compact_lyric_style(theme: &Theme, sweep_fade_em: f32) -> LyricTextStyle {
         sub_font_size_ratio: 0.54,
         sub_line_height_ratio: 1.45,
         padding_x_em: 1.1,
-        padding_y_ratio: 0.03,
+        // 小窗面板沿用略宽松的上下留白（原 3vh 在大窗口约 0.6em），
+        // 但必须随字号缩放：按视口高度算会在竖屏把行距撑开。
+        padding_y_em: 0.6,
         sweep_fade_em,
         ..Default::default()
     }
@@ -434,7 +500,9 @@ fn phone_lyric_style(theme: &Theme, width: f32, height: f32, sweep_fade_em: f32)
         sub_font_size_ratio: 0.55,
         sub_line_height_ratio: 1.45,
         padding_x_em: 1.0,
-        padding_y_ratio: 0.04,
+        // AMLL `.lyricLineWrapper` 的 0.4em。手机壳高度可达宽度的 2 倍以上，
+        // 若按视口比例（此前 4vh）会让每行上下各多出约 1.5em。
+        padding_y_em: 0.4,
         edge_fade_top: 0.1,
         edge_fade_bottom: if vertical { 0.08 } else { 0.1 },
         sweep_fade_em,
@@ -460,7 +528,7 @@ fn immersive_lyric_style(width: f32, height: f32, sweep_fade_em: f32) -> LyricTe
         sub_font_size_ratio: 0.5,
         sub_line_height_ratio: 1.5,
         padding_x_em: 1.0,
-        padding_y_ratio: 0.02,
+        padding_y_em: 0.4,
         // AMLL 歌词容器 mask：横向上下各 10%，竖向只有顶部 10%。
         edge_fade_bottom: if vertical { 0.0 } else { 0.1 },
         sweep_fade_em,
@@ -469,53 +537,40 @@ fn immersive_lyric_style(width: f32, height: f32, sweep_fade_em: f32) -> LyricTe
 }
 
 impl ChordialApp {
-
-
     // ---------- 参数均衡器 ----------
-
 
     const UI_ANIM_PRESS_MS: f32 = 700.0;
     const UI_ANIM_ARROWS_MS: f32 = 600.0;
     const UI_ANIM_SPEAKER_MS: f32 = 750.0;
-    /// Dock→全屏展开弹簧：轻微过冲后收敛。
-    const EXPAND_DAMPING: f32 = 21.0;
-    const EXPAND_STIFFNESS: f32 = 200.0;
-
-
+    /// 沉浸页顶部把手提示：完整展示 5s 后淡出。
+    const IMMERSIVE_HINT_HOLD_MS: f32 = 5000.0;
+    const IMMERSIVE_HINT_FADE_MS: f32 = 320.0;
+    /// 沉浸页无交互多久后收起传输键/音量/「更多」/底栏按钮。
+    const STAGE_IDLE_MS: f32 = 5000.0;
+    /// 收起/恢复的淡入淡出与高度过渡时长。
+    const STAGE_CHROME_FADE_MS: f32 = 260.0;
+    /// Dock→全屏展开：弹簧基准时长（实际手感再乘用户的时长/超伸倍率）。
+    const DOCK_EXPAND_MS: f32 = 320.0;
+    /// 全屏→Dock 收起：接近临界的阻尼由预设控制，这里只给基准时长。
+    const COLLAPSE_MS: f32 = 320.0;
 
     // ---------- 播放 ----------
 
-
-
     // ---------- 设置 / 下载 ----------
-
-
 
     // ---------- 渲染 ----------
 
     // ================= 布局断点 =================
 
-
     // ================= 面板标题 =================
-
 
     // ================= 中间：曲目板 =================
 
-
-
     // ================= 右侧：正在播放 =================
-
 
     // ================= 设置面板 =================
 
-
     // ================= 底部悬浮 Dock =================
-
-
-
-
-
-
 }
 
 impl Render for ChordialApp {
@@ -606,9 +661,7 @@ impl Render for ChordialApp {
     }
 }
 
-impl ChordialApp {
-
-}
+impl ChordialApp {}
 
 impl Drop for ChordialApp {
     fn drop(&mut self) {
@@ -708,6 +761,41 @@ mod tests {
 
         let no_cover = track_with_cover(None, "netease");
         assert_eq!(TrackRowText::new(0, &no_cover).cover_key, None);
+    }
+
+    fn titled_track(title: &str) -> Track {
+        Track::new(
+            TrackId::new(SourceId::new("netease"), title),
+            title,
+            Vec::new(),
+            None,
+            None,
+            TrackOrigin::Remote {
+                source: SourceId::new("netease"),
+            },
+        )
+    }
+
+    #[test]
+    fn fm_refill_appends_only_new_tracks_to_the_tail() {
+        let first = titled_track("First");
+        let second = titled_track("Second");
+        let mut queue = vec![first.clone()];
+
+        // 首批里已有的曲目不重复追加；新曲目按返回顺序接到末尾。
+        let added = ChordialApp::append_unique_tracks(
+            &mut queue,
+            vec![first, titled_track("Third"), second.clone()],
+        );
+        assert_eq!(added, 2);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].title, "First");
+        assert_eq!(queue[1].title, "Third");
+        assert_eq!(queue[2].title, "Second");
+
+        // 空批次不改变列表。
+        assert_eq!(ChordialApp::append_unique_tracks(&mut queue, Vec::new()), 0);
+        assert_eq!(queue.len(), 3);
     }
 
     #[test]

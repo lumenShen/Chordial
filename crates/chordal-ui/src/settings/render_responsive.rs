@@ -20,6 +20,8 @@ impl SettingsView {
             .top_0()
             .left_0()
             .size_full()
+            // 整层遮罩既是关闭区域，也是主界面的命中边界。
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -32,6 +34,9 @@ impl SettingsView {
             .child(
                 div()
                     .id("settings-card")
+                    // 卡片内部的空白、分隔行和滚动留白都不能穿透到下面的
+                    // 曲目列表 / Dock；子控件仍正常接收点击。
+                    .occlude()
                     .on_click(|_, _, cx| cx.stop_propagation())
                     // 固定宽度，避免内部长路径/分段控件把卡片撑宽。
                     .w(px(CARD_W))
@@ -120,6 +125,8 @@ impl SettingsView {
             .left_0()
             .w(px(vw))
             .h(px(vh))
+            // 窄窗设置铺满窗口，也必须阻断底层主界面的命中。
+            .occlude()
             .bg(theme.surface)
             .flex()
             .flex_col()
@@ -132,7 +139,11 @@ impl SettingsView {
     }
 
     /// 手机导航：横向滚动的分段条；比左栏更节省垂直空间。
-    pub(super) fn render_phone_nav(&self, theme: &Theme, weak: &gpui::WeakEntity<Self>) -> AnyElement {
+    pub(super) fn render_phone_nav(
+        &self,
+        theme: &Theme,
+        weak: &gpui::WeakEntity<Self>,
+    ) -> AnyElement {
         let mut row = div()
             .flex()
             .items_center()

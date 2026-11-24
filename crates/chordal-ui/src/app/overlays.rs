@@ -1,6 +1,7 @@
 //! 抽屉 / 提示 / 空闲刷新等覆盖层行为（由 navigation.rs 拆分，行为不变）。
 
 use super::*;
+use crate::motion::PROGRESS_TOL;
 
 impl ChordialApp {
     // ---------- 底部「更多」抽屉 ----------
@@ -9,17 +10,36 @@ impl ChordialApp {
 
     pub(super) fn hide_drawer_now(&mut self) {
         self.drawer_open = false;
-        self.drawer_at = None;
+        self.motion.drawer = None;
         self.drawer_page = DrawerPage::Root;
+    }
+
+    /// 抽屉显隐弹簧：从当前进度与速度换向，快速开合不会先跳到另一端。
+    fn retarget_drawer(&mut self, target: f32, now: Instant) {
+        if let Some(spring) = self.motion.drawer.as_mut() {
+            spring.retarget_with(target, spring.sample(now).velocity, now);
+            return;
+        }
+        let from = 1.0 - target;
+        self.motion.drawer = Some(self.motion_tuning.spring(
+            Self::DRAWER_ANIM_MS,
+            from,
+            target,
+            0.0,
+            now,
+            PROGRESS_TOL.0,
+            PROGRESS_TOL.1,
+        ));
     }
 
     pub(super) fn open_drawer(&mut self, cx: &mut Context<Self>) {
         if self.eq_open {
             return;
         }
+        let now = Instant::now();
         self.drawer_open = true;
         self.drawer_page = DrawerPage::Root;
-        self.drawer_at = Some(Instant::now());
+        self.retarget_drawer(1.0, now);
         self.ensure_ui_anim_ticker(cx);
         cx.notify();
     }
@@ -29,29 +49,21 @@ impl ChordialApp {
             return;
         }
         self.drawer_open = false;
-        self.drawer_at = Some(Instant::now());
+        self.retarget_drawer(0.0, Instant::now());
         self.ensure_ui_anim_ticker(cx);
         cx.notify();
     }
 
-    pub(super) fn drawer_animating(&self, now: Instant) -> bool {
-        self.drawer_at.is_some_and(|at| {
-            now.saturating_duration_since(at).as_secs_f32() * 1000.0 < Self::DRAWER_ANIM_MS
-        })
-    }
-
     pub(super) fn drawer_visible(&self) -> bool {
-        self.drawer_open || self.drawer_at.is_some()
+        self.drawer_open || self.motion.drawer.is_some()
     }
 
     pub(super) fn drawer_progress(&self, now: Instant) -> f32 {
-        let Some(at) = self.drawer_at else {
-            return if self.drawer_open { 1.0 } else { 0.0 };
-        };
-        let t = (now.saturating_duration_since(at).as_secs_f32() * 1000.0 / Self::DRAWER_ANIM_MS)
-            .clamp(0.0, 1.0);
-        let eased = 1.0 - (1.0 - t).powi(3);
-        if self.drawer_open { eased } else { 1.0 - eased }
+        self.motion
+            .drawer
+            .as_ref()
+            .map(|spring| spring.value(now).clamp(0.0, 1.0))
+            .unwrap_or(if self.drawer_open { 1.0 } else { 0.0 })
     }
 
     pub(crate) fn show_portrait_toast(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -77,60 +89,6 @@ impl ChordialApp {
         })
         .detach();
         cx.notify();
-    }
-
-    /// 3.2 秒无输入后隐藏标题 / 进度 / Dock；移动鼠标或点击即恢复。
-    pub(super) fn ensure_portrait_idle_ticker(&mut self, cx: &mut Context<Self>) {
-        if self.portrait_idle_ticker {
-            return;
-        }
-        self.portrait_idle_ticker = true;
-        cx.spawn(async move |weak, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(220))
-                    .await;
-                let alive = weak
-                    .update(cx, |app, cx| {
-                        if !app.immersive || app.portrait_chrome_hidden {
-                            app.portrait_idle_ticker = false;
-                            return false;
-                        }
-                        // 横向布局保持 AMLL 常驻控件，不做自动隐藏。
-                        if !app.force_portrait && app.viewport_width >= app.viewport_height {
-                            app.portrait_idle_ticker = false;
-                            return false;
-                        }
-                        let idle = app.portrait_last_input.elapsed() >= Duration::from_millis(3200);
-                        if idle && !app.drawer_open && app.portrait_transition.is_none() {
-                            app.portrait_chrome_hidden = true;
-                            app.portrait_chrome_at = Some(Instant::now());
-                            app.portrait_idle_ticker = false;
-                            app.ensure_ui_anim_ticker(cx);
-                            cx.notify();
-                            return false;
-                        }
-                        true
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    pub(super) fn portrait_animating(&self) -> bool {
-        if !self.immersive {
-            return false;
-        }
-        let within = |t: Option<Instant>, ms: u64| {
-            t.is_some_and(|t| t.elapsed() < Duration::from_millis(ms))
-        };
-        self.portrait_transition.is_some()
-            || within(self.portrait_enter, 260)
-            || within(self.portrait_chrome_at, 220)
     }
 
     pub(super) fn cycle_play_mode(&mut self, cx: &mut Context<Self>) {

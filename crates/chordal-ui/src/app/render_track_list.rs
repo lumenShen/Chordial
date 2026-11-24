@@ -350,7 +350,7 @@ impl ChordialApp {
                 theme,
                 cover_image,
                 34.0,
-                5.0,
+                1.0,
                 crate::icons::icon(
                     crate::icons::Icon::Note,
                     14.0,
@@ -514,6 +514,9 @@ impl ChordialApp {
                 })
                 .collect::<Vec<_>>()
         });
+        // 偏移存在 App 的句柄里：沉浸层会卸载整个主页面，若只靠元素状态
+        // 保存滚动位置，退出沉浸后列表会回到顶部。
+        body = body.track_scroll(self.track_list_scroll.clone());
         if self.smooth_scroll {
             body = body.smooth_scroll();
         }

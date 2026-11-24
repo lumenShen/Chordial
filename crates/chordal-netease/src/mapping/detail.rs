@@ -86,6 +86,8 @@ pub(super) fn detail_to_track(source: &SourceId, song: SongDetail) -> Track {
         },
     );
     track.track_no = song.no;
+    // track_no 参与跨源身份键，构造后补写必须重算缓存。
+    track.rebuild_identity_key();
     track.year = year;
     track
 }

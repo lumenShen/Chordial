@@ -161,11 +161,7 @@ fn bezier_endpoints() {
 
 #[test]
 fn line_xform_identity_at_scale_one() {
-    let xform = LineXform {
-        scale: 1.0,
-        pivot_x: px(100.0),
-        pivot_y: px(50.0),
-    };
+    let xform = LineXform::plain(1.0, px(100.0), px(50.0));
     assert_eq!(xform.x(px(37.0)), px(37.0));
     assert_eq!(xform.y(px(210.0)), px(210.0));
 }
@@ -173,11 +169,7 @@ fn line_xform_identity_at_scale_one() {
 #[test]
 fn line_xform_scales_around_left_center_pivot() {
     // AMLL `.lyricLine { transform-origin: left }`：左边缘 + 垂直中心。
-    let xform = LineXform {
-        scale: 0.97,
-        pivot_x: px(10.0),
-        pivot_y: px(100.0),
-    };
+    let xform = LineXform::plain(0.97, px(10.0), px(100.0));
     // 锚点自身不动。
     assert!((f32::from(xform.x(px(10.0))) - 10.0).abs() < 1e-4);
     assert!((f32::from(xform.y(px(100.0))) - 100.0).abs() < 1e-4);
@@ -190,11 +182,7 @@ fn line_xform_scales_around_left_center_pivot() {
 fn emphasize_scales_around_char_box_center() {
     // 行不缩放，只有强调缩放：字符盒中心必须保持不动（AMLL 默认
     // transform-origin: 50% 50%）。
-    let xform = LineXform {
-        scale: 1.0,
-        pivot_x: px(0.0),
-        pivot_y: px(0.0),
-    };
+    let xform = LineXform::plain(1.0, px(0.0), px(0.0));
     let glyph_x = px(100.0);
     let baseline = px(80.0);
     let center_x = glyph_x + px(10.0);
@@ -218,11 +206,7 @@ fn emphasize_scales_around_char_box_center() {
 
 #[test]
 fn emphasis_without_scale_is_identity() {
-    let xform = LineXform {
-        scale: 1.0,
-        pivot_x: px(0.0),
-        pivot_y: px(0.0),
-    };
+    let xform = LineXform::plain(1.0, px(0.0), px(0.0));
     let origin = transformed_glyph_origin(
         xform,
         px(12.5),
@@ -239,11 +223,7 @@ fn emphasis_without_scale_is_identity() {
 fn emphasis_offset_is_scaled_with_line_scale() {
     // AMLL 的 `matrix(scale) translate(offset)` 中 offset 会被缩放，
     // 且行级缩放先生效：offset * line_scale * emp_scale。
-    let xform = LineXform {
-        scale: 0.97,
-        pivot_x: px(10.0),
-        pivot_y: px(100.0),
-    };
+    let xform = LineXform::plain(0.97, px(10.0), px(100.0));
     let no_offset = transformed_glyph_origin(
         xform,
         px(100.0),
@@ -266,4 +246,87 @@ fn emphasis_offset_is_scaled_with_line_scale() {
     let sy = (f32::from(with_offset.y) - f32::from(no_offset.y)) / (0.97 * 1.1);
     assert!((sx - 2.0).abs() < 1e-3, "sx = {sx}");
     assert!((sy + 1.0).abs() < 1e-3, "sy = {sy}");
+}
+
+// ---- 单曲歌词替换的 600ms 生命周期 ----
+
+#[test]
+fn lyric_switch_matches_0_to_600ms_timeline() {
+    let mut switch = LyricSwitch::new();
+    // t=0：旧层完全可见、无附加模糊（随后逐渐模糊）；新层全透明、模糊、缩到 0.95。
+    let out0 = switch.outgoing_fade();
+    let in0 = switch.incoming_fade();
+    assert!((out0.opacity - 1.0).abs() < 1e-6);
+    assert!(out0.blur_em.abs() < 1e-6);
+    assert!((out0.content_scale - 1.0).abs() < 1e-6);
+    assert!(in0.opacity.abs() < 1e-6);
+    assert!((in0.blur_em - LYRIC_SWITCH_BLUR_EM).abs() < 1e-6);
+    assert!((in0.content_scale - LYRIC_SWITCH_SCALE).abs() < 1e-6);
+    assert!((out0.opacity + in0.opacity - 1.0).abs() < 1e-6);
+
+    // 中途两层总可见量恒为 1（交叉淡化，不会闪黑）。
+    for _ in 0..18 {
+        assert!(switch.advance(16.0));
+        let out = switch.outgoing_fade();
+        let inc = switch.incoming_fade();
+        assert!((out.opacity + inc.opacity - 1.0).abs() < 1e-5);
+        assert!(out.opacity <= 1.0 && inc.opacity >= 0.0);
+        assert!(out.content_scale >= LYRIC_SWITCH_SCALE);
+        assert!(inc.content_scale <= 1.0);
+    }
+
+    // t=600ms：旧层归零并被移除；新层恢复自身的模糊/透明度/scale。
+    assert!(!switch.advance(600.0));
+    let out = switch.outgoing_fade();
+    let inc = switch.incoming_fade();
+    assert!(out.opacity.abs() < 1e-6);
+    assert!((out.content_scale - LYRIC_SWITCH_SCALE).abs() < 1e-6);
+    assert!((inc.opacity - 1.0).abs() < 1e-6);
+    assert!(inc.blur_em.abs() < 1e-6);
+    assert!((inc.content_scale - 1.0).abs() < 1e-6);
+}
+
+fn install_one_line(inner: &mut Inner) {
+    inner.player.set_lyrics(
+        vec![LyricLine {
+            words: vec![LyricWord::new("词", 0, 1_000)],
+            start_time: 0,
+            end_time: 1_000,
+            ..Default::default()
+        }],
+        0,
+    );
+    let doc = inner.player.document().clone();
+    inner.text.set_lyrics(&doc);
+}
+
+#[test]
+fn rapid_song_switch_keeps_exactly_one_outgoing_layer() {
+    let mut inner = Inner::new();
+    install_one_line(&mut inner);
+
+    // 连续三次切歌：每次都只有一层淡出，更早的层被释放。
+    for _ in 0..3 {
+        inner.begin_switch();
+        assert!(inner.switch.is_some());
+        assert!(inner.outgoing.is_some());
+        install_one_line(&mut inner);
+    }
+    assert_eq!(inner.player.document().len(), 1);
+    assert_eq!(inner.outgoing.as_ref().unwrap().player.document().len(), 1);
+
+    // 到点后彻底清空，不留悬空缓存；下一次切换从零开始。
+    inner.finish_switch();
+    assert!(inner.switch.is_none());
+    assert!(inner.outgoing.is_none());
+}
+
+#[test]
+fn clear_lyrics_does_not_keep_outgoing_layer() {
+    let mut inner = Inner::new();
+    install_one_line(&mut inner);
+    inner.begin_switch();
+    assert!(inner.outgoing.is_some());
+    inner.finish_switch();
+    assert!(inner.outgoing.is_none());
 }

@@ -4,6 +4,9 @@
 
 use super::*;
 
+/// 私人 FM 剩余不足这个数量时提前拉取下一批，给网络请求留出缓冲。
+const FM_REFILL_AHEAD: usize = 5;
+
 impl ChordialApp {
     /// 解析播放句柄（可能跨源网络请求）后交给播放线程。
     pub(super) fn resolve_and_play(&mut self, cx: &mut Context<Self>) {
@@ -23,14 +26,39 @@ impl ChordialApp {
 
         // 显式下载优先：下载文件是“本地资产”，不占缓存配额，也不再请求网络。
         let downloaded = self.downloads.path_for(&track_id);
-        // 在线曲目先找本地同曲候选；歌词/封面仍按原曲目加载。
+        // 源实例当前是否活跃。关闭/删除后不再解析远端，但可以从已启用的
+        // 本地库按跨源身份键找替代副本。
+        let source_available = self.registry.get(&source_id).is_some();
         let local_match = if matches!(track.origin, TrackOrigin::Remote { .. }) {
-            self.local_source
-                .as_ref()
-                .and_then(|source| source.find_equivalent(&track))
+            self.enabled_local_sources(cx)
+                .into_iter()
+                .find_map(|(_, local)| {
+                    local
+                        .find_by_identity(&track)
+                        .or_else(|| local.find_equivalent(&track))
+                })
+        } else if !source_available {
+            // 本地源被关闭时：文件仍存在就直接播；否则去其它本地实例找同曲。
+            match &track.origin {
+                TrackOrigin::Local { path } if path.exists() => Some(track.clone()),
+                _ => self
+                    .enabled_local_sources(cx)
+                    .into_iter()
+                    .find_map(|(_, local)| local.find_by_identity(&track)),
+            }
         } else {
             None
         };
+
+        if !source_available && downloaded.is_none() && local_match.is_none() {
+            let name = self
+                .source_config_by_id(&source_id.0)
+                .map(|source| source.name.clone())
+                .unwrap_or_else(|| source_id.0.clone());
+            self.status_message = Some(format!("「{name}」已关闭，且本地没有替代副本"));
+            cx.notify();
+            return;
+        }
 
         self.play_gen = self.play_gen.wrapping_add(1);
         let play_gen = self.play_gen;
@@ -166,7 +194,7 @@ impl ChordialApp {
         if index >= tracks.len() {
             return;
         }
-        self.queue = tracks;
+        self.set_queue(tracks, None);
         self.queue_pos = Some(index);
         self.status_message = None;
         self.resolve_and_play(cx);
@@ -196,6 +224,29 @@ impl ChordialApp {
             other => other,
         };
         cx.notify();
+    }
+
+    /// 私人 FM 接近末尾时向所追踪的音源再拉一批（同一时刻最多一个在途请求）。
+    pub(super) fn maybe_refill_fm_queue(&mut self, cx: &mut Context<Self>) {
+        let Some(pos) = self.queue_pos else { return };
+        let Some(refill) = self.queue_refill.as_ref() else {
+            return;
+        };
+        if refill.in_flight {
+            return;
+        }
+        // 上一批全是重复曲目时冷却一段距离，避免尾部逐首重复请求。
+        if refill
+            .last_empty_at
+            .is_some_and(|at| pos < at.saturating_add(FM_REFILL_AHEAD))
+        {
+            return;
+        }
+        let remaining = self.queue.len().saturating_sub(pos.saturating_add(1));
+        if remaining >= FM_REFILL_AHEAD {
+            return;
+        }
+        self.refill_fm_queue(cx);
     }
 
     /// 自动播完：单曲循环原地重播；随机模式随机下一首；否则顺序下一首。
@@ -231,6 +282,7 @@ impl ChordialApp {
         } else {
             self.stop_playback(cx);
         }
+        self.maybe_refill_fm_queue(cx);
         cx.notify();
     }
 
@@ -267,6 +319,7 @@ impl ChordialApp {
         }
         self.queue_pos = Some(next);
         self.resolve_and_play(cx);
+        self.maybe_refill_fm_queue(cx);
         cx.notify();
     }
 
@@ -341,12 +394,31 @@ impl ChordialApp {
     // ---------- 网易云账号 / 集合页 ----------
 
     pub(super) fn netease_source(&self) -> Option<Arc<dyn MusicSource>> {
-        self.registry.get(&SourceId::new("netease"))
+        self.primary_netease_id()
+            .and_then(|id| self.registry.get(&id))
+    }
+
+    /// 登录浮层当前绑定的实例：优先用户点开的实例，否则首个网易云实例。
+    pub(super) fn login_source_id(&self) -> Option<SourceId> {
+        let selected = self.login_source.as_ref().filter(|id| {
+            self.source_config_by_id(&id.0)
+                .is_some_and(|source| source.is_netease() && source.enabled)
+        });
+        selected.cloned().or_else(|| self.primary_netease_id())
+    }
+
+    pub(super) fn login_source(&self) -> Option<Arc<dyn MusicSource>> {
+        self.login_source_id().and_then(|id| self.registry.get(&id))
     }
 
     pub(super) fn save_cookie(&mut self, cookie: Option<String>) {
-        let mut cfg = crate::config::load_or_default();
-        cfg.netease.cookie = cookie;
-        crate::config::save(&cfg);
+        // 旧入口没有实例上下文：写回首个网易云实例。
+        let Some(id) = self.login_source_id().or_else(|| self.primary_netease_id()) else {
+            let mut cfg = crate::config::load_or_default();
+            cfg.netease.cookie = cookie;
+            crate::config::save(&cfg);
+            return;
+        };
+        self.set_source_cookie(&id, cookie);
     }
 }

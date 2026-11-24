@@ -5,10 +5,13 @@
 use super::*;
 
 impl ChordialApp {
+    /// `panel = true` 时作为右侧内容区（与宽屏歌词列同位置）渲染：
+    /// 去掉「向下轻扫返回」提示，播放模式胶囊按面板左缘定位。
     pub(super) fn render_portrait_queue(
         &self,
         content_w: f32,
         shared_hidden: bool,
+        panel: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let white = gpui::white();
@@ -17,7 +20,9 @@ impl ChordialApp {
         let current = self.queue_pos;
         let mode = self.play_mode;
 
-        let hint = {
+        let hint: AnyElement = if panel {
+            div().into_any_element()
+        } else {
             let weak = weak.clone();
             div()
                 .id("queue-back")
@@ -35,6 +40,7 @@ impl ChordialApp {
                         app.set_portrait_page(PortraitPage::Art, cx);
                     });
                 })
+                .into_any_element()
         };
 
         let track_header = {
@@ -104,7 +110,7 @@ impl ChordialApp {
                 .on_click(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
                         app.stop_playback(cx);
-                        app.queue = Arc::new(Vec::new());
+                        app.set_queue(Arc::new(Vec::new()), None);
                         app.queue_pos = None;
                         cx.notify();
                     });
@@ -258,7 +264,11 @@ impl ChordialApp {
                 .id("queue-mode-pill")
                 .absolute()
                 .bottom(px(22.0))
-                .left(px(((self.viewport_width - content_w) / 2.0).max(16.0)))
+                .left(px(if panel {
+                    16.0
+                } else {
+                    ((self.viewport_width - content_w) / 2.0).max(16.0)
+                }))
                 .h(px(32.0))
                 .px(px(14.0))
                 .rounded(px(16.0))

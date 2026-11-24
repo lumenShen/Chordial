@@ -6,7 +6,11 @@ use super::*;
 
 impl ChordialApp {
     /// 集合页头部：封面 + 创建者/简介 + 歌手页专辑快捷入口。
-    pub(super) fn render_collection_header(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_collection_header(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(view) = &self.collection else {
             return div().into_any_element();
         };
@@ -28,7 +32,7 @@ impl ChordialApp {
             theme,
             self.collection_cover.clone(),
             size,
-            8.0,
+            1.0,
             placeholder,
         );
         let mut info = div()
@@ -109,6 +113,70 @@ impl ChordialApp {
             info = info.child(chips);
         }
 
+        // 订阅入口只对“远程歌单”出现：本地歌单没有来源可订阅。
+        let subscribe: Option<AnyElement> = if view.id.kind == CollectionKind::Playlist
+            && view.error.is_none()
+            && !view.loading
+            && !view.tracks.is_empty()
+            && self
+                .source_config_by_id(&view.id.source.0)
+                .is_some_and(|source| source.is_netease())
+        {
+            let subscribed = self.playlists.is_subscribed(&view.id);
+            let weak = weak.clone();
+            let trigger = div()
+                .id("collection-subscribe-trigger")
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface_alt)
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .text_size(px(9.5))
+                .text_color(if subscribed { theme.ok } else { theme.text_dim })
+                .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                .child(crate::icons::icon(
+                    if subscribed {
+                        crate::icons::Icon::Check
+                    } else {
+                        crate::icons::Icon::Plus
+                    },
+                    10.0,
+                    if subscribed {
+                        theme.ok
+                    } else {
+                        theme.text_faint
+                    },
+                ))
+                .child(if subscribed { "已订阅" } else { "订阅" })
+                .into_any_element();
+            Some(crate::bubble::bubble_button(
+                crate::bubble::BubbleStyle::for_theme(theme),
+                "collection-subscribe",
+                if subscribed {
+                    "已在「我的歌单」中"
+                } else {
+                    "加入到我的歌单里"
+                },
+                trigger,
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        if subscribed {
+                            app.info_message = Some("已经在「我的歌单」里".into());
+                            cx.notify();
+                        } else {
+                            app.subscribe_current_collection(cx);
+                        }
+                    });
+                },
+            ))
+        } else {
+            None
+        };
+
         div()
             .px(px(14.0))
             .pb(px(10.0))
@@ -117,6 +185,7 @@ impl ChordialApp {
             .gap(px(10.0))
             .child(cover)
             .child(info)
+            .children(subscribe)
             .into_any_element()
     }
 
@@ -267,6 +336,8 @@ impl ChordialApp {
                 })
                 .collect::<Vec<_>>()
         });
+        // 同曲目列表：滚动偏移存 App 句柄，沉浸层卸载页面后仍能恢复。
+        results = results.track_scroll(self.collection_scroll.clone());
         if self.smooth_scroll {
             results = results.smooth_scroll();
         }
@@ -306,13 +377,9 @@ impl ChordialApp {
             }
             cache.as_ref().expect("initialized above").2.clone()
         };
-        // registry.snapshot() 每次都会分配一个完整 Vec，这里走按 version 失效的缓存。
-        let snapshots = self.source_snapshot();
         let route_label = self.source_route.as_ref().map(|id| {
-            snapshots
-                .iter()
-                .find(|s| &s.info.id == id)
-                .map(|s| s.info.display_name.clone())
+            self.source_config_by_id(&id.0)
+                .map(|source| source.name.clone())
                 .unwrap_or_else(|| id.0.clone())
         });
         let subtitle = if self.searching {
@@ -449,7 +516,15 @@ impl ChordialApp {
                     .child(self.search_input_view.clone()),
             )
             .child(body)
-            .child(div().h(px(if phone { 92.0 } else { 84.0 })).flex_none())
+            .child(
+                div()
+                    .h(px(if phone {
+                        92.0
+                    } else {
+                        crate::theme::size::DOCK + crate::theme::size::DOCK_BOTTOM + 14.0
+                    }))
+                    .flex_none(),
+            )
             .into_any_element()
     }
 }

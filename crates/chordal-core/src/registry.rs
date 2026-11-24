@@ -147,6 +147,64 @@ impl SourceRegistry {
         Ok(())
     }
 
+    /// 注册一个已经构造好的实例并直接标记为 Loaded。
+    ///
+    /// 用于音源实例管理：启动时从配置批量装配/重建实例；实例本身由调用方
+    /// 持有，卸载后再启用可复用同一实例（本地索引零丢失）。
+    pub fn register_loaded(
+        &self,
+        info: SourceInfo,
+        source: Arc<dyn MusicSource>,
+    ) -> CoreResult<()> {
+        let id = info.id.clone();
+        {
+            let mut slots = self.slots.write().expect("registry lock poisoned");
+            if slots.contains_key(&id) {
+                return Err(CoreError::SourceExists { src: id.0.clone() });
+            }
+            slots.insert(
+                id,
+                SourceSlot {
+                    info,
+                    status: SourceStatus::Loaded,
+                    source: Some(source),
+                },
+            );
+        }
+        self.bump();
+        Ok(())
+    }
+
+    /// 软关闭：把实例从活跃槽位移除，但**不**调用 `shutdown`。
+    ///
+    /// 与 [`SourceRegistry::unload`] 的区别：关闭音源不应清空缓存/停止
+    /// 托管服务，用户随时可能再打开；真正删除实例时才走 unload。
+    pub fn deactivate(&self, id: &SourceId) -> CoreResult<()> {
+        {
+            let mut slots = self.slots.write().expect("registry lock poisoned");
+            let Some(slot) = slots.get_mut(id) else {
+                return Err(CoreError::SourceNotLoaded { src: id.0.clone() });
+            };
+            slot.source = None;
+            slot.status = SourceStatus::Registered;
+        }
+        self.bump();
+        Ok(())
+    }
+
+    /// 删除槽位（保留实例所有权给调用方）。用于删除音源实例：
+    /// 调用方应先 `unload`（触发 shutdown），再 `unregister`。
+    pub fn unregister(&self, id: &SourceId) -> Option<SourceInfo> {
+        let removed = {
+            let mut slots = self.slots.write().expect("registry lock poisoned");
+            slots.remove(id).map(|slot| slot.info)
+        };
+        if removed.is_some() {
+            self.bump();
+        }
+        removed
+    }
+
     /// 加载已注册的源。工厂在锁外执行（构造本地源可能扫盘），
     /// 失败则槽位标记 [`SourceStatus::Failed`]。
     pub fn load(
@@ -202,6 +260,19 @@ impl SourceRegistry {
         Ok(())
     }
 
+    /// 只更新展示元信息（重命名实例），不动实例/状态。
+    pub fn update_info(&self, id: &SourceId, info: SourceInfo) -> CoreResult<()> {
+        {
+            let mut slots = self.slots.write().expect("registry lock poisoned");
+            let Some(slot) = slots.get_mut(id) else {
+                return Err(CoreError::SourceNotLoaded { src: id.0.clone() });
+            };
+            slot.info = info;
+        }
+        self.bump();
+        Ok(())
+    }
+
     pub fn status(&self, id: &SourceId) -> Option<SourceStatus> {
         self.slots
             .read()
@@ -217,6 +288,14 @@ impl SourceRegistry {
             .expect("registry lock poisoned")
             .get(id)
             .and_then(|s| s.source.clone())
+    }
+
+    pub fn slot_info(&self, id: &SourceId) -> Option<SourceInfo> {
+        self.slots
+            .read()
+            .expect("registry lock poisoned")
+            .get(id)
+            .map(|slot| slot.info.clone())
     }
 
     /// 所有槽位快照（UI 源面板）。O(n) 单遍。

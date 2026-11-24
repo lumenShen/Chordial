@@ -201,7 +201,12 @@ pub(super) fn build_collections(
     (albums, artists)
 }
 
-pub(super) fn build_track(source: &SourceId, id: &str, path: &Path, meta: Option<TrackMeta>) -> Track {
+pub(super) fn build_track(
+    source: &SourceId,
+    id: &str,
+    path: &Path,
+    meta: Option<TrackMeta>,
+) -> Track {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -215,23 +220,27 @@ pub(super) fn build_track(source: &SourceId, id: &str, path: &Path, meta: Option
         .title
         .filter(|t| !t.is_empty())
         .unwrap_or(fallback_title);
+    // 本地标签常把多艺人塞进一个字段（"A & B" / "A/B" / "A; B"）。
+    // 入库时就分列，UI 与跨源身份键都按单个艺人处理。
     let mut artists: Vec<ArtistRef> = meta
         .artists
         .iter()
-        .filter(|a| !a.is_empty())
+        .flat_map(|a| chordal_core::model::split_artist_names(a))
         .map(|a| ArtistRef {
             id: Some(local_artist_id(a)),
-            name: a.clone(),
+            name: a.to_string(),
         })
         .collect();
+    artists.dedup_by(|a, b| a.name == b.name);
     if artists.is_empty()
         && let Some(a) = fallback_artist
     {
-        let id = local_artist_id(&a);
-        artists.push(ArtistRef {
-            id: Some(id),
-            name: a,
-        });
+        for part in chordal_core::model::split_artist_names(&a) {
+            artists.push(ArtistRef {
+                id: Some(local_artist_id(part)),
+                name: part.to_string(),
+            });
+        }
     }
     let album = meta.album.filter(|a| !a.is_empty()).map(|name| AlbumRef {
         id: Some(local_album_id(&name, path)),
@@ -254,6 +263,8 @@ pub(super) fn build_track(source: &SourceId, id: &str, path: &Path, meta: Option
         },
     );
     track.track_no = meta.track_no;
+    // track_no 参与跨源身份键，构造后补写必须重算缓存。
+    track.rebuild_identity_key();
     track.year = meta.year;
     track.quality_info = audio_quality_for(path, meta.duration_ms);
     track.quality = Some(

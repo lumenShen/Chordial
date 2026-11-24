@@ -36,6 +36,7 @@ pub enum Icon {
     Close,
     Refresh,
     ChevronDown,
+    ChevronUp,
     Alert,
     Note,
     More,
@@ -658,6 +659,11 @@ fn paint(
             line(window, &[(11.5, 6.5), (8.0, 10.0)]);
             fill_circle(window, color, o, s, 8.0, 10.0, 0.85);
         }
+        Icon::ChevronUp => {
+            line(window, &[(4.5, 9.5), (8.0, 6.0)]);
+            line(window, &[(11.5, 9.5), (8.0, 6.0)]);
+            fill_circle(window, color, o, s, 8.0, 6.0, 0.85);
+        }
         Icon::Alert => {
             line(window, &[(8.0, 2.6), (14.0, 13.0), (2.0, 13.0), (8.0, 2.6)]);
             line(window, &[(8.0, 6.2), (8.0, 9.4)]);
@@ -856,11 +862,10 @@ fn paint(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::media::*;
+    use super::*;
 
     #[test]
     fn press_animation_hits_amll_keyframes() {

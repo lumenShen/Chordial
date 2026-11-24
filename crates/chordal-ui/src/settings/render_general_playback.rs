@@ -3,7 +3,11 @@
 use super::*;
 
 impl SettingsView {
-    pub(super) fn render_general(&self, theme: &Theme, weak: &gpui::WeakEntity<Self>) -> AnyElement {
+    pub(super) fn render_general(
+        &self,
+        theme: &Theme,
+        weak: &gpui::WeakEntity<Self>,
+    ) -> AnyElement {
         let theme_choice = {
             let mut items: Vec<(
                 &'static str,
@@ -72,6 +76,85 @@ impl SettingsView {
             )
         };
 
+        let motion_preset = {
+            let mut items: Vec<(
+                &'static str,
+                bool,
+                Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+            )> = Vec::new();
+            for preset in [
+                MotionPreset::Compact,
+                MotionPreset::Balanced,
+                MotionPreset::Soft,
+                MotionPreset::Bouncy,
+            ] {
+                let weak = weak.clone();
+                let active = self.motion_preset == preset;
+                items.push((
+                    preset.label(),
+                    active,
+                    Box::new(move |_, window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.apply_motion_preset(preset, window, cx);
+                        });
+                    }),
+                ));
+            }
+            segmented(theme, "settings-motion-preset", items)
+        };
+
+        let duration_preset = |label: &'static str, value: f32| {
+            let weak = weak.clone();
+            let active = (self.animation_duration_multiplier - value).abs() < 0.001;
+            chip(theme, label, active, move |_, window, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.set_motion_duration_preset(value, window, cx);
+                });
+            })
+        };
+        let duration_controls = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .w(px(56.0))
+                    .child(self.motion_duration_field.view.clone()),
+            )
+            .child(hint(theme, "×"))
+            .child(div().w(px(8.0)))
+            .child(duration_preset("时长 0.5", 0.5))
+            .child(duration_preset("时长 1.0", 1.0))
+            .child(duration_preset("时长 1.5", 1.5))
+            .child(duration_preset("时长 2.0", 2.0))
+            .into_any_element();
+
+        let overshoot_preset = |label: &'static str, value: f32| {
+            let weak = weak.clone();
+            let active = (self.animation_overshoot_multiplier - value).abs() < 0.001;
+            chip(theme, label, active, move |_, window, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.set_motion_overshoot_preset(value, window, cx);
+                });
+            })
+        };
+        let overshoot_controls = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .w(px(56.0))
+                    .child(self.motion_overshoot_field.view.clone()),
+            )
+            .child(hint(theme, "×"))
+            .child(div().w(px(8.0)))
+            .child(overshoot_preset("回弹 0.5", 0.5))
+            .child(overshoot_preset("回弹 1.0", 1.0))
+            .child(overshoot_preset("回弹 1.5", 1.5))
+            .child(overshoot_preset("回弹 2.0", 2.0))
+            .into_any_element();
+
         let perf_overlay = {
             let weak = weak.clone();
             toggle(
@@ -129,6 +212,34 @@ impl SettingsView {
                     Some("时间基缓动（45ms），默认关闭以避免与触控板惯性叠加".into()),
                     smooth_scroll,
                 )],
+            )],
+        ))
+        .child(section(
+            theme,
+            "动画",
+            Some("弹簧手感即刻生效；已开始的动画保持创建时的参数，改动只影响新动画。"),
+            vec![group(
+                theme,
+                vec![
+                    setting_row(
+                        theme,
+                        "手感预设",
+                        Some("紧凑起步快、几乎不过冲；柔和临界阻尼不过冲；弹性有克制的回弹".into()),
+                        motion_preset,
+                    ),
+                    setting_row(
+                        theme,
+                        "时长倍率",
+                        Some("大于 1 慢放、小于 1 加速；范围 0.25–3.0，回车应用".into()),
+                        duration_controls,
+                    ),
+                    setting_row(
+                        theme,
+                        "回弹倍率",
+                        Some("大于 1 回弹更明显、小于 1 更稳；范围 0.25–2.0，回车应用".into()),
+                        overshoot_controls,
+                    ),
+                ],
             )],
         ))
         .child(section(
@@ -333,7 +444,7 @@ impl SettingsView {
                             theme,
                             "渲染分辨率除数",
                             Some(
-                                "光栅分辨率 = 背景区域 ÷ N；N 越大越省性能、越模糊，默认 2（更接近真实流体细节），回车应用"
+                                "光栅分辨率 = 背景区域 ÷ N；N 越大越省性能、越模糊，默认 2。÷1 为最高请求画质，渲染器会按实测耗时自动限流保帧率，回车应用"
                                     .into(),
                             ),
                             divisor_controls,

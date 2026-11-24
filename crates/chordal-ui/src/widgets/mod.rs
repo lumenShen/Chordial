@@ -18,11 +18,11 @@ use gpui::{
 use crate::theme::Theme;
 
 mod amll;
-mod media;
 mod controls;
+mod media;
 pub use amll::*;
-pub use media::*;
 pub use controls::*;
+pub use media::*;
 
 pub fn icon_button<F>(
     theme: &Theme,
@@ -162,6 +162,112 @@ pub fn knob_slider(
     .into_any_element()
 }
 
+/// Dock 时间轴：常驻双层滑点（外圈贴合玻璃 Dock，内圈为墨色），
+/// 轨道静止 2px、hover/拖动 4px。与普通 Slider 的差别是拇指始终可见，
+/// 因为时间轴需要成为底栏下层的视觉骨架，而不是 hover 后才出现的控件。
+pub fn timeline_slider(
+    value: f32,
+    colors: SliderColors,
+    ring: Hsla,
+    id: &'static str,
+    on_change: impl FnMut(f32) + 'static,
+) -> AnyElement {
+    Component::new(TimelineSlider {
+        value: value.clamp(0.0, 1.0),
+        colors,
+        ring,
+        id,
+        on_change: Rc::new(RefCell::new(Box::new(on_change))),
+    })
+    .into_any_element()
+}
+
+struct TimelineSlider {
+    value: f32,
+    colors: SliderColors,
+    ring: Hsla,
+    id: &'static str,
+    on_change: Rc<RefCell<Box<dyn FnMut(f32)>>>,
+}
+
+impl RenderOnce for TimelineSlider {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let state = Rc::new(SliderState {
+            bounds: Cell::new(Bounds::new(
+                point(px(0.), px(0.)),
+                gpui::size(px(0.), px(0.)),
+            )),
+            hovered: Cell::new(false),
+            dragging: Cell::new(false),
+            view: Cell::new(None),
+        });
+        let on_change = self.on_change;
+        let value = self.value;
+        let colors = self.colors;
+        let ring = self.ring;
+        let id = self.id;
+
+        let state_down = state.clone();
+        let change_down = on_change.clone();
+        let state_move = state.clone();
+        let change_move = on_change.clone();
+        let state_up = state.clone();
+        let state_hover = state.clone();
+        let state_bounds = state.clone();
+        let state_paint = state.clone();
+
+        div()
+            .id(SharedString::from(format!("timeline-slider-{id}")))
+            .h(px(18.0))
+            .w_full()
+            .relative()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                state_down.dragging.set(true);
+                if let Some(f) = fraction_at(state_down.bounds.get(), event.position) {
+                    (change_down.borrow_mut())(f);
+                    notify_slider_view(&state_down, cx);
+                }
+            })
+            .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
+                if state_move.dragging.get()
+                    && event.pressed_button == Some(MouseButton::Left)
+                    && let Some(f) = fraction_at(state_move.bounds.get(), event.position)
+                {
+                    (change_move.borrow_mut())(f);
+                    notify_slider_view(&state_move, cx);
+                }
+            })
+            .on_mouse_up(MouseButton::Left, move |_, _, _| {
+                state_up.dragging.set(false);
+            })
+            .on_hover(move |hovered, _, cx| {
+                state_hover.hovered.set(*hovered);
+                notify_slider_view(&state_hover, cx);
+            })
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        state_bounds.bounds.set(bounds);
+                        state_bounds.view.set(Some(window.current_view()));
+                        bounds
+                    },
+                    move |_bounds, bounds, window, _| {
+                        paint_timeline_slider(
+                            bounds,
+                            value,
+                            colors,
+                            ring,
+                            state_paint.hovered.get() || state_paint.dragging.get(),
+                            window,
+                        );
+                    },
+                )
+                .size_full(),
+            )
+    }
+}
+
 struct SliderState {
     bounds: Cell<Bounds<Pixels>>,
     hovered: Cell<bool>,
@@ -265,6 +371,36 @@ fn fraction_at(bounds: Bounds<Pixels>, position: gpui::Point<Pixels>) -> Option<
     Some(x.clamp(0.0, 1.0))
 }
 
+fn paint_timeline_slider(
+    bounds: Bounds<Pixels>,
+    value: f32,
+    colors: SliderColors,
+    ring: Hsla,
+    active: bool,
+    w: &mut Window,
+) {
+    let cy = bounds.center().y;
+    let thickness = if active { 4.0 } else { 2.0 };
+    let track = Bounds::new(
+        point(bounds.left(), cy - px(thickness / 2.0)),
+        gpui::size(bounds.size.width, px(thickness)),
+    );
+    w.paint_quad(gpui::fill(track, colors.track).corner_radii(px(thickness / 2.0)));
+    let fill_w = bounds.size.width * value.clamp(0.0, 1.0);
+    if f32::from(fill_w) > 0.0 {
+        let fill = Bounds::new(
+            point(bounds.left(), cy - px(thickness / 2.0)),
+            gpui::size(fill_w, px(thickness)),
+        );
+        w.paint_quad(gpui::fill(fill, colors.fill).corner_radii(px(thickness / 2.0)));
+    }
+    // 拇指始终可见；外圈用 Dock 表面色做“玻璃缺口”，让滑点从细轨上浮出来。
+    let ring_r = if active { 6.2 } else { 5.6 };
+    let dot_r = if active { 4.5 } else { 3.8 };
+    let cx = bounds.left() + fill_w.clamp(px(ring_r), bounds.size.width - px(ring_r));
+    paint_dot(w, cx, cy, ring_r, ring);
+    paint_dot(w, cx, cy, dot_r, colors.thumb);
+}
 
 fn paint_slider(
     bounds: Bounds<Pixels>,
@@ -303,13 +439,15 @@ fn paint_slider(
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::time::Duration;
+
     use gpui::point;
+
+    use crate::motion::{MotionPreset, MotionTuning, PIXEL_TOL};
 
     #[test]
     fn fraction_maps_edges() {
@@ -321,11 +459,28 @@ mod tests {
 
     #[test]
     fn amll_spring_settles_at_target() {
-        // AMLL 收起弹簧：damping=12 / stiffness=200。
-        let (x, v) = spring_at(AMLL_SLIDER_INSET, 0.0, 12.0, 200.0, 1.2);
-        assert!(x.abs() < 0.05, "x={x}");
-        assert!(v.abs() < 1.0, "v={v}");
-        assert_eq!(spring_at(0.0, 0.0, 12.0, 200.0, 0.5), (0.0, 0.0));
+        // AMLL 收起弹簧：基准 200ms，超伸倍率 1.35。
+        let tuning = MotionTuning::new(MotionPreset::Balanced, 1.0, 1.35);
+        let now = Instant::now();
+        let spring = tuning.spring(
+            200.0,
+            AMLL_SLIDER_INSET,
+            0.0,
+            0.0,
+            now,
+            PIXEL_TOL.0,
+            PIXEL_TOL.1,
+        );
+        let settled = now + Duration::from_millis(1200);
+        assert!(
+            spring.value(settled).abs() < 0.05,
+            "x={}",
+            spring.value(settled)
+        );
+        assert!(spring.done(settled));
+        // 起止相同：采样始终停在目标上。
+        let still = tuning.spring(200.0, 0.0, 0.0, 0.0, now, PIXEL_TOL.0, PIXEL_TOL.1);
+        assert_eq!(still.value(now + Duration::from_millis(500)), 0.0);
     }
 
     #[test]

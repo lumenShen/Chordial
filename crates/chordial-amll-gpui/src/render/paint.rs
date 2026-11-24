@@ -13,6 +13,7 @@ pub(super) fn paint_lyric_line(
     colors: LyricRenderColors,
     time: u64,
     is_dynamic: bool,
+    fade: LyricFade,
 ) -> u64 {
     let scale = (line_frame.scale / 100.0).max(0.01);
     let line_top = bounds.top() + px(line_frame.top);
@@ -32,6 +33,10 @@ pub(super) fn paint_lyric_line(
         scale,
         pivot_x,
         pivot_y,
+        // 切换动画只缩放内容：围绕歌词容器中心，不碰容器/背景。
+        content_scale: fade.content_scale,
+        content_cx: bounds.left() + bounds.size.width * 0.5,
+        content_cy: bounds.top() + bounds.size.height * 0.5,
     };
     let mut y = line_top + shape.padding_top;
     let mut painted = 0u64;
@@ -47,7 +52,8 @@ pub(super) fn paint_lyric_line(
     let line_enabled = line_frame.enabled;
     // AMLL `.lyricBgLine`：背景行 wrapper 透明度 0.4。
     let wrapper_alpha = if line.is_bg { 0.4 } else { 1.0 };
-    let opacity = line_frame.opacity * wrapper_alpha;
+    // fade.opacity 是整层的切换透明度；行自身的 AMLL 透明度照旧保留。
+    let opacity = line_frame.opacity * wrapper_alpha * fade.opacity;
     let blur = line_frame.blur;
 
     // AMLL 歌词容器的 CSS mask：上下各按容器高度比例渐隐（竖向布局底部为 0）。
@@ -98,6 +104,7 @@ pub(super) fn paint_lyric_line(
                 &shape.emphasis_chunks,
                 &shape.word_chunks,
                 line_enabled,
+                fade,
             );
         }
         y += row.height;
@@ -123,6 +130,7 @@ pub(super) fn paint_lyric_line(
                 opacity,
                 blur,
                 edge,
+                fade,
             );
         }
         y += row.height;
@@ -147,6 +155,7 @@ pub(super) fn paint_lyric_line(
                 opacity,
                 blur,
                 edge,
+                fade,
             );
         }
         y += row.height;
@@ -177,6 +186,7 @@ pub(super) fn paint_row(
     chunks: &[EmphasisChunk],
     word_chunks: &[Option<usize>],
     line_enabled: bool,
+    switch_fade: LyricFade,
 ) -> u64 {
     let line_height = f32::from(row.height);
     let ascent = f32::from(row.line.ascent);
@@ -190,6 +200,8 @@ pub(super) fn paint_row(
     let mut word_cursor = 0usize;
     let text = row.line.text.clone();
     let font_px = f32::from(font_size);
+    // 切换动画的模糊按本行字号从 em 换算成 px，与行自身的 AMLL 模糊叠加。
+    let blur_px = blur + switch_fade.blur_em * font_px;
 
     // AMLL `initFloatAnimation`：每个词在自己的时长内上浮 0.05em（背景行 0.1em），
     // 行离场时以 playbackRate = -1 回退。先按词缓存，避免逐字形重复计算。
@@ -289,7 +301,9 @@ pub(super) fn paint_row(
             };
             let center_x = glyph_x + advance * 0.5;
 
-            let mut glyph_scale = xform.scale;
+            // 内容缩放叠加在行弹簧缩放之上：xform 已按它平移字形中心，
+            // 这里同倍率缩放字形本身，整体等价于对内容做一次 scale。
+            let mut glyph_scale = xform.scale * xform.content_scale;
             let mut off_x = px(0.0);
             let mut off_y = px(float_y);
             let mut ha = 1.0f32;
@@ -318,7 +332,7 @@ pub(super) fn paint_row(
                 && let Some(frame) =
                     emphasize_glyph(chunk, ordinal, line, time, line_enabled, font_px)
             {
-                glyph_scale = xform.scale * frame.scale;
+                glyph_scale = xform.scale * xform.content_scale * frame.scale;
                 off_x = px(frame.offset_x);
                 off_y = px(frame.offset_y + frame.float_y);
                 glow = frame.glow;
@@ -358,7 +372,7 @@ pub(super) fn paint_row(
                 // 字形（vendor/gpui 在光栅化阶段卷积 alpha 掩码），与行级滤镜
                 // 模糊在方差域叠加；比“稀疏复制 9 次”更接近真实辉光。
                 let shadow_sigma = (font_px * glow_sigma_em * 0.5).max(0.0);
-                let sigma = (blur * blur + shadow_sigma * shadow_sigma).sqrt();
+                let sigma = (blur_px * blur_px + shadow_sigma * shadow_sigma).sqrt();
                 // mask 作用于整个词元素（含 text-shadow），所以辉光也要乘上
                 // 当前字形的亮/暗层 alpha。
                 let shadow_color = Hsla {
@@ -388,7 +402,7 @@ pub(super) fn paint_row(
                 font_size,
                 glyph_scale,
                 color,
-                blur,
+                blur_px,
                 mask,
             );
         }
@@ -440,6 +454,7 @@ pub(super) fn paint_row_plain(
     opacity: f32,
     blur: f32,
     edge: f32,
+    switch_fade: LyricFade,
 ) -> u64 {
     let line_height = f32::from(row.height);
     let base = row_top
@@ -451,6 +466,8 @@ pub(super) fn paint_row_plain(
         a: color.a * opacity * edge,
         ..color
     };
+    let blur_px = blur + switch_fade.blur_em * f32::from(font_size);
+    let glyph_scale = xform.scale * xform.content_scale;
     let mut painted = 0;
     for run in &row.line.runs {
         for glyph in &run.glyphs {
@@ -461,9 +478,9 @@ pub(super) fn paint_row_plain(
                 glyph.id,
                 glyph.is_emoji,
                 font_size,
-                xform.scale,
+                glyph_scale,
                 color,
-                blur,
+                blur_px,
                 SpriteMask::NONE,
             );
         }

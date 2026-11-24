@@ -7,7 +7,18 @@ use super::*;
 impl ChordialApp {
     pub(super) fn open_eq(&mut self, cx: &mut Context<Self>) {
         self.eq_open = true;
-        self.eq_open_at = Some(Instant::now());
+        self.dock_menu = None;
+        self.track_menu = None;
+        let now = Instant::now();
+        self.motion.eq_enter = Some(self.motion_tuning.spring(
+            240.0,
+            0.0,
+            1.0,
+            0.0,
+            now,
+            crate::motion::PROGRESS_TOL.0,
+            crate::motion::PROGRESS_TOL.1,
+        ));
         self.eq.settings = self.eq.settings.clone().sanitized();
         self.player.set_eq(self.eq.settings.clone());
         self.ensure_ui_anim_ticker(cx);
@@ -16,6 +27,7 @@ impl ChordialApp {
 
     pub(crate) fn close_eq(&mut self, cx: &mut Context<Self>) {
         self.eq_open = false;
+        self.motion.eq_enter = None;
         self.eq_save_at = None;
         self.persist_eq();
         cx.notify();
@@ -27,15 +39,6 @@ impl ChordialApp {
             self.persist_eq();
             cx.notify();
         }
-    }
-
-    pub(super) fn eq_animating(&self) -> bool {
-        // 只有打开时的 240ms 入场淡入需要连续帧；400ms 落盘防抖是后台
-        // 一次性任务，不应把整个界面拖入持续重绘。
-        self.eq_open
-            && self
-                .eq_open_at
-                .is_some_and(|t| t.elapsed() < Duration::from_millis(260))
     }
 
     /// 把当前配置推给播放线程，并在 400ms 后落盘。
@@ -96,7 +99,6 @@ impl ChordialApp {
     pub(crate) fn select_eq_band(&mut self, index: usize, cx: &mut Context<Self>) {
         self.eq.selected = Some(index);
         self.eq.type_menu_open = false;
-        self.bump_portrait(cx);
         cx.notify();
     }
 
@@ -317,7 +319,12 @@ impl ChordialApp {
         .detach();
     }
 
-    pub(super) fn store_autoeq_param(&mut self, file: &str, bands: Vec<EqBand>, input_gain_db: f32) {
+    pub(super) fn store_autoeq_param(
+        &mut self,
+        file: &str,
+        bands: Vec<EqBand>,
+        input_gain_db: f32,
+    ) {
         if let Some(entry) = self.eq.autoeq.find_mut(file) {
             entry.bands = Some(bands);
             entry.input_gain_db = input_gain_db;

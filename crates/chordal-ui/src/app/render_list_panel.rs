@@ -14,7 +14,11 @@ impl ChordialApp {
         }
     }
 
-    pub(super) fn render_list_panel(&self, width: Option<f32>, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_list_panel(
+        &self,
+        width: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let phone = self.is_phone();
@@ -252,7 +256,7 @@ impl ChordialApp {
                         .on_click(move |_, _, cx| {
                             let _ = weak.update(cx, |app, cx| {
                                 app.stop_playback(cx);
-                                app.queue = Arc::new(Vec::new());
+                                app.set_queue(Arc::new(Vec::new()), None);
                                 app.queue_pos = None;
                                 app.selection = None;
                                 cx.notify();
@@ -428,7 +432,15 @@ impl ChordialApp {
                 },
             )
             .child(body)
-            .child(div().h(px(if phone { 92.0 } else { 84.0 })).flex_none())
+            .child(
+                div()
+                    .h(px(if phone {
+                        92.0
+                    } else {
+                        crate::theme::size::DOCK + crate::theme::size::DOCK_BOTTOM + 14.0
+                    }))
+                    .flex_none(),
+            )
             .into_any_element()
     }
 }

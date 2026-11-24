@@ -2,11 +2,12 @@
 //!
 //! 状态机只负责「位移 → 进度」和「松手后的弹簧」，不碰任何页面状态。
 //! 渲染层用 `progress` / `offset` 直接摆放卡片，动画结束后再切换页面。
-//! 与 `sheet_drag` 共用同一套解析弹簧语义，掉帧不会改变轨迹。
+//! 松手后的弹簧统一走 `motion` 模块的 [`MotionSpring`]，与 `sheet_drag`
+//! 共用同一套解析解语义，掉帧不会改变轨迹。
 
 use std::time::Instant;
 
-use crate::sheet_drag::SpringSettle;
+use crate::motion::{MotionSpring, MotionTuning, PIXEL_TOL, PROGRESS_TOL, VelocityTracker};
 
 /// 起手死区：小于该位移视为点击。
 const DRAG_SLOP: f32 = 4.0;
@@ -14,14 +15,12 @@ const DRAG_SLOP: f32 = 4.0;
 const COMMIT_RATIO: f32 = 0.24;
 /// 甩动提交速度（px/s）。
 const FLING_VELOCITY: f32 = 560.0;
-/// 回弹弹簧：轻微过冲。
-const RETURN_DAMPING: f32 = 16.0;
-const RETURN_STIFFNESS: f32 = 180.0;
-/// 提交弹簧：接近临界阻尼，直接落到目标。
-const COMMIT_DAMPING: f32 = 25.0;
-const COMMIT_STIFFNESS: f32 = 190.0;
-/// 弹簧最长收敛时间（秒），超过后强制结束。
-const SPRING_MAX_SECS: f32 = 0.75;
+/// 回弹基准时长：对应原先 (damping 16, stiffness 180) 的轻微过冲。
+const RETURN_BASE_MS: f32 = 240.0;
+const RETURN_OVERSHOOT: f32 = 1.2;
+/// 提交基准时长：对应原先 (damping 25, stiffness 190) 的近临界阻尼。
+const COMMIT_BASE_MS: f32 = 200.0;
+const COMMIT_OVERSHOOT: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SheetPage {
@@ -33,13 +32,11 @@ pub enum SheetPage {
 ///
 /// 两个方向都能起手：曲库页从 mini player 往上拖展开，播放页从顶部
 /// 把手往下拖收起。`start_progress` 记录起手时停在哪一端。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SheetSwipe {
     start_progress: f32,
     start_y: f32,
-    last_y: f32,
-    last_at: Instant,
-    velocity: f32,
+    tracker: VelocityTracker,
     progress: f32,
     engaged: bool,
     settle: Option<SheetSettle>,
@@ -47,19 +44,20 @@ pub struct SheetSwipe {
 
 #[derive(Clone, Copy, Debug)]
 struct SheetSettle {
-    spring: SpringSettle,
+    spring: MotionSpring,
     target: f32,
 }
 
 impl SheetSwipe {
     pub fn begin(start_progress: f32, y: f32, now: Instant) -> Self {
         let start_progress = start_progress.clamp(0.0, 1.0);
+        let mut tracker = VelocityTracker::default();
+        // 按下点作为速度基准，第一帧更新即可算出指针速度。
+        tracker.push(y, now);
         Self {
             start_progress,
             start_y: y,
-            last_y: y,
-            last_at: now,
-            velocity: 0.0,
+            tracker,
             progress: start_progress,
             engaged: false,
             settle: None,
@@ -71,15 +69,8 @@ impl SheetSwipe {
         if self.settle.is_some() {
             return false;
         }
+        self.tracker.push(y, now);
         let dy = y - self.start_y;
-        let dt = now
-            .saturating_duration_since(self.last_at)
-            .as_secs_f32()
-            .max(0.001);
-        let instant = (y - self.last_y) / dt;
-        self.velocity = self.velocity * 0.6 + instant * 0.4;
-        self.last_y = y;
-        self.last_at = now;
 
         if !self.engaged {
             if dy.abs() <= DRAG_SLOP {
@@ -103,19 +94,19 @@ impl SheetSwipe {
     }
 
     /// 松手：决定提交还是回弹。返回是否进入动画。
-    pub fn release(&mut self, height: f32, now: Instant) -> bool {
+    ///
+    /// `tuning` 只影响这次新建的弹簧，全局设置后续改动不会改写已开始的动画。
+    pub fn release(&mut self, height: f32, now: Instant, tuning: MotionTuning) -> bool {
         if self.settle.is_some() || !self.engaged {
             return false;
         }
-        // 松手前已经停住，速度不再代表甩动。
-        if now.saturating_duration_since(self.last_at).as_secs_f32() > 0.09 {
-            self.velocity = 0.0;
-        }
+        // 追踪器会在指针静止超过 100ms 后清零速度，停住再松手不算甩动。
+        let velocity = self.tracker.velocity_at(now);
         let expanding = self.start_progress < 0.5;
         let commit = if expanding {
-            self.progress > COMMIT_RATIO || self.velocity < -FLING_VELOCITY
+            self.progress > COMMIT_RATIO || velocity < -FLING_VELOCITY
         } else {
-            self.progress < 1.0 - COMMIT_RATIO || self.velocity > FLING_VELOCITY
+            self.progress < 1.0 - COMMIT_RATIO || velocity > FLING_VELOCITY
         };
         let target = if commit {
             if expanding { 1.0 } else { 0.0 }
@@ -129,19 +120,25 @@ impl SheetSwipe {
             self.progress = target;
             return false;
         }
-        let (damping, stiffness) = if commit {
-            (COMMIT_DAMPING, COMMIT_STIFFNESS)
+        let (base_ms, overshoot_factor) = if commit {
+            (COMMIT_BASE_MS, COMMIT_OVERSHOOT)
         } else {
-            (RETURN_DAMPING, RETURN_STIFFNESS)
+            (RETURN_BASE_MS, RETURN_OVERSHOOT)
         };
+        let tuned = MotionTuning::new(
+            tuning.preset,
+            tuning.duration,
+            tuning.overshoot * overshoot_factor,
+        );
         self.settle = Some(SheetSettle {
-            spring: SpringSettle::new(
+            spring: tuned.spring(
+                base_ms,
                 self.progress,
                 target,
-                self.velocity / height.max(1.0),
+                velocity / height.max(1.0),
                 now,
-                damping,
-                stiffness,
+                PROGRESS_TOL.0,
+                PROGRESS_TOL.1,
             ),
             target,
         });
@@ -150,7 +147,7 @@ impl SheetSwipe {
 
     pub fn progress(&self, now: Instant) -> f32 {
         match self.settle {
-            Some(s) => s.spring.position(now).clamp(0.0, 1.0),
+            Some(s) => s.spring.value(now).clamp(0.0, 1.0),
             None => self.progress,
         }
     }
@@ -162,7 +159,7 @@ impl SheetSwipe {
     /// 是否处于松手后的动画中。
     pub fn animating(&self, now: Instant) -> bool {
         match self.settle {
-            Some(s) => !s.spring.settled(now),
+            Some(s) => s.spring.active(now),
             None => false,
         }
     }
@@ -170,9 +167,7 @@ impl SheetSwipe {
     /// 动画结束后的落点；仍未结束或仍在拖拽时返回 `None`。
     pub fn settled(&self, now: Instant) -> Option<SheetPage> {
         let settle = self.settle?;
-        if !settle.spring.settled(now)
-            && now.saturating_duration_since(self.last_at).as_secs_f32() < SPRING_MAX_SECS
-        {
+        if !settle.spring.done(now) {
             return None;
         }
         Some(if settle.target >= 0.5 {
@@ -201,13 +196,11 @@ pub enum SwipeOutcome {
 ///
 /// 点击仍然由上层 `on_click` 处理；只有横向位移超过死区后
 /// `engaged()` 才为真，上层据此吞掉本次点击。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct EdgeSwipe {
     start_x: f32,
     start_y: f32,
-    last_x: f32,
-    last_at: Instant,
-    velocity: f32,
+    tracker: VelocityTracker,
     offset: f32,
     engaged: bool,
     allow_forward: bool,
@@ -217,18 +210,19 @@ pub struct EdgeSwipe {
 
 #[derive(Clone, Copy, Debug)]
 struct EdgeSettle {
-    spring: SpringSettle,
+    spring: MotionSpring,
     outcome: SwipeOutcome,
 }
 
 impl EdgeSwipe {
     pub fn begin(x: f32, y: f32, now: Instant, allow_forward: bool, allow_back: bool) -> Self {
+        let mut tracker = VelocityTracker::default();
+        // 按下点作为速度基准，第一帧更新即可算出指针速度。
+        tracker.push(x, now);
         Self {
             start_x: x,
             start_y: y,
-            last_x: x,
-            last_at: now,
-            velocity: 0.0,
+            tracker,
             offset: 0.0,
             engaged: false,
             allow_forward,
@@ -241,16 +235,9 @@ impl EdgeSwipe {
         if self.settle.is_some() {
             return false;
         }
+        self.tracker.push(x, now);
         let dx = x - self.start_x;
         let dy = y - self.start_y;
-        let dt = now
-            .saturating_duration_since(self.last_at)
-            .as_secs_f32()
-            .max(0.001);
-        let instant = (x - self.last_x) / dt;
-        self.velocity = self.velocity * 0.6 + instant * 0.4;
-        self.last_x = x;
-        self.last_at = now;
 
         if !self.engaged {
             if dx.abs() <= DRAG_SLOP || dx.abs() <= dy.abs() + DRAG_SLOP {
@@ -273,17 +260,16 @@ impl EdgeSwipe {
         true
     }
 
-    pub fn release(&mut self, width: f32, now: Instant) -> bool {
+    /// `tuning` 只影响这次新建的弹簧。
+    pub fn release(&mut self, width: f32, now: Instant, tuning: MotionTuning) -> bool {
         if self.settle.is_some() || !self.engaged {
             return false;
         }
-        if now.saturating_duration_since(self.last_at).as_secs_f32() > 0.09 {
-            self.velocity = 0.0;
-        }
+        let velocity = self.tracker.velocity_at(now);
         let commit = if self.offset < 0.0 {
-            self.offset.abs() > width * COMMIT_RATIO || self.velocity < -FLING_VELOCITY
+            self.offset.abs() > width * COMMIT_RATIO || velocity < -FLING_VELOCITY
         } else {
-            self.offset.abs() > width * COMMIT_RATIO || self.velocity > FLING_VELOCITY
+            self.offset.abs() > width * COMMIT_RATIO || velocity > FLING_VELOCITY
         };
         let (target, outcome) = if commit {
             if self.offset < 0.0 {
@@ -297,13 +283,26 @@ impl EdgeSwipe {
         if (self.offset - target).abs() <= 0.001 {
             return false;
         }
-        let (damping, stiffness) = if commit {
-            (COMMIT_DAMPING, COMMIT_STIFFNESS)
+        let (base_ms, overshoot_factor) = if commit {
+            (COMMIT_BASE_MS, COMMIT_OVERSHOOT)
         } else {
-            (RETURN_DAMPING, RETURN_STIFFNESS)
+            (RETURN_BASE_MS, RETURN_OVERSHOOT)
         };
+        let tuned = MotionTuning::new(
+            tuning.preset,
+            tuning.duration,
+            tuning.overshoot * overshoot_factor,
+        );
         self.settle = Some(EdgeSettle {
-            spring: SpringSettle::new(self.offset, target, self.velocity, now, damping, stiffness),
+            spring: tuned.spring(
+                base_ms,
+                self.offset,
+                target,
+                velocity,
+                now,
+                PIXEL_TOL.0,
+                PIXEL_TOL.1,
+            ),
             outcome,
         });
         true
@@ -311,7 +310,7 @@ impl EdgeSwipe {
 
     pub fn offset(&self, now: Instant) -> f32 {
         match self.settle {
-            Some(s) => s.spring.position(now),
+            Some(s) => s.spring.value(now),
             None => self.offset,
         }
     }
@@ -322,16 +321,14 @@ impl EdgeSwipe {
 
     pub fn animating(&self, now: Instant) -> bool {
         match self.settle {
-            Some(s) => !s.spring.settled(now),
+            Some(s) => s.spring.active(now),
             None => false,
         }
     }
 
     pub fn settled(&self, now: Instant) -> Option<SwipeOutcome> {
         let settle = self.settle?;
-        if !settle.spring.settled(now)
-            && now.saturating_duration_since(self.last_at).as_secs_f32() < SPRING_MAX_SECS
-        {
+        if !settle.spring.done(now) {
             return None;
         }
         Some(settle.outcome)
@@ -343,6 +340,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// 新弹簧硬超时按 6 个时间常数推导，留足余量再看最终落点。
+    const WAIT_MS: u64 = 1200;
+
     fn at(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
     }
@@ -353,9 +353,9 @@ mod tests {
         let mut swipe = SheetSwipe::begin(0.0, 800.0, now);
         assert!(swipe.update(600.0, 800.0, at(now, 16)));
         assert!(swipe.progress(at(now, 16)) > 0.2);
-        swipe.release(800.0, at(now, 32));
+        swipe.release(800.0, at(now, 32), MotionTuning::default());
         assert!(swipe.animating(at(now, 32)));
-        assert_eq!(swipe.settled(at(now, 32 + 900)), Some(SheetPage::Full));
+        assert_eq!(swipe.settled(at(now, 32 + WAIT_MS)), Some(SheetPage::Full));
     }
 
     #[test]
@@ -364,8 +364,8 @@ mod tests {
         let mut swipe = SheetSwipe::begin(0.0, 800.0, now);
         swipe.update(770.0, 800.0, at(now, 16));
         // 松手前停一下，让速度归零：这是「拖了一点又放回去」而不是甩动。
-        swipe.release(800.0, at(now, 220));
-        assert_eq!(swipe.settled(at(now, 220 + 900)), Some(SheetPage::Mini));
+        swipe.release(800.0, at(now, 220), MotionTuning::default());
+        assert_eq!(swipe.settled(at(now, 220 + WAIT_MS)), Some(SheetPage::Mini));
     }
 
     #[test]
@@ -373,8 +373,8 @@ mod tests {
         let now = Instant::now();
         let mut swipe = SheetSwipe::begin(1.0, 100.0, now);
         assert!(swipe.update(500.0, 800.0, at(now, 16)));
-        swipe.release(800.0, at(now, 32));
-        assert_eq!(swipe.settled(at(now, 32 + 900)), Some(SheetPage::Mini));
+        swipe.release(800.0, at(now, 32), MotionTuning::default());
+        assert_eq!(swipe.settled(at(now, 32 + WAIT_MS)), Some(SheetPage::Mini));
     }
 
     #[test]
@@ -390,9 +390,9 @@ mod tests {
         let now = Instant::now();
         let mut swipe = EdgeSwipe::begin(500.0, 500.0, now, true, false);
         assert!(swipe.update(400.0, 505.0, at(now, 16)));
-        swipe.release(700.0, at(now, 32));
+        swipe.release(700.0, at(now, 32), MotionTuning::default());
         assert_eq!(
-            swipe.settled(at(now, 32 + 900)),
+            swipe.settled(at(now, 32 + WAIT_MS)),
             Some(SwipeOutcome::Committed(SwipeDirection::Forward))
         );
     }

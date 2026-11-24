@@ -11,7 +11,9 @@
 //!   配置类型对应的运行时包装（选择具体渲染器并转发调用）。
 //!
 //! 性能设计：
-//! - 输出分辨率 = viewport × render_scale，硬上限 200k 像素；缓冲区跨帧复用。
+//! - 请求分辨率 = viewport × render_scale，硬上限 200k 像素；此外再按实测
+//!   光栅耗时反推「本帧预算像素数」，避免 ÷1 在大窗口/debug 构建下把光栅
+//!   时间顶到几十毫秒、阻塞 UI 线程（分辨率自适应，除数只是上限请求）。
 //! - 三角形网格在专辑/宽高比变化时才重建；每帧只做光栅化 + 合成。
 //! - 低于目标 FPS 的帧直接复用上一张 `RenderImage`（零分配、零光栅化）。
 //! - 所有热路径埋 `amll.bg.raster` 检查点。
@@ -112,6 +114,18 @@ impl ControlPointPreset {
 
 const TEXTURE_SIZE: usize = 32;
 const MAX_OUTPUT_PIXELS: usize = 200_000;
+/// 交给 GPU 放大前的展示分辨率预算。除数较大时先把光栅结果用 Cubic 重建
+/// 到接近该预算，GPU 那一步双线性拉伸的斜率突变就落在更细的网格上，
+/// 渐变更连续；CPU 开销仍远低于按除数直接提高光栅分辨率。
+const MAX_PRESENT_PIXELS: usize = 130_000;
+/// 预放大的上限倍率，避免展示缓冲过度膨胀。
+const MAX_UPSCALE: f32 = 4.0;
+/// 单帧允许花在「软件光栅 + 展示放大」上的时间。背景通常按 24/30fps 更新，
+/// 但这两步都发生在 UI 线程上；控制在 10ms 以内，才能在 300Hz 屏幕上仍
+/// 留出绘制余量，避免 ÷1 把帧率拖到 24fps。
+const RASTER_FRAME_BUDGET_US: u64 = 10_000;
+/// 自适应分辨率的下限，保证网格仍有足够像素表达颜色过渡，不会退化成色块。
+const MIN_ADAPTIVE_PIXELS: usize = 6_000;
 const SUBDIVISIONS: usize = 12;
 /// 封面交叉淡入淡出的时长（毫秒）。使用真实墙钟时间推进，与视图帧率解耦：
 /// 高刷屏上视图可能每秒调用 200+ 次 `render`，但光栅只有 30fps。
@@ -396,13 +410,23 @@ fn generate_preset(rng: &mut Rng) -> ControlPointPreset {
 pub struct MeshGradientRenderer {
     layers: Vec<MeshLayer>,
     rng: Rng,
-    output: Vec<u8>,
+    /// 低分辨率软件光栅缓冲（常驻，不交给 GPU）。
+    raster: Vec<u8>,
+    /// `raster` 的逐图层暂存（常驻）。
     scratch: Vec<u8>,
+    /// 交给 GPU 的展示帧：大除数时是 Cubic 重建后的图，否则等于 `raster`。
+    output: Vec<u8>,
+    /// Cubic 预放大的常驻中间缓冲（f32 水平 pass + 两轴采样 LUT）。
+    upscale_scratch: UpscaleScratch,
     /// 从已释放的 `RenderImage` 回收的整帧像素缓冲（尺寸匹配时复用）。
     /// 软件光栅每帧都要交出一块 output，回收可消除 30fps × 帧大小的分配抖动。
     recycled: Vec<Vec<u8>>,
+    raster_w: usize,
+    raster_h: usize,
     out_w: usize,
     out_h: usize,
+    /// raster → output 的放大倍率；1.0 表示不需要预放大。
+    upscale: f32,
     viewport_w: usize,
     viewport_h: usize,
     render_scale: f32,
@@ -421,6 +445,12 @@ pub struct MeshGradientRenderer {
     last_image: Option<Arc<RenderImage>>,
     empty_image: Option<Arc<RenderImage>>,
     needs_clear: bool,
+    /// 每光栅像素的实测总耗时（光栅 + 放大，微秒）。按帧平滑，作为自适应
+    /// 分辨率的依据：它与请求尺寸无关，能同时适配构建 profile、CPU 与图层数。
+    raster_us_per_pixel: f64,
+    /// 由实测耗时反推出的当前像素预算。变化幅度小的时候保持不变，避免
+    /// 每帧微调 w/h 触发 needs_clear、反而绕过 FPS 门控变成全速光栅。
+    pixel_budget: usize,
     disposed: bool,
 }
 
@@ -439,11 +469,16 @@ impl MeshGradientRenderer {
         Self {
             layers: Vec::new(),
             rng: Rng(seed.max(1)),
-            output: Vec::new(),
+            raster: Vec::new(),
             scratch: Vec::new(),
+            output: Vec::new(),
+            upscale_scratch: UpscaleScratch::new(),
             recycled: Vec::new(),
+            raster_w: 0,
+            raster_h: 0,
             out_w: 0,
             out_h: 0,
+            upscale: 1.0,
             viewport_w: 0,
             viewport_h: 0,
             render_scale: 0.5,
@@ -459,6 +494,8 @@ impl MeshGradientRenderer {
             last_image: None,
             empty_image: None,
             needs_clear: false,
+            raster_us_per_pixel: 0.0,
+            pixel_budget: MAX_OUTPUT_PIXELS,
             disposed: false,
         }
     }
@@ -561,13 +598,12 @@ impl MeshGradientRenderer {
             // 为背景“异常变黑”。两层交叉淡出可以保证底层始终不透。
             if let Some(mut outgoing) = self.layers.pop() {
                 self.layers.clear();
-                let was_fading = outgoing.fading_out;
                 outgoing.fading_out = true;
-                if !was_fading {
-                    // 之前的封面可能还在淡入（alpha < 1）。切歌瞬间把它补满，
-                    // 让混色只发生在新旧封面之间，而不是混向透明。
-                    outgoing.alpha = 1.0;
-                }
+                // 退场层必须保持不透明。它可能还在淡入（alpha < 1），也可能
+                // 已经被 `clear_album` 标记为淡出（停止播放后立刻切歌）：
+                // 两种情况下若让它以半透明做底色，新封面淡入期间整块背景
+                // 都会透出黑色，看起来就是“换歌瞬间背景变黑”。
+                outgoing.alpha = 1.0;
                 self.layers.push(outgoing);
             }
         }
@@ -606,37 +642,72 @@ impl MeshGradientRenderer {
         let mut h = ((self.viewport_h as f32) * self.render_scale).ceil() as usize;
         w = w.max(2);
         h = h.max(2);
+        // 请求分辨率（viewport × render_scale）先按实测预算收缩，再套硬上限。
+        // 只缩小不放大，保证用户设置的除数始终是「最多请求多少像素」。
+        let cap = self.pixel_budget.min(MAX_OUTPUT_PIXELS);
         let pixels = w.saturating_mul(h);
-        if pixels > MAX_OUTPUT_PIXELS {
-            let scale = (MAX_OUTPUT_PIXELS as f32 / pixels as f32).sqrt();
+        if pixels > cap {
+            let scale = (cap as f32 / pixels as f32).sqrt();
             w = ((w as f32 * scale).floor() as usize).max(2);
             h = ((h as f32 * scale).floor() as usize).max(2);
         }
-        // 只有视口尺寸变化才需要重清缓冲；帧缓冲被 take 走（零拷贝交帧）后
+        self.raster_w = w;
+        self.raster_h = h;
+
+        // 光栅像素太少时，先做一次 Cubic 重建再交给 GPU 拉伸。
+        // 展示预算与光栅预算相互独立：大除数下一张 ~480×270 的重建图
+        // 足以消除双线性接缝，而真正的网格光栅仍只花 1/N² 的成本。
+        let raster_pixels = w.saturating_mul(h) as f32;
+        let factor = (MAX_PRESENT_PIXELS as f32 / raster_pixels).sqrt().min(MAX_UPSCALE).max(1.0);
+        let mut pw = ((w as f32 * factor).round() as usize).max(w);
+        let mut ph = ((h as f32 * factor).round() as usize).max(h);
+        // 四舍五入可能略微越过预算，等比缩回一档即可；最多两次迭代。
+        for _ in 0..2 {
+            if pw.saturating_mul(ph) <= MAX_PRESENT_PIXELS {
+                break;
+            }
+            let k = (MAX_PRESENT_PIXELS as f32 / (pw * ph) as f32).sqrt();
+            pw = ((pw as f32 * k).floor() as usize).max(w);
+            ph = ((ph as f32 * k).floor() as usize).max(h);
+        }
+        let upscale = pw as f32 / w as f32;
+        // 只有尺寸或放大倍率变化才需要重清缓冲；帧缓冲被 take 走（零拷贝交帧）后
         // 下一帧只需补容量，不能借此触发 needs_clear，否则会绕过 FPS 门控
         // 变成每帧全量光栅。
-        if w != self.out_w || h != self.out_h {
-            self.out_w = w;
-            self.out_h = h;
+        if pw != self.out_w || ph != self.out_h || (upscale - self.upscale).abs() > 0.001 {
+            self.out_w = pw;
+            self.out_h = ph;
+            self.upscale = upscale;
             self.needs_clear = true;
             // 尺寸变化后旧尺寸的回收块不再可用。
             self.recycled.clear();
         }
-        let len = w * h * 4;
-        if self.output.len() != len {
+        let raster_len = w * h * 4;
+        let present_len = pw * ph * 4;
+        if self.raster.len() != raster_len {
+            self.raster.resize(raster_len, 0);
+        }
+        if self.scratch.len() != raster_len {
+            self.scratch.resize(raster_len, 0);
+        }
+        if self.output.len() != present_len {
             // 优先复用刚从旧 RenderImage 回收的整帧缓冲（零分配 + 零清零）。
-            if self.recycled.last().is_some_and(|buf| buf.len() == len) {
+            if self.recycled.last().is_some_and(|buf| buf.len() == present_len) {
                 self.output = self.recycled.pop().expect("checked");
             } else {
-                self.output.resize(len, 0);
+                self.output.resize(present_len, 0);
             }
         }
-        if self.scratch.len() != len {
-            self.scratch.resize(len, 0);
-        }
-        // 双缓冲的"配置大小"（output 每帧被 take 走交给 gpui，下次重新补齐；
-        // scratch 常驻）。登记在案便于把背景分辨率除数与常驻内存对上。
-        mem::set_gauge(Gauge::Background, len.saturating_mul(2));
+        self.upscale_scratch.ensure(pw, ph);
+        // raster/scratch 常驻，output 每帧被 take 走交给 gpui 后再回收；
+        // 展示 pass 的 f32 中间缓冲也常驻，统一登记便于核对内存占用。
+        mem::set_gauge(
+            Gauge::Background,
+            raster_len
+                .saturating_mul(2)
+                .saturating_add(present_len)
+                .saturating_add(self.upscale_scratch.memory_bytes()),
+        );
     }
 
     /// 回收一块已从 sprite atlas 移除的整帧像素缓冲。
@@ -655,12 +726,30 @@ impl MeshGradientRenderer {
         self.recycled.len()
     }
 
+    #[doc(hidden)]
+    pub fn debug_pixel_budget(&self) -> usize {
+        self.pixel_budget
+    }
+
+    #[doc(hidden)]
+    pub fn debug_us_per_pixel(&self) -> f64 {
+        self.raster_us_per_pixel
+    }
+
     /// 推进与“真实时间”相关的状态。
     ///
     /// 必须在 FPS 门控**之前**调用：视图在 200Hz+ 屏幕上可能每 3ms 调用一次
     /// `render`，而背景光栅只有 30fps。若只在光栅帧累加，交叉淡入淡出会慢
     /// 一个数量级，快速切歌时多层半透明叠加会让背景明显发黑。
     fn advance_animation(&mut self, dt_ms: f32) {
+        // 没有时间推进就不推进、也不裁剪任何图层。视图可能在同一帧内被
+        // 多次 `render`（第二次 dt=0），或暂停恢复时先收到一帧 0 时长；
+        // 此时 fade=0，若继续走下面的 retain，会把刚加入、alpha 仍为 0 的
+        // 新封面直接裁掉。旧封面随后淡出，`layers` 清空后背景就永久黑屏，
+        // 直到下一次换封面（表现为切歌后 0.42s 淡出、之后全黑）。
+        if !(dt_ms > 0.0) {
+            return;
+        }
         let fade = dt_ms / CROSSFADE_MS;
         for layer in &mut self.layers {
             if layer.fading_out {
@@ -677,7 +766,11 @@ impl MeshGradientRenderer {
                 layer.alpha = 1.0;
             }
         }
-        self.layers.retain(|layer| layer.alpha > 0.001);
+        // 只移除已经淡出的旧图层。新加入的图层即使 alpha 仍为 0 也必须
+        // 保留：它是下一帧交叉淡入的主体，提前裁掉会让背景只剩一个正在
+        // 淡出的旧层，最终变成透明（黑屏）。
+        self.layers
+            .retain(|layer| !layer.fading_out || layer.alpha > 0.001);
         // 当前封面完全显示后，退场的旧封面已无意义，立即丢弃。
         if self.layers.len() > 1 && self.layers.last().is_some_and(|l| l.alpha >= 1.0) {
             self.layers.drain(0..self.layers.len() - 1);
@@ -697,6 +790,36 @@ impl MeshGradientRenderer {
         self.beat_volume = self.beat_volume.clamp(0.0, 1.0);
     }
 
+    /// 用一帧真实的光栅 + 展示放大耗时修正像素预算。
+    ///
+    /// `elapsed_us` 包含网格光栅与 Cubic 重建（两者都在 UI 线程上），
+    /// `raster_pixels` 是本帧的光栅像素数。用「每光栅像素总耗时」做比例控制：
+    /// 图层数、展示放大倍率等因素都体现在实测值里，不需要另行估算。
+    fn adapt_pixel_budget(&mut self, elapsed_us: f64, raster_pixels: u64) {
+        if raster_pixels == 0 || !(elapsed_us > 0.0) || !elapsed_us.is_finite() {
+            return;
+        }
+        let sample = elapsed_us / raster_pixels as f64;
+        // 首帧直接采用；之后指数平滑，避免单次调度抖动造成大幅缩放。
+        self.raster_us_per_pixel = if self.raster_us_per_pixel > 0.0 {
+            self.raster_us_per_pixel * 0.75 + sample * 0.25
+        } else {
+            sample
+        };
+        let per_pixel = self.raster_us_per_pixel;
+        if !(per_pixel > 0.0) || !per_pixel.is_finite() {
+            return;
+        }
+        let affordable = (RASTER_FRAME_BUDGET_US as f64 / per_pixel) as usize;
+        let affordable = affordable.clamp(MIN_ADAPTIVE_PIXELS, MAX_OUTPUT_PIXELS);
+        // 变化不足 12% 时保持原值：输出尺寸每变一次都会清空缓冲并绕过
+        // FPS 门控，若逐帧微调反而会把省下的时间全赔进去。
+        let old = self.pixel_budget;
+        if affordable.abs_diff(old) as f64 > old as f64 * 0.12 {
+            self.pixel_budget = affordable;
+        }
+    }
+
     /// 渲染一帧。返回 `None` 表示本帧无需更新（调用方保留上一张图）。
     pub fn render(&mut self, delta_ms: f32) -> Option<Arc<RenderImage>> {
         if self.disposed || self.viewport_w == 0 || self.viewport_h == 0 {
@@ -706,8 +829,18 @@ impl MeshGradientRenderer {
         if !self.paused {
             self.frame_time += dt * self.flow_speed;
             self.advance_animation(dt);
-        } else if !self.needs_clear {
-            return self.last_image.clone();
+        } else {
+            if !self.needs_clear {
+                return self.last_image.clone();
+            }
+            // 暂停时没有时间推进交叉淡入。若新封面刚加入、alpha 仍为 0，
+            // 直接用 alpha=0 光栅化会得到一帧全透明图（停在黑色底上），
+            // 且暂停期间不会再有帧把它补上。按完成态显示更符合预期。
+            if let Some(top) = self.layers.iter_mut().rev().find(|layer| !layer.fading_out) {
+                if top.alpha <= 0.0 {
+                    top.alpha = 1.0;
+                }
+            }
         }
         if self.fps > 0 && !self.needs_clear {
             self.fps_accum_ms += dt;
@@ -733,11 +866,12 @@ impl MeshGradientRenderer {
             return self.empty_image.clone();
         }
 
-        let aspect = self.out_w as f32 / self.out_h as f32;
+        let aspect = self.raster_w as f32 / self.raster_h as f32;
         // 包络只决定“什么时候跳”，强度决定“跳多大幅度”。
         let volume = self.beat_volume * self.beat_strength;
         let scope = PerfScope::enter("amll.bg.raster");
-        self.output.fill(0);
+        let raster_start = std::time::Instant::now();
+        self.raster.fill(0);
         let mut used = 0u64;
 
         for layer in &mut self.layers {
@@ -746,15 +880,37 @@ impl MeshGradientRenderer {
             rasterize_layer(
                 layer,
                 &mut self.scratch,
-                self.out_w,
-                self.out_h,
+                self.raster_w,
+                self.raster_h,
                 self.frame_time,
                 volume,
             );
-            blend_over(&mut self.output, &self.scratch);
-            used += (self.out_w * self.out_h) as u64;
+            blend_over(&mut self.raster, &self.scratch);
+            used += (self.raster_w * self.raster_h) as u64;
         }
         scope.finish(used);
+
+        // 低分辨率光栅 → Cubic 重建 → GPU 双线性到全屏。
+        // 只有除数较大（光栅像素远少于展示预算）时才走重建，否则一次 memcpy 即可。
+        let upscale_scope = PerfScope::enter("amll.bg.upscale");
+        if self.upscale > 1.001 {
+            upscale_catmull_rom(
+                &self.raster,
+                &mut self.output,
+                &mut self.upscale_scratch,
+                self.raster_w,
+                self.raster_h,
+                self.out_w,
+                self.out_h,
+            );
+        } else {
+            self.output.copy_from_slice(&self.raster);
+        }
+        upscale_scope.finish((self.out_w * self.out_h) as u64);
+        // 预算按「光栅 + 放大」总耗时计算；只统计光栅会让 debug 构建下
+        // Cubic 重建的十几毫秒漏算，除数调小依然会卡。
+        let elapsed_us = raster_start.elapsed().as_secs_f64() * 1_000_000.0;
+        self.adapt_pixel_budget(elapsed_us, (self.raster_w * self.raster_h) as u64);
         self.needs_clear = false;
         self.fps_accum_ms = 0.0;
 
@@ -772,8 +928,11 @@ impl MeshGradientRenderer {
         self.last_image = None;
         self.output.clear();
         self.output.shrink_to_fit();
+        self.raster.clear();
+        self.raster.shrink_to_fit();
         self.scratch.clear();
         self.scratch.shrink_to_fit();
+        self.upscale_scratch.clear();
         self.recycled.clear();
         mem::set_gauge(Gauge::Background, 0);
     }
@@ -781,6 +940,16 @@ impl MeshGradientRenderer {
     #[doc(hidden)]
     pub fn debug_size(&self) -> (usize, usize) {
         (self.out_w, self.out_h)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_upscale(&self) -> f32 {
+        self.upscale
+    }
+
+    #[doc(hidden)]
+    pub fn debug_raster_size(&self) -> (usize, usize) {
+        (self.raster_w, self.raster_h)
     }
 
     /// 取出当前缓存的背景帧（切换渲染器时由调用方从图集释放）。
@@ -946,7 +1115,6 @@ impl LyricBackgroundRenderer {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests;

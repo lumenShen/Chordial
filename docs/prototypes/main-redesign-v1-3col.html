@@ -1,0 +1,1265 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chordial · 主界面重构原型</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #e7e7ea;
+    --sidebar: #efeff2;
+    --surface: #ffffff;
+    --surface-alt: #f4f4f6;
+    --elevated: #ffffff;
+    --hover: rgba(10, 10, 16, .045);
+    --active: #dcdce1;
+    --border: rgba(10, 10, 16, .08);
+    --border-strong: rgba(10, 10, 16, .14);
+    --text: #1d1d1f;
+    --dim: #5e5e66;
+    --faint: #8a8a90;
+    --accent: #1d1d1f;
+    --accent-hover: #000000;
+    --on-accent: #ffffff;
+    --playing: #0a84ff;
+    --ok: #248a3d;
+    --danger: #c0443a;
+    --selection: #e5e5ea;
+    --glass: rgba(255, 255, 255, .92);
+    --glass-border: rgba(10, 10, 16, .1);
+    --shadow: rgba(11, 11, 18, .16);
+    --shadow-strong: rgba(11, 11, 18, .26);
+    --cover-shadow: 0 16px 34px rgba(60, 30, 50, .22);
+    --vip-bg: rgba(160, 100, 10, .12);
+    --vip-fg: #8a5a10;
+    --scroll: rgba(10, 10, 16, .16);
+    --scroll-hover: rgba(10, 10, 16, .28);
+  }
+
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0e0e11;
+    --sidebar: #161619;
+    --surface: #1a1a1e;
+    --surface-alt: #212127;
+    --elevated: #28282e;
+    --hover: rgba(255, 255, 255, .06);
+    --active: #2c2c32;
+    --border: rgba(255, 255, 255, .08);
+    --border-strong: rgba(255, 255, 255, .18);
+    --text: #ededf2;
+    --dim: #a2a2ad;
+    --faint: #767680;
+    --accent: #ededf2;
+    --accent-hover: #ffffff;
+    --on-accent: #141418;
+    --playing: #0a84ff;
+    --ok: #30d158;
+    --danger: #ff6961;
+    --selection: #26262c;
+    --glass: rgba(29, 29, 34, .94);
+    --glass-border: rgba(255, 255, 255, .14);
+    --shadow: rgba(0, 0, 0, .42);
+    --shadow-strong: rgba(0, 0, 0, .6);
+    --cover-shadow: 0 18px 40px rgba(0, 0, 0, .5);
+    --vip-bg: rgba(210, 172, 114, .16);
+    --vip-fg: #d2ac72;
+    --scroll: rgba(255, 255, 255, .18);
+    --scroll-hover: rgba(255, 255, 255, .32);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 700px at 50% -10%, rgba(255, 255, 255, .55), transparent 70%),
+      #d7d7dc;
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei UI", "Segoe UI", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    color: #1d1d1f;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  [data-theme="dark"] body {
+    background: radial-gradient(1200px 700px at 50% -10%, rgba(80, 80, 100, .25), transparent 70%), #0a0a0c;
+    color: #ededf2;
+  }
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+  input { font: inherit; }
+  ::selection { background: rgba(10, 132, 255, .18); }
+
+  /* ---------- prototype chrome ---------- */
+  .proto-bar {
+    width: 100%;
+    max-width: 1916px;
+    height: 52px;
+    padding: 0 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    color: #e9e9ee;
+    background: #1d1d1f;
+    flex: none;
+  }
+  .proto-brand { display: flex; align-items: center; gap: 9px; font-size: 12.5px; font-weight: 600; letter-spacing: .01em; }
+  .proto-brand .pdot { width: 7px; height: 7px; border-radius: 50%; background: #0a84ff; box-shadow: 0 0 0 4px rgba(10, 132, 255, .18); }
+  .proto-hint { font-size: 11px; color: rgba(255, 255, 255, .46); }
+  .proto-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .proto-btn {
+    height: 28px; padding: 0 10px; border-radius: 7px;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; color: rgba(255, 255, 255, .72);
+    border: 1px solid rgba(255, 255, 255, .12);
+  }
+  .proto-btn:hover { background: rgba(255, 255, 255, .08); color: #fff; }
+  .proto-btn.on { background: rgba(255, 255, 255, .14); color: #fff; }
+  .proto-btn .i { width: 13px; height: 13px; }
+
+  #viewport { transform-origin: top center; margin: 16px auto; }
+  .stage { width: 1916px; height: 1040px; transform-origin: top left; }
+
+  /* ---------- window ---------- */
+  .window {
+    width: 100%; height: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    box-shadow: 0 34px 90px rgba(0, 0, 0, .32), 0 2px 0 rgba(255, 255, 255, .35) inset;
+    color: var(--text);
+  }
+
+  .titlebar {
+    height: 40px; flex: none;
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 14px;
+    background: var(--sidebar);
+    border-bottom: 1px solid var(--border);
+    position: relative;
+    z-index: 30;
+  }
+  .traffic { display: flex; gap: 8px; align-items: center; }
+  .traffic span { width: 12px; height: 12px; border-radius: 50%; display: block; }
+  .traffic .r { background: #ff5f57; }
+  .traffic .y { background: #febc2e; }
+  .traffic .g { background: #28c840; }
+  .brand {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    display: flex; align-items: center; gap: 7px;
+    font-size: 12.5px; font-weight: 600; color: var(--dim);
+    pointer-events: none;
+  }
+  .brand .i { width: 13px; height: 13px; color: var(--text); }
+  .tb-right { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+  .tb-btn { width: 27px; height: 27px; border-radius: 7px; display: grid; place-items: center; color: var(--dim); }
+  .tb-btn:hover { background: var(--hover); color: var(--text); }
+  .tb-btn .i { width: 15px; height: 15px; }
+
+  .app { flex: 1; min-height: 0; display: flex; position: relative; }
+
+  .i { width: 16px; height: 16px; display: block; flex: none; }
+
+  /* ---------- sidebar ---------- */
+  .sidebar {
+    width: 232px; flex: none;
+    background: var(--sidebar);
+    border-right: 1px solid var(--border);
+    min-height: 0;
+    display: flex; flex-direction: column;
+    position: relative;
+  }
+  .side-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 12px 10px 18px; }
+  .side-scroll::-webkit-scrollbar { width: 10px; }
+  .side-scroll::-webkit-scrollbar-thumb { background: transparent; border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
+  .side-scroll:hover::-webkit-scrollbar-thumb { background: var(--scroll); background-clip: content-box; }
+
+  .section { margin: 0 0 14px; }
+  .section:last-child { margin-bottom: 0; }
+  .sec-label {
+    height: 26px;
+    display: flex; align-items: flex-end;
+    padding: 0 9px 7px;
+    font-size: 10.5px; font-weight: 600; letter-spacing: .02em;
+    color: var(--faint);
+  }
+  .sec-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 9px 6px;
+    min-height: 27px;
+  }
+  .sec-head .sec-label { height: auto; padding: 0; align-items: center; }
+  .sec-meta {
+    font-size: 9.5px; color: var(--faint);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .sec-meta .ok { color: var(--ok); }
+
+  .nav-row {
+    height: 32px;
+    display: flex; align-items: center; gap: 9px;
+    padding: 0 9px;
+    border-radius: 7px;
+    font-size: 12.5px;
+    color: var(--text);
+    cursor: pointer;
+    user-select: none;
+    position: relative;
+  }
+  .nav-row:hover { background: var(--hover); }
+  .nav-row.active { background: var(--active); font-weight: 500; }
+  .nav-row .i { color: var(--dim); }
+  .nav-row.active .i { color: var(--text); }
+  .nav-row .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nav-row .count {
+    font-size: 10px; font-weight: 400; color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .nav-row .trail { width: 12px; height: 12px; color: var(--faint); }
+  .nav-row.route { color: var(--dim); }
+  .nav-row.route:hover { color: var(--text); }
+  .nav-row.route .label { font-size: 12px; }
+
+  .source {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 9px;
+    border-radius: 9px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .source:hover { background: var(--hover); }
+  .source .tile {
+    width: 30px; height: 30px; flex: none;
+    border-radius: 8px;
+    display: grid; place-items: center;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--dim);
+    position: relative;
+  }
+  [data-theme="dark"] .source .tile { background: var(--surface-alt); }
+  .source .tile .i { width: 15px; height: 15px; }
+  .source .s-meta { flex: 1; min-width: 0; }
+  .source .s-name {
+    font-size: 12px; font-weight: 500; line-height: 1.2;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .source .s-status {
+    margin-top: 2px;
+    display: flex; align-items: center; gap: 5px;
+    font-size: 9.5px; color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .s-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--ok); flex: none; }
+  .source.off .s-name { color: var(--faint); }
+  .source.off .s-dot { background: var(--faint); }
+  .source.off .tile { opacity: .6; }
+
+  .switch {
+    width: 30px; height: 17px; flex: none;
+    border-radius: 9px;
+    background: var(--active);
+    border: 1px solid var(--border-strong);
+    position: relative;
+    transition: background .14s ease, border-color .14s ease;
+  }
+  .switch::after {
+    content: "";
+    position: absolute; top: 1px; left: 1px;
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    background: var(--surface);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, .22);
+    transition: transform .14s ease;
+  }
+  .switch.on { background: var(--accent); border-color: var(--accent); }
+  .switch.on::after { transform: translateX(13px); background: var(--on-accent); }
+  .switch:hover { border-color: var(--dim); }
+
+  .account {
+    margin: 4px 0 16px;
+    padding: 8px;
+    border-radius: 10px;
+    display: flex; align-items: center; gap: 9px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    cursor: default;
+  }
+  .avatar {
+    width: 30px; height: 30px; flex: none;
+    border-radius: 8px;
+    display: grid; place-items: center;
+    color: #fff; font-size: 12px; font-weight: 600;
+    background: linear-gradient(145deg, #8c6dff 0%, #5a7cff 55%, #43b8e8 100%);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .18);
+  }
+  .a-meta { flex: 1; min-width: 0; }
+  .a-name {
+    display: flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .vip {
+    font-size: 8.5px; font-weight: 600; letter-spacing: .04em;
+    padding: 1px 4px; border-radius: 3px;
+    color: var(--vip-fg); background: var(--vip-bg);
+  }
+  .a-sub { margin-top: 2px; font-size: 9.5px; color: var(--faint); }
+  .logout {
+    width: 24px; height: 24px; flex: none;
+    border-radius: 6px; display: grid; place-items: center;
+    color: var(--faint); opacity: .45;
+    transition: opacity .12s, background .12s, color .12s;
+  }
+  .account:hover .logout { opacity: 1; }
+  .logout:hover { background: var(--hover); color: var(--danger); }
+  .logout .i { width: 13px; height: 13px; }
+
+  .playlist {
+    height: 30px;
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 9px;
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--text);
+    cursor: pointer;
+    user-select: none;
+  }
+  .playlist:hover { background: var(--hover); }
+  .playlist.active { background: var(--active); }
+  .playlist .i { width: 13px; height: 13px; color: var(--faint); }
+  .playlist .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .playlist .count {
+    font-size: 9.5px; color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .playlist.liked .i { color: var(--text); }
+  .playlist.liked .label { font-weight: 500; }
+
+  /* ---------- content ---------- */
+  .content { flex: 1; min-width: 0; display: flex; position: relative; }
+
+  .library {
+    width: 352px; flex: none;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+
+  .lib-head {
+    padding: 19px 16px 12px;
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
+  }
+  .eyebrow {
+    font-size: 9.5px; font-weight: 600; letter-spacing: .09em;
+    color: var(--faint);
+    text-transform: uppercase;
+  }
+  .lib-head h1 {
+    margin: 5px 0 3px;
+    font-size: 23px; font-weight: 600; line-height: 1.1;
+    letter-spacing: -.015em;
+  }
+  .lib-sub {
+    font-size: 10.5px; color: var(--faint);
+    display: flex; align-items: center; gap: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .lib-sub .sep { width: 2px; height: 2px; border-radius: 50%; background: var(--faint); }
+  .lib-actions { display: flex; align-items: center; gap: 6px; padding-top: 15px; flex: none; }
+
+  .btn {
+    height: 29px; border-radius: 7px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 0 10px;
+    font-size: 11px; font-weight: 500;
+    border: 1px solid transparent;
+    white-space: nowrap;
+    user-select: none;
+  }
+  .btn .i { width: 12px; height: 12px; }
+  .btn.primary { background: var(--accent); color: var(--on-accent); }
+  .btn.primary:hover { background: var(--accent-hover); }
+  .btn.ghost { border-color: var(--border); color: var(--dim); background: transparent; }
+  .btn.ghost:hover { background: var(--surface-alt); color: var(--text); }
+  .btn.icon { width: 29px; padding: 0; border-color: var(--border); color: var(--dim); }
+  .btn.icon:hover { background: var(--surface-alt); color: var(--text); }
+
+  .search-wrap { padding: 0 16px 11px; }
+  .search {
+    height: 35px;
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 10px;
+    border-radius: 8px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    color: var(--faint);
+    transition: border-color .12s, box-shadow .12s, background .12s;
+  }
+  .search:hover { border-color: var(--border-strong); }
+  .search:focus-within {
+    background: var(--surface);
+    border-color: rgba(10, 132, 255, .42);
+    box-shadow: 0 0 0 3px rgba(10, 132, 255, .12);
+  }
+  .search .i { width: 14px; height: 14px; color: var(--faint); }
+  .search input {
+    flex: 1; min-width: 0;
+    border: 0; outline: 0; background: transparent;
+    font-size: 11.5px; color: var(--text);
+  }
+  .search input::placeholder { color: var(--faint); }
+  .search kbd {
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-size: 9px; line-height: 1;
+    padding: 3px 5px;
+    border-radius: 4px;
+    color: var(--faint);
+    background: var(--surface);
+    border: 1px solid var(--border);
+  }
+
+  .table-head {
+    height: 25px; flex: none;
+    display: grid;
+    grid-template-columns: 22px 38px minmax(0, 1fr) 40px 24px;
+    align-items: center;
+    gap: 10px;
+    padding: 0 16px;
+    font-size: 9.5px; font-weight: 500;
+    color: var(--faint);
+    border-bottom: 1px solid var(--border);
+  }
+  .table-head .right { text-align: right; }
+  .tracks { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 8px 92px; }
+  .tracks::-webkit-scrollbar { width: 10px; }
+  .tracks::-webkit-scrollbar-thumb { background: transparent; border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
+  .tracks:hover::-webkit-scrollbar-thumb { background: var(--scroll); background-clip: content-box; }
+
+  .track {
+    height: 52px;
+    display: grid;
+    grid-template-columns: 22px 38px minmax(0, 1fr) 40px 24px;
+    align-items: center;
+    gap: 10px;
+    padding: 0 8px;
+    border-radius: 7px;
+    cursor: default;
+    user-select: none;
+    position: relative;
+  }
+  .track:hover { background: var(--hover); }
+  .track.current { background: var(--selection); }
+  .idx {
+    font-size: 10px; color: var(--faint);
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    position: relative;
+  }
+  .idx .play-hint { display: none; color: var(--text); }
+  .track:hover .idx .num { display: none; }
+  .track:hover .idx .play-hint { display: block; margin: 0 auto; }
+  .idx .i { width: 11px; height: 11px; }
+  .eq { display: flex; align-items: flex-end; justify-content: center; gap: 2px; height: 11px; }
+  .eq span { width: 2px; border-radius: 1px; background: var(--playing); display: block; }
+  .eq span:nth-child(1) { height: 5px; }
+  .eq span:nth-child(2) { height: 10px; }
+  .eq span:nth-child(3) { height: 7px; }
+
+  .thumb {
+    width: 36px; height: 36px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface-alt);
+    position: relative;
+    overflow: hidden;
+  }
+  .thumb-land {
+    background:
+      radial-gradient(circle at 32% 28%, #ffe0a8 0 17%, transparent 18%),
+      linear-gradient(145deg, #ffc46b 0%, #e88a33 52%, #a94d20 100%);
+  }
+  .thumb-land::after {
+    content: "";
+    position: absolute; left: 50%; top: 50%;
+    width: 13px; height: 13px; margin: -6.5px 0 0 -6.5px;
+    border-radius: 50%;
+    background: rgba(255, 246, 232, .92);
+    box-shadow: 0 3px 8px rgba(90, 40, 10, .25);
+  }
+  .t-meta { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .t-title {
+    font-size: 12.5px; font-weight: 500; line-height: 1.15;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .track.current .t-title { font-weight: 600; }
+  .t-sub {
+    font-size: 10.5px; line-height: 1.15; color: var(--faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .dur {
+    font-size: 10.5px; color: var(--faint);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .more {
+    width: 24px; height: 24px;
+    border-radius: 5px;
+    display: grid; place-items: center;
+    color: var(--faint);
+    opacity: 0;
+    transition: opacity .1s, background .1s, color .1s;
+  }
+  .track:hover .more { opacity: .62; }
+  .more:hover { opacity: 1 !important; background: var(--surface-alt); color: var(--text); }
+  .more .i { width: 13px; height: 13px; }
+
+  .list-empty {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 8px; padding: 54px 24px;
+    text-align: center;
+  }
+  .list-empty .badge {
+    width: 38px; height: 38px; border-radius: 11px;
+    display: grid; place-items: center;
+    background: var(--surface-alt); border: 1px solid var(--border);
+    color: var(--faint); margin-bottom: 2px;
+  }
+  .list-empty .badge .i { width: 18px; height: 18px; }
+  .list-empty .h { font-size: 12.5px; font-weight: 500; }
+  .list-empty .p { max-width: 210px; font-size: 10.5px; line-height: 1.6; color: var(--faint); }
+
+  /* ---------- now playing ---------- */
+  .now {
+    flex: 1; min-width: 0;
+    background: var(--surface);
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+  .now-head { height: 55px; flex: none; padding: 0 26px; display: flex; align-items: center; }
+  .now-head-inner {
+    width: 100%; max-width: 760px; margin: 0 auto;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px;
+  }
+  .now-title { font-size: 12.5px; font-weight: 600; letter-spacing: .01em; }
+  .now-state {
+    display: flex; align-items: center; gap: 9px;
+    font-size: 10px; color: var(--faint);
+    user-select: none;
+  }
+  .now-state .i { width: 11px; height: 11px; }
+  .now-state .eq { height: 10px; }
+  .now-state .eq span { background: var(--playing); }
+  .now-state.paused .eq span { background: var(--faint); }
+
+  .now-scroll {
+    flex: 1; min-height: 0;
+    overflow-y: auto;
+    padding: 18px 26px 116px;
+  }
+  .now-scroll::-webkit-scrollbar { width: 10px; }
+  .now-scroll::-webkit-scrollbar-thumb { background: transparent; border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
+  .now-scroll:hover::-webkit-scrollbar-thumb { background: var(--scroll); background-clip: content-box; }
+  .now-inner { width: 100%; max-width: 760px; margin: 0 auto; }
+
+  .hero { display: flex; align-items: center; gap: 30px; }
+
+  .cover-frame {
+    width: 246px; height: 246px; flex: none;
+    border-radius: 13px;
+    box-shadow: var(--cover-shadow);
+    position: relative;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .cover-frame:active { transform: scale(.995); }
+  .cover-art {
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(110% 80% at 14% 6%, #fdf0f2 0%, transparent 52%),
+      linear-gradient(152deg, #f7cbd6 0%, #ed9fba 44%, #cd6f95 100%);
+  }
+  .cover-art .halo {
+    position: absolute; width: 80%; aspect-ratio: 1;
+    left: -18%; top: -24%;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255, 244, 238, .8), rgba(255, 244, 238, 0) 68%);
+  }
+  .cover-art .scoop {
+    position: absolute;
+    left: 31%; top: 19%;
+    width: 39%; aspect-ratio: 1;
+    border-radius: 50%;
+    background:
+      radial-gradient(circle at 38% 30%, #fffaf0 0 9%, rgba(255, 250, 240, 0) 10%),
+      radial-gradient(circle at 40% 34%, #f5ddbd 0 22%, #eccba5 58%, #ddb389 100%);
+    box-shadow: inset 0 -10px 20px rgba(140, 80, 80, .12), 0 14px 24px rgba(110, 45, 65, .24);
+  }
+  .cover-art .scoop::after {
+    content: "";
+    position: absolute; left: 18%; top: 8%;
+    width: 44%; height: 28%;
+    border-radius: 50%;
+    background: linear-gradient(180deg, rgba(189, 223, 168, .95), rgba(150, 196, 124, .55));
+    filter: blur(1px);
+    transform: rotate(-12deg);
+  }
+  .cover-art .cone {
+    position: absolute; left: 40%; top: 45%;
+    width: 22%; height: 42%;
+    clip-path: polygon(0 0, 100% 0, 50% 100%);
+    background: repeating-linear-gradient(58deg, #dca473 0 5px, #c88d5d 5px 10px);
+    filter: drop-shadow(0 12px 14px rgba(100, 40, 60, .28));
+  }
+  .cover-art .art-word {
+    position: absolute; left: 8%; bottom: 9%;
+    display: flex; flex-direction: column; gap: 2px;
+    color: rgba(255, 255, 255, .96);
+    font-size: 22px; font-weight: 700; letter-spacing: .11em;
+    line-height: 1;
+    text-shadow: 0 1px 10px rgba(120, 50, 75, .22);
+  }
+  .cover-art .art-word small {
+    font-size: 7.5px; font-weight: 500; letter-spacing: .28em;
+    color: rgba(255, 255, 255, .6);
+  }
+  .cover-art .grain {
+    position: absolute; inset: 0;
+    opacity: .28;
+    background-image: radial-gradient(rgba(255, 255, 255, .55) .5px, transparent .6px);
+    background-size: 3px 3px;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+  }
+
+  .hero-info { flex: 1; min-width: 0; padding: 4px 0; }
+  .source-line {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 9.5px; font-weight: 600; letter-spacing: .07em;
+    color: var(--faint);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .source-line .i { width: 12px; height: 12px; color: var(--dim); }
+  .source-line .dot { width: 2px; height: 2px; border-radius: 50%; background: var(--faint); }
+  .quality {
+    padding: 2px 5px;
+    border-radius: 3px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    color: var(--dim);
+    font-size: 8.5px; font-weight: 500; letter-spacing: .03em;
+  }
+
+  .hero-info h2 {
+    margin: 0 0 6px;
+    font-size: 29px; font-weight: 600; line-height: 1.14;
+    letter-spacing: -.025em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .artist-line {
+    font-size: 14.5px; color: var(--dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .album-line {
+    margin-top: 8px;
+    display: flex; align-items: center; gap: 6px;
+    font-size: 10.5px; color: var(--faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .album-line .i { width: 12px; height: 12px; }
+  .album-line .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .album-line .dot { width: 2px; height: 2px; border-radius: 50%; background: var(--faint); flex: none; }
+
+  .hero-actions {
+    display: flex; align-items: center; gap: 6px;
+    margin-top: 18px;
+    flex-wrap: wrap;
+  }
+  .chip {
+    height: 27px;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 0 9px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    color: var(--dim);
+    font-size: 10.5px;
+    user-select: none;
+  }
+  .chip:hover { background: var(--surface-alt); color: var(--text); }
+  .chip .i { width: 12px; height: 12px; color: var(--faint); }
+  .chip .i.trail { width: 10px; height: 10px; margin-left: 1px; }
+  .chip.icon { width: 27px; padding: 0; justify-content: center; }
+
+  .lyrics { margin-top: 30px; padding-top: 18px; border-top: 1px solid var(--border); }
+  .lyrics-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 12px;
+  }
+  .lyrics-title { font-size: 10.5px; font-weight: 600; letter-spacing: .08em; color: var(--faint); }
+  .lyrics-meta { margin-left: 8px; font-weight: 400; letter-spacing: 0; color: var(--faint); }
+  .lyrics-tools { display: flex; align-items: center; gap: 8px; }
+  .lyrics-tools .chip { height: 25px; font-size: 10px; }
+
+  .lyric-line {
+    padding: 5px 0 6px;
+    border-radius: 6px;
+  }
+  .lyric-line .main {
+    font-size: 12.5px; line-height: 1.4; color: var(--dim);
+    opacity: .68;
+    transition: color .12s ease, opacity .12s ease;
+  }
+  .lyric-line .trans {
+    margin-top: 2px;
+    font-size: 10px; line-height: 1.4; color: var(--faint);
+    opacity: .92;
+  }
+  .lyric-line.active { padding: 8px 0 9px; }
+  .lyric-line.active .main {
+    font-size: 16px; font-weight: 600; letter-spacing: -.01em;
+    color: var(--text); opacity: 1;
+  }
+  .lyric-line.active .trans {
+    font-size: 11px; color: var(--dim); opacity: 1;
+  }
+
+  .now-empty {
+    flex: 1; min-height: 0;
+    max-width: 380px; margin: 0 auto; padding-bottom: 70px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center;
+    gap: 10px;
+  }
+  .now-empty[hidden] { display: none; }
+  .now-empty .badge {
+    width: 54px; height: 54px; border-radius: 16px;
+    display: grid; place-items: center;
+    background: var(--surface-alt); border: 1px solid var(--border);
+    color: var(--faint);
+  }
+  .now-empty .badge .i { width: 24px; height: 24px; }
+  .now-empty h3 { margin: 4px 0 0; font-size: 15px; font-weight: 600; }
+  .now-empty p { margin: 0; font-size: 11px; line-height: 1.65; color: var(--faint); }
+
+  /* ---------- dock (unchanged) ---------- */
+  .dock {
+    position: absolute; left: 50%; bottom: 14px;
+    transform: translateX(-50%);
+    width: min(840px, calc(100% - 32px));
+    height: 72px;
+    border-radius: 18px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    box-shadow: 0 18px 46px var(--shadow), 0 0 0 1px rgba(255, 255, 255, .05) inset;
+    display: flex; align-items: center; gap: 14px;
+    padding: 0 14px;
+    z-index: 20;
+  }
+  .dock-track { display: flex; align-items: center; gap: 10px; width: 172px; flex: none; cursor: pointer; }
+  .mini-art {
+    width: 44px; height: 44px; flex: none;
+    border-radius: 8px; overflow: hidden; position: relative;
+    background: linear-gradient(150deg, #f7cbd6, #d97b9f 60%, #a94e73);
+    border: 1px solid var(--border);
+  }
+  .mini-art::after {
+    content: "";
+    position: absolute; left: 50%; top: 46%;
+    width: 16px; height: 16px; margin: -8px 0 0 -8px;
+    border-radius: 50%;
+    background: #f5e2c5;
+    box-shadow: 0 3px 7px rgba(90, 40, 60, .3);
+  }
+  .dock-meta { min-width: 0; }
+  .dock-title { font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dock-artist { margin-top: 2px; font-size: 10px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dock-center { display: flex; align-items: center; gap: 8px; flex: none; }
+  .media-btn {
+    width: 28px; height: 28px; border-radius: 50%;
+    display: grid; place-items: center; color: var(--text);
+  }
+  .media-btn:hover { background: var(--hover); }
+  .media-btn .i { width: 14px; height: 14px; }
+  .play-btn {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: var(--accent); color: var(--on-accent);
+    display: grid; place-items: center;
+  }
+  .play-btn:hover { background: var(--accent-hover); }
+  .play-btn .i { width: 15px; height: 15px; }
+  .seek { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 90px; }
+  .time {
+    font-size: 9.5px; color: var(--faint);
+    font-variant-numeric: tabular-nums; flex: none;
+  }
+  .bar { height: 16px; flex: 1; display: flex; align-items: center; position: relative; cursor: pointer; }
+  .bar .rail { width: 100%; height: 2px; border-radius: 1px; background: var(--border-strong); overflow: hidden; }
+  .bar .fill { height: 100%; width: 47%; background: var(--accent); border-radius: 1px; }
+  .dock-tail { display: flex; align-items: center; gap: 10px; flex: none; }
+  .vol { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  .vol .i { width: 14px; height: 14px; }
+  .vol .bar { width: 62px; flex: none; }
+  .vol .rail { height: 2px; }
+  .vol .fill { width: 64%; background: var(--dim); }
+  .dock-sep { width: 1px; height: 20px; background: var(--border); }
+  .quality-btn { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--dim); }
+  .quality-btn:hover { color: var(--text); }
+  .quality-btn .i { width: 12px; height: 12px; }
+  .dock.empty .mini-art { background: var(--surface-alt); }
+  .dock.empty .mini-art::after { background: var(--border-strong); box-shadow: none; }
+  .dock.empty .dock-title { color: var(--faint); font-weight: 500; }
+  .dock.empty .dock-artist { visibility: hidden; }
+  .dock.empty .play-btn { opacity: .4; pointer-events: none; }
+  .dock.empty .seek .fill, .dock.empty .vol .fill { background: var(--border-strong); }
+
+  /* ---------- annotations ---------- */
+  body.annotate .sidebar { outline: 2px solid #2f6bff; outline-offset: -2px; }
+  body.annotate .content { outline: 2px solid #ff3b30; outline-offset: -2px; }
+  body.annotate .sidebar::after,
+  body.annotate .content::after {
+    position: absolute; z-index: 40;
+    padding: 3px 7px; border-radius: 5px;
+    font-size: 9.5px; font-weight: 600; color: #fff;
+    letter-spacing: .04em;
+    pointer-events: none;
+  }
+  body.annotate .sidebar::after { content: "① 侧栏 · 音源与账号"; left: 8px; bottom: 8px; background: #2f6bff; }
+  body.annotate .content::after { content: "② 内容区 · 曲库 + 正在播放"; left: 12px; bottom: 8px; background: #ff3b30; }
+
+  @media (max-width: 900px) {
+    .proto-hint { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-note" viewBox="0 0 16 16"><path d="M6.2 12.2V4.1l6.6-1.8v8.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="4.6" cy="12.4" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="11.2" cy="10.7" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+    <symbol id="i-queue" viewBox="0 0 16 16"><path d="M3 4.2h7M3 8h7M3 11.8h4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M11.3 9.3v4.2l3-2.1z" fill="currentColor"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7.2" cy="7.2" r="4.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 10.5l3 3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-drive" viewBox="0 0 16 16"><rect x="2.2" y="4" width="11.6" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M4.2 9.4h7.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="11.6" cy="6.8" r=".7" fill="currentColor"/></symbol>
+    <symbol id="i-cloud" viewBox="0 0 16 16"><path d="M4.3 12.3h7.4a2.6 2.6 0 0 0 .4-5.2 4 4 0 0 0-7.6-1.2 3.2 3.2 0 0 0-.2 6.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+    <symbol id="i-playlist" viewBox="0 0 16 16"><path d="M2.8 4.3h5.4M2.8 7.9h5.4M2.8 11.5h3.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M11.2 11.2V4.6l2.3-.8v6.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="10" cy="11.6" r="1.25" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-play" viewBox="0 0 16 16"><path d="M5.2 3.4v9.2L12.6 8z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 16 16"><rect x="4.4" y="3.4" width="2.4" height="9.2" rx=".8" fill="currentColor"/><rect x="9.2" y="3.4" width="2.4" height="9.2" rx=".8" fill="currentColor"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 16 16"><path d="M4.2 3.8v8.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M12.2 3.9v8.2L5.6 8z" fill="currentColor"/></symbol>
+    <symbol id="i-next" viewBox="0 0 16 16"><path d="M11.8 3.8v8.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M3.8 3.9v8.2L10.4 8z" fill="currentColor"/></symbol>
+    <symbol id="i-shuffle" viewBox="0 0 16 16"><path d="M2.6 4.7h2.3c1.2 0 1.9.7 2.6 1.7l1.4 2.2c.7 1 1.4 1.7 2.6 1.7h2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M2.6 11.3h2.3c1.2 0 1.9-.7 2.6-1.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M10.6 8.3c.7-1 1.4-1.7 2.6-1.7h.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M12.6 4.9l1.6 1.6-1.6 1.6M12.6 9.4l1.6 1.6-1.6 1.6" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 16 16"><path d="M6 3.8L10.2 8 6 12.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 16 16"><path d="M3.8 6L8 10.2 12.2 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-more" viewBox="0 0 16 16"><circle cx="3.4" cy="8" r="1.15" fill="currentColor"/><circle cx="8" cy="8" r="1.15" fill="currentColor"/><circle cx="12.6" cy="8" r="1.15" fill="currentColor"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.1" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 2.1v1.5M8 12.4v1.5M2.1 8h1.5M12.4 8h1.5M3.8 3.8l1.1 1.1M11.1 11.1l1.1 1.1M12.2 3.8l-1.1 1.1M4.9 11.1l-1.1 1.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 16 16"><path d="M6.2 3.4H4.1a1 1 0 0 0-1 1v7.2a1 1 0 0 0 1 1h2.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M9.4 5.2L12.3 8l-2.9 2.8M12.1 8H6.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 16 16"><path d="M6 2.8H2.8V6M10 2.8h3.2V6M6 13.2H2.8V10M10 13.2h3.2V10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 16 16"><path d="M8 2.4l5.4 2.8L8 8 2.6 5.2z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M2.6 8.1L8 10.9l5.4-2.8M2.6 10.9L8 13.7l5.4-2.8" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/></symbol>
+    <symbol id="i-person" viewBox="0 0 16 16"><circle cx="8" cy="5.4" r="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.2 13.2c.5-2.4 2.3-3.7 4.8-3.7s4.3 1.3 4.8 3.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.4v9.2M3.4 8h9.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-volume" viewBox="0 0 16 16"><path d="M2.8 6.2h2l3-2.4v8.4l-3-2.4h-2z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/><path d="M10.4 5.8a3 3 0 0 1 0 4.4M12.4 4.2a5.4 5.4 0 0 1 0 7.6" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/></symbol>
+    <symbol id="i-download" viewBox="0 0 16 16"><path d="M8 2.8v6.4M5.6 6.9L8 9.3l2.4-2.4M3.2 11.2v1.4a1 1 0 0 0 1 1h7.6a1 1 0 0 0 1-1v-1.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 1.9v1.4M8 12.7v1.4M1.9 8h1.4M12.7 8h1.4M3.7 3.7l1 1M11.3 11.3l1 1M12.3 3.7l-1 1M4.7 11.3l-1 1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13 9.8A5.4 5.4 0 0 1 6.2 3a5.6 5.6 0 1 0 6.8 6.8z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+    <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.4 8.4l2.9 2.9 6.3-6.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M13 2.8v3.4H9.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 16 16"><rect x="6.1" y="2.4" width="3.8" height="6.6" rx="1.9" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M4.2 7.4a3.8 3.8 0 0 0 7.6 0M8 11.2v2.2M5.9 13.4h4.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+  </defs>
+</svg>
+
+<header class="proto-bar" id="protoBar">
+  <div class="proto-brand"><span class="pdot"></span>Chordial · 三栏主界面重构</div>
+  <div class="proto-hint">蓝框 = 侧栏音源区 · 红框 = 曲库 + 正在播放 · 悬停行/开关可交互</div>
+  <div class="proto-actions">
+    <button class="proto-btn" id="emptyBtn"><svg class="i"><use href="#i-note"/></svg>空态预览</button>
+    <button class="proto-btn" id="annotBtn"><svg class="i"><use href="#i-layers"/></svg>区域标注</button>
+    <button class="proto-btn on" id="themeBtn"><svg class="i" id="themeIcon"><use href="#i-sun"/></svg><span id="themeLabel">浅色</span></button>
+  </div>
+</header>
+
+<div id="viewport">
+<div class="stage" id="stage">
+  <div class="window">
+    <div class="titlebar">
+      <div class="traffic"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+      <div class="brand"><svg class="i"><use href="#i-note"/></svg>Chordial</div>
+      <div class="tb-right">
+        <button class="tb-btn" title="切换主题" id="tbTheme"><svg class="i"><use href="#i-moon"/></svg></button>
+        <button class="tb-btn" title="设置"><svg class="i"><use href="#i-settings"/></svg></button>
+      </div>
+    </div>
+
+    <div class="app">
+      <!-- ① sidebar: sources / account / playlists -->
+      <aside class="sidebar">
+        <div class="side-scroll">
+          <div class="section">
+            <div class="sec-label">音乐</div>
+            <div class="nav-row active" data-nav>
+              <svg class="i"><use href="#i-note"/></svg><span class="label">所有音乐</span><span class="count">1</span>
+            </div>
+            <div class="nav-row" data-nav>
+              <svg class="i"><use href="#i-queue"/></svg><span class="label">播放队列</span><span class="count">1000</span>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="sec-head">
+              <span class="sec-label">音源</span>
+              <span class="sec-meta"><span class="ok">2</span> / 2 就绪</span>
+            </div>
+            <div class="nav-row route">
+              <svg class="i"><use href="#i-search"/></svg><span class="label">全部音源</span>
+              <svg class="i trail"><use href="#i-chevron-right"/></svg>
+            </div>
+
+            <div class="source" data-source>
+              <div class="tile"><svg class="i"><use href="#i-drive"/></svg></div>
+              <div class="s-meta">
+                <div class="s-name">本地音乐</div>
+                <div class="s-status"><span class="s-dot"></span><span class="s-status-text">已就绪 · 1 首</span></div>
+              </div>
+              <button class="switch on" role="switch" aria-checked="true" title="加载 / 卸载音源"></button>
+            </div>
+
+            <div class="source" data-source>
+              <div class="tile"><svg class="i"><use href="#i-cloud"/></svg></div>
+              <div class="s-meta">
+                <div class="s-name">网易云音乐</div>
+                <div class="s-status"><span class="s-dot"></span><span class="s-status-text">已就绪 · API 已连接</span></div>
+              </div>
+              <button class="switch on" role="switch" aria-checked="true" title="加载 / 卸载音源"></button>
+            </div>
+          </div>
+
+          <div class="account">
+            <div class="avatar">愚</div>
+            <div class="a-meta">
+              <div class="a-name">最愚 <span class="vip">VIP</span></div>
+              <div class="a-sub">网易云 · 已登录</div>
+            </div>
+            <button class="logout" title="退出登录"><svg class="i"><use href="#i-logout"/></svg></button>
+          </div>
+
+          <div class="section">
+            <div class="sec-head">
+              <span class="sec-label">我的歌单</span>
+              <span class="sec-meta">12 个</span>
+            </div>
+            <div class="playlist liked" data-playlist>
+              <svg class="i"><use href="#i-note"/></svg><span class="label">最愚喜欢的音乐</span><span class="count">2377</span>
+            </div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">爽，纯</span><span class="count">2</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">relax</span><span class="count">2</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">Tourist History</span><span class="count">10</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">2026 2 7</span><span class="count">38</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">天琴座 无伴奏</span><span class="count">4</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">最愚的2024年度歌单</span><span class="count">10</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">爱情讯息</span><span class="count">92</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">夜间行驶</span><span class="count">24</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">CITY POP 1984</span><span class="count">31</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">雨天循环</span><span class="count">14</span></div>
+            <div class="playlist" data-playlist><svg class="i"><use href="#i-playlist"/></svg><span class="label">固定频率</span><span class="count">8</span></div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- ② content: library + now playing -->
+      <div class="content">
+        <section class="library">
+          <div class="lib-head">
+            <div>
+              <div class="eyebrow">本地音乐</div>
+              <h1>所有音乐</h1>
+              <div class="lib-sub"><span>1 首曲目</span></div>
+            </div>
+            <div class="lib-actions">
+              <button class="btn primary" id="playAll"><svg class="i"><use href="#i-play"/></svg>播放全部</button>
+              <button class="btn icon" title="随机播放全部"><svg class="i"><use href="#i-shuffle"/></svg></button>
+            </div>
+          </div>
+
+          <div class="search-wrap">
+            <label class="search">
+              <svg class="i"><use href="#i-search"/></svg>
+              <input placeholder="搜索歌曲、艺人或专辑" spellcheck="false">
+              <kbd>Ctrl K</kbd>
+            </label>
+          </div>
+
+          <div class="table-head">
+            <span></span><span></span><span>曲目</span><span class="right">时长</span><span></span>
+          </div>
+
+          <div class="tracks">
+            <div class="track" data-track>
+              <div class="idx"><span class="num">1</span><span class="play-hint"><svg class="i"><use href="#i-play"/></svg></span></div>
+              <div class="thumb thumb-land"></div>
+              <div class="t-meta">
+                <div class="t-title">Landslide</div>
+                <div class="t-sub">Vicetone &amp; Youngblood Hawke</div>
+              </div>
+              <div class="dur">2:30</div>
+              <button class="more" title="更多操作"><svg class="i"><use href="#i-more"/></svg></button>
+            </div>
+          </div>
+        </section>
+
+        <section class="now">
+          <div class="now-head">
+            <div class="now-head-inner">
+              <div class="now-title">正在播放</div>
+              <div style="display:flex;align-items:center;gap:12px">
+                <div class="now-state" id="nowState">
+                  <span class="eq"><span></span><span></span><span></span></span>
+                  <span id="nowStateText">正在播放</span>
+                </div>
+                <button class="btn ghost" id="immersiveBtn" style="height:27px;font-size:10px;color:var(--dim)" title="进入沉浸播放页">
+                  <svg class="i" style="width:12px;height:12px"><use href="#i-expand"/></svg>沉浸
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="now-scroll" id="nowScroll">
+            <div class="now-inner">
+              <div class="hero">
+                <div class="cover-frame" title="打开沉浸播放页">
+                  <div class="cover-art">
+                    <div class="halo"></div>
+                    <div class="scoop"></div>
+                    <div class="cone"></div>
+                    <div class="art-word">FÛGENE<small>02 · FUTURE SOUND</small></div>
+                    <div class="grain"></div>
+                  </div>
+                </div>
+                <div class="hero-info">
+                  <div class="source-line">
+                    <svg class="i"><use href="#i-cloud"/></svg>
+                    <span>网易云音乐</span>
+                    <span class="dot"></span>
+                    <span>5:03</span>
+                    <span class="quality">FLAC</span>
+                  </div>
+                  <h2>Hype (feat. Such)</h2>
+                  <div class="artist-line">Such / PSYQUI</div>
+                  <div class="album-line">
+                    <svg class="i"><use href="#i-layers"/></svg>
+                    <span class="name">FÛGENE 02</span>
+                  </div>
+                  <div class="hero-actions">
+                    <button class="chip"><svg class="i"><use href="#i-layers"/></svg>专辑<svg class="i trail"><use href="#i-chevron-right"/></svg></button>
+                    <button class="chip"><svg class="i"><use href="#i-mic"/></svg>歌手<svg class="i trail"><use href="#i-chevron-right"/></svg></button>
+                    <button class="chip icon" title="加入播放队列"><svg class="i"><use href="#i-plus"/></svg></button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="lyrics">
+                <div class="lyrics-head">
+                  <div class="lyrics-title">歌词<span class="lyrics-meta">日文 / 中文 · 8 行</span></div>
+                </div>
+
+                <div class="lyric-line"><div class="main">Time is over</div><div class="trans">时表终止</div></div>
+                <div class="lyric-line"><div class="main">I'm a dreamer</div><div class="trans">未曾放弃梦想</div></div>
+                <div class="lyric-line active"><div class="main">終わらない future sound を</div><div class="trans">永无止境的未来之音</div></div>
+                <div class="lyric-line"><div class="main">鳴り止まない このビート</div><div class="trans">这节奏不会停歇</div></div>
+                <div class="lyric-line"><div class="main">Music and the future</div><div class="trans">音乐与未来</div></div>
+                <div class="lyric-line"><div class="main">We can fly away</div><div class="trans">我们可以远走高飞</div></div>
+                <div class="lyric-line"><div class="main">輝く夜を越えて</div><div class="trans">跨越闪耀的夜晚</div></div>
+                <div class="lyric-line"><div class="main">Just keep on dreaming</div><div class="trans">继续做梦吧</div></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="now-empty" id="nowEmpty" hidden>
+            <div class="badge"><svg class="i"><use href="#i-note"/></svg></div>
+            <h3>还没有正在播放的曲目</h3>
+            <p>从左侧曲库选择一首，或播放全部本地音乐。<br>开始播放后，这里会显示封面、曲目信息与滚动歌词。</p>
+            <div style="display:flex;gap:6px;margin-top:6px">
+              <button class="btn primary" style="height:30px;font-size:11px" id="emptyPlay">
+                <svg class="i"><use href="#i-play"/></svg>播放全部
+              </button>
+              <button class="btn ghost" style="height:30px;font-size:11px;border-color:var(--border)">
+                <svg class="i"><use href="#i-search"/></svg>搜索音乐
+              </button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- unchanged dock, kept for composition -->
+      <div class="dock" id="dock">
+        <div class="dock-track">
+          <div class="mini-art"></div>
+          <div class="dock-meta">
+            <div class="dock-title" id="dockTitle">Hype (feat. Such)</div>
+            <div class="dock-artist" id="dockArtist">Such / PSYQUI</div>
+          </div>
+        </div>
+        <div class="dock-center">
+          <button class="media-btn" title="上一首"><svg class="i"><use href="#i-prev"/></svg></button>
+          <button class="play-btn" id="playBtn" title="暂停">
+            <svg class="i" id="playIcon"><use href="#i-pause"/></svg>
+          </button>
+          <button class="media-btn" title="下一首"><svg class="i"><use href="#i-next"/></svg></button>
+        </div>
+        <div class="seek">
+          <span class="time" id="seekCur">2:24</span>
+          <div class="bar"><div class="rail"><div class="fill" id="seekFill"></div></div></div>
+          <span class="time" id="seekTotal">5:03</span>
+        </div>
+        <div class="dock-tail">
+          <div class="vol"><svg class="i"><use href="#i-volume"/></svg><div class="bar"><div class="rail"><div class="fill"></div></div></div></div>
+          <div class="dock-sep"></div>
+          <button class="quality-btn">音质优先<svg class="i"><use href="#i-chevron-down"/></svg></button>
+          <button class="media-btn" title="下载"><svg class="i"><use href="#i-download"/></svg></button>
+          <button class="media-btn" title="播放队列"><svg class="i"><use href="#i-queue"/></svg></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<script>
+  const stage = document.getElementById('stage');
+  const viewport = document.getElementById('viewport');
+  const bar = document.getElementById('protoBar');
+  const params = new URLSearchParams(location.search);
+  if (params.get('clean') === '1') bar.style.display = 'none';
+
+  function fit() {
+    const barH = bar.offsetHeight || 0;
+    const availW = window.innerWidth - 32;
+    const availH = window.innerHeight - barH - 28;
+    const scale = Math.min(availW / 1916, availH / 1040, 1);
+    stage.style.transform = `scale(${scale})`;
+    viewport.style.width = (1916 * scale) + 'px';
+    viewport.style.height = (1040 * scale) + 'px';
+  }
+  fit();
+  window.addEventListener('resize', fit);
+
+  const root = document.documentElement;
+  const themeBtn = document.getElementById('themeBtn');
+  const themeLabel = document.getElementById('themeLabel');
+  const themeIcon = document.getElementById('themeIcon');
+  const themeIconUse = themeIcon.querySelector('use');
+  const tbTheme = document.getElementById('tbTheme');
+
+  function setTheme(mode) {
+    root.dataset.theme = mode;
+    const dark = mode === 'dark';
+    themeLabel.textContent = dark ? '深色' : '浅色';
+    themeIconUse.setAttribute('href', dark ? '#i-moon' : '#i-sun');
+    tbTheme.querySelector('use').setAttribute('href', dark ? '#i-sun' : '#i-moon');
+  }
+  function toggleTheme() {
+    setTheme(root.dataset.theme === 'dark' ? 'light' : 'dark');
+  }
+  themeBtn.addEventListener('click', toggleTheme);
+  tbTheme.addEventListener('click', toggleTheme);
+  setTheme(params.get('theme') === 'dark' ? 'dark' : 'light');
+
+  const annotBtn = document.getElementById('annotBtn');
+  if (params.get('annotate') === '1') {
+    document.body.classList.add('annotate');
+    annotBtn.classList.add('on');
+  }
+  annotBtn.addEventListener('click', (e) => {
+    document.body.classList.toggle('annotate');
+    e.currentTarget.classList.toggle('on');
+  });
+
+  document.querySelectorAll('.source').forEach((source) => {
+    const sw = source.querySelector('.switch');
+    const text = source.querySelector('.s-status-text');
+    const name = source.querySelector('.s-name').textContent;
+    sw.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const on = !sw.classList.contains('on');
+      sw.classList.toggle('on', on);
+      sw.setAttribute('aria-checked', String(on));
+      source.classList.toggle('off', !on);
+      if (name.includes('本地')) {
+        text.textContent = on ? '已就绪 · 1 首' : '已卸载 · 点击加载';
+      } else {
+        text.textContent = on ? '已就绪 · API 已连接' : '已卸载 · 点击加载';
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-nav]').forEach((row) => {
+    row.addEventListener('click', () => {
+      document.querySelectorAll('[data-nav]').forEach((r) => r.classList.remove('active'));
+      row.classList.add('active');
+    });
+  });
+
+  document.querySelectorAll('[data-playlist]').forEach((row) => {
+    row.addEventListener('click', () => {
+      document.querySelectorAll('[data-playlist]').forEach((r) => r.classList.remove('active'));
+      row.classList.add('active');
+    });
+  });
+
+  let playing = true;
+  const playBtn = document.getElementById('playBtn');
+  const playIcon = document.getElementById('playIcon').querySelector('use');
+  const nowState = document.getElementById('nowState');
+  const nowStateText = document.getElementById('nowStateText');
+  function setPlaying(next) {
+    playing = next;
+    playIcon.setAttribute('href', playing ? '#i-pause' : '#i-play');
+    playBtn.title = playing ? '暂停' : '播放';
+    nowState.classList.toggle('paused', !playing);
+    nowStateText.textContent = playing ? '正在播放' : '已暂停';
+  }
+  playBtn.addEventListener('click', () => setPlaying(!playing));
+
+  document.getElementById('playAll').addEventListener('click', () => {
+    setPlaying(true);
+    const tracks = document.querySelectorAll('[data-track]');
+    tracks.forEach((t) => t.classList.remove('current'));
+    if (tracks[0]) tracks[0].classList.add('current');
+  });
+
+  const nowScroll = document.getElementById('nowScroll');
+  const nowEmpty = document.getElementById('nowEmpty');
+  const emptyBtn = document.getElementById('emptyBtn');
+  const dock = document.getElementById('dock');
+  const dockTitle = document.getElementById('dockTitle');
+  const dockArtist = document.getElementById('dockArtist');
+  const immersiveBtn = document.getElementById('immersiveBtn');
+  function setEmpty(next) {
+    nowScroll.hidden = next;
+    nowEmpty.hidden = !next;
+    nowState.style.visibility = next ? 'hidden' : 'visible';
+    immersiveBtn.style.visibility = next ? 'hidden' : 'visible';
+    dock.classList.toggle('empty', next);
+    dockTitle.textContent = next ? '未在播放' : 'Hype (feat. Such)';
+    dockArtist.textContent = next ? '' : 'Such / PSYQUI';
+    document.getElementById('seekCur').textContent = next ? '0:00' : '2:24';
+    document.getElementById('seekTotal').textContent = next ? '0:00' : '5:03';
+    document.getElementById('seekFill').style.width = next ? '0%' : '47%';
+    playIcon.setAttribute('href', next || !playing ? '#i-play' : '#i-pause');
+    emptyBtn.classList.toggle('on', next);
+  }
+  emptyBtn.addEventListener('click', () => setEmpty(nowEmpty.hidden));
+  document.getElementById('emptyPlay').addEventListener('click', () => {
+    setEmpty(false);
+    setPlaying(true);
+    const tracks = document.querySelectorAll('[data-track]');
+    tracks.forEach((t) => t.classList.remove('current'));
+    if (tracks[0]) tracks[0].classList.add('current');
+  });
+  if (params.get('empty') === '1') setEmpty(true);
+</script>
+</body>
+</html>

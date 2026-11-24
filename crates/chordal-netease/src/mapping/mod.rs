@@ -10,24 +10,25 @@ use serde::Deserialize;
 
 use chordal_core::error::{CoreError, CoreResult};
 use chordal_core::model::{
-
     AccountProfile, AlbumRef, ArtistRef, AudioQuality, CollectionId, CollectionKind,
     CollectionPage, CollectionSummary, LyricLine, Lyrics, QualityTier, ResolvedStream, SearchKind,
     SearchResults, SourceId, StreamHandle, Track, TrackId, TrackOrigin, TrackPage,
 };
 
-mod search;
-mod detail;
-mod stream;
-mod lyrics;
 mod account;
 mod collections;
-pub use search::*;
-pub use detail::*;
-pub use stream::*;
-pub use lyrics::*;
+mod detail;
+mod feeds;
+mod lyrics;
+mod search;
+mod stream;
 pub use account::*;
 pub use collections::*;
+pub use detail::*;
+pub use feeds::*;
+pub use lyrics::*;
+pub use search::*;
+pub use stream::*;
 
 /// 音质档位（/song/url/v1 的 level 参数）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -64,8 +65,6 @@ impl SongQualityLevel {
 
 // ---------- /search ----------
 
-
 #[cfg(test)]
-
 #[cfg(test)]
 mod tests;

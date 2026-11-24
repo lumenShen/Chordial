@@ -95,6 +95,63 @@ impl ChordialApp {
                 })
         });
 
+        // 音源管理二级编辑页的输入框。
+        let source_edit_name_input = cx.new(|cx| {
+            let mut s = InputState::new(cx);
+            s.set_placeholder("音源名称");
+            s
+        });
+        let weak_source_name = weak_self.clone();
+        let source_edit_name_view = cx.new(|cx| {
+            InputView::new(source_edit_name_input.clone(), cx)
+                .with_id("source-edit-name")
+                .on_submit(move |text, _window, cx| {
+                    let _ = weak_source_name.update(cx, |app, cx| app.apply_source_name(text, cx));
+                })
+        });
+        let source_edit_url_input = cx.new(|cx| {
+            let mut s = InputState::new(cx);
+            s.set_placeholder("http://127.0.0.1:3000");
+            s
+        });
+        let weak_source_url = weak_self.clone();
+        let source_edit_url_view = cx.new(|cx| {
+            InputView::new(source_edit_url_input.clone(), cx)
+                .with_id("source-edit-url")
+                .on_submit(move |text, _window, cx| {
+                    let _ = weak_source_url.update(cx, |app, cx| app.apply_source_url(text, cx));
+                })
+        });
+        let source_edit_root_input = cx.new(|cx| {
+            let mut s = InputState::new(cx);
+            s.set_placeholder("添加音乐目录，如 D:\\Music");
+            s
+        });
+        let weak_source_root = weak_self.clone();
+        let source_edit_root_view = cx.new(|cx| {
+            InputView::new(source_edit_root_input.clone(), cx)
+                .with_id("source-edit-root")
+                .on_submit(move |text, _window, cx| {
+                    let _ =
+                        weak_source_root.update(cx, |app, cx| app.apply_source_add_root(text, cx));
+                })
+        });
+
+        let source_playlist_rename_input = cx.new(|cx| {
+            let mut s = InputState::new(cx);
+            s.set_placeholder("歌单名称");
+            s
+        });
+        let weak_playlist_rename = weak_self.clone();
+        let source_playlist_rename_view = cx.new(|cx| {
+            InputView::new(source_playlist_rename_input.clone(), cx)
+                .with_id("playlist-rename")
+                .on_submit(move |text, _window, cx| {
+                    let _ = weak_playlist_rename
+                        .update(cx, |app, cx| app.apply_playlist_rename(text, cx));
+                })
+        });
+
         // 新版设置中心：独立实体，动作回到根视图统一应用。
         let settings_view = {
             let weak_settings = weak_self.clone();
@@ -211,6 +268,9 @@ impl ChordialApp {
             cache,
             downloads: Arc::new(DownloadStore::open(cfg.download_dir.clone())),
             source_preference: cfg.source_preference,
+            source_configs: cfg.sources.clone(),
+            playlists: PlaylistStore::load_default(),
+            page: None,
             smooth_scroll: cfg.smooth_scroll,
             lyric_sweep_fade_em: crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em),
             background_render_divisor,
@@ -225,12 +285,28 @@ impl ChordialApp {
             settings_beat_low_view,
             settings_beat_high_input,
             settings_beat_high_view,
+            source_edit_name_input,
+            source_edit_name_view,
+            source_edit_url_input,
+            source_edit_url_view,
+            source_edit_root_input,
+            source_edit_root_view,
+            source_playlist_rename_input,
+            source_playlist_rename_view,
+            source_user_playlists: HashMap::new(),
+            source_user_playlists_loading: HashSet::new(),
+            source_feeds: HashMap::new(),
+            source_feed_detail: None,
+            source_delete_confirm: None,
+            playlist_delete_confirm: None,
+            playlist_page_cache: RefCell::new(None),
             beat_band,
             account_state: AccountState::Unknown,
             account_avatar: None,
             user_playlists: Arc::new(Vec::new()),
             playlists_loading: false,
             login_open: false,
+            login_source: None,
             login_tab: LoginTab::Qr,
             login_gen: 0,
             login_challenge: None,
@@ -263,6 +339,8 @@ impl ChordialApp {
             last_repeat_mode: PlayMode::Sequential,
             queue: Arc::new(Vec::new()),
             queue_pos: None,
+            queue_refill: None,
+            queue_gen: 0,
             player_status: chordal_player::Status::default(),
             status_message: None,
             info_message: None,
@@ -283,11 +361,12 @@ impl ChordialApp {
             phone_page: PhonePage::Browse,
             phone_backdrop: PhoneBackdrop::Off,
             phone_sheet: None,
-            phone_sheet_spring: None,
             phone_sheet_anchor: None,
             phone_edge_swipe: None,
             phone_swipe_suppress_click: None,
             track_menu: None,
+            playlist_picker: None,
+            dock_menu: None,
             selection: None,
             long_press: None,
             long_press_pos: None,
@@ -299,7 +378,9 @@ impl ChordialApp {
             no_bg: std::env::var_os("CHORDIAL_NO_BG").is_some(),
             immersive: false,
             sheet_drag: None,
-            immersive_expand: None,
+            motion: crate::motion::MotionSystem::default(),
+            motion_tuning: crate::motion::current_tuning(cx),
+            immersive_hint_at: None,
             ui_anim_enter: None,
             ui_anim_play: None,
             ui_anim_shuffle: None,
@@ -308,24 +389,28 @@ impl ChordialApp {
             last_volume_input: 0.9,
             show_remaining_time: true,
             quality_dialog_open: false,
-            cover_scale_anim: None,
             bench_anim: std::env::var_os("CHORDIAL_BENCH_ANIM").is_some(),
             force_portrait: false,
             portrait_page: PortraitPage::Art,
             portrait_transition: None,
-            portrait_enter: None,
-            portrait_last_input: Instant::now(),
-            portrait_chrome_hidden: false,
-            portrait_chrome_at: None,
-            portrait_idle_ticker: false,
             portrait_toast: None,
             drawer_open: false,
-            drawer_at: None,
             drawer_page: DrawerPage::Root,
             wide_lyrics_hidden: false,
+            compact_lyrics_open: false,
+            stage_view: StageView::Lyrics,
+            stage_view_menu_open: false,
+            stage_last_input_at: Instant::now(),
+            stage_chrome_hidden: false,
+            // 起点放在过去，避免应用刚启动的 260ms 内控件误淡入。
+            stage_chrome_at: Instant::now() - Duration::from_secs(1),
             info_marquee: None,
-            stage_motion: None,
             queue_scroll: gpui::UniformListScrollHandle::new(),
+            track_list_scroll: gpui::UniformListScrollHandle::new(),
+            playlist_scroll: gpui::UniformListScrollHandle::new(),
+            collection_scroll: gpui::UniformListScrollHandle::new(),
+            main_page_scroll: gpui::ScrollHandle::new(),
+            now_scroll: gpui::ScrollHandle::new(),
             search_route_cache: RefCell::new(None),
             search_source_counts: RefCell::new(None),
             collection_route_cache: RefCell::new(None),
@@ -339,7 +424,6 @@ impl ChordialApp {
             sleep_until: None,
             sleep_gen: 0,
             eq_open: false,
-            eq_open_at: None,
             eq,
             eq_search_input,
             eq_search_view,
@@ -348,9 +432,9 @@ impl ChordialApp {
             eq_save_gen: 0,
         };
 
-        if let Some(local) = local_source {
-            app.spawn_library_scan(local, cx);
-        }
+        let _ = local_source;
+        // 所有已启用的本地实例并发扫描，结果按源 ID 合并、按身份键去重。
+        app.spawn_library_scan_all(cx);
         app.spawn_netease_warmup(cx);
         app.spawn_account_bootstrap(cx);
         app.spawn_status_poll(cx);
@@ -407,7 +491,7 @@ impl ChordialApp {
                     app.play_first(cx);
                     app.phone_page = PhonePage::Browse;
                     app.phone_sheet = None;
-                    app.phone_sheet_spring = None;
+                    app.motion.phone_sheet = None;
                     match view.as_str() {
                         "player" => app.phone_page = PhonePage::Player,
                         "lyrics" => app.phone_page = PhonePage::Lyrics,
@@ -477,6 +561,8 @@ impl ChordialApp {
                             }
                             changed = true;
                         }
+                        // 闲置收起复用这条 200ms 轮询，不再开第二条常驻定时循环。
+                        changed |= app.tick_stage_chrome(cx);
                         if changed {
                             cx.notify();
                         }

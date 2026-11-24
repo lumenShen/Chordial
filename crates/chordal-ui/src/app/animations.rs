@@ -3,6 +3,7 @@
 //! 从 app.rs 拆分而来；仅做代码搬移，行为不变。
 
 use super::*;
+use crate::motion::PROGRESS_TOL;
 
 impl ChordialApp {
     pub(super) fn anim_progress(start: Option<Instant>, duration_ms: f32) -> f32 {
@@ -30,36 +31,130 @@ impl ChordialApp {
     }
 
     pub(super) fn cover_scale_now(&self, now: Instant) -> f32 {
-        let Some((start, from, to, duration)) = self.cover_scale_anim else {
-            return self.cover_scale_target();
-        };
-        let t = (now.saturating_duration_since(start).as_secs_f32() / duration.max(0.001))
-            .clamp(0.0, 1.0);
-        let eased = if to > from {
-            // 播放：AMLL 的 cubic-bezier(0.3, 0.2, 0.2, 1.4)，轻微过冲。
-            crate::icons::cubic_bezier(0.3, 0.2, 0.2, 1.4, t)
-        } else {
-            crate::icons::cubic_bezier(0.4, 0.2, 0.1, 1.0, t)
-        };
-        from + (to - from) * eased
+        self.motion
+            .cover
+            .as_ref()
+            .map(|spring| spring.value(now))
+            .unwrap_or_else(|| self.cover_scale_target())
     }
 
-    /// 播放状态变化时启动封面缩放；`from` 必须在写入新状态之前采样。
+    /// 播放状态变化时启动封面缩放；`from` 必须在写入新状态之前采样，
+    /// 作为没有在途动画时的起点。已有在途动画时保留其速度继续换向。
     pub(super) fn start_cover_scale_anim(&mut self, from: f32, playing: bool) {
         let target = if playing { 1.0 } else { 0.75 };
+        let now = Instant::now();
+        if let Some(spring) = self.motion.cover.as_mut() {
+            spring.retarget_with(target, spring.sample(now).velocity, now);
+            return;
+        }
         if (from - target).abs() < 0.001 {
-            self.cover_scale_anim = None;
+            self.motion.cover = None;
             return;
         }
         let duration = if playing { 0.5 } else { 0.6 };
-        self.cover_scale_anim = Some((Instant::now(), from, target, duration));
+        self.motion.cover = Some(
+            self.motion_tuning
+                .spring(duration, from, target, 0.0, now, 0.001, 0.02),
+        );
     }
 
-    pub(super) fn cover_scale_anim_active(&self, now: Instant) -> bool {
-        self.cover_scale_anim
-            .is_some_and(|(start, _, _, duration)| {
-                now.saturating_duration_since(start).as_secs_f32() < duration
+    /// 沉浸页顶部把手的展开进度：`1` = 文案胶囊，`0` = 原本的 50×8 小白条。
+    ///
+    /// 进入沉浸页后展开成「拖动/ESC 退出」文案展示 5s，随后用 320ms
+    /// 收回成原来的小白条。
+    pub(super) fn immersive_hint_expand(&self, now: Instant) -> f32 {
+        self.motion
+            .hint
+            .as_ref()
+            .map(|spring| spring.value(now).clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    }
+
+    /// 提示的 5s 静态展示期不请求动画帧，只有淡出阶段需要逐帧重绘。
+    pub(super) fn immersive_hint_fading(&self, now: Instant) -> bool {
+        self.motion.hint.is_some()
+            && self.immersive_hint_at.is_some_and(|start| {
+                now.saturating_duration_since(start).as_secs_f32() * 1000.0
+                    >= Self::IMMERSIVE_HINT_HOLD_MS
             })
+    }
+
+    /// 闲置收起的显隐进度：`1` = 完整控件，`0` = 完全隐藏。
+    /// 起点/终点之间的过渡交给弹簧，打断闲置判定时保留当前速度与位置。
+    pub(super) fn stage_chrome_visibility(&self, now: Instant) -> f32 {
+        self.motion
+            .chrome
+            .as_ref()
+            .map(|spring| spring.value(now).clamp(0.0, 1.0))
+            .unwrap_or(if self.stage_chrome_hidden { 0.0 } else { 1.0 })
+    }
+
+    pub(super) fn stage_chrome_fading(&self, now: Instant) -> bool {
+        self.motion.chrome.as_ref().is_some_and(|s| s.active(now))
+    }
+
+    /// 显隐弹簧：从当前值（或逻辑默认值）换向，速度连续。
+    fn retarget_chrome(&mut self, hidden: bool, now: Instant) {
+        let target = if hidden { 0.0 } else { 1.0 };
+        if let Some(spring) = self.motion.chrome.as_mut() {
+            spring.retarget_with(target, spring.sample(now).velocity, now);
+            return;
+        }
+        let from = if hidden { 1.0 } else { 0.0 };
+        self.motion.chrome = Some(self.motion_tuning.spring(
+            Self::STAGE_CHROME_FADE_MS,
+            from,
+            target,
+            0.0,
+            now,
+            PROGRESS_TOL.0,
+            PROGRESS_TOL.1,
+        ));
+    }
+
+    /// 只有歌词模式与「仅显示主内容」允许闲置隐藏；弹窗/抽屉/手势期间不隐藏。
+    fn stage_chrome_idle_eligible(&self, cx: &App) -> bool {
+        self.immersive
+            && self.portrait_page == PortraitPage::Art
+            && (self.stage_view == StageView::MainOnly || self.immersive_lyrics_visible(cx))
+            && !self.drawer_open
+            && !self.eq_open
+            && !self.quality_dialog_open
+            && !self.stage_view_menu_open
+            && self.sheet_drag.is_none()
+            && !self.immersive_expanding(Instant::now())
+    }
+
+    /// 指针/键盘交互后立刻恢复控件；闲置判定只依赖时间戳，由 200ms
+    /// 播放状态轮询调用 `tick_stage_chrome` 触发，不另开定时循环。
+    pub(super) fn note_stage_interaction(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        self.stage_last_input_at = now;
+        if self.stage_chrome_hidden {
+            self.stage_chrome_hidden = false;
+            self.stage_chrome_at = now;
+            self.retarget_chrome(false, now);
+            self.ensure_ui_anim_ticker(cx);
+            cx.notify();
+        }
+    }
+
+    /// 复用播放状态轮询检查 5s 闲置；返回是否需要重绘。
+    pub(super) fn tick_stage_chrome(&mut self, cx: &mut Context<Self>) -> bool {
+        let now = Instant::now();
+        let idle_ms = now
+            .saturating_duration_since(self.stage_last_input_at)
+            .as_secs_f32()
+            * 1000.0;
+        let should_hide = self.stage_chrome_idle_eligible(cx) && idle_ms >= Self::STAGE_IDLE_MS;
+        if should_hide == self.stage_chrome_hidden {
+            return false;
+        }
+        self.stage_chrome_hidden = should_hide;
+        self.stage_chrome_at = now;
+        self.retarget_chrome(should_hide, now);
+        self.ensure_ui_anim_ticker(cx);
+        true
     }
 
     pub(super) fn ui_anim_active(&self) -> bool {
@@ -76,22 +171,22 @@ impl ChordialApp {
             || self
                 .ui_anim_volume
                 .is_some_and(|(t, _)| t.elapsed().as_secs_f32() * 1000.0 < Self::UI_ANIM_SPEAKER_MS)
-            || self
-                .stage_motion
-                .is_some_and(|motion| motion.active(Instant::now()))
-            || self.cover_scale_anim_active(Instant::now())
+            || self.immersive_hint_fading(Instant::now())
+            || self.stage_chrome_fading(Instant::now())
+            || self.motion.any_active(Instant::now())
             || self
                 .info_marquee
                 .is_some_and(|marquee| marquee.active(Instant::now()))
-            || self.portrait_animating()
-            || self.sheet_drag.is_some_and(|drag| drag.animating())
+            || self.portrait_transition.is_some()
+            || self
+                .sheet_drag
+                .as_ref()
+                .is_some_and(|drag| drag.animating(Instant::now()))
             || self.phone_sheet_animating(Instant::now())
             || self
                 .phone_edge_swipe
+                .as_ref()
                 .is_some_and(|swipe| swipe.animating(Instant::now()))
-            || self.drawer_animating(Instant::now())
-            || self.immersive_expanding(Instant::now())
-            || self.eq_animating()
     }
 
     /// 安排一次重绘。帧节奏由 `Render` 中的 `request_animation_frame` 驱动：
@@ -109,90 +204,87 @@ impl ChordialApp {
         {
             self.portrait_transition = None;
         }
-        if self.stage_motion.is_some_and(|motion| motion.settled(now)) {
-            self.stage_motion = None;
-        }
-        if let Some((start, _, _, duration)) = self.cover_scale_anim
-            && now.saturating_duration_since(start).as_secs_f32() >= duration
-        {
-            self.cover_scale_anim = None;
-        }
         if self
             .info_marquee
             .is_some_and(|marquee| !marquee.active(now))
         {
             self.info_marquee = None;
         }
-        // 抽屉开/合动画结束：清掉起点；关闭状态由 `drawer_visible` 判定隐藏。
-        if self.drawer_at.is_some_and(|at| {
-            now.saturating_duration_since(at).as_secs_f32() * 1000.0 >= Self::DRAWER_ANIM_MS
-        }) {
-            self.drawer_at = None;
+        // 统一弹簧管线：一次性清理所有收敛通道，并把完成事件变成副作用。
+        let events = self.motion.advance(now);
+        if events.immersive_exit_done {
+            // 收起弹簧落点与 Dock 重合，此时才真正卸载沉浸子树。
+            self.finish_immersive_exit(cx);
         }
-        // Dock→全屏展开结束：撤销动画状态，页面由静态布局接管。
-        if self
-            .immersive_expand
-            .is_some_and(|spring| spring.settled(now))
+        if let Some(target) = events.phone_sheet_target
+            && target < 0.5
+            && self.phone_page == PhonePage::Player
         {
-            self.immersive_expand = None;
+            self.phone_page = PhonePage::Browse;
+        }
+        // 顶部把手提示展示完毕：清掉起点，回到静态小白条。
+        if self.immersive_hint_at.is_some_and(|t| {
+            now.saturating_duration_since(t).as_secs_f32() * 1000.0
+                >= Self::IMMERSIVE_HINT_HOLD_MS + Self::IMMERSIVE_HINT_FADE_MS
+        }) {
+            self.immersive_hint_at = None;
         }
         // 下拉关闭：回弹结束直接收手；关闭动画结束才真正退出沉浸层。
-        if let Some(drag) = self.sheet_drag {
-            match drag.settled(now) {
-                Some(SheetDragOutcome::Returned) => self.sheet_drag = None,
-                Some(SheetDragOutcome::Dismissed) => {
-                    self.sheet_drag = None;
-                    self.exit_immersive(cx);
-                }
-                None => {}
+        let drag_outcome = self.sheet_drag.as_ref().and_then(|drag| drag.settled(now));
+        match drag_outcome {
+            Some(SheetDragOutcome::Returned) => self.sheet_drag = None,
+            Some(SheetDragOutcome::Dismissed) => {
+                // 下拉手势已经把卡片带到 Dock 位置，无需再跑一遍收起弹簧。
+                self.sheet_drag = None;
+                self.finish_immersive_exit(cx);
             }
+            None => {}
         }
-        // 手机壳 mini player ⇄ 播放页：动画结束后才切页，避免中途把
-        // sheet 的 `lyric_view` 背景交还给曲库页。
-        if let Some(spring) = self.phone_sheet_spring
-            && spring.settled(now)
-        {
-            let end = spring.position(now);
-            self.phone_sheet_spring = None;
-            if end < 0.5 && self.phone_page == PhonePage::Player {
-                self.phone_page = PhonePage::Browse;
+        // 手机壳 mini player ⇄ 播放页：手势结束后才切页，避免中途把
+        // sheet 的 `lyric_view` 背景交还给曲库页；点击展开/收起交给 `motion.phone_sheet`。
+        let sheet_outcome = self.phone_sheet.as_ref().and_then(|drag| drag.settled(now));
+        match sheet_outcome {
+            Some(SheetPage::Full) => {
+                self.phone_sheet = None;
+                self.phone_page = PhonePage::Player;
+                self.motion.phone_sheet = None;
             }
-        }
-        if let Some(drag) = self.phone_sheet {
-            match drag.settled(now) {
-                Some(SheetPage::Full) => {
-                    self.phone_sheet = None;
-                    self.phone_page = PhonePage::Player;
-                    self.phone_sheet_spring = None;
+            Some(SheetPage::Mini) => {
+                self.phone_sheet = None;
+                if self.phone_page == PhonePage::Player {
+                    self.phone_page = PhonePage::Browse;
                 }
-                Some(SheetPage::Mini) => {
-                    self.phone_sheet = None;
-                    if self.phone_page == PhonePage::Player {
-                        self.phone_page = PhonePage::Browse;
-                    }
-                }
-                None => {}
             }
+            None => {}
         }
         // 封面 ⇄ 歌词横滑：提交后在动画落点切换页面。
-        if let Some(swipe) = self.phone_edge_swipe {
-            match swipe.settled(now) {
-                Some(SwipeOutcome::Committed(crate::phone_gesture::SwipeDirection::Forward)) => {
-                    self.phone_edge_swipe = None;
-                    self.phone_page = PhonePage::Lyrics;
-                    self.phone_swipe_suppress_click = Some(now);
-                }
-                Some(SwipeOutcome::Committed(crate::phone_gesture::SwipeDirection::Back)) => {
-                    self.phone_edge_swipe = None;
-                    self.phone_page = PhonePage::Player;
-                    self.phone_sheet_spring =
-                        Some(SpringSettle::new(0.0, 1.0, 0.0, now, 25.0, 190.0));
-                    self.ensure_ui_anim_ticker(cx);
-                    self.phone_swipe_suppress_click = Some(now);
-                }
-                Some(SwipeOutcome::Returned) => self.phone_edge_swipe = None,
-                None => {}
+        let swipe_outcome = self
+            .phone_edge_swipe
+            .as_ref()
+            .and_then(|swipe| swipe.settled(now));
+        match swipe_outcome {
+            Some(SwipeOutcome::Committed(crate::phone_gesture::SwipeDirection::Forward)) => {
+                self.phone_edge_swipe = None;
+                self.phone_page = PhonePage::Lyrics;
+                self.phone_swipe_suppress_click = Some(now);
             }
+            Some(SwipeOutcome::Committed(crate::phone_gesture::SwipeDirection::Back)) => {
+                self.phone_edge_swipe = None;
+                self.phone_page = PhonePage::Player;
+                self.motion.phone_sheet = Some(self.motion_tuning.spring(
+                    200.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    now,
+                    PROGRESS_TOL.0,
+                    PROGRESS_TOL.1,
+                ));
+                self.ensure_ui_anim_ticker(cx);
+                self.phone_swipe_suppress_click = Some(now);
+            }
+            Some(SwipeOutcome::Returned) => self.phone_edge_swipe = None,
+            None => {}
         }
     }
 
@@ -241,8 +333,8 @@ impl ChordialApp {
         let now = Instant::now();
         let dock_y = dock_rect(self.viewport_width, self.viewport_height).y;
         if let Some(drag) = &mut self.sheet_drag {
-            drag.release(height, dock_y, now);
-            if !drag.animating() {
+            drag.release(height, dock_y, now, self.motion_tuning);
+            if !drag.animating(now) {
                 self.sheet_drag = None;
             }
         }
@@ -253,11 +345,13 @@ impl ChordialApp {
     /// Dock→全屏共享布局的当前进度：`1.0` = 页面仍完全贴在 Dock 上，
     /// `0.0` = 已铺满整个窗口。展开动画与下拉手势共用这一条通道。
     pub(super) fn immersive_dock_progress(&self, now: Instant, height: f32) -> f32 {
-        if let Some(spring) = self.immersive_expand {
-            return spring.position(now).clamp(0.0, 1.0);
+        // 展开与收起共用同一条 dock 弹簧，方向只由 `dock_collapsing` 标记区分，
+        // 因此退出第一帧不会先弹回满屏。
+        if let Some(spring) = self.motion.dock.as_ref() {
+            return spring.value(now).clamp(0.0, 1.0);
         }
-        if let Some(drag) = self.sheet_drag {
-            if drag.engaged() || drag.animating() {
+        if let Some(drag) = self.sheet_drag.as_ref() {
+            if drag.engaged() || drag.animating(now) {
                 let dock_y = dock_rect(self.viewport_width, height).y.max(1.0);
                 return (drag.offset(now) / dock_y).clamp(0.0, 1.0);
             }
@@ -266,34 +360,86 @@ impl ChordialApp {
     }
 
     pub(super) fn immersive_expanding(&self, now: Instant) -> bool {
-        self.immersive_expand
-            .is_some_and(|spring| !spring.settled(now))
+        self.motion.dock.as_ref().is_some_and(|s| s.active(now))
     }
 
     /// 当前沉浸页的共享元素目标模态（与页面实际布局选择一致）。
     pub(super) fn immersive_stage_mode(&self, cx: &App, width: f32, height: f32) -> StageMode {
-        if self.layout_one_active(cx, width, height) {
+        if self.stage_split_active(cx, width, height) {
             StageMode::WideSplit
         } else {
             StageMode::CompactArt
         }
     }
 
+    /// 请求退出沉浸层：先播完反向收起动画，落点与 Dock 重合后才真正卸载。
+    ///
+    /// 从当前 `p` 起弹簧而不是固定从 0 起：展开没结束就按 Esc、或连续切换时，
+    /// 卡片不会先跳回满屏再收起。
     pub(super) fn exit_immersive(&mut self, cx: &mut Context<Self>) {
+        if !self.immersive || self.motion.dock_collapsing {
+            return;
+        }
+        let now = Instant::now();
+        // 采样当前位置与速度：展开没结束就退出时也不会顿一下再反向。
+        let (p, velocity) = self
+            .motion
+            .dock
+            .as_ref()
+            .map(|s| {
+                let sample = s.sample(now);
+                (sample.value, sample.velocity)
+            })
+            .unwrap_or((0.0, 0.0));
+        let p = p.clamp(0.0, 1.0);
+        self.sheet_drag = None;
+        self.motion.dock = Some(self.motion_tuning.spring(
+            Self::COLLAPSE_MS,
+            p,
+            1.0,
+            velocity,
+            now,
+            PROGRESS_TOL.0,
+            PROGRESS_TOL.1,
+        ));
+        self.motion.dock_collapsing = true;
+        // 收起期间不再展示顶部提示胶囊，让它随控件一起淡出。
+        self.immersive_hint_at = None;
+        self.ensure_ui_anim_ticker(cx);
+        cx.notify();
+    }
+
+    /// 真正卸载沉浸子树并恢复主面板样式；只由收起动画结束或下拉关闭触发。
+    pub(super) fn finish_immersive_exit(&mut self, cx: &mut Context<Self>) {
+        if !self.immersive {
+            return;
+        }
         self.immersive = false;
         self.sheet_drag = None;
-        self.immersive_expand = None;
+        self.motion.dock = None;
+        self.motion.dock_collapsing = false;
+        self.motion.hint = None;
+        self.immersive_hint_at = None;
         self.force_portrait = false;
         self.portrait_page = PortraitPage::Art;
         self.portrait_transition = None;
+        self.stage_view_menu_open = false;
+        self.stage_chrome_hidden = false;
+        self.stage_chrome_at = Instant::now();
+        self.motion.chrome = None;
+        self.stage_last_input_at = Instant::now();
         self.hide_drawer_now();
-        self.portrait_chrome_hidden = false;
         self.wide_lyrics_hidden = false;
-        self.stage_motion = None;
+        self.compact_lyrics_open = false;
+        self.motion.stage = None;
+        self.motion.portrait = None;
+        self.motion.eq_enter = None;
         let theme = Theme::get(cx).clone();
         self.lyric_view.update(cx, |view, _| {
             view.set_text_visible(true);
             view.set_click_seek_enabled(true);
+            // 非沉浸页面按自身容器尺寸布局；纯背景层不预热不可见歌词。
+            view.set_layout_when_hidden(false);
             view.set_background_visible(true);
             view.set_background_bounds(None);
             view.set_colors(LyricRenderColors {

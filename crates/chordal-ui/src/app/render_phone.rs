@@ -37,9 +37,7 @@ impl ChordialApp {
             }
         }))
         .on_action(cx.listener(|app, _: &RescanLibrary, _, cx| {
-            if let Some(local) = app.local_source.clone() {
-                app.spawn_library_scan(local, cx);
-            }
+            app.spawn_library_scan_all(cx);
         }))
         .on_action(cx.listener(|app, _: &ToggleSidebar, _, cx| {
             // 手机壳没有侧栏；Ctrl+B 改成开合手机抽屉（同样的“导航”语义）。
@@ -63,8 +61,14 @@ impl ChordialApp {
                 app.close_settings(cx);
             } else if app.drawer_open {
                 app.close_drawer(cx);
+            } else if app.dock_menu.is_some() {
+                app.close_dock_menu(cx);
+            } else if app.playlist_picker.is_some() {
+                app.close_playlist_picker(cx);
             } else if app.track_menu.is_some() {
                 app.close_track_menu(cx);
+            } else if app.page.is_some() {
+                app.close_main_page(cx);
             } else if app.selection.is_some() {
                 app.exit_selection(cx);
             } else if app.is_phone() && app.phone_page == PhonePage::Player {
@@ -166,10 +170,15 @@ impl ChordialApp {
                 ))
             })
             .when(!covered_by_eq, |d| {
-                d.child(gpui::batch_layer(self.render_list_panel(list_width, cx)))
-                    .when(show_now, |d| {
-                        d.child(gpui::batch_layer(self.render_now_playing(cx)))
-                    })
+                if self.page.is_some() {
+                    // 音源页 / 管理音源 / 本地歌单：整块主内容区。
+                    d.child(gpui::batch_layer(self.render_main_page(cx)))
+                } else {
+                    d.child(gpui::batch_layer(self.render_list_panel(list_width, cx)))
+                        .when(show_now, |d| {
+                            d.child(gpui::batch_layer(self.render_now_playing(cx)))
+                        })
+                }
             });
 
         let view = self
@@ -177,6 +186,9 @@ impl ChordialApp {
             .child(self.render_titlebar(cx))
             .child(middle)
             .child(gpui::batch_layer(self.render_dock(cx)))
+            .when(self.dock_menu.is_some(), |d| {
+                d.child(self.render_dock_menu(cx))
+            })
             .when(self.settings_open, |d| d.child(self.render_settings(cx)))
             .when(self.login_open, |d| d.child(self.render_login(cx)))
             .when(self.eq_open, |d| {
@@ -184,6 +196,9 @@ impl ChordialApp {
             })
             .when(self.track_menu.is_some(), |d| {
                 d.child(self.render_track_menu(cx))
+            })
+            .when(self.playlist_picker.is_some(), |d| {
+                d.child(self.render_playlist_picker(cx))
             })
             .when(self.queue_drag.is_some(), |d| {
                 d.child(
@@ -214,7 +229,7 @@ impl ChordialApp {
     // ================= 手机壳（单列） =================
 
     /// 手机壳：没有侧栏/右栏/Dock，播放页 / 歌词页 / 曲库页三选一。
-    /// 抽屉是唯一的“全局面板”，承载曲库、队列、设置与均衡器入口。
+    /// 曲库页底部有常驻一级导航；抽屉承载次级入口与播放页/歌词页跳转。
     pub(super) fn render_phone_main(
         &mut self,
         window: &mut Window,
@@ -413,6 +428,7 @@ impl ChordialApp {
         let now = Instant::now();
         let swipe_offset = self
             .phone_edge_swipe
+            .as_ref()
             .map(|swipe| swipe.offset(now))
             .unwrap_or(0.0);
         let suppress_click = self.phone_swipe_click_suppressed();
@@ -486,7 +502,7 @@ impl ChordialApp {
                     .top(px(COMPACT_TOP))
                     .w(px(cover))
                     .child(self.amll_player_column(
-                        cover, height, controls_h, 1.0, true, false, window, cx,
+                        cover, height, controls_h, true, 1.0, false, false, window, cx,
                     )),
             )
             // 封面是手机播放页最自然的「打开歌词」入口；横向拖动则切换
@@ -652,7 +668,7 @@ impl ChordialApp {
     }
 
     /// 手机曲库页：桌面曲目板直接铺满，外层只负责标题栏与返回播放。
-    /// 底部悬浮 mini player；多选时换成批量操作条。
+    /// 底部常驻一级导航条；mini player 悬浮在导航条上方。多选时换成批量操作条。
     pub(super) fn render_phone_browse(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let selecting = self.selection.is_some();
@@ -677,8 +693,12 @@ impl ChordialApp {
             );
         if selecting {
             root = root.child(self.render_phone_selection_actions(cx));
-        } else if self.current_track.is_some() {
-            root = root.child(self.render_phone_mini_player(cx));
+        } else {
+            if self.current_track.is_some() {
+                root = root.child(self.render_phone_mini_player(cx));
+            }
+            // 一级导航常驻：曲库 / 队列 / 搜索 / 设置。
+            root = root.child(self.render_phone_bottom_nav(cx));
         }
         // mini player 上按住后，指针可能很快离开小条；从这里开始整窗
         // 接管，越过死区才真正展开播放页。
@@ -731,7 +751,7 @@ impl ChordialApp {
             &theme,
             self.cover_image.clone(),
             42.0,
-            8.0,
+            1.0,
             crate::icons::icon(crate::icons::Icon::Note, 16.0, theme.text_faint),
         );
         let current_index = self.queue_pos.filter(|pos| *pos < self.queue.len());
@@ -847,7 +867,7 @@ impl ChordialApp {
                         app.view_tab = ViewTab::Library;
                         app.library_filter = LibraryFilter::Queue;
                         app.phone_sheet = None;
-                        app.phone_sheet_spring = None;
+                        app.motion.phone_sheet = None;
                         cx.notify();
                     });
                 })
@@ -887,7 +907,7 @@ impl ChordialApp {
             .absolute()
             .left(px(12.0))
             .right(px(12.0))
-            .bottom(px(12.0))
+            .bottom(px(Self::PHONE_NAV_H + 8.0))
             .h(px(58.0))
             .rounded(px(16.0))
             .overflow_hidden()

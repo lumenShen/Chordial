@@ -19,10 +19,49 @@ pub(super) enum QueueList {
     Collection,
 }
 
+/// 当前队列的续接追踪：私人 FM 播放时记录所追踪的音源与在途状态。
+///
+/// `None` 表示有限列表（本地库/搜索/歌单/集合/每日推荐等），播完按播放模式
+/// 处理；`Some` 表示接近末尾时要向该音源再次请求 `personal_fm()` 并追加。
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct QueueRefill {
+    pub(super) source: SourceId,
+    pub(super) in_flight: bool,
+    /// 上次成功但没拿到新曲目的位置；避免尾部每首歌都重复打接口。
+    pub(super) last_empty_at: Option<usize>,
+}
+
+/// 主内容区的“整页”视图。`None` = 现有的曲库/搜索/集合三栏内容。
+///
+/// 音源页/管理页/本地歌单页需要完整内容宽度，因此作为覆盖页渲染，
+/// 侧栏与 Dock 保持不变。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MainPage {
+    /// 单个音源的状态/功能页。
+    Source(SourceId),
+    /// 音源端点状态列表。
+    ManageSources,
+    /// 新增音源：选择类型。
+    NewSource,
+    /// 二级编辑某个音源实例。
+    EditSource(SourceId),
+    /// 本地/订阅歌单页。
+    Playlist(chordal_core::playlist::PlaylistId),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LibraryFilter {
     All,
     Queue,
+}
+
+/// 底部 Dock 的弹出菜单。歌词不再有浮层：曲目区直接进入沉浸页。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DockMenu {
+    /// 播放队列概览：下 3 首 + 打开完整队列。
+    Queue,
+    /// 播放来源 / 下载 / 均衡器等低频操作。
+    More,
 }
 
 /// 底部「更多」抽屉的二级页。抽屉本身不改变播放页布局。
@@ -30,6 +69,42 @@ pub(super) enum LibraryFilter {
 pub(super) enum DrawerPage {
     Root,
     Sleep,
+}
+
+/// 沉浸页右下角选择器的四种视图。
+///
+/// 前三种共用同一个右侧内容区（与宽屏歌词列完全相同的几何），
+/// `MainOnly` 则收起整个右侧内容区，只保留中间的播放列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StageView {
+    /// 宽屏右列 / 窄窗全屏歌词。
+    Lyrics,
+    /// 右侧内容区显示播放队列。
+    Queue,
+    /// 右侧内容区显示当前曲目的音频详情。
+    Audio,
+    /// 仅显示主播放列。
+    MainOnly,
+}
+
+impl StageView {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Lyrics => "显示歌词",
+            Self::Queue => "显示播放队列",
+            Self::Audio => "音频详情",
+            Self::MainOnly => "仅显示主内容",
+        }
+    }
+
+    pub(super) fn icon(self) -> crate::icons::Icon {
+        match self {
+            Self::Lyrics => crate::icons::Icon::Lyrics,
+            Self::Queue => crate::icons::Icon::Queue,
+            Self::Audio => crate::icons::Icon::Sliders,
+            Self::MainOnly => crate::icons::Icon::Expand,
+        }
+    }
 }
 
 /// 手机壳（单列）当前页面。宽屏没有这个概念：侧栏/曲目板/右栏同时存在。
@@ -66,6 +141,13 @@ pub(super) struct TrackMenuState {
     pub(super) has_album: bool,
     pub(super) has_artist: bool,
     pub(super) in_queue: bool,
+}
+
+/// 曲目菜单里的“添加到歌单”浮层。
+pub(super) struct PlaylistPickerState {
+    pub(super) track: Track,
+    pub(super) x: f32,
+    pub(super) y: f32,
 }
 
 /// 手机/桌面的多选快照。进入多选后列表仍可继续更换，但批量操作只
@@ -124,7 +206,11 @@ pub(super) struct QueueDragState {
 ///
 /// 用户正在搜索/看集合/看队列时，保留他的浏览上下文；只有在普通曲库
 /// 或播放中时才落到播放页——否则“拉窄窗口”会把正在找歌的人踢回播放器。
-pub(super) fn phone_default_page(view_tab: ViewTab, filter: LibraryFilter, has_track: bool) -> PhonePage {
+pub(super) fn phone_default_page(
+    view_tab: ViewTab,
+    filter: LibraryFilter,
+    has_track: bool,
+) -> PhonePage {
     let browsing = match view_tab {
         ViewTab::Search | ViewTab::Collection => true,
         ViewTab::Library => filter == LibraryFilter::Queue,
@@ -270,6 +356,86 @@ pub(super) fn estimate_library_bytes(tracks: &[Track]) -> usize {
         }
     }
     bytes
+}
+
+/// 歌单页的一行：预计算文本 + 可播放性。
+pub(super) struct PlaylistRowView {
+    pub(super) track: Track,
+    pub(super) identity_key: String,
+    pub(super) title: SharedString,
+    pub(super) artist: SharedString,
+    pub(super) source_label: SharedString,
+    pub(super) duration: SharedString,
+    /// 源未加载且本地没有同身份副本。
+    pub(super) unavailable: bool,
+    /// 源未加载，但本地库有同身份副本（点击播放本地副本）。
+    pub(super) local_substitute: bool,
+}
+
+pub(super) struct PlaylistPageCache {
+    pub(super) id: chordal_core::playlist::PlaylistId,
+    pub(super) updated_at_ms: u64,
+    pub(super) registry_version: u64,
+    pub(super) library_ptr: usize,
+    pub(super) rows: Arc<Vec<PlaylistRowView>>,
+}
+
+/// 账号源页面的推荐流快照。各区块独立记录错误与加载态，
+/// 单个接口失败不会拖垮整页。
+#[derive(Default)]
+pub(super) struct SourceFeedState {
+    pub(super) daily: Vec<Track>,
+    pub(super) fm: Vec<Track>,
+    pub(super) recommended: Vec<CollectionSummary>,
+    pub(super) radar: Vec<CollectionSummary>,
+    pub(super) daily_error: Option<SharedString>,
+    pub(super) fm_error: Option<SharedString>,
+    pub(super) recommended_error: Option<SharedString>,
+    pub(super) radar_error: Option<SharedString>,
+    pub(super) loading_daily: bool,
+    pub(super) loading_fm: bool,
+    pub(super) loading_recommended: bool,
+    pub(super) loading_radar: bool,
+    pub(super) fetched_at_ms: u64,
+}
+
+impl SourceFeedState {
+    pub(super) fn loading(&self) -> bool {
+        self.loading_daily || self.loading_fm || self.loading_recommended || self.loading_radar
+    }
+
+    pub(super) fn has_content(&self) -> bool {
+        !self.daily.is_empty()
+            || !self.fm.is_empty()
+            || !self.recommended.is_empty()
+            || !self.radar.is_empty()
+    }
+}
+
+/// 网易云源页面里「推荐入口」点开后展示的详情类型。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SourceFeedKind {
+    Daily,
+    Fm,
+    Recommended,
+    Radar,
+}
+
+impl SourceFeedKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "今日推荐",
+            Self::Fm => "私人 FM",
+            Self::Recommended => "每日推荐歌单",
+            Self::Radar => "私人雷达",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct SourceFeedDetail {
+    pub(super) source: SourceId,
+    pub(super) kind: SourceFeedKind,
 }
 
 /// 当前打开的集合页（歌单 / 专辑 / 歌手）。

@@ -19,12 +19,15 @@ mod input;
 mod layout_morph;
 mod lyrics;
 mod main_state;
+mod motion;
 mod perf_overlay;
 mod phone_gesture;
 mod player_page;
+mod playlists;
 mod responsive;
 mod settings;
 mod sheet_drag;
+mod sources;
 mod theme;
 mod widgets;
 
@@ -34,7 +37,6 @@ use std::sync::Arc;
 use chordal_cache::{CacheConfig, ObjectCache};
 use chordal_core::model::SourceId;
 use chordal_core::registry::SourceRegistry;
-use chordal_core::source::{MusicSource, SourceInfo};
 use chordal_local::LocalSource;
 use chordal_netease::NeteaseSource;
 use chordal_player::Player;
@@ -44,6 +46,7 @@ use gpui::{
 };
 
 use crate::app::{ChordialApp, SourceBuilder};
+use crate::motion::MotionTuning;
 
 /// 运行内存观测：包装系统分配器，记录堆活跃/峰值与分配次数。
 ///
@@ -114,92 +117,70 @@ fn main() {
         }),
     );
 
-    // ---- 源装配：预构建实例 + builder 挂回工厂 ----
+    // ---- 源装配：配置里的每个实例都预构建，ENABLED 的才挂进 registry ----
+    //
+    // 注册但不加载的实例保留在槽位里（status = Registered），UI 的开关只是
+    // 在“加载/软关闭”之间切换；软关闭不调用 shutdown，重开时复用同一实例，
+    // 本地索引与网易云会话都不会丢。
     let registry = Arc::new(SourceRegistry::new());
     let mut builders: HashMap<SourceId, SourceBuilder> = HashMap::new();
+    let mut local_sources: HashMap<SourceId, Arc<LocalSource>> = HashMap::new();
+    let mut netease_sources: HashMap<SourceId, Arc<NeteaseSource>> = HashMap::new();
+    let mut local_for_app: Option<Arc<LocalSource>> = None;
 
-    // 本地源：实例常驻（卸载只摘除注册，索引保留，重载零成本）。
-    let local = LocalSource::new(
-        SourceId::new("local"),
-        chordal_local::LocalSourceConfig {
-            roots: cfg.local_roots.clone(),
-        },
-        "本地音乐",
-    );
-    {
-        let info = SourceInfo {
-            id: SourceId::new("local"),
-            display_name: "本地音乐".into(),
-            description: local.info().description.clone(),
-            kind: chordal_core::model::SourceKind::LocalLibrary,
-            priority: 0,
+    for source_config in &cfg.sources {
+        let built = match sources::build(source_config, cache.clone()) {
+            Ok(built) => built,
+            Err(e) => {
+                tracing::warn!(id = %source_config.id, error = %e, "skip source instance");
+                continue;
+            }
         };
-        let local_for_info = local.clone();
-        let _ = local_for_info;
-        registry
-            .register(chordal_core::registry::SourceDescriptor {
-                info: info.clone(),
-                build: {
-                    let local = local.clone();
-                    Box::new(move |_| Ok(local.clone()))
-                },
-            })
-            .expect("register local source");
-        let local_arc: Arc<dyn chordal_core::source::MusicSource> = local.clone();
-        registry
-            .load(&SourceId::new("local"), |_| Ok(local_arc.clone()))
-            .expect("load local source");
-        builders.insert(
-            SourceId::new("local"),
-            Arc::new({
-                let local = local.clone();
-                move |_: &SourceInfo| Ok(local.clone() as Arc<_>)
-            }),
-        );
+        let id = built.info.id.clone();
+        let builder = built.builder();
+        builders.insert(id.clone(), builder.clone());
+        if let Some(local) = &built.local {
+            local_sources.insert(id.clone(), local.clone());
+            if local_for_app.is_none() && source_config.enabled {
+                local_for_app = Some(local.clone());
+            }
+        }
+        if let Some(netease) = &built.netease {
+            netease_sources.insert(id.clone(), netease.clone());
+        }
+        let descriptor_factory = {
+            let instance = built.source.clone();
+            Box::new(move |_: &chordal_core::source::SourceInfo| Ok(instance.clone()))
+                as Box<
+                    dyn Fn(
+                            &chordal_core::source::SourceInfo,
+                        ) -> chordal_core::error::CoreResult<
+                            Arc<dyn chordal_core::source::MusicSource>,
+                        > + Send
+                        + Sync,
+                >
+        };
+        if let Err(e) = registry.register(chordal_core::registry::SourceDescriptor {
+            info: built.info.clone(),
+            build: descriptor_factory,
+        }) {
+            tracing::warn!(id = %id, error = %e, "register source failed");
+            continue;
+        }
+        if source_config.enabled {
+            let instance = built.source.clone();
+            if let Err(e) = registry.load(&id, |_| Ok(instance.clone())) {
+                tracing::warn!(id = %id, error = %e, "load source failed");
+            }
+        }
     }
-
-    // 网易云源：构建失败不致命（服务未启动时保持 Registered 状态，可稍后加载）。
-    let netease_ready = {
-        let netease = NeteaseSource::new_with_cache(
-            SourceId::new("netease"),
-            cfg.netease.clone(),
-            "网易云音乐",
-            Some(cache.clone()),
-        );
-        let info = SourceInfo {
-            id: SourceId::new("netease"),
-            display_name: "网易云音乐".into(),
-            description: netease.info().description.clone(),
-            kind: chordal_core::model::SourceKind::HttpApi,
-            priority: 1,
-        };
-        registry
-            .register(chordal_core::registry::SourceDescriptor {
-                info,
-                build: {
-                    let netease = netease.clone();
-                    Box::new(move |_| Ok(netease.clone()))
-                },
-            })
-            .expect("register netease source");
-        builders.insert(
-            SourceId::new("netease"),
-            Arc::new({
-                let netease = netease.clone();
-                move |_: &SourceInfo| Ok(netease.clone() as Arc<_>)
-            }),
-        );
-        // 预加载（后续 health 探测失败会在 UI 显示）。
-        let netease_arc: Arc<dyn chordal_core::source::MusicSource> = netease.clone();
-        registry
-            .load(&SourceId::new("netease"), |_| Ok(netease_arc.clone()))
-            .is_ok()
-    };
-    let _ = netease_ready;
+    // 没有启用的本地实例时，仍给主面板一个可扫描的本地句柄（源页面可再开启）。
+    if local_for_app.is_none() {
+        local_for_app = local_sources.values().next().cloned();
+    }
 
     let player = Player::new(cfg.player_device.clone());
     let search_timeout = cfg.search_timeout_ms;
-    let local_for_app = local.clone();
     // 上次退出时性能浮窗是开着的，就在主窗口建好后恢复。
     let startup_perf_overlay = cfg.perf_overlay;
 
@@ -207,7 +188,19 @@ fn main() {
         theme::Theme::for_mode(cfg.appearance).set_global(cx);
         actions::install_keybindings(cx);
         input::install_input_keybindings(cx);
-        main_state::install(registry.clone(), player.clone(), builders, cx);
+        main_state::install(
+            registry.clone(),
+            player.clone(),
+            builders,
+            local_sources,
+            netease_sources,
+            MotionTuning::new(
+                cfg.motion_preset,
+                cfg.animation_duration_multiplier,
+                cfg.animation_overshoot_multiplier,
+            ),
+            cx,
+        );
 
         let desired_size = std::env::var("CHORDIAL_SIZE")
             .ok()
@@ -248,7 +241,7 @@ fn main() {
                     ChordialApp::new(
                         registry.clone(),
                         player.clone(),
-                        Some(local_for_app.clone()),
+                        local_for_app.clone(),
                         cache.clone(),
                         search_timeout,
                         window,

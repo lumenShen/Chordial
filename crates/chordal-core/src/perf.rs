@@ -154,6 +154,7 @@ pub fn budget_us(name: &str) -> Option<u64> {
         "amll.text.shape" => Some(FRAME),
         "amll.render.pass" => Some(FRAME),
         "amll.bg.raster" => Some(FRAME),
+        "amll.bg.upscale" => Some(FRAME),
         "amll.convert" => Some(2_000),
         "amll.cover.decode" => Some(BACKGROUND),
         _ => None,
@@ -176,6 +177,7 @@ pub fn budget_for(name: &str, items: u64) -> Option<u64> {
         "amll.layout" => 2,
         "amll.text.shape" => 2,
         "amll.bg.raster" => 1,
+        "amll.bg.upscale" => 1,
         "amll.convert" => 1,
         _ => 0,
     };

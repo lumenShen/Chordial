@@ -16,6 +16,7 @@ pub mod error;
 pub mod mem;
 pub mod model;
 pub mod perf;
+pub mod playlist;
 pub mod registry;
 pub mod source;
 
@@ -25,6 +26,10 @@ pub use model::{
     CollectionKind, CollectionPage, CollectionSummary, LoginChallenge, LoginMethod, LoginProgress,
     LyricLine, Lyrics, QualityTier, ResolvedStream, SearchQuery, SearchResults, SourceId,
     SourceKind, StreamHandle, TimedLine, TimedWord, Track, TrackId, TrackOrigin, TrackPage,
+};
+pub use playlist::{
+    PlaylistEditCapabilities, PlaylistEditResult, PlaylistEditor, PlaylistEntry, PlaylistId,
+    PlaylistKind, PlaylistMutation, PlaylistSummary, SavedPlaylist,
 };
 pub use registry::{SourceDescriptor, SourceRegistry, SourceStatus};
 pub use source::{AccountSource, CatalogSource, MusicSource, SourceInfo};
