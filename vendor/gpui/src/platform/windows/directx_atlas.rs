@@ -3,15 +3,18 @@ use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
 use windows::Win32::Graphics::{
     Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-        ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
+        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView,
+        ID3D11Texture2D,
     },
     Dxgi::Common::*,
 };
 
 use crate::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, DevicePixels, PlatformAtlas,
-    Point, Size, platform::AtlasTextureList,
+    Point, Size,
+    platform::{ATLAS_TILE_PADDING, AtlasTextureList, expand_atlas_tile_border},
+    point,
 };
 
 pub(crate) struct DirectXAtlas(Mutex<DirectXAtlasState>);
@@ -86,7 +89,18 @@ impl PlatformAtlas for DirectXAtlas {
                 .allocate(size, key.texture_kind())
                 .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
             let texture = lock.texture(tile.texture_id);
-            texture.upload(&lock.device_context, tile.bounds, &bytes);
+            let padded = expand_atlas_tile_border(&bytes, size, texture.bytes_per_pixel);
+            let upload_bounds = Bounds {
+                origin: point(
+                    DevicePixels(tile.bounds.origin.x.0 - ATLAS_TILE_PADDING),
+                    DevicePixels(tile.bounds.origin.y.0 - ATLAS_TILE_PADDING),
+                ),
+                size: Size {
+                    width: DevicePixels(size.width.0 + 2 * ATLAS_TILE_PADDING),
+                    height: DevicePixels(size.height.0 + 2 * ATLAS_TILE_PADDING),
+                },
+            };
+            texture.upload(&lock.device_context, upload_bounds, &padded);
             lock.tiles_by_key.insert(key.clone(), tile.clone());
             Ok(Some(tile))
         }
@@ -141,7 +155,11 @@ impl DirectXAtlasState {
             }
         }
 
-        let texture = self.push_texture(size, texture_kind)?;
+        let padded_size = Size {
+            width: DevicePixels(size.width.0 + 2 * ATLAS_TILE_PADDING),
+            height: DevicePixels(size.height.0 + 2 * ATLAS_TILE_PADDING),
+        };
+        let texture = self.push_texture(padded_size, texture_kind)?;
         texture.allocate(size)
     }
 
@@ -191,12 +209,19 @@ impl DirectXAtlasState {
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
+        let initial_data =
+            vec![0u8; size.width.0 as usize * size.height.0 as usize * bytes_per_pixel as usize];
+        let subresource = D3D11_SUBRESOURCE_DATA {
+            pSysMem: initial_data.as_ptr() as _,
+            SysMemPitch: size.width.0 as u32 * bytes_per_pixel,
+            SysMemSlicePitch: 0,
+        };
         let mut texture: Option<ID3D11Texture2D> = None;
         unsafe {
             // This only returns None if the device is lost, which we will recreate later.
             // So it's ok to return None here.
             self.device
-                .CreateTexture2D(&texture_desc, None, Some(&mut texture))
+                .CreateTexture2D(&texture_desc, Some(&subresource), Some(&mut texture))
                 .ok()?;
         }
         let texture = texture.unwrap();
@@ -244,15 +269,25 @@ impl DirectXAtlasState {
 
 impl DirectXAtlasTexture {
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
-        let allocation = self.allocator.allocate(size.into())?;
+        // Reserve a border texel on every side; the sprite's UVs address only
+        // the inner rect, so bilinear sampling at the edge never reaches the
+        // neighbouring tile's ink.
+        let padded_size = Size {
+            width: DevicePixels(size.width.0 + 2 * ATLAS_TILE_PADDING),
+            height: DevicePixels(size.height.0 + 2 * ATLAS_TILE_PADDING),
+        };
+        let allocation = self.allocator.allocate(padded_size.into())?;
         let tile = AtlasTile {
             texture_id: self.id,
             tile_id: allocation.id.into(),
             bounds: Bounds {
-                origin: allocation.rectangle.min.into(),
+                origin: point(
+                    DevicePixels(allocation.rectangle.min.x + ATLAS_TILE_PADDING),
+                    DevicePixels(allocation.rectangle.min.y + ATLAS_TILE_PADDING),
+                ),
                 size,
             },
-            padding: 0,
+            padding: ATLAS_TILE_PADDING as u32,
         };
         self.live_atlas_keys += 1;
         Some(tile)

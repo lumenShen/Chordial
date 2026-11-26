@@ -812,6 +812,55 @@ pub(crate) struct AtlasTile {
     pub(crate) bounds: Bounds<DevicePixels>,
 }
 
+/// Border reserved around every atlas tile, in device pixels.
+///
+/// Sprites sample their tile with a linear filter at UVs that run from the
+/// tile's first to its last texel. Without a border, the first and last pixel
+/// of a sprite blend with the neighbouring tile's texels, which shows up as
+/// bright specks/lines along glyph edges when a blurred glow glyph sits next
+/// to a sharp glyph in the atlas.
+pub(crate) const ATLAS_TILE_PADDING: i32 = 1;
+
+/// Return a copy of `bytes` with a one-pixel border that repeats the edge
+/// texels. The sprite UVs address the original rect, so the border is only
+/// used to keep filtering at the rect boundary away from other tiles.
+pub(crate) fn expand_atlas_tile_border(
+    bytes: &[u8],
+    size: Size<DevicePixels>,
+    bytes_per_pixel: u32,
+) -> Vec<u8> {
+    let width = size.width.0.max(0) as usize;
+    let height = size.height.0.max(0) as usize;
+    let bpp = bytes_per_pixel as usize;
+    let padding = ATLAS_TILE_PADDING as usize;
+    if width == 0 || height == 0 || bpp == 0 || bytes.len() < width * height * bpp {
+        return bytes.to_vec();
+    }
+
+    let padded_width = width + 2 * padding;
+    let padded_height = height + 2 * padding;
+    let mut padded = vec![0u8; padded_width * padded_height * bpp];
+    for y in 0..height {
+        let src = &bytes[y * width * bpp..(y + 1) * width * bpp];
+        let dst = (y + padding) * padded_width * bpp;
+        padded[dst + padding * bpp..dst + (padding + width) * bpp].copy_from_slice(src);
+        padded[dst..dst + bpp].copy_from_slice(&src[..bpp]);
+        padded[dst + (padding + width) * bpp..dst + padded_width * bpp]
+            .copy_from_slice(&src[(width - 1) * bpp..width * bpp]);
+    }
+    for y in 0..padding {
+        let first =
+            padded[padding * padded_width * bpp..(padding + 1) * padded_width * bpp].to_vec();
+        padded[y * padded_width * bpp..(y + 1) * padded_width * bpp].copy_from_slice(&first);
+        let last = (height + padding - 1) * padded_width * bpp;
+        let last = padded[last..last + padded_width * bpp].to_vec();
+        padded[(height + padding + y) * padded_width * bpp
+            ..(height + padding + y + 1) * padded_width * bpp]
+            .copy_from_slice(&last);
+    }
+    padded
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub(crate) struct AtlasTextureId {
@@ -1858,5 +1907,21 @@ impl From<String> for ClipboardString {
             text: value,
             metadata: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod atlas_padding_tests {
+    use super::*;
+
+    #[test]
+    fn border_replicates_edge_texels() {
+        let bytes = [1u8, 2, 3, 4];
+        let size = Size {
+            width: DevicePixels(2),
+            height: DevicePixels(2),
+        };
+        let padded = expand_atlas_tile_border(&bytes, size, 1);
+        assert_eq!(padded, [1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4]);
     }
 }

@@ -11,13 +11,13 @@ use crate::{
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
     Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    SUBPIXEL_VARIANTS_Y_PRECISE, ScaledPixels, Scene, Shadow, SharedString, Size,
-    SpriteMask, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, SUBPIXEL_VARIANTS_Y_PRECISE,
+    ScaledPixels, Scene, Shadow, SharedString, Size, SpriteMask, StrikethroughStyle, Style,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement, TransformationMatrix, Underline,
+    UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -3252,7 +3252,10 @@ impl Window {
         // size so a glyph doesn't pop when its blur crosses zero and switches
         // to the sharp path.
         let blur_radius = if blur_radius.0 > 0.0 {
-            px(((blur_radius.0 * scale_factor).clamp(0.0, 63.0) * 2.0).round() / 2.0)
+            // A positive request must never quantize back to zero: that would
+            // silently switch the glow pass to the sharp 4x4 sub-pixel path and
+            // draw a crisp white copy of the glyph instead of a halo.
+            px((((blur_radius.0 * scale_factor).clamp(0.0, 63.0) * 2.0).round() / 2.0).max(0.5))
         } else {
             px(0.0)
         };
@@ -3330,10 +3333,7 @@ impl Window {
                         x: raster_origin.x + ScaledPixels::from(subpixel_shift.x),
                         y: raster_origin.y + ScaledPixels::from(subpixel_shift.y),
                     };
-                    let delta = point(
-                        glyph_origin.x - anchor.x,
-                        glyph_origin.y - anchor.y,
-                    );
+                    let delta = point(glyph_origin.x - anchor.x, glyph_origin.y - anchor.y);
                     (
                         glyph_origin.x.0 * inv_scale + delta.x.0 * scale,
                         glyph_origin.y.0 * inv_scale + delta.y.0 * scale,

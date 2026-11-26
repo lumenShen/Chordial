@@ -76,7 +76,22 @@ fragment shader 里按屏幕 x 插值，才能让同一个字形内部也连续�
      取 dark），避免除零。
    - `build.rs`：cbindgen 的 `export.include` 增加 `"SpriteMask"`，Metal 的
      shared header 由 Rust 结构自动生成。
-5. `src/text_system.rs` 末尾 `#[cfg(test)] mod blur_alpha_tests`（参考用；
+5. 图集边缘防渗色（修复强调词辉光的白点/白线）
+   - `src/platform.rs`：新增 `ATLAS_TILE_PADDING = 1` 与
+     `expand_atlas_tile_border()`；每个图集条目四周保留 1 像素边界，边界像素
+     复制自图块边缘（不是黑色），所以 UV 落在图块边缘时线性采样不会读到
+     相邻图块的字形墨迹。
+   - Windows `directx_atlas.rs`、Blade `blade_atlas.rs`、Metal `metal_atlas.rs`：
+     分配时把图块尺寸加上两侧边界，`AtlasTile.bounds.origin` 指向**内部**
+     矩形，`padding` 记为 1；上传时写入含边界的矩形。shader 的
+     `to_tile_position` 不需要改（它本来就是按 `bounds` 取内部矩形）。
+     Windows 另外在 `CreateTexture2D` 时用零数据初始化纹理，避免尚未上传的
+     图集区域是未定义内容。
+   - `src/window.rs`：正的模糊半径量化后至少保留 0.5 设备像素；否则辉光会
+     退化成未模糊的清晰白色字形，在文字边缘形成白点。
+   - `chordial-amll-gpui` 的 `paint.rs`：emoji 跳过辉光（彩色 emoji 没有
+     单色掩码，重复绘制只会叠出一份全亮度副本）。
+6. `src/text_system.rs` 末尾 `#[cfg(test)] mod blur_alpha_tests`（参考用；
    vendor crate 不在 workspace 里，不能直接 `cargo test -p gpui`）。
 
 ## 精度验证

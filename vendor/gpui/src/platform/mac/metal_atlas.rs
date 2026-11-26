@@ -1,6 +1,8 @@
 use crate::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, DevicePixels, PlatformAtlas,
-    Point, Size, platform::AtlasTextureList,
+    Point, Size,
+    platform::{ATLAS_TILE_PADDING, AtlasTextureList, expand_atlas_tile_border},
+    point,
 };
 use anyhow::{Context as _, Result};
 use collections::FxHashMap;
@@ -51,7 +53,18 @@ impl PlatformAtlas for MetalAtlas {
                 .allocate(size, key.texture_kind())
                 .context("failed to allocate")?;
             let texture = lock.texture(tile.texture_id);
-            texture.upload(tile.bounds, &bytes);
+            let padded = expand_atlas_tile_border(&bytes, size, texture.bytes_per_pixel());
+            let upload_bounds = Bounds {
+                origin: point(
+                    DevicePixels(tile.bounds.origin.x.0 - ATLAS_TILE_PADDING),
+                    DevicePixels(tile.bounds.origin.y.0 - ATLAS_TILE_PADDING),
+                ),
+                size: Size {
+                    width: DevicePixels(size.width.0 + 2 * ATLAS_TILE_PADDING),
+                    height: DevicePixels(size.height.0 + 2 * ATLAS_TILE_PADDING),
+                },
+            };
+            texture.upload(upload_bounds, &padded);
             lock.tiles_by_key.insert(key.clone(), tile.clone());
             Ok(Some(tile))
         }
@@ -110,7 +123,11 @@ impl MetalAtlasState {
             }
         }
 
-        let texture = self.push_texture(size, texture_kind);
+        let padded_size = Size {
+            width: DevicePixels(size.width.0 + 2 * ATLAS_TILE_PADDING),
+            height: DevicePixels(size.height.0 + 2 * ATLAS_TILE_PADDING),
+        };
+        let texture = self.push_texture(padded_size, texture_kind);
         texture.allocate(size)
     }
 
@@ -195,15 +212,22 @@ struct MetalAtlasTexture {
 
 impl MetalAtlasTexture {
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
-        let allocation = self.allocator.allocate(size.into())?;
+        let padded_size = Size {
+            width: DevicePixels(size.width.0 + 2 * ATLAS_TILE_PADDING),
+            height: DevicePixels(size.height.0 + 2 * ATLAS_TILE_PADDING),
+        };
+        let allocation = self.allocator.allocate(padded_size.into())?;
         let tile = AtlasTile {
             texture_id: self.id,
             tile_id: allocation.id.into(),
             bounds: Bounds {
-                origin: allocation.rectangle.min.into(),
+                origin: point(
+                    DevicePixels(allocation.rectangle.min.x + ATLAS_TILE_PADDING),
+                    DevicePixels(allocation.rectangle.min.y + ATLAS_TILE_PADDING),
+                ),
                 size,
             },
-            padding: 0,
+            padding: ATLAS_TILE_PADDING as u32,
         };
         self.live_atlas_keys += 1;
         Some(tile)

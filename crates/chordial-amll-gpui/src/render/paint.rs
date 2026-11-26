@@ -1,7 +1,7 @@
 //! paint（由 render.rs 拆分，行为不变）。
 
-use super::*;
 use super::emphasis::*;
+use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_lyric_line(
     window: &mut Window,
@@ -374,7 +374,9 @@ pub(super) fn paint_row(
             let gx = origin.x;
             let gy = origin.y;
 
-            if glow > 0.01 {
+            // 彩色 emoji 没有可模糊的单色掩码：再画一遍只会叠出一份全亮度
+            // 的清晰 emoji（边缘看起来是白点），直接跳过辉光。
+            if glow > 0.01 && !glyph.is_emoji {
                 // AMLL 强调词用 CSS `text-shadow: 0 0 R rgba(...)`；R 是模糊
                 // 半径，浏览器按高斯 σ = R/2 实现。这里直接绘制一份真模糊的
                 // 字形（vendor/gpui 在光栅化阶段卷积 alpha 掩码），与行级滤镜
