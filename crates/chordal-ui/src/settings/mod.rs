@@ -9,8 +9,10 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Instant;
 
 use chordal_core::mem::Gauge;
+use chordal_core::{AudioBandKind, AudioBandRanges, AudioControlMapping};
 use chordal_netease::{NeteaseMode, SongQualityLevel};
 use gpui::prelude::*;
 use gpui::{
@@ -18,9 +20,10 @@ use gpui::{
     SharedString, Window, div, point, px,
 };
 
-use crate::config::SourcePreference;
+use crate::config::{AppConfig, SourcePreference};
 use crate::icons::{self, Icon};
 use crate::input::{InputState, InputView};
+use crate::motion::MotionPreset;
 use crate::theme::{Appearance, Theme};
 
 // ---- 按职责拆分出的子模块（纯代码搬移） ----
@@ -108,13 +111,22 @@ pub enum SettingsAction {
     SetAppearance(Appearance),
     SetSourcePreference(SourcePreference),
     SetSmoothScroll(bool),
-    SetBeatBand(f32, f32),
+    /// 一次更新五路独立监听频段。
+    SetAudioBandRanges(AudioBandRanges),
+    /// 一次更新五路频段到内部控制点的映射。
+    SetAudioBandControls(AudioControlMapping),
     /// 鼓点视觉效果倍率（0..=1.5，1.0 = 原始幅度）。
     SetBeatStrength(f32),
     /// 流体背景光栅分辨率除数（1..=20，1 = 原始分辨率）。
     SetBackgroundRenderDivisor(u32),
     /// 动态歌词整行扫光渐变带宽度（em，0.1..=4.0）。
     SetLyricSweepFade(f32),
+    /// 统一弹簧预设（紧凑/均衡/柔和/弹性）。
+    SetMotionPreset(MotionPreset),
+    /// 动画时长倍率（0.25..=3.0，> 1 慢放）。
+    SetMotionDuration(f32),
+    /// 动画回弹倍率（0.25..=2.0，> 1 回弹更明显）。
+    SetMotionOvershoot(f32),
     /// 画面性能诊断浮窗开关。
     SetPerfOverlay(bool),
     SetEqEnabled(bool),
@@ -181,10 +193,14 @@ pub struct SettingsView {
     appearance: Appearance,
     source_preference: SourcePreference,
     smooth_scroll: bool,
-    beat_band: (f32, f32),
+    audio_band_ranges: AudioBandRanges,
+    audio_band_controls: AudioControlMapping,
     beat_strength: f32,
     background_render_divisor: u32,
     lyric_sweep_fade_em: f32,
+    motion_preset: MotionPreset,
+    animation_duration_multiplier: f32,
+    animation_overshoot_multiplier: f32,
     perf_overlay: bool,
     cache_dir: PathBuf,
     download_dir: PathBuf,
@@ -212,11 +228,14 @@ pub struct SettingsView {
     // ---- 输入框 ----
     cache_dir_field: TextField,
     download_dir_field: TextField,
-    beat_low_field: TextField,
-    beat_high_field: TextField,
+    audio_band_low_fields: Vec<TextField>,
+    audio_band_high_fields: Vec<TextField>,
+    audio_band_control_fields: Vec<TextField>,
     beat_strength_field: TextField,
     background_divisor_field: TextField,
     lyric_sweep_field: TextField,
+    motion_duration_field: TextField,
+    motion_overshoot_field: TextField,
     search_timeout_field: TextField,
     netease_url_field: TextField,
     device_field: TextField,
@@ -230,6 +249,7 @@ impl SettingsView {
 }
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let start = Instant::now();
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let viewport = window.viewport_size();
@@ -238,12 +258,14 @@ impl Render for SettingsView {
         // 800×600 卡片需要四周留出 24px；窗口装不下时改成整窗设置页，
         // 导航从左栏变成顶部横向分段，内容宽度跟随窗口。
         let compact = vw < CARD_W + 48.0 || vh < CARD_H + 48.0;
-        if compact {
+        let view = if compact {
             self.render_phone(&theme, &weak, cx, vw, vh)
                 .into_any_element()
         } else {
             self.render_desktop(&theme, &weak, cx).into_any_element()
-        }
+        };
+        crate::frame_trace::add("settings.total", start.elapsed());
+        view
     }
 }
 

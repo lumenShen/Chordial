@@ -6,13 +6,32 @@
 use super::*;
 
 use chordal_core::model::SourceId;
-use chordal_core::registry::{SourceDescriptor, SourceStatus};
+use chordal_core::registry::{SourceDescriptor, SourceSlotSnapshot, SourceStatus};
 use chordal_core::source::SourceInfo;
 
-use crate::config::{SOURCE_TYPE_LOCAL, SOURCE_TYPE_NETEASE, SourceInstanceConfig, next_source_id};
+use crate::config::{SourceInstanceConfig, next_source_id};
 use crate::sources;
 
 impl ChordialApp {
+    pub(super) fn source_slots(&self) -> Arc<HashMap<SourceId, SourceSlotSnapshot>> {
+        let version = self.registry.version();
+        let mut cache = self.source_snapshot.borrow_mut();
+        match cache.as_ref() {
+            Some((cached_version, slots)) if *cached_version == version => slots.clone(),
+            _ => {
+                let slots: Arc<HashMap<SourceId, SourceSlotSnapshot>> = Arc::new(
+                    self.registry
+                        .snapshot()
+                        .into_iter()
+                        .map(|slot| (slot.info.id.clone(), slot))
+                        .collect(),
+                );
+                *cache = Some((version, slots.clone()));
+                slots
+            }
+        }
+    }
+
     pub(super) fn source_config(&self, id: &SourceId) -> Option<&SourceInstanceConfig> {
         self.source_configs.iter().find(|source| source.id == id.0)
     }
@@ -80,11 +99,11 @@ impl ChordialApp {
 
     /// 持久化音源配置；同时回写旧版 `local_roots` / `netease` 字段。
     pub(super) fn persist_source_configs(&mut self) {
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.sources = self.source_configs.clone();
         cfg.normalize_sources();
         self.source_configs = cfg.sources.clone();
-        crate::config::save(&cfg);
+        self.commit_config(&cfg);
     }
 
     /// 启用/关闭音源。关闭只摘除活跃实例，不清理缓存/不停止托管服务。
@@ -123,7 +142,7 @@ impl ChordialApp {
                 .source_config_by_id(&id.0)
                 .is_some_and(|s| s.is_local())
             {
-                self.remove_source_tracks_from_library(id);
+                self.remove_source_tracks_from_library(id, cx);
             }
             if self.collection.as_ref().is_some_and(|c| &c.id.source == id) {
                 self.collection = None;
@@ -314,7 +333,7 @@ impl ChordialApp {
             globals.netease_sources.remove(&id);
         }
         if old.is_local() {
-            self.remove_source_tracks_from_library(&id);
+            self.remove_source_tracks_from_library(&id, cx);
         }
         let built = match sources::build(&next, self.cache.clone()) {
             Ok(built) => built,
@@ -358,7 +377,7 @@ impl ChordialApp {
             globals.local_sources.remove(id);
             globals.netease_sources.remove(id);
         }
-        self.remove_source_tracks_from_library(id);
+        self.remove_source_tracks_from_library(id, cx);
         if self.collection.as_ref().is_some_and(|c| &c.id.source == id) {
             self.collection = None;
             let old_cover = self.collection_cover.take();
@@ -379,15 +398,17 @@ impl ChordialApp {
     }
 
     pub(super) fn set_source_cookie(&mut self, id: &SourceId, cookie: Option<String>) {
-        if let Some(config) = self.source_configs.iter_mut().find(|s| s.id == id.0)
-            && let Some(netease) = config.netease.as_mut()
-        {
-            netease.cookie = cookie;
+        let changed = self
+            .source_configs
+            .iter_mut()
+            .find(|source| source.id == id.0)
+            .is_some_and(|source| source.set_session_cookie(cookie));
+        if changed {
             self.persist_source_configs();
         }
     }
 
-    pub(super) fn logout_netease_source(&mut self, id: &SourceId, cx: &mut Context<Self>) {
+    pub(super) fn logout_source(&mut self, id: &SourceId, cx: &mut Context<Self>) {
         let Some(source) = self.registry.get(id) else {
             return;
         };
@@ -407,7 +428,11 @@ impl ChordialApp {
                     app.retire_image(old_avatar);
                     app.user_playlists = Arc::new(Vec::new());
                 }
-                app.info_message = Some("已退出网易云账号".into());
+                let source_name = app
+                    .source_config_by_id(&source_id.0)
+                    .map(|source| source.name.clone())
+                    .unwrap_or_else(|| source_id.0.clone());
+                app.info_message = Some(format!("已退出{}账号", source_name));
                 cx.notify();
             });
         })
@@ -489,7 +514,11 @@ impl ChordialApp {
         source_type: &str,
         cx: &mut Context<Self>,
     ) -> Option<SourceId> {
-        let config = self.new_source_config(source_type);
+        let Some(config) = self.new_source_config(source_type) else {
+            self.status_message = Some("该音源类型暂不可用".into());
+            cx.notify();
+            return None;
+        };
         let id = self.create_source_instance(config, cx)?;
         self.open_source_edit(id.clone(), cx);
         Some(id)
@@ -577,56 +606,133 @@ impl ChordialApp {
         self.replace_source_config(config, cx);
     }
 
-    fn remove_source_tracks_from_library(&mut self, id: &SourceId) {
-        if !self.library.iter().any(|track| &track.id.source == id) {
+    fn remove_source_tracks_from_library(&mut self, id: &SourceId, cx: &mut Context<Self>) {
+        let removed = self.library_source_tracks.remove(id).is_some();
+        if !removed && !self.library.iter().any(|track| &track.id.source == id) {
             return;
         }
-        let tracks: Vec<Track> = self
-            .library
-            .iter()
-            .filter(|track| &track.id.source != id)
-            .cloned()
-            .collect();
-        self.library = Arc::new(tracks);
-        chordal_core::mem::set_gauge(Gauge::Library, estimate_library_bytes(&self.library));
-        let mut cache = self.row_text_cache.borrow_mut();
-        *cache = None;
+        self.spawn_library_merge(cx);
     }
 
-    /// 扫描单个本地实例，替换该实例在聚合库中的曲目（按源 ID 过滤）。
+    /// 扫描单个本地实例。同源请求合并为 pending，不同源仍可并发；扫描结果
+    /// 先更新按源快照，再由 latest-wins 的后台任务聚合，避免互相覆盖。
     pub(super) fn spawn_library_scan_source(
         &mut self,
         local: Arc<chordal_local::LocalSource>,
         cx: &mut Context<Self>,
     ) {
-        self.library_scanning = true;
         let source_id = local.info().id.clone();
+        let Some(generation) = self.begin_library_scan(&source_id) else {
+            cx.notify();
+            return;
+        };
         cx.notify();
+        let local_for_task = local.clone();
         cx.spawn(async move |weak, cx| {
-            let tracks = cx
-                .background_executor()
-                .spawn(async move {
-                    let summary = local.scan_blocking();
-                    (summary.tracks, local.all_tracks())
-                })
-                .await;
+            let scanned =
+                ChordialApp::run_background(async move { local_for_task.scan_with_tracks() }).await;
             let _ = weak.update(cx, |app, cx| {
-                let mut merged: Vec<Track> = app
-                    .library
-                    .iter()
-                    .filter(|track| track.id.source != source_id)
-                    .cloned()
-                    .collect();
-                merged.extend(tracks.1);
-                let deduped = dedupe_library(merged);
-                chordal_core::mem::set_gauge(Gauge::Library, estimate_library_bytes(&deduped));
-                app.library = Arc::new(deduped);
-                app.library_scanning = false;
-                app.row_text_cache.borrow_mut().take();
-                tracing::info!(tracks = tracks.0, source = %source_id, "local source scan finished");
-                if std::env::var_os("CHORDIAL_AUTOPLAY").is_some() && !app.library.is_empty() {
-                    app.play_first(cx);
-                    app.enter_immersive(cx);
+                match scanned {
+                    Ok((summary, tracks)) => {
+                        let restart = app.finish_library_scan(&source_id, generation);
+                        let current = cx
+                            .global::<Globals>()
+                            .local_sources
+                            .get(&source_id)
+                            .cloned();
+                        let is_current = current
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &local))
+                            && app
+                                .source_config_by_id(&source_id.0)
+                                .is_some_and(|config| config.enabled)
+                            && app.registry.get(&source_id).is_some();
+                        if is_current {
+                            app.library_source_tracks.insert(source_id.clone(), tracks);
+                            tracing::info!(
+                                tracks = summary.tracks,
+                                source = %source_id,
+                                "local source scan finished"
+                            );
+                            app.spawn_library_merge(cx);
+                        }
+                        if restart && let Some(current) = current {
+                            app.spawn_library_scan_source(current, cx);
+                        }
+                    }
+                    Err(_) => {
+                        app.cancel_library_scan(&source_id, generation);
+                        app.status_message = Some("后台任务繁忙，本地扫描稍后重试".into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn spawn_library_merge(&mut self, cx: &mut Context<Self>) {
+        self.library_merge_gen = self.library_merge_gen.wrapping_add(1);
+        let generation = self.library_merge_gen;
+        let mut sources: Vec<_> = self.library_source_tracks.clone().into_iter().collect();
+        sources.sort_by(|(left, _), (right, _)| left.0.cmp(&right.0));
+        cx.spawn(async move |weak, cx| {
+            let merged = ChordialApp::run_background(async move {
+                let mut tracks = Vec::new();
+                for (_, source_tracks) in sources {
+                    tracks.extend(source_tracks.iter().cloned());
+                }
+                dedupe_library(tracks)
+            })
+            .await;
+            let _ = weak.update(cx, |app, cx| {
+                if app.library_merge_gen != generation {
+                    return;
+                }
+                match merged {
+                    Ok(tracks) => {
+                        let library = Arc::new(tracks);
+                        mem::set_gauge(Gauge::Library, estimate_library_bytes(&library));
+                        app.library = library;
+                        app.row_text_cache.borrow_mut().take();
+                        if std::env::var_os("CHORDIAL_AUTOPLAY").is_some()
+                            && !app.library.is_empty()
+                        {
+                            app.play_first(cx);
+                            app.enter_immersive(cx);
+                        }
+                        if let Ok(view) = std::env::var("CHORDIAL_START_PHONE")
+                            && app.is_phone()
+                            && !app.library.is_empty()
+                        {
+                            app.play_first(cx);
+                            app.phone_page = PhonePage::Browse;
+                            app.phone_sheet = None;
+                            app.motion.phone_sheet = None;
+                            match view.as_str() {
+                                "player" => app.phone_page = PhonePage::Player,
+                                "lyrics" => app.open_lyrics_immersive(cx),
+                                "queue" => {
+                                    app.view_tab = ViewTab::Library;
+                                    app.library_filter = LibraryFilter::Queue;
+                                }
+                                "selection" => app.enter_selection(QueueList::Library, 0, cx),
+                                "menu" => {
+                                    app.open_track_menu(QueueList::Library, 0, 150.0, 520.0, cx)
+                                }
+                                "drawer" => app.open_drawer(cx),
+                                "sheet" => {
+                                    let h = app.viewport_height.max(1.0);
+                                    app.begin_phone_sheet_drag(h, cx);
+                                    app.update_phone_sheet_drag(h * 0.45, cx);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        app.status_message = Some("后台任务繁忙，本地库合并稍后重试".into());
+                    }
                 }
                 cx.notify();
             });
@@ -637,8 +743,12 @@ impl ChordialApp {
     pub(super) fn spawn_library_scan_all(&mut self, cx: &mut Context<Self>) {
         let sources = self.enabled_local_sources(cx);
         if sources.is_empty() {
+            self.library_source_tracks.clear();
+            self.library_merge_gen = self.library_merge_gen.wrapping_add(1);
             self.library = Arc::new(Vec::new());
-            self.library_scanning = false;
+            mem::set_gauge(Gauge::Library, 0);
+            self.row_text_cache.borrow_mut().take();
+            self.library_scanning = !self.library_scans.is_empty();
             cx.notify();
             return;
         }
@@ -658,7 +768,11 @@ impl ChordialApp {
         }
         if self
             .source_config_by_id(&id.0)
-            .is_some_and(|source| source.is_netease())
+            .is_some_and(|source| source.enabled)
+            && self
+                .registry
+                .get(&id)
+                .is_some_and(|source| source.account().is_some())
         {
             self.load_source_user_playlists(&id, cx);
             self.ensure_source_feeds(&id, cx);
@@ -699,21 +813,8 @@ impl ChordialApp {
     }
 
     /// 新建音源的默认配置（管理页的“添加音源”）。
-    pub(super) fn new_source_config(&self, source_type: &str) -> SourceInstanceConfig {
-        let id = self.new_source_id(source_type);
-        match source_type {
-            SOURCE_TYPE_LOCAL => SourceInstanceConfig::local(
-                id,
-                "本地音乐",
-                vec![dirs::audio_dir().unwrap_or_else(|| PathBuf::from("."))],
-            ),
-            SOURCE_TYPE_NETEASE => SourceInstanceConfig::netease(
-                id,
-                "网易云音乐",
-                chordal_netease::NeteaseConfig::default(),
-            ),
-            _ => SourceInstanceConfig::local(id, "新音源", vec![]),
-        }
+    pub(super) fn new_source_config(&self, source_type: &str) -> Option<SourceInstanceConfig> {
+        crate::sources::create_source_config(source_type, self.new_source_id(source_type))
     }
 
     fn new_source_id(&self, source_type: &str) -> String {

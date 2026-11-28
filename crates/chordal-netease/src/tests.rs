@@ -12,6 +12,35 @@ fn config_defaults() {
     assert!(c.cookie.is_none());
 }
 
+#[test]
+fn cancelling_outer_future_aborts_inner_task() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct SignalOnDrop(mpsc::Sender<()>);
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    shared_runtime().block_on(async {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let mut outer = Box::pin(spawn_inner(move || async move {
+            let _signal = SignalOnDrop(dropped_tx);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await
+        }));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(outer.as_mut().poll(&mut context).is_pending());
+        started_rx.await.unwrap();
+        drop(outer);
+        dropped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    });
+}
+
 /// 扫码登录：key → create → check(803) → user/account；Cookie 必须注入。
 #[test]
 fn qr_login_sets_cookie_and_profile() {

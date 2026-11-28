@@ -1,6 +1,8 @@
 //! `ChordialApp` 的 eq_actions 行为。
 //!
-//! 从 app.rs 拆分而来；仅做代码搬移，行为不变。
+//! 从 app.rs 拆分而来。编辑器采用三层链路：耳机档案、内置预设、自定义
+//! 频段；任何一层变化都通过 [`EqState::rebuild`] 重新合成最终滤波器链，
+//! 再推给播放线程。
 
 use super::*;
 
@@ -9,8 +11,17 @@ impl ChordialApp {
         self.eq_open = true;
         self.dock_menu = None;
         self.track_menu = None;
-        self.eq_open_at = Some(Instant::now());
-        self.eq.settings = self.eq.settings.clone().sanitized();
+        let now = Instant::now();
+        self.motion.eq_enter = Some(self.motion_tuning.spring(
+            Duration::from_millis(240),
+            0.0,
+            1.0,
+            0.0,
+            now,
+            crate::motion::PROGRESS_TOL.0,
+            crate::motion::PROGRESS_TOL.1,
+        ));
+        self.eq.rebuild();
         self.player.set_eq(self.eq.settings.clone());
         self.ensure_ui_anim_ticker(cx);
         cx.notify();
@@ -18,6 +29,7 @@ impl ChordialApp {
 
     pub(crate) fn close_eq(&mut self, cx: &mut Context<Self>) {
         self.eq_open = false;
+        self.motion.eq_enter = None;
         self.eq_save_at = None;
         self.persist_eq();
         cx.notify();
@@ -26,27 +38,15 @@ impl ChordialApp {
     pub(crate) fn remove_saved_preset(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.eq.saved.len() {
             self.eq.saved.remove(index);
+            self.eq.preview_saved = None;
             self.persist_eq();
             cx.notify();
         }
     }
 
-    pub(super) fn eq_animating(&self) -> bool {
-        // 只有打开时的 240ms 入场淡入需要连续帧；400ms 落盘防抖是后台
-        // 一次性任务，不应把整个界面拖入持续重绘。
-        self.eq_open
-            && self
-                .eq_open_at
-                .is_some_and(|t| t.elapsed() < Duration::from_millis(260))
-    }
-
-    /// 把当前配置推给播放线程，并在 400ms 后落盘。
+    /// 把当前链路推给播放线程，并在 400ms 后落盘。
     pub(crate) fn apply_eq(&mut self, cx: &mut Context<Self>) {
-        self.eq.settings = self.eq.settings.clone().sanitized();
-        self.eq.selected = self
-            .eq
-            .selected
-            .filter(|index| *index < self.eq.settings.bands.len());
+        self.eq.rebuild();
         self.player.set_eq(self.eq.settings.clone());
         self.eq_save_at = Some(Instant::now());
         self.eq_save_gen = self.eq_save_gen.wrapping_add(1);
@@ -82,27 +82,47 @@ impl ChordialApp {
         cx.notify();
     }
 
+    // ---------- 自定义频段 ----------
+
     pub(crate) fn add_eq_band(&mut self, cx: &mut Context<Self>) {
-        if self.eq.add_band().is_some() {
+        if self.eq.add_custom_band().is_some() {
             self.apply_eq(cx);
         } else {
-            self.show_portrait_toast(format!("最多 {EQ_MAX_BANDS} 个频段"), cx);
+            self.show_portrait_toast("频段已达 32 段上限", cx);
         }
     }
 
     pub(crate) fn remove_eq_band(&mut self, cx: &mut Context<Self>) {
+        if self.eq.selected.is_none() {
+            return;
+        }
         self.eq.remove_selected();
         self.apply_eq(cx);
     }
 
     pub(crate) fn select_eq_band(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.eq.selected = Some(index);
-        self.eq.type_menu_open = false;
-        cx.notify();
+        if index < self.eq.custom.len() {
+            self.eq.selected = Some(EqSelection::Custom(index));
+            self.eq.type_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_eq_band_enabled(
+        &mut self,
+        index: usize,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(band) = self.eq.custom.get_mut(index) {
+            band.enabled = enabled;
+            self.eq.touch();
+            self.apply_eq(cx);
+        }
     }
 
     pub(crate) fn set_eq_filter_kind(&mut self, kind: FilterKind, cx: &mut Context<Self>) {
-        if let Some(band) = self.eq.selected_band_mut() {
+        if let Some(band) = self.eq.selected_custom_mut() {
             band.kind = kind;
             self.eq.type_menu_open = false;
             self.eq.touch();
@@ -111,7 +131,7 @@ impl ChordialApp {
     }
 
     pub(crate) fn set_eq_freq(&mut self, freq_hz: f32, cx: &mut Context<Self>) {
-        if let Some(band) = self.eq.selected_band_mut() {
+        if let Some(band) = self.eq.selected_custom_mut() {
             band.freq_hz = freq_hz.clamp(20.0, 20_000.0);
             self.eq.touch();
             self.apply_eq(cx);
@@ -119,7 +139,7 @@ impl ChordialApp {
     }
 
     pub(crate) fn set_eq_gain(&mut self, gain_db: f32, cx: &mut Context<Self>) {
-        if let Some(band) = self.eq.selected_band_mut() {
+        if let Some(band) = self.eq.selected_custom_mut() {
             band.gain_db = gain_db.clamp(EQ_MIN_GAIN_DB, EQ_MAX_GAIN_DB);
             self.eq.touch();
             self.apply_eq(cx);
@@ -127,18 +147,135 @@ impl ChordialApp {
     }
 
     pub(crate) fn set_eq_q(&mut self, q: f32, cx: &mut Context<Self>) {
-        if let Some(band) = self.eq.selected_band_mut() {
+        if let Some(band) = self.eq.selected_custom_mut() {
             band.q = q.clamp(chordal_player::EQ_MIN_Q, chordal_player::EQ_MAX_Q);
             self.eq.touch();
             self.apply_eq(cx);
         }
     }
 
-    pub(crate) fn load_eq_preset(&mut self, preset: PresetEntry, cx: &mut Context<Self>) {
-        self.eq.load_preset(&preset);
+    pub(crate) fn set_eq_master_gain(
+        &mut self,
+        output: bool,
+        value_db: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let value_db = value_db.clamp(EQ_MIN_GAIN_DB, EQ_MAX_GAIN_DB);
+        if output {
+            self.eq.master_output_db = value_db;
+        } else {
+            self.eq.master_input_db = value_db;
+        }
+        self.eq.touch();
+        self.apply_eq(cx);
+    }
+
+    // ---------- 内置预设链路 ----------
+
+    pub(crate) fn select_eq_block(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.eq.blocks.len() {
+            self.eq.selected = Some(EqSelection::Block(index));
+            self.eq.type_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    /// 把内置预设加入 / 移出编辑器链路（预设库里的 + / √）。
+    pub(crate) fn toggle_builtin_membership(
+        &mut self,
+        preset_id: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.eq.block_index(preset_id) {
+            let name = builtin_preset(preset_id)
+                .map(|preset| preset.name)
+                .unwrap_or("预设");
+            self.eq.remove_block(index);
+            self.apply_eq(cx);
+            self.show_portrait_toast(format!("已移出「{name}」"), cx);
+            return;
+        }
+        let Some(preset) = builtin_preset(preset_id) else {
+            return;
+        };
+        match self.eq.add_block(preset) {
+            Ok(_) => {
+                self.apply_eq(cx);
+                self.show_portrait_toast(format!("已加入「{}」", preset.name), cx);
+            }
+            Err(message) => self.show_portrait_toast(message, cx),
+        }
+    }
+
+    /// 预设库左侧圆点：未加入则加入并启用，已加入则切换启用 / 旁路。
+    pub(crate) fn toggle_builtin_power(&mut self, preset_id: &'static str, cx: &mut Context<Self>) {
+        if let Some(index) = self.eq.block_index(preset_id) {
+            self.eq.toggle_block_enabled(index);
+            self.apply_eq(cx);
+            return;
+        }
+        let Some(preset) = builtin_preset(preset_id) else {
+            return;
+        };
+        match self.eq.add_block(preset) {
+            Ok(_) => self.apply_eq(cx),
+            Err(message) => self.show_portrait_toast(message, cx),
+        }
+    }
+
+    pub(crate) fn remove_eq_block(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.eq.remove_block(index);
+        self.apply_eq(cx);
+    }
+
+    pub(crate) fn set_eq_block_enabled(
+        &mut self,
+        index: usize,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(block) = self.eq.blocks.get_mut(index) {
+            block.enabled = enabled;
+            self.eq.touch();
+            self.apply_eq(cx);
+        }
+    }
+
+    pub(crate) fn set_eq_block_amount(
+        &mut self,
+        index: usize,
+        amount: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.eq.set_block_amount(index, amount);
+        self.apply_eq(cx);
+    }
+
+    // ---------- 耳机档案 ----------
+
+    pub(crate) fn select_eq_profile(&mut self, cx: &mut Context<Self>) {
+        if self.eq.profile.is_some() {
+            self.eq.selected = Some(EqSelection::Profile);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn clear_eq_profile(&mut self, cx: &mut Context<Self>) {
+        self.eq.clear_profile();
+        self.apply_eq(cx);
+        self.show_portrait_toast("已清除耳机档案", cx);
+    }
+
+    // ---------- 个人配置 ----------
+
+    pub(crate) fn apply_saved_eq_preset(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(preset) = self.eq.saved.get(index).cloned() else {
+            return;
+        };
+        self.eq.load_saved(&preset);
+        self.eq.preview_saved(index);
         self.apply_eq(cx);
         self.show_portrait_toast(format!("已应用「{}」", preset.name), cx);
-        cx.notify();
     }
 
     // ---------- AutoEQ 耳机档案 ----------
@@ -185,10 +322,9 @@ impl ChordialApp {
         self.eq.autoeq.error = None;
         cx.notify();
         cx.spawn(async move |weak, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async { autoeq::fetch_index_blocking() })
-                .await;
+            let result = ChordialApp::run_background(async { autoeq::fetch_index_blocking() })
+                .await
+                .unwrap_or_else(|_| Err("后台任务繁忙，请稍后重试".into()));
             let _ = weak.update(cx, |app, cx| {
                 app.eq.autoeq.index_loading = false;
                 let toast = match result {
@@ -277,10 +413,10 @@ impl ChordialApp {
         }
         cx.spawn(async move |weak, cx| {
             let key = file.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { autoeq::fetch_param_blocking(&key) })
-                .await;
+            let result =
+                ChordialApp::run_background(async move { autoeq::fetch_param_blocking(&key) })
+                    .await
+                    .unwrap_or_else(|_| Err("后台任务繁忙，请稍后重试".into()));
             let _ = weak.update(cx, |app, cx| {
                 let pending = app.eq.autoeq.pending_apply.clone();
                 let mut apply_now = false;
@@ -332,6 +468,7 @@ impl ChordialApp {
         }
     }
 
+    /// 耳机档案只替换链路第一层；已加入的内置预设与自定义频段保留。
     pub(crate) fn apply_autoeq_entry(&mut self, file: &str, cx: &mut Context<Self>) {
         let Some((name, settings)) = self.eq.autoeq.find(file).and_then(|entry| {
             entry
@@ -340,10 +477,23 @@ impl ChordialApp {
         }) else {
             return;
         };
-        self.eq.load_settings(name.clone(), settings);
+        let needed = settings.bands.len();
+        let available = self.eq.bands_available_for_profile();
+        if needed > available {
+            self.show_portrait_toast(
+                format!("档案需要 {needed} 段，当前链路只剩 {available} 段，请先移除一些节点"),
+                cx,
+            );
+            return;
+        }
+        self.eq.set_profile(EqProfile {
+            name: name.clone(),
+            source: "AutoEQ".into(),
+            settings,
+        });
         self.eq.autoeq_preview = Some(file.to_string());
         self.apply_eq(cx);
-        self.show_portrait_toast(format!("已应用「{name}」"), cx);
+        self.show_portrait_toast(format!("已应用耳机档案「{name}」"), cx);
         cx.notify();
     }
 
@@ -361,9 +511,10 @@ impl ChordialApp {
     }
 
     pub(crate) fn persist_eq(&mut self) {
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.equalizer = self.eq.settings.clone();
+        cfg.eq_recipe = Some(self.eq.recipe());
         cfg.eq_saved_presets = self.eq.saved.clone();
-        crate::config::save(&cfg);
+        self.commit_config(&cfg);
     }
 }

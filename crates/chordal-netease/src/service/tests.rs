@@ -1,8 +1,7 @@
 //! 托管服务测试（由 service.rs 拆分，行为不变）。
 
-use super::*;
 use super::helpers::*;
-
+use super::*;
 
 #[test]
 fn auto_uses_manager_but_external_stays_direct() {
@@ -130,8 +129,7 @@ fn spawns_and_stops_a_node_process() {
         eprintln!("node not available; skipping sidecar spawn test");
         return;
     }
-    let dir =
-        std::env::temp_dir().join(format!("chordial-sidecar-spawn-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("chordial-sidecar-spawn-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(

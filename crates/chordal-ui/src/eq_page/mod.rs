@@ -9,6 +9,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use chordal_player::{
     EQ_MAX_BANDS, EQ_MAX_GAIN_DB, EQ_MIN_GAIN_DB, EqSettings, FilterKind, fmt_db, fmt_freq,
@@ -24,8 +25,9 @@ use gpui::{
 use crate::app::ChordialApp;
 use crate::autoeq::{AutoEqLibrary, AutoEqStatus};
 use crate::eq::{
-    EqTab, GraphGeom, PresetEntry, band_summary, builtin_presets, freq_to_slider, q_to_slider,
-    slider_to_freq, slider_to_q, v4_presets,
+    BandOrigin, BuiltinPreset, EqProfile, EqSelection, EqTab, GraphGeom, PresetBlock, PresetGroup,
+    band_summary, builtin_preset, builtin_presets, freq_to_slider, q_to_slider, slider_to_freq,
+    slider_to_q,
 };
 use crate::icons::{self, Icon};
 use crate::theme::Theme;
@@ -41,7 +43,7 @@ mod desktop_shell;
 mod drawing;
 
 const RAIL_W: f32 = 196.0;
-const INSPECTOR_W: f32 = 286.0;
+const INSPECTOR_W: f32 = 304.0;
 const COMPACT_MAX_W: f32 = 560.0;
 /// 紧凑布局一次最多铺多少行 AutoEQ；完整列表有 6000+ 条，
 /// 依赖搜索缩小范围，避免把整份索引塞进一次布局。
@@ -72,8 +74,10 @@ struct CurveCache {
 }
 
 thread_local! {
-    static CURVE_CACHE: std::cell::RefCell<Option<CurveCache>> =
-        const { std::cell::RefCell::new(None) };
+    /// 主曲线与检视器迷你曲线各占一个槽位，避免两种几何/设置每帧互相
+    /// 踢出缓存（曲线采样是本页最大的 CPU 成本）。
+    static CURVE_CACHE: std::cell::RefCell<[Option<CurveCache>; 2]> =
+        const { std::cell::RefCell::new([None, None]) };
 }
 
 fn eq_curve_key(settings: &EqSettings) -> u64 {
@@ -93,6 +97,7 @@ fn eq_curve_key(settings: &EqSettings) -> u64 {
     hasher.finish()
 }
 
+#[allow(clippy::too_many_arguments)] // 几何 + 缓存槽位都是绘制上下文的一部分
 fn eq_curve_points(
     settings: &EqSettings,
     geom: &GraphGeom,
@@ -101,6 +106,7 @@ fn eq_curve_points(
     width: f32,
     height: f32,
     compact: bool,
+    slot: usize,
 ) -> Rc<Vec<(f32, f32)>> {
     let key = eq_curve_key(settings);
     let width_bits = width.to_bits();
@@ -108,9 +114,10 @@ fn eq_curve_points(
     let left_bits = ox.to_bits();
     let top_bits = oy.to_bits();
     let steps = if compact { 150 } else { 260 };
+    let slot = slot.min(1);
     CURVE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(cached) = cache.as_ref()
+        if let Some(cached) = cache[slot].as_ref()
             && cached.key == key
             && cached.width_bits == width_bits
             && cached.height_bits == height_bits
@@ -129,7 +136,7 @@ fn eq_curve_points(
             points.push((ox + geom.x(freq), oy + geom.y(db)));
         }
         let points = Rc::new(points);
-        *cache = Some(CurveCache {
+        cache[slot] = Some(CurveCache {
             key,
             width_bits,
             height_bits,
@@ -283,18 +290,16 @@ fn db_num(db: f32) -> String {
 
 fn tab_meta(tab: EqTab) -> (&'static str, &'static str) {
     match tab {
-        EqTab::Edit => ("编辑器", "点按曲线添加，拖动节点调整"),
-        EqTab::V4 => ("V4 预设", "Moriafly / Syaran 风格配置"),
-        EqTab::AutoEq => ("AutoEQ 耳机档案", "jaakkopasanen/AutoEq · 按测量曲线校准"),
-        EqTab::Builtin => ("内置预设", "按听感调校的房间与风格"),
-        EqTab::Personal => ("我的配置", "「另存为」得到的个人预设"),
+        EqTab::Edit => ("编辑器", "耳机档案 → 内置预设 → 自定义滤波器"),
+        EqTab::AutoEq => ("耳机档案", "AutoEQ 测量曲线 · 链路第一层"),
+        EqTab::Builtin => ("内置预设", "单点增益 · 可叠加、可调幅度"),
+        EqTab::Personal => ("我的配置", "「另存为」保存的完整链路"),
     }
 }
 
 fn tab_icon(tab: EqTab) -> Option<Icon> {
     match tab {
         EqTab::Edit => Some(Icon::Sliders),
-        EqTab::V4 => Some(Icon::Equalizer),
         EqTab::AutoEq => Some(Icon::Headphones),
         EqTab::Builtin => Some(Icon::Layers),
         EqTab::Personal => Some(Icon::Person),
@@ -305,21 +310,25 @@ fn tab_icon(tab: EqTab) -> Option<Icon> {
 
 impl ChordialApp {
     pub(crate) fn render_eq(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let start = Instant::now();
         let theme = Theme::get(cx).clone();
         let pal = EqPalette::new(&theme);
         let enter = self
-            .eq_open_at
-            .map(|t| (t.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0))
+            .motion
+            .eq_enter
+            .as_ref()
+            .map(|spring| spring.value(Instant::now()).clamp(0.0, 1.0))
             .unwrap_or(1.0);
-        let enter: f32 = 1.0 - (1.0 - enter).powi(3);
-        match eq_layout(
+        let view = match eq_layout(
             self.viewport_width,
             self.viewport_height,
             self.force_portrait,
         ) {
-            EqLayout::Desktop => self.eq_render_desktop(&pal, enter, cx),
+            EqLayout::Desktop => self.eq_render_desktop(&pal, enter, _window.mouse_position(), cx),
             EqLayout::Compact => self.eq_render_compact(&pal, enter, cx),
-        }
+        };
+        crate::frame_trace::add("eq.total", start.elapsed());
+        view
     }
 
     // ---------- 桌面：预设库 ----------

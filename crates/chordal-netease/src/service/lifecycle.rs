@@ -1,7 +1,7 @@
 //! 托管服务：lifecycle（由 service.rs 拆分，行为不变）。
 
-use super::*;
 use super::helpers::*;
+use super::*;
 
 impl NeteaseService {
     pub fn from_config(

@@ -5,16 +5,21 @@
 //!   零构建期依赖，缺库时优雅降级；
 //! - **Windows**：[`wasapi`] 原生 WASAPI 共享模式（f32 交错 +
 //!   `AUTOCONVERTPCM` 系统重采样）；
+//! - **Android**：[`aaudio`] 链接 NDK `libaaudio.so`（API 26+），低延迟共享流；
 //! - 其他平台：`open_sink` 返回 Err，由调用方降级 [`NullSink`]。
 //!
 //! 契约：[`AudioSink::write`] 接收 f32 交错帧样本，返回写入的**样本数**；
 //! 全部实现都是 `Send`（播放线程独占）。
 
+#[cfg(target_os = "android")]
+mod aaudio;
 #[cfg(target_os = "linux")]
 mod alsa;
 #[cfg(windows)]
 mod wasapi;
 
+#[cfg(target_os = "android")]
+pub use aaudio::AAudioSink;
 #[cfg(target_os = "linux")]
 pub use alsa::AlsaSink;
 #[cfg(windows)]
@@ -61,8 +66,19 @@ pub fn open_sink(
     WasapiSink::open(device, sample_rate, channels).map(|s| Box::new(s) as Box<dyn AudioSink>)
 }
 
+/// 打开 Android AAudio 输出；`device` 仅用于诊断，路由交给系统。
+/// 失败返回 Err，调用方可降级 [`NullSink`]。
+#[cfg(target_os = "android")]
+pub fn open_sink(
+    device: Option<&str>,
+    sample_rate: u32,
+    channels: usize,
+) -> CoreResult<Box<dyn AudioSink>> {
+    AAudioSink::open(device, sample_rate, channels).map(|s| Box::new(s) as Box<dyn AudioSink>)
+}
+
 /// 其他平台没有音频输出后端；调用方降级 [`NullSink`]。
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 pub fn open_sink(
     device: Option<&str>,
     sample_rate: u32,
@@ -70,7 +86,7 @@ pub fn open_sink(
 ) -> CoreResult<Box<dyn AudioSink>> {
     let _ = (device, sample_rate, channels);
     Err(chordal_core::error::CoreError::Other(
-        "no audio output backend on this platform (ALSA/WASAPI only)".into(),
+        "no audio output backend on this platform (ALSA/WASAPI/AAudio only)".into(),
     ))
 }
 

@@ -3,7 +3,6 @@
 use super::*;
 
 impl Inner {
-
     // ---------- 账号 / 集合 ----------
 
     pub(super) fn account_state(&self) -> AccountState {
@@ -85,7 +84,10 @@ impl Inner {
         }
     }
 
-    pub(super) async fn login_begin_inner(&self, method: LoginMethod) -> CoreResult<LoginChallenge> {
+    pub(super) async fn login_begin_inner(
+        &self,
+        method: LoginMethod,
+    ) -> CoreResult<LoginChallenge> {
         match method {
             LoginMethod::Qr => {
                 // 防缓存 timestamp 由 NeteaseClient 统一附加（api-enhanced
@@ -123,7 +125,10 @@ impl Inner {
         }
     }
 
-    pub(super) async fn login_poll_inner(&self, challenge: &LoginChallenge) -> CoreResult<LoginProgress> {
+    pub(super) async fn login_poll_inner(
+        &self,
+        challenge: &LoginChallenge,
+    ) -> CoreResult<LoginProgress> {
         let Some(key) = challenge.key.as_deref() else {
             return Ok(LoginProgress::Failed("登录挑战缺少 key".into()));
         };

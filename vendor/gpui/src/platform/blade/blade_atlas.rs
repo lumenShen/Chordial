@@ -97,8 +97,8 @@ impl PlatformAtlas for BladeAtlas {
                 return Ok(None);
             };
             let tile = lock.allocate(size, key.texture_kind());
-            let bytes_per_pixel = lock.storage[tile.texture_id.kind].bytes_per_pixel();
-            let padded = expand_atlas_tile_border(&bytes, size, bytes_per_pixel);
+            let bytes_per_pixel = lock.storage[tile.texture_id].bytes_per_pixel();
+            let padded = expand_atlas_tile_border(&bytes, size, bytes_per_pixel.into());
             let upload_bounds = Bounds {
                 origin: point(
                     DevicePixels(tile.bounds.origin.x.0 - ATLAS_TILE_PADDING),

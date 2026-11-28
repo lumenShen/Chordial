@@ -12,14 +12,23 @@
 //! - 所有热点路径埋有性能检查点（[`perf::perf_scope`]），超过预算会在
 //!   tracing 中告警并记入 [`perf::CheckpointLedger`]，供测试阶段断言。
 
+pub mod audio;
 pub mod error;
+pub mod fs;
 pub mod mem;
 pub mod model;
 pub mod perf;
 pub mod playlist;
 pub mod registry;
+pub mod runtime;
 pub mod source;
 
+pub use audio::{
+    AUDIO_BAND_COUNT, AudioBandKind, AudioBandRanges, AudioBands, AudioControlMapping,
+    CONTROL_GRID_SIZE, CONTROL_POINT_COUNT, ControlPointParseError, ControlPointSet,
+    FrequencyRange, MAX_AUDIO_HZ, MIN_AUDIO_HZ, is_interior_point_number,
+    normalize_frequency_range, parse_control_point_set,
+};
 pub use error::{CoreError, CoreResult};
 pub use model::{
     AccountProfile, AccountState, AlbumRef, ArtistRef, AudioQuality, Capabilities, CollectionId,

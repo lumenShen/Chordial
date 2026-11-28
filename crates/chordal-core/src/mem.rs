@@ -572,10 +572,8 @@ mod platform {
             if ok != 0 {
                 return None;
             }
-            let user = usage.ru_utime.tv_sec as u64 * 1_000_000
-                + usage.ru_utime.tv_usec as u64;
-            let system = usage.ru_stime.tv_sec as u64 * 1_000_000
-                + usage.ru_stime.tv_usec as u64;
+            let user = usage.ru_utime.tv_sec as u64 * 1_000_000 + usage.ru_utime.tv_usec as u64;
+            let system = usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64;
             Some(Duration::from_micros(user.saturating_add(system)))
         }
     }

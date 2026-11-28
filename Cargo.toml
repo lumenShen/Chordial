@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/gpui"]
 members = [
     "crates/chordal-cache",
+    "crates/chordal-android",
     "crates/chordal-core",
     "crates/chordal-local",
     "crates/chordal-netease",
@@ -69,10 +71,16 @@ opt-level = 1
 # libc::ENOATTR，任何全新构建都会失败。vendor/xattr 是修复版
 # （Linux 分支改为 libc::ENODATA），纯修复、无 API 变化。
 #
-# gpui 没有内容模糊 API（filter: blur），歌词行只能用稀疏字形叠加近似，
-# 重影明显。vendor/gpui 增加了 paint_glyph_with_blur：在字形光栅化阶段
-# 对 alpha 掩码做真高斯/三次盒式卷积，复用字形图集缓存，每字形仍只画一次。
+# gpui 上游没有内容模糊 API（filter: blur）。vendor/gpui 增加了
+# paint_glyph_with_blur（字形光栅化阶段对 alpha 掩码做真高斯/三次盒式卷积）
+# 与场景级 PaintFilter（按锚点缩放、透明度及多重采样模糊整组绘制）。
 # 补丁位置见 vendor/gpui/PATCHES.md。
+#
+# blade-graphics 只按扩展名判断必需扩展，而 Vulkan 1.3 驱动（如 Android
+# 模拟器的 gfxstream）会把 inline uniform block / dynamic rendering 提升为
+# 核心特性、不再枚举扩展名，于是被误判为不支持。vendor/blade-graphics 允许
+# “核心版本已满足”即通过。补丁位置见 vendor/blade-graphics/PATCHES.md。
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
 gpui = { path = "vendor/gpui" }
+blade-graphics = { path = "vendor/blade-graphics" }

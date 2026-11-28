@@ -67,6 +67,11 @@ impl ChordialApp {
                             .map(|s| s.info.display_name)
                             .unwrap_or_else(|| id.0.clone())
                     });
+                    let failed_count = self
+                        .search_reports
+                        .iter()
+                        .filter(|report| report.outcome.is_err())
+                        .count();
                     let subtitle = if self.searching {
                         "正在向已加载的音源请求…".to_string()
                     } else if visible.is_empty() {
@@ -80,6 +85,9 @@ impl ChordialApp {
                             format!("{} 项 · 聚合 {}ms", visible.len(), self.search_elapsed_ms);
                         if let Some(route) = route_label {
                             s.push_str(&format!(" · {route}"));
+                        }
+                        if failed_count > 0 {
+                            s.push_str(&format!(" · {failed_count} 个音源失败"));
                         }
                         s
                     };
@@ -127,13 +135,14 @@ impl ChordialApp {
                 }
             };
 
+        let action_h = if phone { 40.0 } else { 26.0 };
         let mut actions = div().flex().items_center().gap(px(6.0));
         if self.view_tab == ViewTab::Collection {
             let weak = weak.clone();
             actions = actions.child(
                 div()
                     .id("collection-back")
-                    .h(px(26.0))
+                    .h(px(action_h))
                     .px(px(8.0))
                     .rounded(px(6.0))
                     .border_1()
@@ -166,7 +175,7 @@ impl ChordialApp {
             actions = actions.child(
                 div()
                     .id("clear-route")
-                    .h(px(26.0))
+                    .h(px(action_h))
                     .px(px(8.0))
                     .rounded(px(6.0))
                     .border_1()
@@ -193,14 +202,13 @@ impl ChordialApp {
         }
         if !tracks.is_empty() {
             let weak = weak.clone();
-            let list = list.clone();
             actions = actions.child(crate::widgets::icon_button(
                 &theme,
                 crate::icons::icon(crate::icons::Icon::Play, 13.0, theme.text_dim),
-                28.0,
+                if phone { 40.0 } else { 28.0 },
                 "播放全部",
                 move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| app.queue_play_all(&list, cx));
+                    let _ = weak.update(cx, |app, cx| app.play_from_list(list, 0, cx));
                 },
             ));
         }
@@ -212,7 +220,7 @@ impl ChordialApp {
             actions = actions.child(
                 div()
                     .id("queue-mode")
-                    .h(px(26.0))
+                    .h(px(action_h))
                     .px(px(9.0))
                     .rounded(px(13.0))
                     .border_1()
@@ -244,18 +252,40 @@ impl ChordialApp {
                 actions = actions.child(
                     div()
                         .id("queue-clear-header")
-                        .h(px(26.0))
+                        .h(px(action_h))
                         .px(px(8.0))
                         .rounded(px(6.0))
                         .flex()
                         .items_center()
                         .cursor_pointer()
                         .text_size(px(10.5))
-                        .text_color(theme.text_faint)
+                        .text_color(if self.queue_clear_confirm {
+                            theme.danger
+                        } else {
+                            theme.text_faint
+                        })
+                        .when(self.queue_clear_confirm, |d| {
+                            d.border_color(theme.danger).bg(theme.danger.opacity(0.08))
+                        })
                         .hover(|s| s.bg(theme.surface_alt).text_color(theme.danger))
-                        .child("清除")
+                        .child(if self.queue_clear_confirm {
+                            "确认清除"
+                        } else {
+                            "清除"
+                        })
                         .on_click(move |_, _, cx| {
-                            let _ = weak.update(cx, |app, cx| app.clear_queue(cx));
+                            let _ = weak.update(cx, |app, cx| {
+                                if !app.queue_clear_confirm {
+                                    app.queue_clear_confirm = true;
+                                    cx.notify();
+                                    return;
+                                }
+                                app.stop_playback(cx);
+                                app.set_queue(Arc::new(Vec::new()), None);
+                                app.queue_pos = None;
+                                app.selection = None;
+                                cx.notify();
+                            });
                         }),
                 );
             }
@@ -335,7 +365,7 @@ impl ChordialApp {
                         (
                             crate::icons::Icon::Note,
                             "本地库为空",
-                            "在 config.json 的 local_roots 添加音乐文件夹",
+                            "选择电脑上的音乐文件夹，或添加在线音源",
                         )
                     }
                 }
@@ -345,7 +375,7 @@ impl ChordialApp {
                             ("正在加载集合", "正在请求歌单/专辑/歌手信息")
                         }
                         Some(view) if view.error.is_some() => {
-                            ("集合加载失败", "检查网易云服务是否可用后重试")
+                            ("集合加载失败", "确认音源已启用且服务可用，然后重试")
                         }
                         Some(_) => ("集合为空", "这个歌单/专辑暂时没有曲目"),
                         None => ("未选择集合", "从侧栏歌单或曲目信息进入"),
@@ -353,35 +383,142 @@ impl ChordialApp {
                     (crate::icons::Icon::Layers, title, hint)
                 }
             };
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap(px(7.0))
-                .pb(px(40.0))
-                .child(crate::icons::icon(icon, 22.0, theme.text_faint))
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(empty_title),
-                )
-                .child(
-                    div()
-                        .max_w(px(240.0))
-                        .text_center()
-                        .text_size(px(11.0))
-                        .line_height(px(16.0))
-                        .text_color(theme.text_faint)
-                        .child(hint),
-                )
-                .into_any_element()
+            {
+                let mut empty = div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(7.0))
+                    .pb(px(40.0))
+                    .child(crate::icons::icon(icon, 22.0, theme.text_faint))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(empty_title),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(280.0))
+                            .text_center()
+                            .text_size(px(11.0))
+                            .line_height(px(16.0))
+                            .text_color(theme.text_faint)
+                            .child(hint),
+                    );
+                if self.view_tab == ViewTab::Library
+                    && self.library_filter == LibraryFilter::All
+                    && !self.library_scanning
+                {
+                    let local_id = self
+                        .source_configs
+                        .iter()
+                        .find(|source| source.is_local())
+                        .map(|source| SourceId(source.id.clone()));
+                    let target = local_id.clone();
+                    let weak_choose = weak.clone();
+                    empty = empty.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(8.0))
+                            .mt(px(8.0))
+                            .child(crate::widgets::text_button_with_height(
+                                &theme,
+                                "选择音乐文件夹",
+                                true,
+                                if phone { 40.0 } else { 30.0 },
+                                move |_, _, cx| {
+                                    let _ = weak_choose.update(cx, |app, cx| {
+                                        if let Some(id) = target.clone() {
+                                            app.open_source_edit(id, cx);
+                                        } else {
+                                            app.open_new_source(cx);
+                                        }
+                                    });
+                                },
+                            ))
+                            .child({
+                                let weak_manage = weak.clone();
+                                crate::widgets::text_button_with_height(
+                                    &theme,
+                                    "管理音源",
+                                    false,
+                                    if phone { 40.0 } else { 30.0 },
+                                    move |_, _, cx| {
+                                        let _ = weak_manage.update(cx, |app, cx| {
+                                            app.open_source_manager(cx);
+                                        });
+                                    },
+                                )
+                            }),
+                    );
+                } else if self.view_tab == ViewTab::Library
+                    && self.library_filter == LibraryFilter::Queue
+                {
+                    let weak_search = weak.clone();
+                    empty = empty.child(div().mt(px(8.0)).child(
+                        crate::widgets::text_button_with_height(
+                            &theme,
+                            "搜索歌曲",
+                            true,
+                            if phone { 40.0 } else { 30.0 },
+                            move |_, window, cx| {
+                                let _ = weak_search.update(cx, |app, cx| {
+                                    app.phone_page = PhonePage::Browse;
+                                    app.view_tab = ViewTab::Search;
+                                    app.source_route = None;
+                                    let input = app.search_input.clone();
+                                    cx.defer_in(window, move |_, window, cx| {
+                                        focus_input(&input, window, cx);
+                                    });
+                                    cx.notify();
+                                });
+                            },
+                        ),
+                    ));
+                } else if self.view_tab == ViewTab::Collection
+                    && self
+                        .collection
+                        .as_ref()
+                        .is_some_and(|view| view.error.is_some())
+                {
+                    let retry = self
+                        .collection
+                        .as_ref()
+                        .map(|view| (view.id.clone(), view.title.clone()));
+                    let weak_retry = weak.clone();
+                    empty = empty.child(div().mt(px(8.0)).child(
+                        crate::widgets::text_button_with_height(
+                            &theme,
+                            "重试",
+                            true,
+                            if phone { 40.0 } else { 30.0 },
+                            move |_, _, cx| {
+                                let _ = weak_retry.update(cx, |app, cx| {
+                                    if let Some((id, title)) = &retry {
+                                        app.open_collection(id.clone(), title.clone(), cx);
+                                    }
+                                });
+                            },
+                        ),
+                    ));
+                }
+                empty.into_any_element()
+            }
         } else {
             self.render_track_table(&theme, tracks, list, cx)
         };
+
+        let failed_search_count = self
+            .search_reports
+            .iter()
+            .filter(|report| report.outcome.is_err())
+            .count();
 
         let header = if phone {
             self.render_phone_pane_header(
@@ -412,6 +549,54 @@ impl ChordialApp {
             .when(self.view_tab == ViewTab::Search, |d| {
                 d.child(self.render_search_tabs(&theme, cx))
             })
+            .when(
+                self.view_tab == ViewTab::Search && !self.searching && failed_search_count > 0,
+                |d| {
+                    let weak_retry = weak.clone();
+                    d.child(
+                        div()
+                            .mx(px(12.0))
+                            .mb(px(8.0))
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(theme.warn.opacity(0.28))
+                            .bg(theme.warn.opacity(0.07))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(crate::icons::icon(
+                                crate::icons::Icon::Alert,
+                                14.0,
+                                theme.warn,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_dim)
+                                    .child(format!(
+                                        "{failed_search_count} 个音源未响应，当前显示可用结果"
+                                    )),
+                            )
+                            .child(crate::widgets::text_button(
+                                &theme,
+                                "重试",
+                                false,
+                                move |_, _, cx| {
+                                    let _ = weak_retry.update(cx, |app, cx| {
+                                        let query = app.search_input.read(cx).content().to_string();
+                                        if !query.trim().is_empty() {
+                                            app.start_search(query, cx);
+                                        }
+                                    });
+                                },
+                            )),
+                    )
+                },
+            )
             // 播放队列是操作面板，不需要再占一行搜索框。
             .when(
                 self.view_tab != ViewTab::Collection

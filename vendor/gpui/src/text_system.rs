@@ -325,10 +325,7 @@ impl TextSystem {
             // Blurred glyphs need a zero-filled margin for the kernel to decay
             // in; the platform rasterizer renders the glyph into this expanded
             // rect and the resulting bitmap is convolved below.
-            if params.blur_radius.0 > 0.0
-                && bounds.size.width.0 > 0
-                && bounds.size.height.0 > 0
-            {
+            if params.blur_radius.0 > 0.0 && bounds.size.width.0 > 0 && bounds.size.height.0 > 0 {
                 let pad = blur_padding(params.blur_radius.0);
                 bounds.origin.x = DevicePixels(bounds.origin.x.0 - pad);
                 bounds.origin.y = DevicePixels(bounds.origin.y.0 - pad);
@@ -457,7 +454,13 @@ fn three_box_blur_alpha(mask: &mut [u8], width: usize, height: usize, sigma: f32
     }
 }
 
-fn box_blur_f32(buffer: &mut [f32], scratch: &mut [f32], width: usize, height: usize, box_width: usize) {
+fn box_blur_f32(
+    buffer: &mut [f32],
+    scratch: &mut [f32],
+    width: usize,
+    height: usize,
+    box_width: usize,
+) {
     let radius = box_width / 2;
     if radius == 0 {
         return;

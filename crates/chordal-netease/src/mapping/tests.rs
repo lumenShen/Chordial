@@ -25,7 +25,10 @@ fn song_detail_maps_album_year() {
     assert_eq!(track.title, "终于见到了你");
     assert_eq!(track.primary_artist(), "吴琳珂Moske");
     assert_eq!(track.album.as_ref().unwrap().name, "终于见到了你");
-    assert_eq!(track.album.as_ref().unwrap().cover.as_deref(), Some("https://x/c.jpg"));
+    assert_eq!(
+        track.album.as_ref().unwrap().cover.as_deref(),
+        Some("https://x/c.jpg")
+    );
     assert_eq!(track.year, Some(1993));
     assert_eq!(track.track_no, Some(1));
 }

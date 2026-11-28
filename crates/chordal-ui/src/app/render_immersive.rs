@@ -25,7 +25,7 @@ impl ChordialApp {
             w: width,
             h: height,
         };
-        let card = full.lerp(dock_rect(width, height), p);
+        let card = full.lerp(self.current_dock_rect(), p);
         let card_w = card.w.max(1.0);
         let card_h = card.h.max(1.0);
         // 显隐通道全部走 smoothstep：两端斜率为 0，控件不会在行程起止帧
@@ -69,14 +69,23 @@ impl ChordialApp {
             view.set_background_render_scale(bg_scale);
         });
 
-        let dock_shared = p > 0.001;
-        // 歌词 / 队列 / 音频详情共用「左播放列 + 右内容列」的分栏；
-        // 「仅显示主内容」与窄窗沿用居中播放列。
+        let source_mode = self.source_stage_mode();
+        let dock_stage_active =
+            self.stage_request.as_ref().is_some_and(|request| {
+                request.from_mode.is_source() || request.to_mode.is_source()
+            }) || self
+                .motion
+                .stage
+                .as_ref()
+                .is_some_and(|spring| spring.active(now) && spring.touches_source());
+        let dock_shared = p > 0.001 || dock_stage_active;
+        // 页面始终按最终视口布局，卡片只负责裁剪；避免动画每帧重排，
+        // 也让隐藏测量得到与静态页面逐像素一致的目标。
         let split_layout = self.stage_split_active(cx, width, height);
         let page = if split_layout {
-            self.render_immersive_wide(card_w, card_h, dock_shared, dock_opacity, window, cx)
+            self.render_immersive_wide(width, height, dock_shared, dock_opacity, window, cx)
         } else {
-            self.render_immersive_compact(card_w, card_h, dock_shared, dock_opacity, window, cx)
+            self.render_immersive_compact(width, height, dock_shared, dock_opacity, window, cx)
         };
 
         let mut card_el = div()
@@ -96,44 +105,50 @@ impl ChordialApp {
                 .border_color(card_border)
                 .bg(card_bg);
         }
-        // 只在沉浸页这一侧存在的控件（进度/传输/音量/顶栏/底栏）随淡入
-        // 一起轻微上浮。共享封面走独立舞台，不受这层位移影响，于是两者
-        // 之间形成一点视差：元素像是「长出来」而不是在原地凭空出现。
-        let content_offset_y = (1.0 - content_opacity) * 10.0;
         card_el = card_el.child(
             div()
                 .absolute()
                 .inset_0()
-                .top(px(content_offset_y))
                 .opacity(content_opacity)
                 .child(page),
         );
 
-        // 共享舞台（封面/曲名/艺人）独立于页面缩放，从 Dock 内的小元素
-        // 连续飞到沉浸页对应位置；坐标从窗口空间平移进卡片空间。
-        if dock_shared {
-            let mode = self.immersive_stage_mode(cx, width, height);
-            let page_geometry = immersive_geometry(mode, width, height);
-            let dock_stage = dock_geometry(width, height);
-            let shared = page_geometry
-                .lerp(dock_stage, p)
-                .translated(-card.x, -card.y);
-            card_el =
-                card_el.child(self.render_dock_shared_stage(shared, title_color, artist_color, p));
+        // 共享舞台使用窗口坐标，不随卡片裁剪或位移，首尾直接交给真实布局。
+        let shared_geometry = if let Some(request) = self.stage_request {
+            (request.from_mode.is_source() || request.to_mode.is_source()).then_some(request.from)
+        } else if dock_stage_active {
+            self.motion.stage.as_ref().map(|spring| spring.sample(now))
+        } else if p > 0.001 {
+            let target = if self.motion.dock_collapsing {
+                self.stage_measurements
+                    .cached(source_mode)
+                    .unwrap_or_else(|| immersive_geometry(source_mode, width, height))
+            } else {
+                let mode = self.immersive_stage_mode(cx, width, height);
+                self.stage_measurements
+                    .cached(mode)
+                    .unwrap_or_else(|| immersive_geometry(mode, width, height))
+            };
+            let dock = self
+                .stage_measurements
+                .cached(source_mode)
+                .unwrap_or_else(|| immersive_geometry(source_mode, width, height));
+            Some(
+                if self.sheet_drag.is_some() || self.motion.dock_collapsing {
+                    target.lerp(dock, p)
+                } else {
+                    target
+                },
+            )
+        } else {
+            None
         }
+        .filter(|geometry| geometry.is_valid());
 
         // 「更多」抽屉画在页面与共享舞台之上；布局 1 / 布局 2 共用。
-        if self.drawer_visible() {
-            card_el = card_el.child(self.render_drawer(card_w, card_h, now, cx));
-        }
-
         // 底栏按钮行与主沉浸区左右边界对齐；下拉菜单锚定在右边界上方。
-        let bottom_rect = stage_bottom_rect(
-            width,
-            height,
-            split_layout,
-            stable_lyric_pad(self.viewport_width, self.viewport_height),
-        );
+        // 竖屏歌词态的底栏是 1em 内缩的全宽列，必须走同一套几何。
+        let bottom_rect = self.immersive_view_menu_rect(width, height, split_layout, cx);
         let menu_right = (width - bottom_rect.x - bottom_rect.w).max(0.0);
         let menu_bottom = (height - bottom_rect.y + 8.0).max(0.0);
 
@@ -142,8 +157,12 @@ impl ChordialApp {
             .id("immersive-root")
             .size_full()
             .relative()
-            .on_mouse_move(cx.listener(|app, _: &MouseMoveEvent, _, cx| {
-                app.note_stage_interaction(cx);
+            .on_mouse_move(cx.listener(|app, event: &MouseMoveEvent, _, cx| {
+                app.note_stage_pointer(
+                    f32::from(event.position.x),
+                    f32::from(event.position.y),
+                    cx,
+                );
             }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -152,6 +171,13 @@ impl ChordialApp {
                 }),
             )
             .child(card_el);
+        if dock_shared && let Some(geometry) = shared_geometry {
+            root =
+                root.child(self.render_dock_shared_stage(geometry, title_color, artist_color, p));
+        }
+        if self.drawer_visible() {
+            root = root.child(self.render_drawer(card_w, card_h, now, cx));
+        }
         // 菜单展开时先铺一层透明遮挡：点菜单外即收起，菜单本身阻止冒泡。
         if self.stage_view_menu_open {
             root = root.child(
@@ -181,19 +207,25 @@ impl ChordialApp {
                     .id("immersive-drag-capture")
                     .absolute()
                     .inset_0()
+                    .occlude()
                     .cursor(CursorStyle::ClosedHand)
                     .on_mouse_move(cx.listener(move |app, event: &MouseMoveEvent, _, cx| {
+                        let y = f32::from(event.position.y);
                         if event.pressed_button == Some(gpui::MouseButton::Left) {
-                            app.update_sheet_drag(f32::from(event.position.y), cx);
-                        } else if app.sheet_drag.is_some_and(|drag| !drag.animating()) {
-                            app.release_sheet_drag(height, cx);
+                            app.update_sheet_drag(y, cx);
+                        } else if app
+                            .sheet_drag
+                            .as_ref()
+                            .is_some_and(|drag| !drag.animating(Instant::now()))
+                        {
+                            app.release_sheet_drag(y, height, cx);
                         }
                     }))
                     .on_mouse_up(
                         gpui::MouseButton::Left,
-                        cx.listener(move |app, _: &MouseUpEvent, _, cx| {
+                        cx.listener(move |app, event: &MouseUpEvent, _, cx| {
                             if app.sheet_drag.is_some() {
-                                app.release_sheet_drag(height, cx);
+                                app.release_sheet_drag(f32::from(event.position.y), height, cx);
                             }
                         }),
                     ),
@@ -210,6 +242,21 @@ impl ChordialApp {
     /// 菜单钮 35×35 贴右缘 3em；歌词铺满其余高度并对齐 0.1/top，
     /// mask 只在顶部 10% 渐隐；歌词打开时不显示传输控件（与 AMLL 竖向一致）。
     // ---- AMLL 播放器控件（横向/竖向共用同一套写法） ----
+
+    /// 给带 `occlude` 的控件行补发舞台交互通知。
+    ///
+    /// `occlude` 会截断命中链，沉浸根节点上的 `on_mouse_move` / `on_mouse_down`
+    /// 收不到行内事件；闲置计时与控件唤出必须在这里补上，否则在控件上移动或
+    /// 点击不会刷新 5s 闲置窗口，控件可能在操作中途淡出。
+    fn stage_row_interaction(row: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
+        row.on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(|app, _: &MouseDownEvent, _, cx| app.note_stage_interaction(cx)),
+        )
+        .on_mouse_move(cx.listener(|app, event: &MouseMoveEvent, _, cx| {
+            app.note_stage_pointer(f32::from(event.position.x), f32::from(event.position.y), cx);
+        }))
+    }
 
     /// AMLL BouncingSlider 进度条 + 时间/音质标签行。
     ///
@@ -247,7 +294,13 @@ impl ChordialApp {
                 }
             }
         };
-        let progress_bar = crate::widgets::amll_slider(progress, "seek", seek);
+        let progress_bar = crate::widgets::amll_playback_slider(
+            progress,
+            duration,
+            status.state == PlayerState::Playing,
+            "seek",
+            seek,
+        );
 
         // AMLL `.qualityTag`：高 ≤1080 时 scale=1，否则 1.4。
         let tag_scale = if height > 1080.0 { 1.4 } else { 1.0 };
@@ -306,31 +359,37 @@ impl ChordialApp {
                 })
         };
 
-        div()
-            .w(px(width))
-            .flex()
-            .flex_col()
-            .child(div().h(px(24.0)).child(progress_bar))
-            .child(
-                div()
-                    .w_full()
-                    .mt(px(4.0))
-                    .flex()
-                    .items_center()
-                    .text_size(px(label_font))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(white.opacity(0.5))
-                    .child(div().flex_1().child(SharedString::from(fmt_ms(position))))
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .justify_center()
-                            .child(quality_pill),
-                    )
-                    .child(right_label),
-            )
-            .into_any_element()
+        // 进度条/时间标签压在歌词之上：整块 occlude，避免按下时同时命中
+        // 背后歌词视图的「点字跳转」监听（否则点滑杆会先跳歌词时间轴）。
+        Self::stage_row_interaction(
+            div()
+                .w(px(width))
+                .flex()
+                .flex_col()
+                .occlude()
+                .child(div().h(px(24.0)).child(progress_bar))
+                .child(
+                    div()
+                        .w_full()
+                        .mt(px(4.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(label_font))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(white.opacity(0.5))
+                        .child(div().flex_1().child(SharedString::from(fmt_ms(position))))
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .justify_center()
+                                .child(quality_pill),
+                        )
+                        .child(right_label),
+                ),
+            cx,
+        )
+        .into_any_element()
     }
 
     /// AMLL MediaButton 传输行：shuffle / prev / play / next / repeat。
@@ -476,7 +535,7 @@ impl ChordialApp {
             let weak = weak.clone();
             media_btn(
                 "amll-play",
-                if playing { "暂停" } else { "播放" }.into(),
+                self.playback_action_label().into(),
                 crate::icons::icon_motion(
                     if playing {
                         crate::icons::Icon::PauseMedia
@@ -545,20 +604,26 @@ impl ChordialApp {
                 }),
             )
         };
-        div()
-            .w(px(width))
-            .flex()
-            .items_center()
-            .child(shuffle)
-            .child(sp())
-            .child(prev)
-            .child(sp())
-            .child(play)
-            .child(sp())
-            .child(next)
-            .child(sp())
-            .child(repeat)
-            .into_any_element()
+        // 传输键同样压在歌词之上；occlude 保证点按钮/按钮间隙都不会把
+        // 按下事件漏给歌词的点击跳转。
+        Self::stage_row_interaction(
+            div()
+                .w(px(width))
+                .flex()
+                .items_center()
+                .occlude()
+                .child(shuffle)
+                .child(sp())
+                .child(prev)
+                .child(sp())
+                .child(play)
+                .child(sp())
+                .child(next)
+                .child(sp())
+                .child(repeat),
+            cx,
+        )
+        .into_any_element()
     }
 
     /// AMLL VolumeControl 等价音量行。
@@ -589,62 +654,61 @@ impl ChordialApp {
         };
         // AMLL VolumeControl：行高 40（svg 布局高度），左右负边距 -12 / -8，
         // 喇叭的可见图形只占 svg 画布的一小部分。
-        div()
-            .w(px(width + 20.0))
-            .ml(px(-12.0))
-            .mr(px(-8.0))
-            .h(px(40.0))
-            .flex()
-            .items_center()
-            .child(
-                div()
-                    .w(px(32.0))
-                    .h(px(40.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(crate::icons::icon_motion(
-                        crate::icons::Icon::VolumeLow,
-                        26.7,
-                        white.opacity(0.5),
-                        crate::icons::IconMotion {
-                            speaker: speaker_low,
-                            ..Default::default()
-                        },
-                    )),
-            )
-            .child(div().flex_1().child(volume_slider))
-            .child(
-                div()
-                    .w(px(43.0))
-                    .h(px(40.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(crate::icons::icon_motion(
-                        crate::icons::Icon::VolumeHigh,
-                        33.4,
-                        white.opacity(0.5),
-                        crate::icons::IconMotion {
-                            speaker: speaker_high,
-                            ..Default::default()
-                        },
-                    )),
-            )
-            .into_any_element()
+        Self::stage_row_interaction(
+            div()
+                .w(px(width + 20.0))
+                .ml(px(-12.0))
+                .mr(px(-8.0))
+                .h(px(40.0))
+                .flex()
+                .items_center()
+                .occlude()
+                .child(
+                    div()
+                        .w(px(32.0))
+                        .h(px(40.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::icons::icon_motion(
+                            crate::icons::Icon::VolumeLow,
+                            26.7,
+                            white.opacity(0.5),
+                            crate::icons::IconMotion {
+                                speaker: speaker_low,
+                                ..Default::default()
+                            },
+                        )),
+                )
+                .child(div().flex_1().child(volume_slider))
+                .child(
+                    div()
+                        .w(px(43.0))
+                        .h(px(40.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::icons::icon_motion(
+                            crate::icons::Icon::VolumeHigh,
+                            33.4,
+                            white.opacity(0.5),
+                            crate::icons::IconMotion {
+                                speaker: speaker_high,
+                                ..Default::default()
+                            },
+                        )),
+                ),
+            cx,
+        )
+        .into_any_element()
     }
 
     /// 布局 1 / 布局 2 共用的底部控制行。
     ///
     /// 左：全屏；右：一个「图标 + 文字 + 箭头」的视图选择器。四项视图共用
     /// 同一个右侧内容区；「更多」入口已收进曲目信息右侧的圆钮。
-    /// `chrome` 是闲置隐藏的淡出进度，隐藏时按钮仍然占位但不再响应点击。
-    pub(super) fn immersive_bottom_row(
-        &self,
-        width: f32,
-        chrome: f32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// 透明度、模糊与缩放由外层的 `StageChromeGroup` 统一拥有。
+    pub(super) fn immersive_bottom_row(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let white = gpui::white();
         let weak = cx.entity().downgrade();
         let bubble_style = crate::bubble::BubbleStyle::on_dark(Theme::get(cx).font_family.clone());
@@ -683,7 +747,7 @@ impl ChordialApp {
             )
         };
 
-        let view = self.stage_view;
+        let view = self.visible_stage_view();
         let select = {
             let weak = weak.clone();
             div()
@@ -735,7 +799,6 @@ impl ChordialApp {
             .items_center()
             .justify_between()
             .occlude()
-            .opacity(chrome)
             .child(fullscreen)
             .child(select)
             .into_any_element()
@@ -788,7 +851,7 @@ impl ChordialApp {
                 panel = panel.child(div().h(px(1.0)).mx(px(8.0)).bg(theme.border));
             }
             let weak = weak.clone();
-            let active = self.stage_view == view;
+            let active = self.visible_stage_view() == view;
             panel = panel.child(
                 div()
                     .id(gpui::ElementId::named_usize("stage-view", index))

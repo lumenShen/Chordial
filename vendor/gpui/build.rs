@@ -25,6 +25,10 @@ fn main() {
             #[cfg(target_os = "windows")]
             windows::build();
         }
+        Ok("android") => {
+            println!("cargo::rustc-link-lib=android");
+            println!("cargo::rustc-link-lib=log");
+        }
         _ => (),
     };
 }

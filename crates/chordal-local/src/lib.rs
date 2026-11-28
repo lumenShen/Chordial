@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use chordal_core::error::{CoreError, CoreResult};
@@ -56,7 +56,7 @@ type Fingerprints = HashMap<PathBuf, (u64, u64)>;
 
 #[derive(Default)]
 struct Index {
-    tracks: Vec<Track>,
+    tracks: Arc<Vec<Track>>,
     /// 源内 id（= 规范路径字符串）→ tracks 下标。O(1) 查找。
     by_id: HashMap<String, u32>,
     /// `dedup_key` → tracks 下标。用于“在线播放时找本地同曲”。
@@ -135,6 +135,8 @@ pub struct LocalSource {
     config: RwLock<LocalSourceConfig>,
     tag_reader: RwLock<Box<dyn TagReader>>,
     index: RwLock<Index>,
+    /// 同一实例的扫描串行执行，避免旧 roots 的结果覆盖新 roots。
+    scan_lock: Mutex<()>,
     /// 扫描代数：每次扫描自增，UI 可观察。
     scan_generation: AtomicU64,
 }
@@ -176,6 +178,7 @@ impl LocalSource {
             config: RwLock::new(config),
             tag_reader: RwLock::new(tag_reader),
             index: RwLock::new(Index::default()),
+            scan_lock: Mutex::new(()),
             scan_generation: AtomicU64::new(0),
         })
     }
@@ -209,6 +212,12 @@ impl LocalSource {
     /// 复杂度：O(文件数) 单遍 walkdir + 单遍 stat + 仅变更文件读标签。
     /// 检查点 `local.scan.index`（items = 音频文件数）。
     pub fn scan_blocking(&self) -> ScanSummary {
+        self.scan_with_tracks().0
+    }
+
+    /// 扫描并返回同一代摘要与曲目快照，避免两步之间被另一次扫描替换。
+    pub fn scan_with_tracks(&self) -> (ScanSummary, Arc<Vec<Track>>) {
+        let _scan = self.scan_lock.lock().expect("local scan lock poisoned");
         let scope = PerfScope::enter("local.scan.index");
 
         // 旧索引只读快照：增量复用的数据源。整个扫描持读锁，
@@ -337,7 +346,7 @@ impl LocalSource {
         let (albums, artists) = build_collections(&tracks);
         {
             let mut index = self.index.write().expect("local index lock poisoned");
-            index.tracks = tracks;
+            index.tracks = Arc::new(tracks);
             index.by_id = by_id;
             index.by_dedup = by_dedup;
             index.by_identity = by_identity;
@@ -355,7 +364,8 @@ impl LocalSource {
             reused,
             "local library scanned"
         );
-        self.last_summary()
+        let summary = self.last_summary();
+        (summary, self.all_tracks_arc())
     }
 
     /// 最近一次扫描摘要。
@@ -390,7 +400,7 @@ impl LocalSource {
         }
         let (albums, artists) = build_collections(&tracks);
         let mut index = self.index.write().expect("local index lock poisoned");
-        index.tracks = tracks;
+        index.tracks = Arc::new(tracks);
         index.by_id = by_id;
         index.by_dedup = by_dedup;
         index.by_identity = by_identity;
@@ -405,6 +415,11 @@ impl LocalSource {
 
     /// 全库曲目快照（library 视图用；UI 侧持有到下一次扫描为止）。
     pub fn all_tracks(&self) -> Vec<Track> {
+        self.all_tracks_arc().to_vec()
+    }
+
+    /// 与索引共享所有权的快照；适合播放器整树重绘，避免深拷贝整库。
+    pub fn all_tracks_arc(&self) -> Arc<Vec<Track>> {
         self.index
             .read()
             .expect("local index lock poisoned")
@@ -486,7 +501,10 @@ impl LocalSource {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::time::Duration;
 
     /// 计数假标签读取器：断言增量扫描只重读变更文件。
     struct SharedReader(Arc<AtomicU64>);
@@ -502,6 +520,22 @@ mod tests {
                 track_no: None,
                 year: Some(2024),
             })
+        }
+    }
+
+    struct BlockingReader {
+        inner: SharedReader,
+        started: Sender<()>,
+        release: Mutex<Option<Receiver<()>>>,
+    }
+
+    impl TagReader for BlockingReader {
+        fn read(&self, path: &Path) -> Option<TrackMeta> {
+            if let Some(release) = self.release.lock().unwrap().take() {
+                let _ = self.started.send(());
+                let _ = release.recv();
+            }
+            self.inner.read(path)
         }
     }
 
@@ -566,6 +600,80 @@ mod tests {
     }
 
     #[test]
+    fn scan_with_tracks_returns_one_consistent_generation() {
+        let tmp =
+            std::env::temp_dir().join(format!("chordial-local-snapshot-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        write_file(&tmp, "a - one.mp3");
+        write_file(&tmp, "b - two.mp3");
+        let (src, _) = make_source(vec![tmp.clone()]);
+        let (summary, tracks) = src.scan_with_tracks();
+        assert_eq!(summary.tracks, 2);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(summary.scan_generation, src.scan_generation());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn concurrent_scans_are_serialized_and_latest_roots_win() {
+        let old_root =
+            std::env::temp_dir().join(format!("chordial-local-old-{}", std::process::id()));
+        let new_root =
+            std::env::temp_dir().join(format!("chordial-local-new-{}", std::process::id()));
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&new_root).unwrap();
+        write_file(&old_root, "old.mp3");
+        write_file(&new_root, "new-a.mp3");
+        write_file(&new_root, "new-b.mp3");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicU64::new(0));
+        let src = LocalSource::new_with_tag_reader(
+            SourceId::new("local-test"),
+            LocalSourceConfig {
+                roots: vec![old_root.clone()],
+            },
+            "test",
+            Box::new(BlockingReader {
+                inner: SharedReader(calls),
+                started: started_tx,
+                release: Mutex::new(Some(release_rx)),
+            }),
+        );
+
+        let first_source = src.clone();
+        let first = std::thread::spawn(move || first_source.scan_blocking());
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        src.set_roots(vec![new_root.clone()]);
+        let second_source = src.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let _ = second_source.scan_blocking();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "second scan must wait for the first scan lock"
+        );
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let tracks = src.all_tracks_arc();
+        assert_eq!(tracks.len(), 2);
+        assert!(tracks.iter().all(|track| match &track.origin {
+            TrackOrigin::Local { path } => path.starts_with(&new_root),
+            _ => false,
+        }));
+        let _ = fs::remove_dir_all(old_root);
+        let _ = fs::remove_dir_all(new_root);
+    }
+
+    #[test]
     fn incremental_rescan_only_rechanges() {
         let tmp = std::env::temp_dir().join(format!("chordial-inc-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
@@ -586,6 +694,28 @@ mod tests {
         fs::remove_file(tmp.join("b - two.mp3")).unwrap();
         src.scan_blocking();
         assert_eq!(src.last_summary().tracks, 2);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn track_snapshots_share_storage_until_rescan() {
+        let tmp = std::env::temp_dir().join(format!("chordial-snapshot-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        write_file(&tmp, "a - one.mp3");
+        let (src, _) = make_source(vec![tmp.clone()]);
+        src.scan_blocking();
+
+        let first = src.all_tracks_arc();
+        let same = src.all_tracks_arc();
+        assert!(Arc::ptr_eq(&first, &same));
+
+        write_file(&tmp, "b - two.mp3");
+        src.scan_blocking();
+        let second = src.all_tracks_arc();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 2);
 
         let _ = fs::remove_dir_all(&tmp);
     }

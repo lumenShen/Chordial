@@ -1,4 +1,4 @@
-//! EQ 页面区块：compact_panels（由 eq_page.rs 拆分，行为不变）。
+//! EQ 页面区块：compact_panels（紧凑布局的检视器与预设库）。
 
 use super::controls::*;
 use super::*;
@@ -10,13 +10,6 @@ impl ChordialApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let weak = cx.entity().downgrade();
-        let selected = self.eq.selected.and_then(|index| {
-            self.eq
-                .settings
-                .bands
-                .get(index)
-                .map(|band| (index, band.clone()))
-        });
         let mut panel = div()
             .w_full()
             .rounded(px(16.0))
@@ -28,149 +21,30 @@ impl ChordialApp {
             .flex_col()
             .gap(px(12.0));
 
-        match selected {
-            Some((index, band)) => {
-                panel = panel.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap(px(1.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(5.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(9.0))
-                                                .text_color(pal.text_faint)
-                                                .child(SharedString::from(format!(
-                                                    "频段 {:02} / {:02}",
-                                                    index + 1,
-                                                    self.eq.settings.bands.len()
-                                                ))),
-                                        )
-                                        .child({
-                                            let weak_toggle = weak.clone();
-                                            let enabled = band.enabled;
-                                            div()
-                                                .id("eq-band-enabled-compact")
-                                                .h(px(24.0))
-                                                .px(px(8.0))
-                                                .rounded(px(12.0))
-                                                .bg(if enabled {
-                                                    pal.accent_soft
-                                                } else {
-                                                    pal.chip
-                                                })
-                                                .flex()
-                                                .items_center()
-                                                .cursor_pointer()
-                                                .text_size(px(9.0))
-                                                .text_color(if enabled {
-                                                    pal.accent
-                                                } else {
-                                                    pal.text_faint
-                                                })
-                                                .child(if enabled { "启用" } else { "旁路" })
-                                                .on_click(move |_, _, cx| {
-                                                    let _ = weak_toggle.update(cx, |app, cx| {
-                                                        if let Some(band) =
-                                                            app.eq.settings.bands.get_mut(index)
-                                                        {
-                                                            band.enabled = !enabled;
-                                                            app.eq.touch();
-                                                            app.apply_eq(cx);
-                                                        }
-                                                    });
-                                                })
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_baseline()
-                                        .gap(px(4.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(22.0))
-                                                .font_family(pal.mono.clone())
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(pal.text)
-                                                .child(SharedString::from(fmt_freq(band.freq_hz))),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(9.0))
-                                                .text_color(pal.text_faint)
-                                                .child("Hz"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(13.0))
-                                                .font_family(pal.mono.clone())
-                                                .text_color(pal.accent)
-                                                .child(SharedString::from(format!(
-                                                    "  {} dB",
-                                                    if band.kind.uses_gain() {
-                                                        db_num(band.gain_db)
-                                                    } else {
-                                                        "—".into()
-                                                    }
-                                                ))),
-                                        ),
-                                ),
-                        )
-                        .child({
-                            let weak = weak.clone();
-                            eq_icon_button(
-                                pal,
-                                Icon::Close,
-                                32.0,
-                                "eq-remove-compact",
-                                "删除频段",
-                                move |_, _, cx| {
-                                    let _ = weak.update(cx, |app, cx| {
-                                        app.eq.selected = Some(index);
-                                        app.remove_eq_band(cx);
-                                    });
-                                },
-                            )
-                        }),
-                );
-
-                panel = panel.child(self.eq_kind_row_compact(pal, index, band.kind, cx));
-                panel = panel.child(self.eq_params_block(pal, index, &band, true, cx));
-                panel = panel.child(eq_divider(pal));
+        match self.eq.selected {
+            Some(EqSelection::Custom(index)) => {
+                if let Some(band) = self.eq.custom.get(index).cloned() {
+                    panel = panel.child(self.eq_custom_inspector(pal, index, &band, true, cx));
+                    panel = panel.child(eq_divider(pal));
+                }
+            }
+            Some(EqSelection::Block(index)) => {
+                if let Some(block) = self.eq.blocks.get(index).cloned()
+                    && let Some(preset) = self.eq.block_preset(index)
+                {
+                    panel = panel.child(self.eq_block_inspector(pal, index, preset, &block, cx));
+                    panel = panel.child(eq_divider(pal));
+                }
+            }
+            Some(EqSelection::Profile) => {
+                if let Some(profile) = self.eq.profile.clone() {
+                    panel = panel.child(self.eq_profile_inspector(pal, &profile, cx));
+                    panel = panel.child(eq_divider(pal));
+                }
             }
             None => {
-                panel = panel.child(
-                    div()
-                        .w_full()
-                        .py(px(14.0))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap(px(4.0))
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(pal.text_dim)
-                                .child("还没有频段"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(pal.text_faint)
-                                .child("点按上方曲线即可添加第一个频段"),
-                        ),
-                );
+                panel = panel.child(self.eq_chain_overview(pal));
+                panel = panel.child(eq_divider(pal));
             }
         }
 
@@ -209,63 +83,36 @@ impl ChordialApp {
                     .text_center()
                     .text_size(px(9.0))
                     .text_color(pal.text_faint)
-                    .child("调整会自动保存；需要复用曲线时点「另存为」"),
+                    .child("调整会自动保存；需要复用整条链路时点「另存为」"),
             );
         }
         panel.into_any_element()
     }
 
-    pub(super) fn eq_kind_row_compact(
-        &self,
-        pal: &EqPalette,
-        _index: usize,
-        active: FilterKind,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let weak = cx.entity().downgrade();
-        let mut row = div().w_full().flex().gap(px(5.0));
-        for kind in FilterKind::ALL {
-            let weak = weak.clone();
-            let is_active = active == kind;
-            row = row.child(
-                div()
-                    .id(SharedString::from(format!("eq-kind-c-{}", kind.label())))
-                    .h(px(32.0))
-                    .flex_1()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(if is_active {
-                        pal.accent_line
-                    } else {
-                        pal.border
-                    })
-                    .bg(if is_active { pal.accent_soft } else { pal.chip })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .text_size(px(10.5))
-                    .text_color(if is_active { pal.accent } else { pal.text_dim })
-                    .on_click(move |_, _, cx| {
-                        let _ = weak.update(cx, |app, cx| app.set_eq_filter_kind(kind, cx));
-                    })
-                    .child(kind.label()),
-            );
-        }
-        row.into_any_element()
-    }
+    // ---------- 紧凑：内置预设库 ----------
 
-    // ---------- 紧凑：预设库 ----------
-
-    pub(super) fn eq_library_compact(
-        &self,
-        pal: &EqPalette,
-        entries: Vec<PresetEntry>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(super) fn eq_builtin_compact(&self, pal: &EqPalette, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
-        let (title, subtitle) = tab_meta(self.eq.tab);
-        let filtered: Vec<PresetEntry> = entries;
+        let entries = builtin_presets();
+        let filtered: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, preset)| {
+                self.eq
+                    .builtin_group
+                    .is_none_or(|group| preset.group == group)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let preview = self
+            .eq
+            .preview_builtin
+            .and_then(builtin_preset)
+            .filter(|preset| {
+                self.eq
+                    .builtin_group
+                    .is_none_or(|group| preset.group == group)
+            });
 
         let mut body = div().w_full().flex().flex_col().gap(px(8.0)).child(
             div()
@@ -283,13 +130,13 @@ impl ChordialApp {
                                 .text_size(px(17.0))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(pal.text)
-                                .child(title),
+                                .child("内置预设"),
                         )
                         .child(
                             div()
                                 .text_size(px(9.5))
                                 .text_color(pal.text_faint)
-                                .child(subtitle),
+                                .child("单点增益 · 可叠加、可调幅度"),
                         ),
                 )
                 .child(
@@ -297,53 +144,184 @@ impl ChordialApp {
                         .text_size(px(9.5))
                         .font_family(pal.mono.clone())
                         .text_color(pal.text_faint)
-                        .child(SharedString::from(format!("{} 项", filtered.len()))),
+                        .child(SharedString::from(format!(
+                            "{} / {} 已加入",
+                            self.eq.blocks.len(),
+                            entries.len()
+                        ))),
                 ),
         );
 
-        if filtered.is_empty() {
+        let mut chips = div()
+            .id("eq-builtin-chips")
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .overflow_x_scroll()
+            .when(self.smooth_scroll, |d| d.smooth_scroll());
+        {
+            let weak = weak.clone();
+            chips = chips.child(eq_chip(
+                pal,
+                "全部",
+                self.eq.builtin_group.is_none(),
+                "eq-builtin-group-c-all",
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.eq.builtin_group = None;
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        for group in PresetGroup::ALL {
+            let weak = weak.clone();
+            let active = self.eq.builtin_group == Some(group);
+            chips = chips.child(eq_chip(
+                pal,
+                group.label(),
+                active,
+                SharedString::from(format!("eq-builtin-group-c-{}", group.label())),
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.eq.builtin_group = Some(group);
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        body = body.child(chips);
+
+        if let Some(preset) = preview {
+            let preset_id = preset.id;
+            let block = self
+                .eq
+                .blocks
+                .iter()
+                .find(|block| block.preset_id == preset.id)
+                .cloned();
+            let weak_add = weak.clone();
+            let on_add: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+                let _ = weak_add.update(cx, |app, cx| {
+                    app.toggle_builtin_membership(preset_id, cx);
+                });
+            });
+            let weak_power = weak.clone();
+            let on_power: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+                let _ = weak_power.update(cx, |app, cx| {
+                    app.toggle_builtin_power(preset_id, cx);
+                });
+            });
+            let weak_amount = weak.clone();
+            let on_amount: Rc<dyn Fn(f32, &mut App)> = Rc::new(move |amount, cx: &mut App| {
+                let _ = weak_amount.update(cx, |app, cx| {
+                    if let Some(index) = app.eq.block_index(preset_id) {
+                        app.set_eq_block_amount(index, amount, cx);
+                    }
+                });
+            });
+            let weak_close = weak.clone();
             body = body.child(
                 div()
                     .w_full()
-                    .h(px(140.0))
-                    .rounded(px(12.0))
-                    .bg(pal.panel)
-                    .border_1()
-                    .border_color(pal.border)
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(5.0))
-                    .child(icons::icon(Icon::Headphones, 20.0, pal.text_faint))
+                    .gap(px(4.0))
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(pal.text_dim)
-                            .child("没有匹配的配置"),
-                    ),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(pal.text_faint)
+                                    .child("预设预览"),
+                            )
+                            .child(
+                                div()
+                                    .id("eq-builtin-preview-close")
+                                    .h(px(20.0))
+                                    .px(px(7.0))
+                                    .rounded(px(10.0))
+                                    .bg(pal.chip)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .cursor_pointer()
+                                    .text_size(px(8.5))
+                                    .text_color(pal.text_faint)
+                                    .child(icons::icon(Icon::Close, 9.0, pal.text_faint))
+                                    .child("收起")
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak_close.update(cx, |app, cx| {
+                                            app.eq.preview_builtin = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(eq_builtin_preview_panel(
+                        pal,
+                        preset,
+                        block.as_ref(),
+                        true,
+                        on_add,
+                        on_power,
+                        on_amount,
+                    )),
             );
         }
 
-        for (index, entry) in filtered.iter().enumerate() {
-            let weak = weak.clone();
-            let entry = *entry;
-            let active = !self.eq.dirty && self.eq.preset_name == entry.name;
-            body = body.child(eq_preset_row(
+        if filtered.is_empty() {
+            return body
+                .child(eq_notice(
+                    pal,
+                    Icon::Layers,
+                    "这个分组还没有预设",
+                    "切换到「全部」查看完整的单点增益列表。",
+                    None,
+                ))
+                .into_any_element();
+        }
+
+        for (row, &index) in filtered.iter().enumerate() {
+            let preset = &entries[index];
+            let block = self
+                .eq
+                .blocks
+                .iter()
+                .find(|block| block.preset_id == preset.id)
+                .cloned();
+            let added = block.is_some();
+            let enabled = block.as_ref().is_some_and(|block| block.enabled);
+            let previewed = self.eq.preview_builtin == Some(preset.id);
+            let preset_id = preset.id;
+            let weak_preview = weak.clone();
+            let weak_add = weak.clone();
+            let weak_power = weak.clone();
+            body = body.child(eq_builtin_row(
                 pal,
-                entry.name,
-                entry.subtitle(),
-                Some(Icon::Equalizer),
-                None,
-                active,
-                false,
-                false,
-                SharedString::from(format!("eq-preset-c-{index}")),
+                row,
+                preset,
+                added,
+                enabled,
+                previewed,
+                true,
                 move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        app.load_eq_preset(entry, cx);
-                        app.show_portrait_toast(format!("已应用「{}」", entry.name), cx);
+                    let _ = weak_preview.update(cx, |app, cx| {
+                        app.eq.preview_builtin = Some(preset_id);
                         cx.notify();
+                    });
+                },
+                move |_, _, cx| {
+                    let _ = weak_add.update(cx, |app, cx| {
+                        app.toggle_builtin_membership(preset_id, cx);
+                    });
+                },
+                move |_, _, cx| {
+                    let _ = weak_power.update(cx, |app, cx| {
+                        app.toggle_builtin_power(preset_id, cx);
                     });
                 },
             ));
@@ -361,8 +339,7 @@ impl ChordialApp {
         let total = entries.len();
         let filtered = lib.visible_indices(&self.eq.category, &self.eq.search);
         let filtered_count = filtered.len();
-        let active_name = self.eq.preset_name.clone();
-        let dirty = self.eq.dirty;
+        let profile_name = self.eq.profile.as_ref().map(|profile| profile.name.clone());
         let loading = lib.index_loading || lib.status == AutoEqStatus::Loading;
         let mut body = div().w_full().flex().flex_col().gap(px(8.0)).child(
             div()
@@ -509,7 +486,7 @@ impl ChordialApp {
             let entry = &entries[index];
             let weak_row = weak.clone();
             let file = entry.file.clone();
-            let active = !dirty && active_name == entry.name;
+            let active = profile_name.as_deref() == Some(entry.name.as_str());
             let previewed = self.eq.autoeq_preview.as_deref() == Some(entry.file.as_str());
             let badge = if entry.loading {
                 Some("拉取中".to_string())
@@ -565,7 +542,7 @@ impl ChordialApp {
                             div()
                                 .text_size(px(9.5))
                                 .text_color(pal.text_faint)
-                                .child("「另存为」得到的个人预设"),
+                                .child("「另存为」保存的完整链路"),
                         ),
                 )
                 .child(
@@ -602,7 +579,7 @@ impl ChordialApp {
                         div()
                             .text_size(px(9.5))
                             .text_color(pal.text_faint)
-                            .child("在编辑器里调好曲线后点「另存为个人预设」"),
+                            .child("在编辑器里调好链路后点「另存为个人预设」"),
                     ),
             );
             return body.into_any_element();
@@ -634,14 +611,7 @@ impl ChordialApp {
                     .cursor_pointer()
                     .on_click(move |_, _, cx| {
                         let _ = weak_load.update(cx, |app, cx| {
-                            let preset = app.eq.saved.get(index).cloned();
-                            if let Some(preset) = preset {
-                                app.eq.load_saved(&preset);
-                                app.eq.preview_saved(index);
-                                app.apply_eq(cx);
-                                app.show_portrait_toast(format!("已应用「{}」", preset.name), cx);
-                                cx.notify();
-                            }
+                            app.apply_saved_eq_preset(index, cx);
                         });
                     })
                     .child(
@@ -689,12 +659,11 @@ impl ChordialApp {
                             .justify_center()
                             .cursor_pointer()
                             .hover(|s| s.bg(pal.danger_soft))
-                            .child(icons::icon(Icon::Close, 13.0, pal.danger))
+                            .child(icons::icon(Icon::Trash, 13.0, pal.danger))
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
                                 let _ = weak_remove.update(cx, |app, cx| {
                                     app.remove_saved_preset(index, cx);
-                                    app.eq.preview_saved = None;
                                 });
                             }),
                     ),
@@ -705,13 +674,6 @@ impl ChordialApp {
 
     pub(super) fn eq_nav_compact(&self, pal: &EqPalette, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
-        let tabs = [
-            EqTab::Edit,
-            EqTab::V4,
-            EqTab::AutoEq,
-            EqTab::Builtin,
-            EqTab::Personal,
-        ];
         let mut row = div()
             .h(px(60.0))
             .w_full()
@@ -721,7 +683,7 @@ impl ChordialApp {
             .bg(pal.panel)
             .flex()
             .items_center();
-        for tab in tabs {
+        for tab in EqTab::ALL {
             let weak = weak.clone();
             let active = self.eq.tab == tab;
             let icon = tab_icon(tab);

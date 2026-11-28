@@ -73,15 +73,25 @@ impl ChordialApp {
         let Some(source) = self.netease_source() else {
             return;
         };
+        // Android 没有 api-enhanced 的 Node 预编译包，托管安装必然失败。
+        // 在线源需要用户在音源配置里填远程 base_url；启动阶段只做静默预热，
+        // 不把平台限制当成全局错误弹出来。
+        let android = cfg!(target_os = "android");
         const PREPARING: &str = "正在准备网易云服务…首次运行会自动下载运行组件";
-        self.info_message = Some(PREPARING.into());
+        const PREPARING_ANDROID: &str = "正在连接网易云服务…";
+        let preparing = if android {
+            PREPARING_ANDROID
+        } else {
+            PREPARING
+        };
+        self.info_message = Some(preparing.into());
         cx.notify();
         cx.spawn(async move |weak, cx| {
             let result = source.warm_up().await;
             let _ = weak.update(cx, |app, cx| {
                 match result {
                     Ok(()) => {
-                        if app.info_message.as_deref() == Some(PREPARING) {
+                        if app.info_message.as_deref() == Some(preparing) {
                             app.info_message = None;
                         }
                         // 旧版下载只写了音频流；服务就绪后原地补标签，
@@ -89,7 +99,17 @@ impl ChordialApp {
                         app.spawn_download_metadata_repair(cx);
                     }
                     Err(e) => {
-                        app.status_message = Some(format!("网易云服务准备失败：{e}"));
+                        if android {
+                            // 托管安装不可用是平台限制，不是运行故障：只在
+                            // 日志里留痕，等用户配置远程服务后再提示。
+                            tracing::warn!(
+                                target: "chordial::netease",
+                                error = %e,
+                                "netease warm-up skipped on android"
+                            );
+                        } else {
+                            app.status_message = Some(format!("网易云服务准备失败：{e}"));
+                        }
                         app.info_message = None;
                     }
                 }
@@ -107,13 +127,15 @@ impl ChordialApp {
         let downloads = self.downloads.clone();
         let registry = self.registry.clone();
         cx.spawn(async move |weak, cx| {
-            let pending = cx
-                .background_executor()
-                .spawn({
-                    let downloads = downloads.clone();
-                    async move { downloads.entries_missing_metadata() }
-                })
-                .await;
+            let pending = match ChordialApp::run_background({
+                let downloads = downloads.clone();
+                async move { downloads.entries_missing_metadata() }
+            })
+            .await
+            {
+                Ok(pending) => pending,
+                Err(_) => return,
+            };
             if pending.is_empty() {
                 return;
             }
@@ -126,23 +148,27 @@ impl ChordialApp {
                 let Ok(track) = source.track(&id).await else {
                     continue;
                 };
-                let lyrics = source
-                    .lyrics(&id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|lyrics| lyrics_to_lrc(&lyrics));
+                let source_for_lyrics = source.clone();
+                let lyrics = ChordialApp::run_background(async move {
+                    source_for_lyrics
+                        .lyrics(&id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|lyrics| lyrics_to_lrc(&lyrics))
+                })
+                .await
+                .ok()
+                .flatten();
                 let cover_url = crate::lyrics::cover_url(&track);
                 let downloads = downloads.clone();
                 let path_for_task = path.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let cover = cover_url.and_then(crate::lyrics::fetch_cover_raw_blocking);
-                        let extras = DownloadExtras { cover, lyrics };
-                        downloads.enrich_file_blocking(&path_for_task, &track, &extras)
-                    })
-                    .await;
+                let result = ChordialApp::run_background(async move {
+                    let cover = cover_url.and_then(crate::lyrics::fetch_cover_raw_blocking);
+                    let extras = DownloadExtras { cover, lyrics };
+                    downloads.enrich_file_blocking(&path_for_task, &track, &extras)
+                })
+                .await;
                 if result.is_ok() {
                     repaired.push(path);
                 }
@@ -193,8 +219,9 @@ impl ChordialApp {
                         app.user_playlists = Arc::new(list);
                         app.status_message = None;
                         // 登录后“正在加载用户歌单”的提示在数据到位后要收掉。
-                        if app.info_message.as_deref() == Some("已登录网易云，正在加载用户歌单")
-                        {
+                        if app.info_message.as_deref().is_some_and(|message| {
+                            message.starts_with("已登录") && message.ends_with("，正在加载用户歌单")
+                        }) {
                             app.info_message = None;
                         }
                     }
@@ -218,7 +245,7 @@ impl ChordialApp {
         self.start_login(cx);
     }
 
-    /// 从某个网易云实例的页面打开登录：浮层绑定到该实例，而不是默认实例。
+    /// 从某个音源实例的页面打开登录：浮层绑定到该实例，而不是默认实例。
     pub(super) fn open_login_for(&mut self, id: SourceId, cx: &mut Context<Self>) {
         self.login_source = Some(id);
         self.open_login(cx);
@@ -297,7 +324,7 @@ impl ChordialApp {
             return;
         }
         let Some(source) = self.login_source() else {
-            self.login_status = Some("网易云源未加载".into());
+            self.login_status = Some("音源未加载或暂不支持登录".into());
             cx.notify();
             return;
         };
@@ -347,12 +374,12 @@ impl ChordialApp {
             return;
         }
         let Some(source_id) = self.login_source_id() else {
-            self.login_status = Some("网易云源未加载".into());
+            self.login_status = Some("音源未加载或暂不支持登录".into());
             cx.notify();
             return;
         };
         let Some(source) = self.registry.get(&source_id) else {
-            self.login_status = Some("网易云源未加载".into());
+            self.login_status = Some("音源未加载或暂不支持登录".into());
             cx.notify();
             return;
         };
@@ -379,7 +406,11 @@ impl ChordialApp {
                         app.login_challenge = None;
                         app.login_captcha_input
                             .update(cx, |state, cx| state.clear(cx));
-                        app.info_message = Some("已登录网易云，正在加载用户歌单".into());
+                        let source_name = app
+                            .source_config_by_id(&source_id.0)
+                            .map(|source| source.name.clone())
+                            .unwrap_or_else(|| source_id.0.clone());
+                        app.info_message = Some(format!("已登录{source_name}，正在加载用户歌单"));
                         cx.notify();
                     });
                 }
@@ -407,12 +438,14 @@ impl ChordialApp {
         };
         let cache = self.cache.clone();
         // 头像属于账号数据：单独 namespace，登出/卸载时随账号缓存一起回收。
-        let namespace = SourceId::new(format!("netease-account-{}", profile.uid));
+        let namespace = SourceId::new(format!("{}-account-{}", profile.source, profile.uid));
         cx.spawn(async move |weak, cx| {
-            let decoded = cx
-                .background_executor()
-                .spawn(async move { fetch_cover_blocking(Some(cache), &namespace, url) })
-                .await;
+            let decoded = ChordialApp::run_background(async move {
+                fetch_cover_blocking(Some(cache), &namespace, url)
+            })
+            .await
+            .ok()
+            .flatten();
             if let Some((w, h, rgba)) = decoded {
                 let _ = weak.update(cx, |app, cx| {
                     let old = app.account_avatar.replace(Self::rgba_to_image(w, h, &rgba));
@@ -434,12 +467,12 @@ impl ChordialApp {
         cx.notify();
 
         let Some(source_id) = self.login_source_id() else {
-            self.login_status = Some("网易云源未加载".into());
+            self.login_status = Some("音源未加载或暂不支持登录".into());
             cx.notify();
             return;
         };
         let Some(source) = self.registry.get(&source_id) else {
-            self.login_status = Some("网易云源未加载".into());
+            self.login_status = Some("音源未加载或暂不支持登录".into());
             cx.notify();
             return;
         };
@@ -463,9 +496,10 @@ impl ChordialApp {
             };
             let qr_url = challenge.qr_data_url.clone();
             let decoded = if let Some(url) = qr_url {
-                cx.background_executor()
-                    .spawn(async move { decode_data_url_image(&url) })
+                ChordialApp::run_background(async move { decode_data_url_image(&url) })
                     .await
+                    .ok()
+                    .flatten()
             } else {
                 None
             };
@@ -539,7 +573,12 @@ impl ChordialApp {
                             let old_qr = app.login_qr.take();
                             app.retire_image(old_qr);
                             app.login_challenge = None;
-                            app.info_message = Some("已登录网易云，正在加载用户歌单".into());
+                            let source_name = app
+                                .source_config_by_id(&source_id.0)
+                                .map(|source| source.name.clone())
+                                .unwrap_or_else(|| source_id.0.clone());
+                            app.info_message =
+                                Some(format!("已登录{source_name}，正在加载用户歌单"));
                             cx.notify();
                         });
                         return;
@@ -636,10 +675,20 @@ impl ChordialApp {
         let cache = self.cache.clone();
         let source_id = id.source.clone();
         cx.spawn(async move |weak, cx| {
-            let Some(catalog) = source.catalog() else {
-                return;
+            let id_for_task = id.clone();
+            let result = match ChordialApp::run_background(async move {
+                let Some(catalog) = source.catalog() else {
+                    return Err(chordal_core::CoreError::Config("该音源不支持集合页".into()));
+                };
+                catalog.collection(&id_for_task).await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(chordal_core::CoreError::Other(
+                    "后台任务繁忙，请稍后重试".into(),
+                )),
             };
-            let result = catalog.collection(&id).await;
             let _ = weak.update(cx, |app, cx| {
                 if app.collection_gen != generation {
                     return;
@@ -676,12 +725,12 @@ impl ChordialApp {
                             let cache = cache.clone();
                             let ns = source_id.clone();
                             cx.spawn(async move |weak, cx| {
-                                let decoded =
-                                    cx.background_executor()
-                                        .spawn(async move {
-                                            fetch_cover_blocking(Some(cache), &ns, cover)
-                                        })
-                                        .await;
+                                let decoded = ChordialApp::run_background(async move {
+                                    fetch_cover_blocking(Some(cache), &ns, cover)
+                                })
+                                .await
+                                .ok()
+                                .flatten();
                                 if let Some((w, h, rgba)) = decoded {
                                     let _ = weak.update(cx, |app, cx| {
                                         if app.collection_gen == generation {

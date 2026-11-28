@@ -5,14 +5,19 @@ use super::*;
 impl SettingsView {
     pub fn new(
         handler: impl Fn(SettingsAction, &mut Window, &mut App) + 'static,
+        cfg: AppConfig,
         cx: &mut Context<Self>,
     ) -> Self {
-        let cfg = crate::config::load_or_default();
-        let beat_band = chordal_player::normalize_band(cfg.beat_band_low_hz, cfg.beat_band_high_hz);
+        let audio_band_ranges = cfg.audio_band_ranges.sanitized();
+        let audio_band_controls = cfg.audio_band_controls.sanitized();
         let beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
         let lyric_sweep_fade_em = crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
         let background_render_divisor =
             crate::config::clamp_background_render_divisor(cfg.background_render_divisor);
+        let animation_duration_multiplier =
+            crate::config::clamp_animation_duration_multiplier(cfg.animation_duration_multiplier);
+        let animation_overshoot_multiplier =
+            crate::config::clamp_animation_overshoot_multiplier(cfg.animation_overshoot_multiplier);
         let quality = cfg.netease.level.unwrap_or_default();
         let weak = cx.entity().downgrade();
 
@@ -38,28 +43,63 @@ impl SettingsView {
                 cx,
             )
         };
-        let beat_low_field = {
-            let weak = weak.clone();
-            TextField::new(
-                "settings-beat-low",
-                "4000",
+        const BAND_LOW_IDS: [&str; 5] = [
+            "settings-band-rumble-low",
+            "settings-band-kick-low",
+            "settings-band-vocals-low",
+            "settings-band-instruments-low",
+            "settings-band-air-low",
+        ];
+        const BAND_HIGH_IDS: [&str; 5] = [
+            "settings-band-rumble-high",
+            "settings-band-kick-high",
+            "settings-band-vocals-high",
+            "settings-band-instruments-high",
+            "settings-band-air-high",
+        ];
+        const BAND_CONTROL_IDS: [&str; 5] = [
+            "settings-band-rumble-controls",
+            "settings-band-kick-controls",
+            "settings-band-vocals-controls",
+            "settings-band-instruments-controls",
+            "settings-band-air-controls",
+        ];
+        let mut audio_band_low_fields = Vec::with_capacity(5);
+        let mut audio_band_high_fields = Vec::with_capacity(5);
+        let mut audio_band_control_fields = Vec::with_capacity(5);
+        for index in 0..5 {
+            let weak_low = weak.clone();
+            audio_band_low_fields.push(TextField::new(
+                BAND_LOW_IDS[index],
+                "下限 Hz",
                 move |_text, window, cx| {
-                    let _ = weak.update(cx, |view, cx| view.submit_beat_band(window, cx));
+                    let _ =
+                        weak_low.update(cx, |view, cx| view.submit_audio_band(index, window, cx));
                 },
                 cx,
-            )
-        };
-        let beat_high_field = {
-            let weak = weak.clone();
-            TextField::new(
-                "settings-beat-high",
-                "10000",
+            ));
+            let weak_high = weak.clone();
+            audio_band_high_fields.push(TextField::new(
+                BAND_HIGH_IDS[index],
+                "上限 Hz",
                 move |_text, window, cx| {
-                    let _ = weak.update(cx, |view, cx| view.submit_beat_band(window, cx));
+                    let _ =
+                        weak_high.update(cx, |view, cx| view.submit_audio_band(index, window, cx));
                 },
                 cx,
-            )
-        };
+            ));
+            let weak_controls = weak.clone();
+            audio_band_control_fields.push(TextField::new(
+                BAND_CONTROL_IDS[index],
+                "如 7,8,12,13",
+                move |_text, window, cx| {
+                    let _ = weak_controls.update(cx, |view, cx| {
+                        view.submit_audio_band_controls(index, window, cx)
+                    });
+                },
+                cx,
+            ));
+        }
         let beat_strength_field = {
             let weak = weak.clone();
             TextField::new(
@@ -91,6 +131,31 @@ impl SettingsView {
                 "0.6",
                 move |text, window, cx| {
                     let _ = weak.update(cx, |view, cx| view.submit_lyric_sweep(text, window, cx));
+                },
+                cx,
+            )
+        };
+        let motion_duration_field = {
+            let weak = weak.clone();
+            TextField::new(
+                "settings-motion-duration",
+                "1.00",
+                move |text, window, cx| {
+                    let _ =
+                        weak.update(cx, |view, cx| view.submit_motion_duration(text, window, cx));
+                },
+                cx,
+            )
+        };
+        let motion_overshoot_field = {
+            let weak = weak.clone();
+            TextField::new(
+                "settings-motion-overshoot",
+                "1.00",
+                move |text, window, cx| {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.submit_motion_overshoot(text, window, cx)
+                    });
                 },
                 cx,
             )
@@ -147,10 +212,14 @@ impl SettingsView {
             appearance: cfg.appearance,
             source_preference: cfg.source_preference,
             smooth_scroll: cfg.smooth_scroll,
-            beat_band,
+            audio_band_ranges,
+            audio_band_controls,
             beat_strength,
             background_render_divisor,
             lyric_sweep_fade_em,
+            motion_preset: cfg.motion_preset,
+            animation_duration_multiplier,
+            animation_overshoot_multiplier,
             perf_overlay: cfg.perf_overlay,
             cache_dir: cfg.cache_dir,
             download_dir: cfg.download_dir,
@@ -173,11 +242,14 @@ impl SettingsView {
             mem: chordal_core::mem::snapshot(),
             cache_dir_field,
             download_dir_field,
-            beat_low_field,
-            beat_high_field,
+            audio_band_low_fields,
+            audio_band_high_fields,
+            audio_band_control_fields,
             beat_strength_field,
             background_divisor_field,
             lyric_sweep_field,
+            motion_duration_field,
+            motion_overshoot_field,
             search_timeout_field,
             netease_url_field,
             device_field,
@@ -189,18 +261,22 @@ impl SettingsView {
     }
 
     /// 打开设置时同步配置与运行时统计。
-    pub fn sync(&mut self, runtime: SettingsRuntime, cx: &mut Context<Self>) {
-        let cfg = crate::config::load_or_default();
+    pub fn sync(&mut self, cfg: &AppConfig, runtime: SettingsRuntime, cx: &mut Context<Self>) {
         self.appearance = cfg.appearance;
         self.source_preference = cfg.source_preference;
         self.smooth_scroll = cfg.smooth_scroll;
-        self.beat_band =
-            chordal_player::normalize_band(cfg.beat_band_low_hz, cfg.beat_band_high_hz);
+        self.audio_band_ranges = cfg.audio_band_ranges.sanitized();
+        self.audio_band_controls = cfg.audio_band_controls.sanitized();
         self.beat_strength = cfg.beat_strength.clamp(0.0, 1.5);
         self.background_render_divisor =
             crate::config::clamp_background_render_divisor(cfg.background_render_divisor);
         self.lyric_sweep_fade_em =
             crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em);
+        self.motion_preset = cfg.motion_preset;
+        self.animation_duration_multiplier =
+            crate::config::clamp_animation_duration_multiplier(cfg.animation_duration_multiplier);
+        self.animation_overshoot_multiplier =
+            crate::config::clamp_animation_overshoot_multiplier(cfg.animation_overshoot_multiplier);
         self.perf_overlay = cfg.perf_overlay;
         self.cache_dir = cfg.cache_dir.clone();
         self.download_dir = cfg.download_dir.clone();
@@ -274,16 +350,23 @@ impl SettingsView {
             .set(self.cache_dir.display().to_string(), cx);
         self.download_dir_field
             .set(self.download_dir.display().to_string(), cx);
-        self.beat_low_field
-            .set(format!("{:.0}", self.beat_band.0), cx);
-        self.beat_high_field
-            .set(format!("{:.0}", self.beat_band.1), cx);
+        for (index, kind) in AudioBandKind::ALL.into_iter().enumerate() {
+            let range = self.audio_band_ranges.get(kind);
+            self.audio_band_low_fields[index].set(format!("{:.0}", range.low_hz), cx);
+            self.audio_band_high_fields[index].set(format!("{:.0}", range.high_hz), cx);
+            self.audio_band_control_fields[index]
+                .set(self.audio_band_controls.get(kind).display(), cx);
+        }
         self.beat_strength_field
             .set(format!("{:.0}", self.beat_strength * 100.0), cx);
         self.background_divisor_field
             .set(self.background_render_divisor.to_string(), cx);
         self.lyric_sweep_field
             .set(format!("{:.2}", self.lyric_sweep_fade_em), cx);
+        self.motion_duration_field
+            .set(format!("{:.2}", self.animation_duration_multiplier), cx);
+        self.motion_overshoot_field
+            .set(format!("{:.2}", self.animation_overshoot_multiplier), cx);
         self.search_timeout_field
             .set(self.search_timeout_ms.to_string(), cx);
         self.netease_url_field
@@ -353,24 +436,91 @@ impl SettingsView {
         self.notice_ok(format!("下载目录 {text}"), cx);
     }
 
-    pub(super) fn submit_beat_band(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let low_text = self.beat_low_field.state.read(cx).content().to_string();
-        let high_text = self.beat_high_field.state.read(cx).content().to_string();
+    pub(super) fn submit_audio_band(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(kind) = AudioBandKind::ALL.get(index).copied() else {
+            return;
+        };
+        let low_text = self.audio_band_low_fields[index]
+            .state
+            .read(cx)
+            .content()
+            .to_string();
+        let high_text = self.audio_band_high_fields[index]
+            .state
+            .read(cx)
+            .content()
+            .to_string();
         let (Some(low), Some(high)) = (parse_hz(&low_text), parse_hz(&high_text)) else {
             self.notice_error("频段格式无效，可填 4000 / 4k / 10khz", cx);
             return;
         };
-        let in_range = |v: f32| (20.0..=22_050.0).contains(&v);
-        if !in_range(low) || !in_range(high) || high <= low {
+        if !(20.0..=22_050.0).contains(&low) || !(20.0..=22_050.0).contains(&high) || high <= low {
             self.notice_error("需满足 20 ≤ 下限 < 上限 ≤ 22050 Hz", cx);
             return;
         }
-        let (low, high) = chordal_player::normalize_band(low, high);
-        self.beat_band = (low, high);
-        self.beat_low_field.set(format!("{low:.0}"), cx);
-        self.beat_high_field.set(format!("{high:.0}"), cx);
-        self.emit(SettingsAction::SetBeatBand(low, high), window, cx);
-        self.notice_ok(format!("背景鼓点频段 {low:.0}–{high:.0} Hz"), cx);
+        self.audio_band_ranges.set(
+            kind,
+            chordal_core::FrequencyRange {
+                low_hz: low,
+                high_hz: high,
+            },
+        );
+        self.audio_band_low_fields[index].set(format!("{low:.0}"), cx);
+        self.audio_band_high_fields[index].set(format!("{high:.0}"), cx);
+        self.emit(
+            SettingsAction::SetAudioBandRanges(self.audio_band_ranges),
+            window,
+            cx,
+        );
+        self.notice_ok(format!("{} {low:.0}–{high:.0} Hz", kind.label()), cx);
+    }
+
+    pub(super) fn submit_audio_band_controls(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(kind) = AudioBandKind::ALL.get(index).copied() else {
+            return;
+        };
+        let text = self.audio_band_control_fields[index]
+            .state
+            .read(cx)
+            .content()
+            .to_string();
+        let controls = match chordal_core::parse_control_point_set(&text) {
+            Ok(controls) => controls,
+            Err(chordal_core::ControlPointParseError::InvalidNumber) => {
+                self.notice_error("控制点编号需用逗号分隔，如 7,8,12,13", cx);
+                return;
+            }
+            Err(chordal_core::ControlPointParseError::BoundaryOrOutOfRange(_)) => {
+                self.notice_error("仅可分配内部点 7,8,9,12,13,14,17,18,19；边界点保持固定", cx);
+                return;
+            }
+        };
+        self.audio_band_controls.set(kind, controls);
+        let display = controls.display();
+        self.audio_band_control_fields[index].set(display.clone(), cx);
+        self.emit(
+            SettingsAction::SetAudioBandControls(self.audio_band_controls),
+            window,
+            cx,
+        );
+        self.notice_ok(
+            format!(
+                "{} → 控制点 {}",
+                kind.label(),
+                if controls.is_empty() { "无" } else { &display }
+            ),
+            cx,
+        );
     }
 
     /// 提交“效果强度”（百分比，0–150）。
@@ -412,7 +562,7 @@ impl SettingsView {
         self.beat_strength_field
             .set(format!("{:.0}", value * 100.0), cx);
         self.emit(SettingsAction::SetBeatStrength(value), window, cx);
-        self.notice_ok(format!("背景鼓点强度 {:.0}%", value * 100.0), cx);
+        self.notice_ok(format!("背景音频反应强度 {:.0}%", value * 100.0), cx);
     }
 
     /// 提交流体背景分辨率除数（整数，1–20）。
@@ -504,6 +654,106 @@ impl SettingsView {
         self.lyric_sweep_field.set(format!("{value:.2}"), cx);
         self.emit(SettingsAction::SetLyricSweepFade(value), window, cx);
         self.notice_ok(format!("歌词扫光宽度 {value:.2}em"), cx);
+    }
+
+    /// 切换弹簧预设：即刻影响新动画，已开始的动画保持原参数。
+    pub(super) fn apply_motion_preset(
+        &mut self,
+        preset: MotionPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.motion_preset = preset;
+        self.emit(SettingsAction::SetMotionPreset(preset), window, cx);
+        self.notice_ok(format!("动画预设 {}", preset.label()), cx);
+    }
+
+    /// 提交动画时长倍率（0.25–3.0，> 1 慢放）。
+    pub(super) fn submit_motion_duration(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(value) = text.trim().parse::<f32>() else {
+            self.notice_error("时长倍率需为 0.25–3.0 的数字", cx);
+            return;
+        };
+        if !value.is_finite()
+            || !(crate::config::ANIMATION_DURATION_MULTIPLIER_MIN
+                ..=crate::config::ANIMATION_DURATION_MULTIPLIER_MAX)
+                .contains(&value)
+        {
+            self.notice_error("时长倍率范围 0.25–3.0", cx);
+            return;
+        }
+        self.apply_motion_duration(value, window, cx);
+    }
+
+    pub(super) fn set_motion_duration_preset(
+        &mut self,
+        value: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_motion_duration(value, window, cx);
+    }
+
+    pub(super) fn apply_motion_duration(
+        &mut self,
+        value: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = crate::config::clamp_animation_duration_multiplier(value);
+        self.animation_duration_multiplier = value;
+        self.motion_duration_field.set(format!("{value:.2}"), cx);
+        self.emit(SettingsAction::SetMotionDuration(value), window, cx);
+        self.notice_ok(format!("动画时长 {value:.2}×（越大越慢放）"), cx);
+    }
+
+    /// 提交动画回弹倍率（0.25–2.0，> 1 回弹更明显）。
+    pub(super) fn submit_motion_overshoot(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(value) = text.trim().parse::<f32>() else {
+            self.notice_error("回弹倍率需为 0.25–2.0 的数字", cx);
+            return;
+        };
+        if !value.is_finite()
+            || !(crate::config::ANIMATION_OVERSHOOT_MULTIPLIER_MIN
+                ..=crate::config::ANIMATION_OVERSHOOT_MULTIPLIER_MAX)
+                .contains(&value)
+        {
+            self.notice_error("回弹倍率范围 0.25–2.0", cx);
+            return;
+        }
+        self.apply_motion_overshoot(value, window, cx);
+    }
+
+    pub(super) fn set_motion_overshoot_preset(
+        &mut self,
+        value: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_motion_overshoot(value, window, cx);
+    }
+
+    pub(super) fn apply_motion_overshoot(
+        &mut self,
+        value: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = crate::config::clamp_animation_overshoot_multiplier(value);
+        self.animation_overshoot_multiplier = value;
+        self.motion_overshoot_field.set(format!("{value:.2}"), cx);
+        self.emit(SettingsAction::SetMotionOvershoot(value), window, cx);
+        self.notice_ok(format!("动画回弹 {value:.2}×（越大回弹越明显）"), cx);
     }
 
     pub(super) fn submit_search_timeout(

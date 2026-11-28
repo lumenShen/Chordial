@@ -13,6 +13,7 @@ fn page_scroll(
     content: AnyElement,
     max_w: f32,
     scroll: &gpui::ScrollHandle,
+    compact: bool,
 ) -> AnyElement {
     div()
         .flex_1()
@@ -31,9 +32,9 @@ fn page_scroll(
                         .w_full()
                         .max_w(px(max_w))
                         .mx_auto()
-                        .px(px(30.0))
-                        .pt(px(22.0))
-                        .pb(px(120.0))
+                        .px(px(if compact { 16.0 } else { 30.0 }))
+                        .pt(px(if compact { 12.0 } else { 22.0 }))
+                        .pb(px(if compact { 92.0 } else { 120.0 }))
                         .child(content),
                 ),
         )
@@ -43,12 +44,13 @@ fn page_scroll(
 fn back_row(
     theme: &Theme,
     label: &'static str,
+    compact: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     div()
         .id(SharedString::from(format!("page-back-{label}")))
-        .h(px(28.0))
-        .px(px(8.0))
+        .h(px(if compact { 40.0 } else { 28.0 }))
+        .px(px(if compact { 10.0 } else { 8.0 }))
         .rounded(px(6.0))
         .flex()
         .items_center()
@@ -73,15 +75,18 @@ fn page_header(
     title: String,
     subtitle: String,
     actions: AnyElement,
+    compact: bool,
 ) -> AnyElement {
     div()
         .flex()
         .items_end()
         .justify_between()
         .gap(px(24.0))
+        .when(compact, |d| d.flex_col().items_start().gap(px(12.0)))
         .child(
             div()
                 .min_w(px(0.0))
+                .when(compact, |d| d.w_full())
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
@@ -108,7 +113,15 @@ fn page_header(
                         .child(SharedString::from(subtitle)),
                 ),
         )
-        .child(div().flex().items_center().gap(px(6.0)).child(actions))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.0))
+                .when(compact, |d| d.w_full())
+                .child(actions),
+        )
         .into_any_element()
 }
 
@@ -186,6 +199,7 @@ fn source_hero(
     description: String,
     status: AnyElement,
     actions: AnyElement,
+    compact: bool,
 ) -> AnyElement {
     div()
         .mt(px(12.0))
@@ -197,11 +211,15 @@ fn source_hero(
         .flex()
         .items_center()
         .gap(px(14.0))
+        .when(compact, |d| {
+            d.flex_col().items_start().gap(px(12.0)).p(px(14.0))
+        })
         .child(icon_badge(theme, icon, 48.0, theme.text))
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
+                .when(compact, |d| d.w_full())
                 .flex()
                 .flex_col()
                 .gap(px(3.0))
@@ -228,8 +246,8 @@ fn source_hero(
                         .child(SharedString::from(description)),
                 ),
         )
-        .child(status)
-        .child(actions)
+        .child(div().when(compact, |d| d.w_full()).child(status))
+        .child(div().when(compact, |d| d.w_full()).child(actions))
         .into_any_element()
 }
 
@@ -360,7 +378,7 @@ fn stat_tile(
     let dark = theme.is_dark();
     div()
         .flex_1()
-        .min_w(px(0.0))
+        .min_w(px(120.0))
         .p(px(13.0))
         .rounded(px(10.0))
         .border_1()
@@ -423,27 +441,35 @@ fn source_toggle(
 ) -> AnyElement {
     div()
         .id(SharedString::from(format!("page-source-switch-{}", id.0)))
-        .w(px(34.0))
-        .h(px(19.0))
+        .w(px(44.0))
+        .h(px(44.0))
         .flex_none()
-        .rounded(px(10.0))
-        .border_1()
-        .border_color(if on {
-            theme.accent
-        } else {
-            theme.border_strong
-        })
-        .bg(if on { theme.accent } else { theme.active })
-        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
         .cursor_pointer()
         .child(
             div()
-                .absolute()
-                .top(px(1.0))
-                .left(px(if on { 15.0 } else { 1.0 }))
-                .size(px(15.0))
-                .rounded(px(8.0))
-                .bg(if on { theme.on_accent } else { theme.surface }),
+                .w(px(34.0))
+                .h(px(19.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(if on {
+                    theme.accent
+                } else {
+                    theme.border_strong
+                })
+                .bg(if on { theme.accent } else { theme.active })
+                .relative()
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(1.0))
+                        .left(px(if on { 15.0 } else { 1.0 }))
+                        .size(px(15.0))
+                        .rounded(px(8.0))
+                        .bg(if on { theme.on_accent } else { theme.surface }),
+                ),
         )
         .on_click(move |_, _, cx| {
             let id = id.clone();
@@ -463,7 +489,7 @@ fn status_line(
 ) -> (String, gpui::Hsla) {
     let status = self_.source_status(id);
     if !config.enabled {
-        return ("已关闭 · 配置保留".into(), self_.theme_faint(cx));
+        return ("已关闭 · 保留设置".into(), self_.theme_faint(cx));
     }
     match status {
         SourceStatus::Loaded => {
@@ -476,11 +502,10 @@ fn status_line(
                     .unwrap_or(0);
                 (format!("已就绪 · {tracks} 首"), self_.theme_ok(cx))
             } else {
-                let account = cx
-                    .global::<Globals>()
-                    .netease_sources
+                let account = self_
+                    .registry
                     .get(id)
-                    .and_then(|source| source.account().map(|a| a.account_state()));
+                    .and_then(|source| source.account().map(|account| account.account_state()));
                 match account {
                     Some(AccountState::LoggedIn(profile)) => {
                         (format!("已连接 · {}", profile.nickname), self_.theme_ok(cx))
@@ -548,6 +573,7 @@ fn feed_track_section(
     title: &'static str,
     hint: String,
     tracks: &[Track],
+    queue: Arc<Vec<Track>>,
     error: Option<&SharedString>,
     loading: bool,
     empty_hint: &'static str,
@@ -555,10 +581,6 @@ fn feed_track_section(
     source: &SourceId,
     kind: SourceFeedKind,
     weak: &gpui::WeakEntity<ChordialApp>,
-    track_covers: &std::sync::Mutex<TrackCovers>,
-    queue_pos: Option<usize>,
-    current_id: Option<&chordal_core::model::TrackId>,
-    current_queue: Arc<Vec<Track>>,
 ) -> AnyElement {
     let mut block = div().flex().flex_col();
     block = block.child(section_title_flat(theme, title, Some(hint)));
@@ -577,31 +599,80 @@ fn feed_track_section(
             .child(feed_note(theme, empty_hint, false))
             .into_any_element();
     }
-    // 推荐流行也复用完整队列的行渲染：封面懒加载、均衡器、时长与 ⋮ 菜单一致。
-    let feed_list = QueueList::Feed {
-        source: source.clone(),
-        kind,
-    };
     for (index, track) in tracks.iter().take(limit).enumerate() {
-        let row_text = TrackRowText::new(index, track);
-        block = block.child(ChordialApp::render_track_row(
-            theme,
-            index,
-            &row_text,
-            track_covers,
-            feed_list.clone(),
-            queue_pos,
-            current_id,
-            weak.clone(),
-            current_queue.clone(),
-            false,
-            false,
-            false,
-            None,
-            None,
-            &TrackRowStyle::full(),
-            None,
-        ));
+        let weak = weak.clone();
+        let queue = queue.clone();
+        let source = source.clone();
+        let artist = track
+            .artists
+            .iter()
+            .map(|artist| artist.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let duration = track
+            .duration_ms
+            .map(fmt_ms)
+            .unwrap_or_else(|| "--:--".into());
+        let seed = if track.title.is_empty() {
+            "♪"
+        } else {
+            track.title.as_str()
+        };
+        block = block.child(
+            div()
+                .id(SharedString::from(format!("feed-track-{title}-{index}")))
+                .h(px(46.0))
+                .px(px(6.0))
+                .rounded(px(7.0))
+                .flex()
+                .items_center()
+                .gap(px(11.0))
+                .hover(|s| s.bg(theme.hover))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.play_feed_tracks(&source, kind, queue.clone(), index, cx);
+                    });
+                })
+                .child(
+                    div()
+                        .w(px(18.0))
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format!("{:02}", index + 1))),
+                )
+                .child(cover_thumb(theme, seed, 32.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(theme.text)
+                                .text_ellipsis()
+                                .child(SharedString::from(track.title.clone())),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(theme.text_faint)
+                                .text_ellipsis()
+                                .child(SharedString::from(artist)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(duration)),
+                ),
+        );
     }
     block.into_any_element()
 }
@@ -718,11 +789,13 @@ fn feed_entry_card(
     weak: &gpui::WeakEntity<ChordialApp>,
     source: SourceId,
     kind: SourceFeedKind,
+    compact: bool,
 ) -> AnyElement {
     let weak_click = weak.clone();
     div()
         .id(SharedString::from(format!("feed-entry-{kind:?}")))
-        .w(px(268.0))
+        .w_full()
+        .when(!compact, |d| d.w(px(268.0)))
         .h(px(92.0))
         .flex_none()
         .p(px(10.0))
@@ -836,6 +909,7 @@ impl ChordialApp {
                     .into_any_element(),
                 PAGE_MAX_W,
                 &self.main_page_scroll,
+                self.is_phone(),
             );
         };
         let weak = cx.entity().downgrade();
@@ -845,7 +919,7 @@ impl ChordialApp {
 
         let back = {
             let weak = weak.clone();
-            back_row(theme, "返回曲库", move |_, _, cx| {
+            back_row(theme, "返回曲库", self.is_phone(), move |_, _, cx| {
                 let _ = weak.update(cx, |app, cx| app.close_main_page(cx));
             })
         };
@@ -854,8 +928,8 @@ impl ChordialApp {
             let id_edit = id.clone();
             let weak_toggle = weak.clone();
             let id_toggle = id.clone();
-            let mut row = div().flex().items_center().gap(px(6.0));
-            row = row.child(crate::widgets::text_button(
+            let mut row = div().flex().flex_wrap().items_center().gap(px(6.0));
+            row = row.child(crate::widgets::text_button_with_height(
                 theme,
                 if enabled {
                     "关闭音源"
@@ -863,16 +937,18 @@ impl ChordialApp {
                     "启用音源"
                 },
                 enabled,
+                if self.is_phone() { 40.0 } else { 30.0 },
                 move |_, _, cx| {
                     let _ = weak_toggle.update(cx, |app, cx| {
                         app.set_source_enabled(&id_toggle, !enabled, cx);
                     });
                 },
             ));
-            row = row.child(crate::widgets::text_button(
+            row = row.child(crate::widgets::text_button_with_height(
                 theme,
                 "编辑配置",
                 false,
+                if self.is_phone() { 40.0 } else { 30.0 },
                 move |_, _, cx| {
                     let _ = weak_edit.update(cx, |app, cx| {
                         app.open_source_edit(id_edit.clone(), cx);
@@ -907,17 +983,18 @@ impl ChordialApp {
             } else {
                 crate::icons::Icon::Cloud
             },
-            "音源实例",
+            "音乐来源",
             config.name.clone(),
             config.summary(),
             status_pill(theme, status_text, status_color),
             actions,
+            self.is_phone(),
         );
 
         let body: AnyElement = if is_local {
             self.render_local_source_body(config, id, theme, cx)
         } else {
-            self.render_netease_source_body(config, id, theme, cx)
+            self.render_remote_source_body(config, id, theme, cx)
         };
 
         let content = div()
@@ -928,7 +1005,13 @@ impl ChordialApp {
             .child(hero)
             .child(body)
             .into_any_element();
-        page_scroll(theme, content, PAGE_MAX_W, &self.main_page_scroll)
+        page_scroll(
+            theme,
+            content,
+            PAGE_MAX_W,
+            &self.main_page_scroll,
+            self.is_phone(),
+        )
     }
 
     fn render_local_source_body(
@@ -953,16 +1036,15 @@ impl ChordialApp {
                     .map(|local| local.roots.clone())
                     .unwrap_or_default()
             });
-        let tracks = Arc::new(
-            local
-                .as_ref()
-                .map(|local| local.all_tracks())
-                .unwrap_or_default(),
-        );
+        let tracks = local
+            .as_ref()
+            .map(|local| local.all_tracks_arc())
+            .unwrap_or_default();
         let weak = cx.entity().downgrade();
 
         let stats_row = div()
             .flex()
+            .flex_wrap()
             .gap(px(9.0))
             .mt(px(18.0))
             .child(stat_tile(
@@ -1002,11 +1084,17 @@ impl ChordialApp {
         let add_root = {
             let weak = weak.clone();
             let id_add = id.clone();
-            crate::widgets::text_button(theme, "管理目录", false, move |_, _, cx| {
-                let _ = weak.update(cx, |app, cx| {
-                    app.open_source_edit(id_add.clone(), cx);
-                });
-            })
+            crate::widgets::text_button_with_height(
+                theme,
+                "管理目录",
+                false,
+                if self.is_phone() { 40.0 } else { 30.0 },
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.open_source_edit(id_add.clone(), cx);
+                    });
+                },
+            )
         };
 
         let mut roots_rows = div().flex().flex_col().gap(px(2.0));
@@ -1115,40 +1203,117 @@ impl ChordialApp {
                     ),
             );
         } else {
-            // 音源页曲目预览与完整队列共用同一行；行内 ⋮ 也能直接入队。
-            let source_list = QueueList::Snapshot(tracks.clone());
             for (index, track) in tracks.iter().take(40).enumerate() {
-                let row_text = TrackRowText::new(index, track);
-                tracks_rows = tracks_rows.child(ChordialApp::render_track_row(
-                    theme,
-                    index,
-                    &row_text,
-                    &self.track_covers,
-                    source_list.clone(),
-                    self.queue_pos,
-                    self.queue_pos
-                        .and_then(|p| self.queue.get(p))
-                        .map(|t| &t.id),
-                    weak.clone(),
-                    tracks.clone(),
-                    false,
-                    false,
-                    false,
-                    None,
-                    None,
-                    &TrackRowStyle::full(),
-                    None,
-                ));
+                let weak = weak.clone();
+                let snapshot = tracks.clone();
+                let artist = track
+                    .artists
+                    .iter()
+                    .map(|artist| artist.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                let album = track
+                    .album
+                    .as_ref()
+                    .map(|album| album.name.as_str())
+                    .unwrap_or("");
+                let seed = if track.title.is_empty() {
+                    "♪"
+                } else {
+                    track.title.as_str()
+                };
+                tracks_rows = tracks_rows.child(
+                    div()
+                        .id(gpui::ElementId::named_usize("source-track", index))
+                        .h(px(50.0))
+                        .rounded(px(7.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(11.0))
+                        .hover(|s| s.bg(theme.hover))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            let tracks = snapshot.clone();
+                            let _ = weak.update(cx, |app, cx| {
+                                app.play_tracks(tracks, index, cx);
+                            });
+                        })
+                        .child(
+                            div()
+                                .w(px(18.0))
+                                .flex_none()
+                                .text_size(px(9.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from((index + 1).to_string())),
+                        )
+                        .child(cover_thumb(theme, seed, 34.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text)
+                                        .text_ellipsis()
+                                        .child(SharedString::from(track.title.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(theme.text_faint)
+                                        .text_ellipsis()
+                                        .child(SharedString::from(format!(
+                                            "{}{}",
+                                            artist,
+                                            if album.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" · {album}")
+                                            }
+                                        ))),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(44.0))
+                                .flex_none()
+                                .text_right()
+                                .text_size(px(9.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(
+                                    track
+                                        .duration_ms
+                                        .map(fmt_ms)
+                                        .unwrap_or_else(|| "--:--".into()),
+                                )),
+                        )
+                        .child(crate::icons::icon(
+                            crate::icons::Icon::Play,
+                            11.0,
+                            theme.text_faint,
+                        )),
+                );
             }
         }
 
         let play_all = {
             let weak = weak.clone();
             let snapshot = tracks.clone();
-            crate::widgets::text_button(theme, "播放全部", true, move |_, _, cx| {
-                let tracks = snapshot.clone();
-                let _ = weak.update(cx, |app, cx| app.play_tracks(tracks, 0, cx));
-            })
+            crate::widgets::text_button_with_height(
+                theme,
+                "播放全部",
+                true,
+                if self.is_phone() { 40.0 } else { 30.0 },
+                move |_, _, cx| {
+                    let tracks = snapshot.clone();
+                    let _ = weak.update(cx, |app, cx| app.play_tracks(tracks, 0, cx));
+                },
+            )
         };
 
         div()
@@ -1240,48 +1405,37 @@ impl ChordialApp {
         let kind = detail.kind;
         let back = {
             let weak = weak.clone();
-            back_row(theme, "返回音源", move |_, _, cx| {
+            back_row(theme, "返回音源", self.is_phone(), move |_, _, cx| {
                 let _ = weak.update(cx, |app, cx| app.close_feed_detail(cx));
             })
         };
         let refresh = {
             let weak = weak.clone();
             let id_refresh = source.clone();
-            crate::widgets::text_button(theme, "刷新", false, move |_, _, cx| {
-                let _ = weak.update(cx, |app, cx| {
-                    app.refresh_source_feeds(&id_refresh, cx);
-                });
-            })
+            crate::widgets::text_button_with_height(
+                theme,
+                "刷新",
+                false,
+                if self.is_phone() { 40.0 } else { 30.0 },
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.refresh_source_feeds(&id_refresh, cx);
+                    });
+                },
+            )
         };
 
         let feeds = self.source_feeds.get(&source);
-        let (title, desc, cover_seed, accent): (&'static str, String, &'static str, gpui::Hsla) =
-            match kind {
-                SourceFeedKind::Daily => (
-                    "今日推荐",
-                    "根据你的收听习惯每日生成".to_string(),
-                    "荐",
-                    theme.playing,
-                ),
-                SourceFeedKind::Fm => (
-                    "私人 FM",
-                    "无限播放的个性化电台".to_string(),
-                    "FM",
-                    theme.ok,
-                ),
-                SourceFeedKind::Recommended => (
-                    "每日推荐歌单",
-                    "打开歌单后可订阅到我的歌单".to_string(),
-                    "单",
-                    theme.warn,
-                ),
-                SourceFeedKind::Radar => (
-                    "私人雷达",
-                    "按账号每日生成的发现歌单".to_string(),
-                    "雷",
-                    theme.text,
-                ),
-            };
+        let (title, desc, cover_seed): (&'static str, String, &'static str) = match kind {
+            SourceFeedKind::Daily => ("今日推荐", "根据你的收听习惯每日生成".to_string(), "荐"),
+            SourceFeedKind::Fm => ("私人 FM", "无限播放的个性化电台".to_string(), "FM"),
+            SourceFeedKind::Recommended => (
+                "每日推荐歌单",
+                "打开歌单后可订阅到我的歌单".to_string(),
+                "单",
+            ),
+            SourceFeedKind::Radar => ("私人雷达", "按账号每日生成的发现歌单".to_string(), "雷"),
+        };
 
         let detail_hero = div()
             .mt(px(12.0))
@@ -1319,28 +1473,39 @@ impl ChordialApp {
 
         let list: AnyElement = match kind {
             SourceFeedKind::Daily | SourceFeedKind::Fm => {
-                let (tracks, error, loading) = match feeds {
+                let (tracks, queue, error, loading) = match feeds {
                     Some(feed) => match kind {
                         SourceFeedKind::Daily => (
                             feed.daily.as_slice(),
+                            feed.daily.clone(),
                             feed.daily_error.as_ref(),
                             feed.loading_daily,
                         ),
-                        _ => (feed.fm.as_slice(), feed.fm_error.as_ref(), feed.loading_fm),
+                        _ => (
+                            feed.fm.as_slice(),
+                            feed.fm.clone(),
+                            feed.fm_error.as_ref(),
+                            feed.loading_fm,
+                        ),
                     },
-                    None => (&[][..], None, true),
+                    None => (&[][..], Arc::new(Vec::new()), None, true),
                 };
                 let play_all = {
                     let weak = weak.clone();
-                    let feed_list = QueueList::Feed {
-                        source: source.clone(),
-                        kind,
-                    };
-                    crate::widgets::text_button(theme, "播放全部", true, move |_, _, cx| {
-                        let _ = weak.update(cx, |app, cx| {
-                            app.queue_play_all(&feed_list, cx)
-                        });
-                    })
+                    let snapshot = queue.clone();
+                    let source = source.clone();
+                    crate::widgets::text_button_with_height(
+                        theme,
+                        "播放全部",
+                        true,
+                        if self.is_phone() { 40.0 } else { 30.0 },
+                        move |_, _, cx| {
+                            let tracks = snapshot.clone();
+                            let _ = weak.update(cx, |app, cx| {
+                                app.play_feed_tracks(&source, kind, tracks, 0, cx)
+                            });
+                        },
+                    )
                 };
                 div()
                     .flex()
@@ -1351,6 +1516,7 @@ impl ChordialApp {
                         title,
                         format!("{} 首", tracks.len()),
                         tracks,
+                        queue,
                         error,
                         loading,
                         "暂无内容",
@@ -1358,12 +1524,6 @@ impl ChordialApp {
                         &source,
                         kind,
                         &weak,
-                        &self.track_covers,
-                        self.queue_pos,
-                        self.queue_pos
-                            .and_then(|p| self.queue.get(p))
-                            .map(|t| &t.id),
-                        self.queue.clone(),
                     ))
                     .into_any_element()
             }
@@ -1411,10 +1571,11 @@ impl ChordialApp {
                 .into_any_element(),
             PAGE_MAX_W,
             &self.main_page_scroll,
+            self.is_phone(),
         )
     }
 
-    fn render_netease_source_body(
+    fn render_remote_source_body(
         &self,
         config: &SourceInstanceConfig,
         id: &SourceId,
@@ -1428,11 +1589,12 @@ impl ChordialApp {
             return self.render_feed_detail(detail, theme, cx);
         }
         let weak = cx.entity().downgrade();
-        let netease = cx.global::<Globals>().netease_sources.get(id).cloned();
-        let account = netease
+        let source = self.registry.get(id);
+        let account = source
             .as_ref()
             .and_then(|source| source.account().map(|account| account.account_state()))
-            .unwrap_or(AccountState::Unknown);
+            .unwrap_or(AccountState::Unsupported);
+        let has_account = !matches!(account, AccountState::Unsupported);
         let enabled = config.enabled;
 
         let account_card: AnyElement = if !enabled {
@@ -1444,6 +1606,7 @@ impl ChordialApp {
                 .border_color(theme.border)
                 .bg(theme.surface_alt)
                 .flex()
+                .when(self.is_phone(), |d| d.flex_col().items_start())
                 .items_center()
                 .gap(px(14.0))
                 .child(icon_badge(
@@ -1469,7 +1632,7 @@ impl ChordialApp {
                             div()
                                 .text_size(px(10.0))
                                 .text_color(theme.text_faint)
-                                .child("启用后账号、歌单与推荐继续使用本地保存的配置"),
+                                .child("启用后可继续使用账号、歌单与推荐"),
                         ),
                 )
                 .into_any_element()
@@ -1478,7 +1641,11 @@ impl ChordialApp {
                 AccountState::LoggedIn(profile) => {
                     let weak_logout = weak.clone();
                     let id_logout = id.clone();
-                    let avatar = self.account_avatar.clone();
+                    let avatar = if profile.source == *id {
+                        self.account_avatar.clone()
+                    } else {
+                        None
+                    };
                     let playlist_count = self
                         .source_user_playlists
                         .get(id)
@@ -1492,6 +1659,7 @@ impl ChordialApp {
                         .border_color(theme.border)
                         .bg(theme.surface_alt)
                         .flex()
+                        .when(self.is_phone(), |d| d.flex_col().items_start())
                         .items_center()
                         .gap(px(14.0))
                         .child(crate::widgets::cover_plain(
@@ -1505,6 +1673,7 @@ impl ChordialApp {
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
+                                .when(self.is_phone(), |d| d.w_full())
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.0))
@@ -1530,7 +1699,7 @@ impl ChordialApp {
                                 .child(
                                     div().text_size(px(9.5)).text_color(theme.text_faint).child(
                                         SharedString::from(format!(
-                                            "UID {} · 已连接 api-enhanced",
+                                            "账号 {} · 已连接",
                                             profile.uid
                                         )),
                                     ),
@@ -1556,13 +1725,14 @@ impl ChordialApp {
                                         .child("账号歌单"),
                                 ),
                         )
-                        .child(crate::widgets::text_button(
+                        .child(crate::widgets::text_button_with_height(
                             theme,
                             "退出登录",
                             false,
+                            if self.is_phone() { 40.0 } else { 30.0 },
                             move |_, _, cx| {
                                 let _ = weak_logout.update(cx, |app, cx| {
-                                    app.logout_netease_source(&id_logout, cx);
+                                    app.logout_source(&id_logout, cx);
                                 });
                             },
                         ))
@@ -1579,6 +1749,7 @@ impl ChordialApp {
                         .border_color(theme.border)
                         .bg(theme.surface_alt)
                         .flex()
+                        .when(self.is_phone(), |d| d.flex_col().items_start())
                         .items_center()
                         .gap(px(14.0))
                         .child(icon_badge(
@@ -1598,7 +1769,7 @@ impl ChordialApp {
                                         .text_size(px(12.5))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text)
-                                        .child("未登录网易云"),
+                                        .child(format!("未登录{}", config.name)),
                                 )
                                 .child(
                                     div()
@@ -1609,10 +1780,11 @@ impl ChordialApp {
                                         ),
                                 ),
                         )
-                        .child(crate::widgets::text_button(
+                        .child(crate::widgets::text_button_with_height(
                             theme,
-                            "登录网易云",
+                            format!("登录{}", config.name),
                             true,
+                            if self.is_phone() { 40.0 } else { 30.0 },
                             move |_, _, cx| {
                                 let _ = weak_login.update(cx, |app, cx| {
                                     app.open_login_for(id_login.clone(), cx);
@@ -1621,6 +1793,40 @@ impl ChordialApp {
                         ))
                         .into_any_element()
                 }
+                AccountState::Unsupported => div()
+                    .mt(px(16.0))
+                    .p(px(14.0))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface_alt)
+                    .flex()
+                    .when(self.is_phone(), |d| d.flex_col().items_start())
+                    .items_center()
+                    .gap(px(14.0))
+                    .child(icon_badge(theme, crate::icons::Icon::Check, 38.0, theme.ok))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child("此音源无需登录"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_faint)
+                                    .child("可直接搜索并播放；可用内容由音源能力决定"),
+                            ),
+                    )
+                    .into_any_element(),
                 _ => {
                     let weak_refresh = weak.clone();
                     let id_refresh = id.clone();
@@ -1632,6 +1838,7 @@ impl ChordialApp {
                         .border_color(theme.border)
                         .bg(theme.surface_alt)
                         .flex()
+                        .when(self.is_phone(), |d| d.flex_col().items_start())
                         .items_center()
                         .gap(px(14.0))
                         .child(icon_badge(
@@ -1647,10 +1854,11 @@ impl ChordialApp {
                                 .text_color(theme.text_dim)
                                 .child("正在校验账号状态"),
                         )
-                        .child(crate::widgets::text_button(
+                        .child(crate::widgets::text_button_with_height(
                             theme,
                             "重新校验",
                             false,
+                            if self.is_phone() { 40.0 } else { 30.0 },
                             move |_, _, cx| {
                                 let _ = weak_refresh.update(cx, |app, cx| {
                                     app.refresh_source_account(&id_refresh, cx);
@@ -1693,7 +1901,7 @@ impl ChordialApp {
                                 "source-user-playlist-{}",
                                 summary.id.id
                             )))
-                            .h(px(48.0))
+                            .h(px(if self.is_phone() { 52.0 } else { 48.0 }))
                             .px(px(6.0))
                             .rounded(px(7.0))
                             .flex()
@@ -1776,10 +1984,11 @@ impl ChordialApp {
                                     "音源已关闭；启用后可加载账号歌单"
                                 }),
                         )
-                        .child(crate::widgets::text_button(
+                        .child(crate::widgets::text_button_with_height(
                             theme,
                             "加载",
                             false,
+                            if self.is_phone() { 40.0 } else { 30.0 },
                             move |_, _, cx| {
                                 let _ = weak.update(cx, |app, cx| {
                                     app.load_source_user_playlists(&id_load, cx);
@@ -1793,12 +2002,12 @@ impl ChordialApp {
 
         let feeds = self.source_feeds.get(id);
         let mut content = div().flex().flex_col().child(account_card);
-        if enabled {
+        if enabled && has_account {
             let loading = feeds.is_some_and(SourceFeedState::loading);
             let refresh = {
                 let weak = weak.clone();
                 let id_refresh = id.clone();
-                crate::widgets::text_button(
+                crate::widgets::text_button_with_height(
                     theme,
                     if loading {
                         "刷新中…"
@@ -1806,6 +2015,7 @@ impl ChordialApp {
                         "刷新推荐"
                     },
                     false,
+                    if self.is_phone() { 40.0 } else { 30.0 },
                     move |_, _, cx| {
                         let _ = weak.update(cx, |app, cx| {
                             app.refresh_source_feeds(&id_refresh, cx);
@@ -1869,6 +2079,8 @@ impl ChordialApp {
             let entries = div()
                 .mt(px(10.0))
                 .flex()
+                .flex_wrap()
+                .when(self.is_phone(), |d| d.flex_col())
                 .gap(px(10.0))
                 .child(feed_entry_card(
                     theme,
@@ -1880,6 +2092,7 @@ impl ChordialApp {
                     &weak,
                     id.clone(),
                     SourceFeedKind::Daily,
+                    self.is_phone(),
                 ))
                 .child(feed_entry_card(
                     theme,
@@ -1891,6 +2104,7 @@ impl ChordialApp {
                     &weak,
                     id.clone(),
                     SourceFeedKind::Fm,
+                    self.is_phone(),
                 ))
                 .child(feed_entry_card(
                     theme,
@@ -1902,6 +2116,7 @@ impl ChordialApp {
                     &weak,
                     id.clone(),
                     SourceFeedKind::Recommended,
+                    self.is_phone(),
                 ))
                 .child(feed_entry_card(
                     theme,
@@ -1913,10 +2128,11 @@ impl ChordialApp {
                     &weak,
                     id.clone(),
                     SourceFeedKind::Radar,
+                    self.is_phone(),
                 ));
             content = content.child(entries);
         }
-        if enabled {
+        if enabled && has_account {
             content = content
                 .child(section_title_v2(
                     theme,
@@ -1934,26 +2150,33 @@ impl ChordialApp {
         let weak = cx.entity().downgrade();
         let back = {
             let weak = weak.clone();
-            back_row(theme, "返回曲库", move |_, _, cx| {
+            back_row(theme, "返回曲库", self.is_phone(), move |_, _, cx| {
                 let _ = weak.update(cx, |app, cx| app.close_main_page(cx));
             })
         };
         let add = {
             let weak = weak.clone();
-            crate::widgets::text_button(theme, "添加音源", true, move |_, _, cx| {
-                let _ = weak.update(cx, |app, cx| app.open_new_source(cx));
-            })
+            crate::widgets::text_button_with_height(
+                theme,
+                "添加音源",
+                true,
+                if self.is_phone() { 40.0 } else { 30.0 },
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.open_new_source(cx));
+                },
+            )
         };
         let header = page_header(
             theme,
             "音源".into(),
             "管理音源".into(),
             format!(
-                "端点状态 · 配置 · 新增 · 共 {} 个实例 / {} 个开启",
+                "添加、启用或编辑音源 · 共 {} 个实例 / {} 个开启",
                 self.source_configs.len(),
                 self.source_configs.iter().filter(|s| s.enabled).count()
             ),
             add,
+            self.is_phone(),
         );
 
         let mut rows = div().flex().flex_col();
@@ -2032,7 +2255,7 @@ impl ChordialApp {
                                             .rounded(px(3.0))
                                             .bg(theme.surface_alt)
                                             .text_color(theme.text_faint)
-                                            .child(config.type_label()),
+                                            .child(config.category_label()),
                                     ),
                             )
                             .child(
@@ -2079,13 +2302,16 @@ impl ChordialApp {
                     .text_size(px(10.0))
                     .line_height(px(16.0))
                     .text_color(theme.text_faint)
-                    .child(
-                        "每个实例都有独立的追踪 ID。删除或关闭实例不会删除我的歌单；\
-                         歌单里引用该源的曲目会灰显，若本地库有同身份副本则自动改播本地。",
-                    ),
+                    .child("关闭音源不会删除歌单或已下载内容；再次启用即可恢复。"),
             )
             .into_any_element();
-        page_scroll(theme, content, PAGE_MAX_W, &self.main_page_scroll)
+        page_scroll(
+            theme,
+            content,
+            PAGE_MAX_W,
+            &self.main_page_scroll,
+            self.is_phone(),
+        )
     }
 
     // ================= 新增音源 =================
@@ -2094,22 +2320,26 @@ impl ChordialApp {
         let weak = cx.entity().downgrade();
         let back = {
             let weak = weak.clone();
-            back_row(theme, "返回音源管理", move |_, _, cx| {
-                let _ = weak.update(cx, |app, cx| app.open_source_manager(cx));
-            })
+            back_row(
+                theme,
+                "返回音源管理",
+                self.is_phone(),
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.open_source_manager(cx));
+                },
+            )
         };
         let header = page_header(
             theme,
             "音源".into(),
             "添加音源".into(),
-            "选择本程序已支持的数据源类型；新增实例会生成独立追踪 ID".into(),
+            "选择要添加的音乐来源；每个实例独立管理".into(),
             div().into_any_element(),
+            self.is_phone(),
         );
-        let option = |icon: crate::icons::Icon,
-                      title: &'static str,
-                      description: &'static str,
-                      source_type: &'static str,
+        let option = |descriptor: &'static crate::sources::SourceTypeDescriptor,
                       weak: gpui::WeakEntity<ChordialApp>| {
+            let source_type = descriptor.source_type;
             div()
                 .id(SharedString::from(format!("add-source-{source_type}")))
                 .flex_1()
@@ -2129,20 +2359,27 @@ impl ChordialApp {
                         app.create_source_of_type(source_type, cx);
                     });
                 })
-                .child(crate::icons::icon(icon, 22.0, theme.text_dim))
+                .child(crate::icons::icon(
+                    match descriptor.kind {
+                        chordal_core::model::SourceKind::LocalLibrary => crate::icons::Icon::Drive,
+                        chordal_core::model::SourceKind::HttpApi => crate::icons::Icon::Cloud,
+                    },
+                    22.0,
+                    theme.text_dim,
+                ))
                 .child(
                     div()
                         .text_size(px(14.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(title),
+                        .child(descriptor.display_name),
                 )
                 .child(
                     div()
                         .text_size(px(10.5))
                         .line_height(px(16.0))
                         .text_color(theme.text_faint)
-                        .child(description),
+                        .child(descriptor.description),
                 )
                 .child(
                     div()
@@ -2162,45 +2399,38 @@ impl ChordialApp {
                 .into_any_element()
         };
 
+        let mut options = div()
+            .mt(px(14.0))
+            .flex()
+            .when(self.is_phone(), |d| d.flex_col())
+            .gap(px(12.0));
+        for descriptor in crate::sources::SOURCE_TYPE_DESCRIPTORS {
+            options = options.child(option(descriptor, weak.clone()));
+        }
+
         let content = div()
             .flex()
             .flex_col()
             .child(back)
             .child(div().h(px(6.0)))
             .child(header)
-            .child(
-                div()
-                    .mt(px(14.0))
-                    .flex()
-                    .gap(px(12.0))
-                    .child(option(
-                        crate::icons::Icon::Drive,
-                        "本地音乐",
-                        "扫描一个或多个音乐目录；支持增量扫描、封面/歌词边车文件。",
-                        crate::config::SOURCE_TYPE_LOCAL,
-                        weak.clone(),
-                    ))
-                    .child(option(
-                        crate::icons::Icon::Cloud,
-                        "网易云音乐",
-                        "连接自部署 api-enhanced；可登录账号、加载歌单与推荐。",
-                        crate::config::SOURCE_TYPE_NETEASE,
-                        weak,
-                    )),
-            )
+            .child(options)
             .child(
                 div()
                     .mt(px(14.0))
                     .text_size(px(10.0))
                     .line_height(px(16.0))
                     .text_color(theme.text_faint)
-                    .child(
-                        "同一类型可以添加多个实例（例如两个不同音乐目录的本地库）。\
-                         实例 ID 与曲目/歌单引用绑定，重命名不会改变引用。",
-                    ),
+                    .child("同一类型可以添加多个实例，例如两个不同目录的本地音乐库。"),
             )
             .into_any_element();
-        page_scroll(theme, content, PAGE_MAX_W, &self.main_page_scroll)
+        page_scroll(
+            theme,
+            content,
+            PAGE_MAX_W,
+            &self.main_page_scroll,
+            self.is_phone(),
+        )
     }
 
     // ================= 二级编辑 =================
@@ -2217,17 +2447,37 @@ impl ChordialApp {
         let weak = cx.entity().downgrade();
         let back = {
             let weak = weak.clone();
-            back_row(theme, "返回音源管理", move |_, _, cx| {
-                let _ = weak.update(cx, |app, cx| app.open_source_manager(cx));
-            })
+            back_row(
+                theme,
+                "返回音源管理",
+                self.is_phone(),
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.open_source_manager(cx));
+                },
+            )
         };
         let enabled = config.enabled;
+        let editor = crate::sources::source_type_descriptor(&config.source_type)
+            .map(|descriptor| descriptor.editor)
+            .unwrap_or(crate::sources::SourceConfigEditor::Unsupported);
+        let edit_description = match editor {
+            crate::sources::SourceConfigEditor::LocalRoots => {
+                "修改名称与音乐目录；已有歌单引用保持不变"
+            }
+            crate::sources::SourceConfigEditor::HttpEndpoint => {
+                "修改名称与服务地址；已有歌单引用保持不变"
+            }
+            crate::sources::SourceConfigEditor::Unsupported => {
+                "修改名称或启用状态；已有歌单引用保持不变"
+            }
+        };
         let header = page_header(
             theme,
             format!("{} · 编辑", config.type_label()),
             config.name.clone(),
-            "实例 ID 固定不变；名称、目录或地址变更不会影响歌单引用".into(),
+            edit_description.into(),
             div().into_any_element(),
+            self.is_phone(),
         );
         let enabled_row = {
             let weak = weak.clone();
@@ -2276,88 +2526,91 @@ impl ChordialApp {
                 div()
                     .text_size(px(9.5))
                     .text_color(theme.text_faint)
-                    .child("回车应用；只改展示名，不改追踪 ID"),
+                    .child("回车保存名称；已有歌单与播放记录不受影响"),
             )
             .into_any_element();
 
-        let type_section: AnyElement = if config.is_local() {
-            let roots = config
-                .local
-                .as_ref()
-                .map(|local| local.roots.clone())
-                .unwrap_or_default();
-            let mut root_rows = div().flex().flex_col();
-            for (index, root) in roots.iter().enumerate() {
-                let weak = weak.clone();
-                let id = id.clone();
-                let can_remove = roots.len() > 1;
-                root_rows = root_rows.child(
-                    div()
-                        .h(px(36.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(crate::icons::icon(
-                            crate::icons::Icon::Drive,
-                            13.0,
-                            theme.text_faint,
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .text_size(px(10.5))
-                                .text_color(theme.text_dim)
-                                .text_ellipsis()
-                                .child(SharedString::from(root.display().to_string())),
-                        )
-                        .when(can_remove, |d| {
-                            d.child(
+        let type_section: AnyElement = match editor {
+            crate::sources::SourceConfigEditor::LocalRoots => {
+                let roots = config
+                    .local
+                    .as_ref()
+                    .map(|local| local.roots.clone())
+                    .unwrap_or_default();
+                let mut root_rows = div().flex().flex_col();
+                for (index, root) in roots.iter().enumerate() {
+                    let weak = weak.clone();
+                    let id = id.clone();
+                    let can_remove = roots.len() > 1;
+                    root_rows = root_rows.child(
+                        div()
+                            .h(px(if self.is_phone() { 44.0 } else { 36.0 }))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(crate::icons::icon(
+                                crate::icons::Icon::Drive,
+                                13.0,
+                                theme.text_faint,
+                            ))
+                            .child(
                                 div()
-                                    .id(SharedString::from(format!("source-root-remove-{index}")))
-                                    .h(px(22.0))
-                                    .px(px(7.0))
-                                    .rounded(px(5.0))
-                                    .flex()
-                                    .items_center()
-                                    .text_size(px(9.5))
-                                    .text_color(theme.text_faint)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme.hover).text_color(theme.danger))
-                                    .child("移除")
-                                    .on_click(move |_, _, cx| {
-                                        let _ = weak.update(cx, |app, cx| {
-                                            app.remove_source_root(&id, index, cx);
-                                        });
-                                    }),
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_dim)
+                                    .text_ellipsis()
+                                    .child(SharedString::from(root.display().to_string())),
                             )
-                        }),
-                );
+                            .when(can_remove, |d| {
+                                d.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "source-root-remove-{index}"
+                                        )))
+                                        .h(px(if self.is_phone() { 44.0 } else { 22.0 }))
+                                        .px(px(7.0))
+                                        .rounded(px(5.0))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(9.5))
+                                        .text_color(theme.text_faint)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme.hover).text_color(theme.danger))
+                                        .child("移除")
+                                        .on_click(move |_, _, cx| {
+                                            let _ = weak.update(cx, |app, cx| {
+                                                app.remove_source_root(&id, index, cx);
+                                            });
+                                        }),
+                                )
+                            }),
+                    );
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text_faint)
+                            .child("音乐目录"),
+                    )
+                    .child(root_rows)
+                    .child(self.source_edit_root_view.clone())
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(theme.text_faint)
+                            .child("回车添加目录；保存后自动重新扫描"),
+                    )
+                    .into_any_element()
             }
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(7.0))
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.text_faint)
-                        .child("音乐目录"),
-                )
-                .child(root_rows)
-                .child(self.source_edit_root_view.clone())
-                .child(
-                    div()
-                        .text_size(px(9.5))
-                        .text_color(theme.text_faint)
-                        .child("回车添加目录；保存会重建实例并重新扫描"),
-                )
-                .into_any_element()
-        } else {
-            div()
+            crate::sources::SourceConfigEditor::HttpEndpoint => div()
                 .flex()
                 .flex_col()
                 .gap(px(7.0))
@@ -2373,9 +2626,31 @@ impl ChordialApp {
                     div()
                         .text_size(px(9.5))
                         .text_color(theme.text_faint)
-                        .child("回车应用并重建实例；Cookie 由登录维护，不会显示在这里"),
+                        .child("回车保存并重新连接；登录状态由音源维护"),
                 )
-                .into_any_element()
+                .into_any_element(),
+            crate::sources::SourceConfigEditor::Unsupported => div()
+                .p(px(14.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface_alt)
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text)
+                        .child("此音源暂无可编辑配置"),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(theme.text_faint)
+                        .child("仍可修改名称、启用或删除实例"),
+                )
+                .into_any_element(),
         };
 
         let delete = {
@@ -2388,6 +2663,7 @@ impl ChordialApp {
                 .border_t_1()
                 .border_color(theme.border)
                 .flex()
+                .when(self.is_phone(), |d| d.flex_col().items_start())
                 .items_center()
                 .justify_between()
                 .child(
@@ -2411,7 +2687,7 @@ impl ChordialApp {
                 .child(
                     div()
                         .id("source-delete")
-                        .h(px(28.0))
+                        .h(px(if self.is_phone() { 40.0 } else { 28.0 }))
                         .px(px(10.0))
                         .rounded(px(6.0))
                         .border_1()
@@ -2468,7 +2744,13 @@ impl ChordialApp {
             )
             .child(delete)
             .into_any_element();
-        page_scroll(theme, content, PAGE_MAX_W, &self.main_page_scroll)
+        page_scroll(
+            theme,
+            content,
+            PAGE_MAX_W,
+            &self.main_page_scroll,
+            self.is_phone(),
+        )
     }
 
     // ================= 添加到歌单浮层 =================
@@ -2481,9 +2763,12 @@ impl ChordialApp {
         let weak = cx.entity().downgrade();
         let width = self.viewport_width;
         let height = self.viewport_height;
-        // 订阅歌单也列入：远端 AddTracks 由 PlaylistEditor 执行，
-        // 跨源曲目会被音源自身过滤并给出提示。
-        let local: Vec<_> = self.playlists.summaries();
+        let local: Vec<_> = self
+            .playlists
+            .summaries()
+            .into_iter()
+            .filter(|summary| !summary.is_subscribed())
+            .collect();
         let panel_w = 248.0;
         let rows_h = (local.len().min(8) as f32) * 32.0;
         let panel_h = (74.0 + rows_h + 68.0).min(380.0);
@@ -2541,11 +2826,7 @@ impl ChordialApp {
             let weak = weak.clone();
             let id = summary.id.clone();
             rows.push(item_label(
-                if summary.is_subscribed() {
-                    crate::icons::Icon::Cloud
-                } else {
-                    crate::icons::Icon::Layers
-                },
+                crate::icons::Icon::Layers,
                 summary.title.clone().into(),
                 summary.count.to_string(),
                 Box::new(move |_, _, cx| {
@@ -2667,12 +2948,11 @@ impl ChordialApp {
                 div().child("歌单不存在").into_any_element(),
                 PAGE_MAX_W,
                 &self.main_page_scroll,
+                self.is_phone(),
             );
         };
         let weak = cx.entity().downgrade();
-        // 订阅歌单只要源实现了 PlaylistEditor 就同样可编辑（网易云支持）。
-        let caps = self.playlist_capabilities(playlist);
-        let editable = caps.remove_tracks && caps.reorder;
+        let editable = matches!(playlist.kind, PlaylistKind::Local);
         let subscribed = playlist.kind.is_subscribed();
         let kind_label = if subscribed {
             "订阅歌单"
@@ -2701,31 +2981,33 @@ impl ChordialApp {
 
         let back = {
             let weak = weak.clone();
-            back_row(theme, "返回曲库", move |_, _, cx| {
+            back_row(theme, "返回曲库", self.is_phone(), move |_, _, cx| {
                 let _ = weak.update(cx, |app, cx| app.close_main_page(cx));
             })
         };
         let actions = {
-            let mut row = div().flex().items_center().gap(px(6.0));
+            let mut row = div().flex().flex_wrap().items_center().gap(px(6.0));
             {
                 let weak = weak.clone();
                 let id = id.clone();
-                row = row.child(crate::widgets::text_button(
+                row = row.child(crate::widgets::text_button_with_height(
                     theme,
                     "播放全部",
                     true,
+                    if self.is_phone() { 40.0 } else { 30.0 },
                     move |_, _, cx| {
                         let _ = weak.update(cx, |app, cx| app.play_playlist(&id, cx));
                     },
                 ));
             }
-            if caps.add_tracks {
+            if editable {
                 let weak = weak.clone();
                 let id = id.clone();
-                row = row.child(crate::widgets::text_button(
+                row = row.child(crate::widgets::text_button_with_height(
                     theme,
                     "从当前队列添加",
                     false,
+                    if self.is_phone() { 40.0 } else { 30.0 },
                     move |_, _, cx| {
                         let _ = weak.update(cx, |app, cx| {
                             app.add_queue_to_playlist(&id, cx);
@@ -2740,7 +3022,7 @@ impl ChordialApp {
                 row = row.child(
                     div()
                         .id("playlist-delete")
-                        .h(px(29.0))
+                        .h(px(if self.is_phone() { 40.0 } else { 29.0 }))
                         .px(px(9.0))
                         .rounded(px(7.0))
                         .flex()
@@ -2780,6 +3062,7 @@ impl ChordialApp {
             playlist.title.clone(),
             subtitle,
             actions,
+            self.is_phone(),
         );
 
         let rename_row = div()
@@ -2831,115 +3114,21 @@ impl ChordialApp {
         let list_weak = weak.clone();
         let list_rows = rows.clone();
         let playlist_id = id.clone();
-        let list_ref = QueueList::Playlist(id.clone());
-        let tracks_snapshot: Arc<Vec<Track>> =
-            Arc::new(rows.iter().map(|row| row.track.clone()).collect());
-        let covers = self.track_covers.clone();
-        let queue_pos = self.queue_pos;
-        let current_id = queue_pos
-            .and_then(|pos| self.queue.get(pos))
-            .map(|t| t.id.clone());
         let mut list = uniform_list("playlist-tracks", count, move |range, _window, _cx| {
             range
                 .filter_map(|index| {
                     let row = list_rows.get(index)?;
-                    let row_text = TrackRowText::new(index, &row.track);
-                    let style = TrackRowStyle {
-                        source_label: Some(row.source_label.clone()),
-                        unavailable: row.unavailable,
-                        local_substitute: row.local_substitute,
-                        ..TrackRowStyle::full()
-                    };
-                    // 歌单编辑按钮作为行尾随操作交给统一行渲染器。
-                    let trailing = editable.then(|| {
-                        let weak_remove = list_weak.clone();
-                        let weak_up = list_weak.clone();
-                        let weak_down = list_weak.clone();
-                        let playlist_id_remove = playlist_id.clone();
-                        let playlist_id_up = playlist_id.clone();
-                        let playlist_id_down = playlist_id.clone();
-                        let track_remove = row.track.clone();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .id(gpui::ElementId::named_usize("playlist-up", index))
-                                    .size(px(22.0))
-                                    .rounded(px(5.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .opacity(0.55)
-                                    .hover(|s| s.bg(list_theme.surface_alt).opacity(1.0))
-                                    .child(crate::icons::icon(
-                                        crate::icons::Icon::ChevronUp,
-                                        12.0,
-                                        list_theme.text_faint,
-                                    ))
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        if index == 0 {
-                                            return;
-                                        }
-                                        let _ = weak_up.update(cx, |app, cx| {
-                                            app.reorder_playlist(&playlist_id_up, index, index - 1, cx);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id(gpui::ElementId::named_usize("playlist-down", index))
-                                    .size(px(22.0))
-                                    .rounded(px(5.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .opacity(0.55)
-                                    .hover(|s| s.bg(list_theme.surface_alt).opacity(1.0))
-                                    .child(crate::icons::icon(
-                                        crate::icons::Icon::ChevronDown,
-                                        12.0,
-                                        list_theme.text_faint,
-                                    ))
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        let _ = weak_down.update(cx, |app, cx| {
-                                            app.reorder_playlist(&playlist_id_down, index, index + 1, cx);
-                                        });
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id(gpui::ElementId::named_usize("playlist-remove", index))
-                                    .size(px(22.0))
-                                    .rounded(px(5.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .opacity(0.55)
-                                    .hover(|s| s.bg(list_theme.surface_alt).opacity(1.0))
-                                    .child(crate::icons::icon(
-                                        crate::icons::Icon::Close,
-                                        11.0,
-                                        list_theme.text_faint,
-                                    ))
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        let _ = weak_remove.update(cx, |app, cx| {
-                                            app.apply_playlist_mutation(
-                                                &playlist_id_remove,
-                                                PlaylistMutation::RemoveTracks {
-                                                    tracks: vec![track_remove.clone()],
-                                                },
-                                                cx,
-                                            );
-                                        });
-                                    }),
-                            )
-                            .into_any_element()
-                    });
+                    let weak = list_weak.clone();
+                    let playlist_id = playlist_id.clone();
+                    let editable = editable;
+                    let row_theme = list_theme.clone();
+                    let unavailable = row.unavailable;
+                    let track = row.track.clone();
+                    let source_label = row.source_label.clone();
+                    let duration = row.duration.clone();
+                    let title = row.title.clone();
+                    let artist = row.artist.clone();
+                    let local_substitute = row.local_substitute;
                     Some(
                         div()
                             .w_full()
@@ -2949,24 +3138,249 @@ impl ChordialApp {
                                     .w_full()
                                     .max_w(px(PAGE_MAX_W))
                                     .mx_auto()
-                                    .child(ChordialApp::render_track_row(
-                                        &list_theme,
-                                        index,
-                                        &row_text,
-                                        &covers,
-                                        list_ref.clone(),
-                                        queue_pos,
-                                        current_id.as_ref(),
-                                        list_weak.clone(),
-                                        tracks_snapshot.clone(),
-                                        false,
-                                        false,
-                                        false,
-                                        None,
-                                        None,
-                                        &style,
-                                        trailing,
-                                    )),
+                                    .h(px(54.0))
+                                    .rounded(px(7.0))
+                                    .px(px(10.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .opacity(if unavailable { 0.48 } else { 1.0 })
+                                    .id(gpui::ElementId::named_usize("playlist-track", index))
+                                    .hover(|s| s.bg(row_theme.hover))
+                                    .cursor_pointer()
+                                    .on_click({
+                                        let weak = weak.clone();
+                                        let playlist_id = playlist_id.clone();
+                                        move |_, _, cx| {
+                                            let _ = weak.update(cx, |app, cx| {
+                                                if unavailable {
+                                                    app.info_message = Some(
+                                                        "音源已关闭，且本地没有同身份副本".into(),
+                                                    );
+                                                } else {
+                                                    app.play_playlist_at(&playlist_id, index, cx);
+                                                }
+                                                cx.notify();
+                                            });
+                                        }
+                                    })
+                                    .child(
+                                        div()
+                                            .w(px(24.0))
+                                            .text_size(px(9.5))
+                                            .text_color(row_theme.text_faint)
+                                            .child(SharedString::from((index + 1).to_string())),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.0))
+                                                    .text_color(if unavailable {
+                                                        row_theme.disabled_fg
+                                                    } else {
+                                                        row_theme.text
+                                                    })
+                                                    .text_ellipsis()
+                                                    .child(title),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(6.0))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.0))
+                                                            .text_color(row_theme.text_faint)
+                                                            .text_ellipsis()
+                                                            .child(artist),
+                                                    )
+                                                    .when(unavailable, |d| {
+                                                        d.child(
+                                                            div()
+                                                                .text_size(px(9.0))
+                                                                .text_color(row_theme.danger)
+                                                                .child("无法拉取"),
+                                                        )
+                                                    })
+                                                    .when(local_substitute, |d| {
+                                                        d.child(
+                                                            div()
+                                                                .text_size(px(9.0))
+                                                                .text_color(row_theme.ok)
+                                                                .child("本地替代"),
+                                                        )
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(124.0))
+                                            .text_size(px(9.5))
+                                            .text_color(row_theme.text_faint)
+                                            .text_ellipsis()
+                                            .child(source_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(44.0))
+                                            .text_size(px(9.5))
+                                            .text_color(row_theme.text_faint)
+                                            .child(duration),
+                                    )
+                                    .when(editable, |d| {
+                                        let weak_remove = weak.clone();
+                                        let weak_up = weak.clone();
+                                        let weak_down = weak.clone();
+                                        let playlist_id_remove = playlist_id.clone();
+                                        let playlist_id_up = playlist_id.clone();
+                                        let playlist_id_down = playlist_id.clone();
+                                        let track_remove = track.clone();
+                                        d.child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(2.0))
+                                                .child(
+                                                    div()
+                                                        .id(gpui::ElementId::named_usize(
+                                                            "playlist-up",
+                                                            index,
+                                                        ))
+                                                        .size(px(22.0))
+                                                        .rounded(px(5.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .opacity(0.55)
+                                                        .hover(|s| {
+                                                            s.bg(row_theme.surface_alt)
+                                                                .opacity(1.0)
+                                                        })
+                                                        .child(crate::icons::icon(
+                                                            crate::icons::Icon::ChevronUp,
+                                                            12.0,
+                                                            row_theme.text_faint,
+                                                        ))
+                                                        .on_click(move |_, _, cx| {
+                                                            cx.stop_propagation();
+                                                            if index == 0 {
+                                                                return;
+                                                            }
+                                                            let _ = weak_up.update(cx, |app, cx| {
+                                                                let ordered = app
+                                                                    .playlists
+                                                                    .get(&playlist_id_up)
+                                                                    .map(|playlist| {
+                                                                        playlist
+                                                                            .entries
+                                                                            .iter()
+                                                                            .map(|entry| entry.track.clone())
+                                                                            .collect()
+                                                                    })
+                                                                    .unwrap_or_default();
+                                                                app.apply_playlist_mutation(
+                                                                    &playlist_id_up,
+                                                                    PlaylistMutation::Reorder {
+                                                                        from: index,
+                                                                        to: index - 1,
+                                                                        ordered,
+                                                                    },
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(gpui::ElementId::named_usize(
+                                                            "playlist-down",
+                                                            index,
+                                                        ))
+                                                        .size(px(22.0))
+                                                        .rounded(px(5.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .opacity(0.55)
+                                                        .hover(|s| {
+                                                            s.bg(row_theme.surface_alt)
+                                                                .opacity(1.0)
+                                                        })
+                                                        .child(crate::icons::icon(
+                                                            crate::icons::Icon::ChevronDown,
+                                                            12.0,
+                                                            row_theme.text_faint,
+                                                        ))
+                                                        .on_click(move |_, _, cx| {
+                                                            cx.stop_propagation();
+                                                            let _ = weak_down.update(cx, |app, cx| {
+                                                                let ordered = app
+                                                                    .playlists
+                                                                    .get(&playlist_id_down)
+                                                                    .map(|playlist| {
+                                                                        playlist
+                                                                            .entries
+                                                                            .iter()
+                                                                            .map(|entry| entry.track.clone())
+                                                                            .collect()
+                                                                    })
+                                                                    .unwrap_or_default();
+                                                                app.apply_playlist_mutation(
+                                                                    &playlist_id_down,
+                                                                    PlaylistMutation::Reorder {
+                                                                        from: index,
+                                                                        to: index + 1,
+                                                                        ordered,
+                                                                    },
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(gpui::ElementId::named_usize(
+                                                            "playlist-remove",
+                                                            index,
+                                                        ))
+                                                        .size(px(22.0))
+                                                        .rounded(px(5.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .opacity(0.55)
+                                                        .hover(|s| {
+                                                            s.bg(row_theme.surface_alt)
+                                                                .opacity(1.0)
+                                                        })
+                                                        .child(crate::icons::icon(
+                                                            crate::icons::Icon::Close,
+                                                            11.0,
+                                                            row_theme.text_faint,
+                                                        ))
+                                                        .on_click(move |_, _, cx| {
+                                                            cx.stop_propagation();
+                                                            let _ = weak_remove.update(cx, |app, cx| {
+                                                                app.apply_playlist_mutation(
+                                                                    &playlist_id_remove,
+                                                                    PlaylistMutation::RemoveTracks {
+                                                                        tracks: vec![track_remove.clone()],
+                                                                    },
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                ),
+                                        )
+                                    })
+                                    .into_any_element(),
                             )
                             .into_any_element(),
                     )

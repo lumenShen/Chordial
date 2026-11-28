@@ -135,6 +135,7 @@ impl SettingsView {
         width: Option<f32>,
         pad: f32,
     ) -> AnyElement {
+        let body_start = Instant::now();
         let body: AnyElement = match self.tab {
             SettingsTab::General => self.render_general(theme, weak),
             SettingsTab::Playback => self.render_playback(theme, weak, cx),
@@ -142,6 +143,7 @@ impl SettingsView {
             SettingsTab::Storage => self.render_storage(theme, weak, cx),
             SettingsTab::About => self.render_about(theme),
         };
+        crate::frame_trace::add("settings.body", body_start.elapsed());
 
         // 桌面固定为「卡片宽 − 导航宽 − 分隔线」；手机/窄窗由外层给
         // `None`，内容随窗口伸缩，避免 800px 卡片把窗口撑出可视区。

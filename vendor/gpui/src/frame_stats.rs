@@ -169,7 +169,7 @@ fn report(stats: &Stats) {
 
     log::info!(
         target: "gpui::frame",
-        "frames={} window={} target={:.1}Hz effective={:.1}Hz miss={}/{} \
+        "frames={} window={} target={:.1}Hz effective={:.1}Hz miss={}/{} cum_miss={} \
          draw_us(p50/p95/p99/max)={}/{}/{}/{} \
          prepaint_us(p50/p95/p99/max)={}/{}/{}/{} \
          paint_us(p50/p95/p99/max)={}/{}/{}/{} \
@@ -181,6 +181,7 @@ fn report(stats: &Stats) {
         1_000_000.0 / target as f64,
         effective_hz,
         window_miss,
+        window.len(),
         stats.missed,
         draw_p50,
         draw_p95,

@@ -32,18 +32,6 @@ impl ChordialApp {
             })
         });
 
-        // 顶栏的全局搜索入口复用同一个输入状态：两处输入内容永远同步，
-        // 但外框由标题栏绘制，所以这里用 bare + 独立元素 id。
-        let weak_top_search = weak_self.clone();
-        let search_top_view = cx.new(|cx| {
-            InputView::new(search_input.clone(), cx)
-                .with_id("topbar-search")
-                .bare()
-                .on_submit(move |text, _window, cx| {
-                    let _ = weak_top_search.update(cx, |app, cx| app.start_search(text, cx));
-                })
-        });
-
         // 设置面板的路径输入框：回车即应用。
         let settings_cache_input = cx.new(|cx| {
             let mut s = InputState::new(cx);
@@ -75,37 +63,95 @@ impl ChordialApp {
                 })
         });
 
-        // 背景鼓点频段：两个数字输入框，任一框回车都提交整组频段。
-        let beat_band = chordal_player::normalize_band(cfg.beat_band_low_hz, cfg.beat_band_high_hz);
-        player.set_beat_band(beat_band.0, beat_band.1);
-        let settings_beat_low_input = cx.new(|cx| {
-            let mut s = InputState::new(cx);
-            s.set_placeholder("4000");
-            s.set_content(format!("{:.0}", beat_band.0), cx);
-            s
-        });
-        let weak_beat_low = weak_self.clone();
-        let settings_beat_low_view = cx.new(|cx| {
-            InputView::new(settings_beat_low_input.clone(), cx)
-                .with_id("settings-beat-low")
-                .on_submit(move |_text, _window, cx| {
-                    let _ = weak_beat_low.update(cx, |app, cx| app.apply_beat_band(cx));
-                })
-        });
-        let settings_beat_high_input = cx.new(|cx| {
-            let mut s = InputState::new(cx);
-            s.set_placeholder("10000");
-            s.set_content(format!("{:.0}", beat_band.1), cx);
-            s
-        });
-        let weak_beat_high = weak_self.clone();
-        let settings_beat_high_view = cx.new(|cx| {
-            InputView::new(settings_beat_high_input.clone(), cx)
-                .with_id("settings-beat-high")
-                .on_submit(move |_text, _window, cx| {
-                    let _ = weak_beat_high.update(cx, |app, cx| app.apply_beat_band(cx));
-                })
-        });
+        // 五路频段与内部控制点：每个频段两个频率输入和一个编号列表。
+        let audio_band_ranges = cfg.audio_band_ranges.sanitized();
+        let audio_band_controls = cfg.audio_band_controls.sanitized();
+        player.set_audio_band_ranges(audio_band_ranges);
+        const BAND_LOW_IDS: [&str; 5] = [
+            "settings-band-rumble-low",
+            "settings-band-kick-low",
+            "settings-band-vocals-low",
+            "settings-band-instruments-low",
+            "settings-band-air-low",
+        ];
+        const BAND_HIGH_IDS: [&str; 5] = [
+            "settings-band-rumble-high",
+            "settings-band-kick-high",
+            "settings-band-vocals-high",
+            "settings-band-instruments-high",
+            "settings-band-air-high",
+        ];
+        const BAND_CONTROL_IDS: [&str; 5] = [
+            "settings-band-rumble-controls",
+            "settings-band-kick-controls",
+            "settings-band-vocals-controls",
+            "settings-band-instruments-controls",
+            "settings-band-air-controls",
+        ];
+        let mut settings_audio_low_inputs = Vec::with_capacity(5);
+        let mut settings_audio_low_views = Vec::with_capacity(5);
+        let mut settings_audio_high_inputs = Vec::with_capacity(5);
+        let mut settings_audio_high_views = Vec::with_capacity(5);
+        let mut settings_audio_control_inputs = Vec::with_capacity(5);
+        let mut settings_audio_control_views = Vec::with_capacity(5);
+        for (index, kind) in AudioBandKind::ALL.into_iter().enumerate() {
+            let range = audio_band_ranges.get(kind);
+            let low_input = cx.new(|cx| {
+                let mut state = InputState::new(cx);
+                state.set_placeholder("下限 Hz");
+                state.set_content(format!("{:.0}", range.low_hz), cx);
+                state
+            });
+            let weak_low = weak_self.clone();
+            let low_view = cx.new(|cx| {
+                InputView::new(low_input.clone(), cx)
+                    .with_id(BAND_LOW_IDS[index])
+                    .on_submit(move |_text, _window, cx| {
+                        let _ = weak_low.update(cx, |app, cx| app.apply_audio_band(index, cx));
+                    })
+            });
+            let high_input = cx.new(|cx| {
+                let mut state = InputState::new(cx);
+                state.set_placeholder("上限 Hz");
+                state.set_content(format!("{:.0}", range.high_hz), cx);
+                state
+            });
+            let weak_high = weak_self.clone();
+            let high_view = cx.new(|cx| {
+                InputView::new(high_input.clone(), cx)
+                    .with_id(BAND_HIGH_IDS[index])
+                    .on_submit(move |_text, _window, cx| {
+                        let _ = weak_high.update(cx, |app, cx| app.apply_audio_band(index, cx));
+                    })
+            });
+            let control_input = cx.new(|cx| {
+                let mut state = InputState::new(cx);
+                state.set_placeholder("如 7,8,12,13");
+                state.set_content(audio_band_controls.get(kind).display(), cx);
+                state
+            });
+            let weak_controls = weak_self.clone();
+            let control_view = cx.new(|cx| {
+                InputView::new(control_input.clone(), cx)
+                    .with_id(BAND_CONTROL_IDS[index])
+                    .on_submit(move |_text, _window, cx| {
+                        let _ = weak_controls
+                            .update(cx, |app, cx| app.apply_audio_band_controls(index, cx));
+                    })
+            });
+            settings_audio_low_inputs.push(low_input);
+            settings_audio_low_views.push(low_view);
+            settings_audio_high_inputs.push(high_input);
+            settings_audio_high_views.push(high_view);
+            settings_audio_control_inputs.push(control_input);
+            settings_audio_control_views.push(control_view);
+        }
+        let settings_audio_low_inputs = settings_audio_low_inputs.try_into().unwrap();
+        let settings_audio_low_views = settings_audio_low_views.try_into().unwrap();
+        let settings_audio_high_inputs = settings_audio_high_inputs.try_into().unwrap();
+        let settings_audio_high_views = settings_audio_high_views.try_into().unwrap();
+        let settings_audio_control_inputs = settings_audio_control_inputs.try_into().unwrap();
+        let settings_audio_control_views = settings_audio_control_views.try_into().unwrap();
 
         // 音源管理二级编辑页的输入框。
         let source_edit_name_input = cx.new(|cx| {
@@ -174,6 +220,7 @@ impl ChordialApp {
                             app.handle_settings_action(action, window, cx);
                         });
                     },
+                    cfg.clone(),
                     cx,
                 )
             })
@@ -222,9 +269,10 @@ impl ChordialApp {
                 })));
             }
             {
-                // 背景鼓点：视图每帧读取播放线程算好的频段包络。
+                // 五频段反应：视图每帧只读取一次整份快照，再分发给不同控制点。
                 let player = player.clone();
-                view.set_beat_source(Some(Arc::new(move || player.beat_level())));
+                view.set_audio_source(Some(Arc::new(move || player.audio_bands())));
+                view.set_audio_control_mapping(audio_band_controls);
             }
             view.set_colors(LyricRenderColors {
                 text: theme.text,
@@ -269,19 +317,27 @@ impl ChordialApp {
                     });
                 })
         });
-        let eq = EqState::new(cfg.equalizer.clone(), cfg.eq_saved_presets.clone());
+        let eq = EqState::new(
+            cfg.equalizer.clone(),
+            cfg.eq_saved_presets.clone(),
+            cfg.eq_recipe.clone(),
+        );
         player.set_eq(eq.settings.clone());
 
+        let persistence = crate::storage::JsonWriter::new();
+        let playlists = PlaylistStore::load_default_with_writer(Some(persistence.clone()));
         let mut app = Self {
             registry,
             player,
             local_source: local_source.clone(),
             search_timeout_ms,
             cache,
+            config: cfg.clone(),
+            persistence,
             downloads: Arc::new(DownloadStore::open(cfg.download_dir.clone())),
             source_preference: cfg.source_preference,
             source_configs: cfg.sources.clone(),
-            playlists: PlaylistStore::load_default(),
+            playlists,
             page: None,
             smooth_scroll: cfg.smooth_scroll,
             lyric_sweep_fade_em: crate::config::clamp_lyric_sweep_fade_em(cfg.lyric_sweep_fade_em),
@@ -293,10 +349,12 @@ impl ChordialApp {
             settings_view,
             settings_cache_view,
             settings_download_view,
-            settings_beat_low_input,
-            settings_beat_low_view,
-            settings_beat_high_input,
-            settings_beat_high_view,
+            settings_audio_low_inputs,
+            settings_audio_low_views,
+            settings_audio_high_inputs,
+            settings_audio_high_views,
+            settings_audio_control_inputs,
+            settings_audio_control_views,
             source_edit_name_input,
             source_edit_name_view,
             source_edit_url_input,
@@ -312,7 +370,8 @@ impl ChordialApp {
             source_delete_confirm: None,
             playlist_delete_confirm: None,
             playlist_page_cache: RefCell::new(None),
-            beat_band,
+            audio_band_ranges,
+            audio_band_controls,
             account_state: AccountState::Unknown,
             account_avatar: None,
             user_playlists: Arc::new(Vec::new()),
@@ -336,7 +395,6 @@ impl ChordialApp {
             sidebar_open: true,
             search_input,
             search_input_view,
-            search_top_view,
             search_kind: SearchKind::Track,
             search_collections: Arc::new(Vec::new()),
             search_gen: 0,
@@ -347,13 +405,19 @@ impl ChordialApp {
             source_route: None,
             library: Arc::new(Vec::new()),
             library_scanning: false,
+            library_scans: HashMap::new(),
+            library_scan_epoch: 0,
+            library_source_tracks: HashMap::new(),
+            library_merge_gen: 0,
             library_filter: LibraryFilter::All,
             play_mode: PlayMode::Sequential,
             last_repeat_mode: PlayMode::Sequential,
             queue: Arc::new(Vec::new()),
             queue_pos: None,
+            shuffle_plan: None,
             queue_refill: None,
             queue_gen: 0,
+            queue_clear_confirm: false,
             player_status: chordal_player::Status::default(),
             status_message: None,
             info_message: None,
@@ -374,7 +438,6 @@ impl ChordialApp {
             phone_page: PhonePage::Browse,
             phone_backdrop: PhoneBackdrop::Off,
             phone_sheet: None,
-            phone_sheet_spring: None,
             phone_sheet_anchor: None,
             phone_edge_swipe: None,
             phone_swipe_suppress_click: None,
@@ -392,8 +455,10 @@ impl ChordialApp {
             no_bg: std::env::var_os("CHORDIAL_NO_BG").is_some(),
             immersive: false,
             sheet_drag: None,
-            immersive_expand: None,
-            immersive_collapse: None,
+            motion: crate::motion::MotionSystem::default(),
+            stage_measurements: crate::app::stage_measure::StageMeasurements::default(),
+            stage_request: None,
+            motion_tuning: crate::motion::current_tuning(cx),
             immersive_hint_at: None,
             ui_anim_enter: None,
             ui_anim_play: None,
@@ -403,27 +468,23 @@ impl ChordialApp {
             last_volume_input: 0.9,
             show_remaining_time: true,
             quality_dialog_open: false,
-            cover_scale_anim: None,
             bench_anim: std::env::var_os("CHORDIAL_BENCH_ANIM").is_some(),
             force_portrait: false,
             portrait_page: PortraitPage::Art,
             portrait_transition: None,
-            portrait_enter: None,
             portrait_toast: None,
             drawer_open: false,
-            drawer_at: None,
             drawer_page: DrawerPage::Root,
-            drawer_add_message: None,
             wide_lyrics_hidden: false,
             compact_lyrics_open: false,
             stage_view: StageView::Lyrics,
             stage_view_menu_open: false,
             stage_last_input_at: Instant::now(),
+            stage_last_pointer: None,
             stage_chrome_hidden: false,
             // 起点放在过去，避免应用刚启动的 260ms 内控件误淡入。
             stage_chrome_at: Instant::now() - Duration::from_secs(1),
             info_marquee: None,
-            stage_motion: None,
             queue_scroll: gpui::UniformListScrollHandle::new(),
             track_list_scroll: gpui::UniformListScrollHandle::new(),
             playlist_scroll: gpui::UniformListScrollHandle::new(),
@@ -436,17 +497,17 @@ impl ChordialApp {
             row_text_cache: RefCell::new(None),
             track_covers: Arc::new(std::sync::Mutex::new(TrackCovers::new())),
             now_playing_text: RefCell::new(None),
-            playlist_rows: RefCell::new(None),
+            playlist_summaries: RefCell::new(None),
             source_snapshot: RefCell::new(None),
             sidebar_scroll: gpui::ScrollHandle::new(),
             sleep_minutes: None,
             sleep_until: None,
             sleep_gen: 0,
             eq_open: false,
-            eq_open_at: None,
             eq,
-            eq_search_input,
             eq_search_view,
+            eq_chain_scroll: gpui::ScrollHandle::new(),
+            eq_inspector_scroll: gpui::ScrollHandle::new(),
             progress_clock: (0, false, Instant::now()),
             eq_save_at: None,
             eq_save_gen: 0,
@@ -479,61 +540,7 @@ impl ChordialApp {
         local: Arc<chordal_local::LocalSource>,
         cx: &mut Context<Self>,
     ) {
-        self.library_scanning = true;
-        cx.notify();
-        cx.spawn(async move |weak, cx| {
-            let tracks = cx
-                .background_executor()
-                .spawn(async move {
-                    let summary = local.scan_blocking();
-                    let tracks = Arc::new(local.all_tracks());
-                    (summary.tracks, tracks)
-                })
-                .await;
-            let _ = weak.update(cx, |app, cx| {
-                let library_bytes = estimate_library_bytes(&tracks.1);
-                app.library = tracks.1;
-                mem::set_gauge(Gauge::Library, library_bytes);
-                app.library_scanning = false;
-                tracing::info!(tracks = tracks.0, "library scan finished");
-                // 诊断：扫描完成后自动播放第一首并进入沉浸页，便于 300Hz
-                // 歌词/播放路径压测（CHORDIAL_AUTOPLAY=1）。
-                if std::env::var_os("CHORDIAL_AUTOPLAY").is_some() && !app.library.is_empty() {
-                    app.play_first(cx);
-                    app.enter_immersive(cx);
-                }
-                // 诊断 / 截图：直接把手机壳停在某个视图，省去自动化点击。
-                // 取值：player / mini / lyrics / queue / selection / menu。
-                if let Ok(view) = std::env::var("CHORDIAL_START_PHONE")
-                    && app.is_phone()
-                    && !app.library.is_empty()
-                {
-                    app.play_first(cx);
-                    app.phone_page = PhonePage::Browse;
-                    app.phone_sheet = None;
-                    app.phone_sheet_spring = None;
-                    match view.as_str() {
-                        "player" => app.phone_page = PhonePage::Player,
-                        "lyrics" => app.phone_page = PhonePage::Lyrics,
-                        "queue" => {
-                            app.view_tab = ViewTab::Library;
-                            app.library_filter = LibraryFilter::Queue;
-                        }
-                        "selection" => app.enter_selection(QueueList::Library, 0, cx),
-                        "menu" => app.open_track_menu(QueueList::Library, 0, 150.0, 520.0, cx),
-                        "drawer" => app.open_drawer(cx),
-                        "sheet" => {
-                            let h = app.viewport_height.max(1.0);
-                            app.begin_phone_sheet_drag(h, cx);
-                            app.update_phone_sheet_drag(h * 0.45, cx);
-                        }
-                        _ => {}
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.spawn_library_scan_source(local, cx);
     }
 
     /// 播放状态轮询（200ms）：读快照、弹事件、必要时刷新 UI。
@@ -550,7 +557,10 @@ impl ChordialApp {
                         while let Some(ev) = app.player.try_pop_event() {
                             match ev {
                                 PlayerEvent::TrackEnded(_) => {
-                                    app.on_track_ended(cx);
+                                    if !matches!(app.player.status().state, PlayerState::Failed(_))
+                                    {
+                                        app.on_track_ended(cx);
+                                    }
                                     changed = true;
                                 }
                                 PlayerEvent::StreamError(msg) => {
@@ -598,6 +608,13 @@ impl ChordialApp {
 
     /// 播放/暂停并立刻刷新状态与按钮回弹，不等待 200ms 轮询。
     pub(super) fn toggle_playback(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.player_status.state, PlayerState::Failed(_)) {
+            self.resolve_and_play(cx);
+            return;
+        }
+        if self.player_status.state == PlayerState::Loading {
+            return;
+        }
         let was_playing = self.player_status.state == PlayerState::Playing;
         self.player.toggle();
         let status = self.player.status();
@@ -625,15 +642,6 @@ impl ChordialApp {
         self.search_gen += 1;
         self.searching = true;
         self.view_tab = ViewTab::Search;
-        // 顶栏搜索在任何页面都能发起：关掉会遮住结果的浮层，回到曲库面板，
-        // 并清空单源路由，让本次搜索真正覆盖全部已加载音源。
-        self.page = None;
-        self.source_route = None;
-        self.close_settings(cx);
-        self.close_login(cx);
-        self.close_eq(cx);
-        self.dock_menu = None;
-        self.track_menu = None;
         self.show_phone_browse();
         cx.notify();
 
@@ -649,7 +657,23 @@ impl ChordialApp {
         };
         if kind == SearchKind::Track {
             cx.spawn(async move |weak, cx| {
-                let agg = registry.search_all(&query, timeout).await;
+                let agg = match ChordialApp::run_background(async move {
+                    registry.search_all(&query, timeout).await
+                })
+                .await
+                {
+                    Ok(agg) => agg,
+                    Err(_) => {
+                        let _ = weak.update(cx, |app, cx| {
+                            if app.search_gen == generation {
+                                app.searching = false;
+                                app.status_message = Some("后台任务繁忙，请稍后重试搜索".into());
+                                cx.notify();
+                            }
+                        });
+                        return;
+                    }
+                };
                 let _ = weak.update(cx, |app, cx| {
                     if app.search_gen != generation {
                         return; // 过期搜索，丢弃
@@ -665,7 +689,23 @@ impl ChordialApp {
             .detach();
         } else {
             cx.spawn(async move |weak, cx| {
-                let agg = registry.search_collections_all(&query, timeout).await;
+                let agg = match ChordialApp::run_background(async move {
+                    registry.search_collections_all(&query, timeout).await
+                })
+                .await
+                {
+                    Ok(agg) => agg,
+                    Err(_) => {
+                        let _ = weak.update(cx, |app, cx| {
+                            if app.search_gen == generation {
+                                app.searching = false;
+                                app.status_message = Some("后台任务繁忙，请稍后重试搜索".into());
+                                cx.notify();
+                            }
+                        });
+                        return;
+                    }
+                };
                 let _ = weak.update(cx, |app, cx| {
                     if app.search_gen != generation {
                         return;
@@ -901,9 +941,9 @@ impl ChordialApp {
                 view.set_background_color(theme.bg);
             });
         }
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.appearance = mode;
-        crate::config::save(&cfg);
+        self.commit_config(&cfg);
         cx.notify();
     }
 }

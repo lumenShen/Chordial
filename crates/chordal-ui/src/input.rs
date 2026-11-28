@@ -25,6 +25,15 @@ const INPUT_FONT_SIZE: f32 = 13.0;
 const INPUT_LINE_HEIGHT: f32 = 18.0;
 const INPUT_PADDING_X: f32 = 10.0;
 const INPUT_PADDING_Y: f32 = 8.0;
+const PHONE_INPUT_HEIGHT: f32 = 44.0;
+
+fn input_height(width: f32) -> f32 {
+    if crate::responsive::ViewportClass::of(width).is_phone() {
+        PHONE_INPUT_HEIGHT
+    } else {
+        INPUT_LINE_HEIGHT + INPUT_PADDING_Y * 2.0
+    }
+}
 
 actions!(
     chord_input,
@@ -719,8 +728,6 @@ fn shape_line(
 pub struct InputView {
     state: Entity<InputState>,
     id: SharedString,
-    /// 由宿主绘制外框（例如顶栏搜索胶囊）时只保留文字与光标。
-    bare: bool,
     on_submit: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
     on_blur: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
@@ -732,7 +739,6 @@ impl InputView {
         Self {
             state,
             id: "search-input".into(),
-            bare: false,
             on_submit: None,
             on_blur: None,
         }
@@ -741,12 +747,6 @@ impl InputView {
     /// 多个输入框同时存在时用不同 id，避免 gpui 元素 id 冲突。
     pub fn with_id(mut self, id: impl Into<SharedString>) -> Self {
         self.id = id.into();
-        self
-    }
-
-    /// 去掉自身的圆角/边框/底色，让宿主容器统一绘制输入框外观。
-    pub fn bare(mut self) -> Self {
-        self.bare = true;
         self
     }
 
@@ -770,32 +770,27 @@ impl Render for InputView {
         let focus_handle = state.read(cx).focus_handle.clone();
         let focused = focus_handle.is_focused(window);
 
-        let theme = crate::theme::Theme::get(cx);
         let mut el: Stateful<gpui::Div> = div()
             .id(self.id.clone())
             .flex()
             .items_center()
             .w_full()
-            .min_h(px(INPUT_LINE_HEIGHT + INPUT_PADDING_Y * 2.0))
+            .min_h(px(input_height(window.viewport_size().width.into())))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if focused {
+                crate::theme::Theme::get(cx).focus_ring
+            } else {
+                crate::theme::Theme::get(cx).border
+            })
+            .bg(crate::theme::Theme::get(cx).surface_alt)
             .overflow_hidden()
             .cursor(CursorStyle::IBeam)
             .key_context("ChordInput")
             .track_focus(&focus_handle)
             .child(InputElement {
                 state: state.clone(),
-            });
-        if !self.bare {
-            el = el
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(if focused {
-                    theme.focus_ring
-                } else {
-                    theme.border
-                })
-                .bg(theme.surface_alt);
-        }
-        el = el
+            })
             // 动作绑定
             .on_action(cx.listener(|this: &mut Self, _: &Backspace, _, cx| {
                 this.state.update(cx, |s, cx| s.backspace(cx));
@@ -887,4 +882,21 @@ impl Render for InputView {
 pub fn focus_input(state: &Entity<InputState>, window: &mut Window, cx: &mut App) {
     let handle = state.read(cx).focus_handle.clone();
     window.focus(&handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phone_inputs_use_touch_height() {
+        assert_eq!(input_height(360.0), 44.0);
+        assert_eq!(input_height(719.9), 44.0);
+    }
+
+    #[test]
+    fn desktop_inputs_keep_compact_height() {
+        assert_eq!(input_height(720.0), 34.0);
+        assert_eq!(input_height(1200.0), 34.0);
+    }
 }

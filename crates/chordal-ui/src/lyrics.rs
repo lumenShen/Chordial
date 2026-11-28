@@ -1,7 +1,7 @@
 //! 领域歌词 → AMLL 歌词模型转换，以及专辑封面下载/解码。
 //!
-//! 所有耗时操作（网络、图片解码）都在 gpui 的 background executor 上执行，
-//! UI 线程只接收已经解码好的 RGBA 像素。
+//! 所有耗时操作（网络、图片解码、缓存写入）都由应用有界后台池或 Tokio
+//! blocking pool 执行，UI 线程只接收已经解码好的 RGBA 像素。
 
 use std::sync::Arc;
 
@@ -438,14 +438,16 @@ fn spawn_cover_refresh(
             return;
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            cache.touch(
-                &key,
-                CacheTags {
-                    etag,
-                    last_modified,
-                    ..Default::default()
-                },
-            );
+            let cache = cache.clone();
+            let key = key.clone();
+            let tags = CacheTags {
+                etag,
+                last_modified,
+                ..Default::default()
+            };
+            let _ = chordal_netease::shared_runtime()
+                .spawn_blocking(move || cache.touch(&key, tags))
+                .await;
             return;
         }
         if !response.status().is_success() {
@@ -459,15 +461,16 @@ fn spawn_cover_refresh(
         if bytes.len() as u64 > MAX_COVER_BYTES {
             return;
         }
-        cache.put(
-            &key,
-            &bytes,
-            CacheTags {
-                etag,
-                last_modified,
-                ..Default::default()
-            },
-        );
+        let cache = cache.clone();
+        let key = key.clone();
+        let tags = CacheTags {
+            etag,
+            last_modified,
+            ..Default::default()
+        };
+        let _ = chordal_netease::shared_runtime()
+            .spawn_blocking(move || cache.put(&key, &bytes, tags))
+            .await;
     });
 }
 

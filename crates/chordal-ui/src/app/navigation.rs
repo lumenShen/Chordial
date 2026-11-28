@@ -3,23 +3,68 @@
 //! 从 app.rs 拆分而来；仅做代码搬移，行为不变。
 
 use super::*;
+use crate::motion::PROGRESS_TOL;
+
+/// `1` 是 Dock，`0` 是全屏。首次进入必须从 Dock 端开始；只有打断中的
+/// 动画才继承当前采样，避免创建 `0 -> 0` 的静态弹簧。
+fn dock_enter_start(current: Option<(f32, f32)>, source_progress: f32) -> (f32, f32) {
+    current.unwrap_or((source_progress, 0.0))
+}
+
+fn source_mode_for_phone(is_phone: bool, page: PhonePage, has_track: bool) -> StageMode {
+    if !is_phone {
+        StageMode::Dock
+    } else if page == PhonePage::Player && has_track {
+        StageMode::PhonePlayer
+    } else {
+        StageMode::MiniPlayer
+    }
+}
 
 impl ChordialApp {
     pub(super) fn enter_immersive(&mut self, cx: &mut Context<Self>) {
+        if self.immersive {
+            return;
+        }
         // 若上一次收起还没结束就再次进入，从当前画面位置接着展开，
         // 避免卡片先弹回满屏或先跳回 Dock 再重播一遍。
         let now = Instant::now();
-        let p = self
-            .immersive_dock_progress(now, self.viewport_height)
-            .clamp(0.0, 1.0);
-        self.immersive_collapse = None;
-        self.immersive = true;
+        let source_mode = self.source_stage_mode();
+        // 若上一次收起还在跑，继承它的位置与速度，避免连续进出时倒退再重播。
+        let (p, velocity) = dock_enter_start(
+            self.motion.dock.as_ref().map(|s| {
+                let sample = s.sample(now);
+                (sample.value, sample.velocity)
+            }),
+            if source_mode == StageMode::PhonePlayer {
+                0.0
+            } else {
+                1.0
+            },
+        );
+        let p = p.clamp(0.0, 1.0);
+        self.motion.dock_collapsing = false;
         self.immersive = true;
         self.sheet_drag = None;
         // 顶部把手先展开成「拖动/ESC 退出」文案，5s 后回收成小白条。
         // 展示期本身是静态画面，不逐帧重绘；只定时唤醒一次接上淡出动画。
         let hint_started = Instant::now();
         self.immersive_hint_at = Some(hint_started);
+        // 5s 静态保持期由上面的定时唤醒负责；弹簧起点放在保持期结束之后，
+        // 因此保持期既不采样弹簧也不请求动画帧。
+        self.motion.hint = Some(
+            self.motion_tuning
+                .spring(
+                    Duration::from_secs_f32(Self::IMMERSIVE_HINT_FADE_MS / 1000.0),
+                    1.0,
+                    0.0,
+                    0.0,
+                    hint_started,
+                    PROGRESS_TOL.0,
+                    PROGRESS_TOL.1,
+                )
+                .delayed(Self::IMMERSIVE_HINT_HOLD_MS / 1000.0),
+        );
         let weak = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             cx.background_executor()
@@ -36,17 +81,26 @@ impl ChordialApp {
         .detach();
         // Dock→全屏：第一帧就是（当前进度的）Dock 卡片，随后与共享封面/曲名
         // 一起放大到满窗。
-        self.immersive_expand = Some(SpringSettle::new(
+        self.motion.dock = Some(self.motion_tuning.spring(
+            Duration::from_secs_f32(Self::DOCK_EXPAND_MS / 1000.0),
             p,
             0.0,
-            0.0,
+            velocity,
             now,
-            Self::EXPAND_DAMPING,
-            Self::EXPAND_STIFFNESS,
+            PROGRESS_TOL.0,
+            PROGRESS_TOL.1,
         ));
         self.portrait_page = PortraitPage::Art;
         self.portrait_transition = None;
-        self.portrait_enter = Some(Instant::now());
+        self.motion.portrait_enter = Some(self.motion_tuning.spring(
+            Duration::from_millis(260),
+            0.0,
+            1.0,
+            0.0,
+            now,
+            PROGRESS_TOL.0,
+            PROGRESS_TOL.1,
+        ));
         self.portrait_toast = None;
         self.hide_drawer_now();
         self.wide_lyrics_hidden = false;
@@ -56,7 +110,10 @@ impl ChordialApp {
         self.stage_chrome_hidden = false;
         self.stage_chrome_at = now;
         self.stage_last_input_at = now;
-        self.stage_motion = None;
+        self.stage_last_pointer = None;
+        self.motion.chrome = None;
+        let target = self.immersive_stage_mode(cx, self.viewport_width, self.viewport_height);
+        self.request_stage_to(target, source_mode, now, cx);
         // AMLL：页面打开时所有 MediaButton 的 SVG 内容重新挂载 → pressed 回弹；
         // 上一首/下一首的双箭头同时播放一次合并入场动画。
         self.ui_anim_enter = Some(Instant::now());
@@ -66,7 +123,7 @@ impl ChordialApp {
         self.ui_anim_volume = None;
         self.last_volume_input = self.player_status.volume;
         self.quality_dialog_open = false;
-        self.cover_scale_anim = None;
+        self.motion.cover = None;
         self.ensure_ui_anim_ticker(cx);
         // 沉浸层会接管 `lyric_view` 的样式与背景；先撤销手机壳的 Mesh
         // 背景标记，退出沉浸后下一帧才能重新套用手机播放页样式。
@@ -140,6 +197,8 @@ impl ChordialApp {
         self.enter_immersive(cx);
         // 窄窗/竖屏没有右侧歌词列，用布局 2 的全屏歌词承接这个入口。
         self.compact_lyrics_open = true;
+        let target = self.immersive_stage_mode(cx, self.viewport_width, self.viewport_height);
+        self.retarget_stage_request(target, Instant::now(), cx);
         cx.notify();
     }
 
@@ -171,16 +230,14 @@ impl ChordialApp {
         } else {
             Self::stage_mode_for_page(page)
         };
-        // 队列是覆盖在播放页上的子页面，整页纵向位移。
-        let moving_page = from != page;
-        if moving_page {
-            let transition = Transition::new(from, page);
-            self.stage_motion =
-                Some(self.layout_motion_to(target_mode, current_mode, now, transition.duration_ms));
-            self.portrait_transition = Some(transition);
+        // 页面与共享元素共用一次准备好的目标测量；测量帧保持源画面冻结，
+        // 下一页真正出现时位置和速度从当前可见状态接续。
+        if let Some(transition) = self.portrait_transition.as_mut() {
+            transition.retarget(page, now);
         } else {
-            self.portrait_transition = None;
+            self.portrait_transition = Some(Transition::new(from, page, self.motion_tuning));
         }
+        self.request_stage_to(target_mode, current_mode, now, cx);
         self.portrait_page = page;
         if page == PortraitPage::Queue
             && let Some(position) = self.queue_pos
@@ -200,30 +257,220 @@ impl ChordialApp {
         }
     }
 
-    /// 构造一段 First→Last 补间。`fallback` 是当前静止模态；若上一段补间
-    /// 尚未结束，则从它的当前插值几何继续，避免连续点击时画面跳变。
-    pub(super) fn layout_motion_to(
-        &self,
+    pub(super) fn source_stage_mode(&self) -> StageMode {
+        source_mode_for_phone(
+            self.is_phone(),
+            self.phone_page,
+            self.current_track.is_some(),
+        )
+    }
+
+    /// 冻结当前可见几何并请求目标布局测量；公式只在首次测量前作为兜底。
+    pub(super) fn request_stage_to(
+        &mut self,
         to_mode: StageMode,
         fallback: StageMode,
         now: Instant,
-        duration_ms: f32,
-    ) -> LayoutMotion {
-        let from = self.current_stage_geometry(fallback, now);
-        let to = immersive_geometry(to_mode, self.viewport_width, self.viewport_height);
-        LayoutMotion::starting_at(fallback, from, to_mode, to, now, duration_ms)
+        cx: &mut Context<Self>,
+    ) {
+        let cover_scale = self.cover_scale_now(now).clamp(0.5, 1.1);
+        let (from_mode, from, velocity, cover_scale) = if let Some(request) = self.stage_request {
+            (
+                request.from_mode,
+                request.from,
+                request.velocity,
+                request.cover_scale,
+            )
+        } else if let Some(spring) = self.motion.stage.as_ref() {
+            (
+                spring.to_mode(),
+                spring.sample(now),
+                spring.velocity(now),
+                cover_scale,
+            )
+        } else {
+            let mode = if self.immersive {
+                fallback
+            } else {
+                self.source_stage_mode()
+            };
+            let geometry = self
+                .stage_measurements
+                .cached_current(
+                    mode,
+                    self.viewport_width,
+                    self.viewport_height,
+                    cover_scale,
+                    1.0 - self.stage_chrome_visibility(now),
+                )
+                .unwrap_or_else(|| {
+                    immersive_geometry(mode, self.viewport_width, self.viewport_height)
+                });
+            (mode, geometry, StageGeometry::default(), cover_scale)
+        };
+        self.motion.stage = None;
+        self.stage_request = Some(StageRequest {
+            from_mode,
+            from,
+            velocity,
+            to_mode,
+            cover_scale,
+        });
+        self.ensure_ui_anim_ticker(cx);
     }
 
-    /// 当前屏幕上的共享元素几何：补间进行中就用插值结果。
-    pub(super) fn current_stage_geometry(
-        &self,
-        fallback: StageMode,
+    pub(super) fn retarget_stage_request(
+        &mut self,
+        to_mode: StageMode,
         now: Instant,
-    ) -> StageGeometry {
-        if let Some(motion) = self.stage_motion.filter(|motion| motion.active(now)) {
-            return motion.geometry(now);
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(request) = self.stage_request.as_mut() {
+            request.to_mode = to_mode;
+        } else {
+            let fallback = self
+                .motion
+                .stage
+                .as_ref()
+                .map(|spring| spring.to_mode())
+                .unwrap_or(to_mode);
+            self.request_stage_to(to_mode, fallback, now, cx);
         }
-        immersive_geometry(fallback, self.viewport_width, self.viewport_height)
+    }
+
+    pub(super) fn shared_stage_active(&self, now: Instant) -> bool {
+        self.stage_request.is_some()
+            || self
+                .motion
+                .stage
+                .as_ref()
+                .is_some_and(|spring| spring.active(now))
+    }
+
+    pub(super) fn prepare_stage_transition(&mut self, now: Instant, cx: &mut Context<Self>) {
+        let measured = self.stage_measurements.finish_frame();
+        let mode = if self.immersive {
+            self.immersive_stage_mode(cx, self.viewport_width, self.viewport_height)
+        } else {
+            self.source_stage_mode()
+        };
+        let measure_mode = if self.motion.dock_collapsing {
+            self.source_stage_mode()
+        } else {
+            self.stage_request
+                .as_ref()
+                .map(|request| request.to_mode)
+                .unwrap_or(mode)
+        };
+        let live_cover_scale = self.cover_scale_now(now).clamp(0.5, 1.1);
+        let requested_cover_scale = self
+            .stage_request
+            .as_ref()
+            .map(|request| request.cover_scale)
+            .unwrap_or(live_cover_scale);
+        let cover_scale = requested_cover_scale;
+        let idle_shift = if self.shared_stage_active(now) {
+            0.0
+        } else {
+            1.0 - self.stage_chrome_visibility(now)
+        };
+
+        if let Some(request) = self.stage_request.take() {
+            if let Some(target) = self
+                .stage_measurements
+                .cached_current(
+                    request.to_mode,
+                    self.viewport_width,
+                    self.viewport_height,
+                    cover_scale,
+                    idle_shift,
+                )
+                .filter(|geometry| geometry.is_valid())
+            {
+                let touches_source = request.from_mode.is_source() || request.to_mode.is_source();
+                let spec = if touches_source {
+                    self.motion
+                        .dock
+                        .as_ref()
+                        .map(|spring| spring.spec())
+                        .unwrap_or_else(|| {
+                            self.motion_tuning
+                                .spec(Duration::from_secs_f32(Self::DOCK_EXPAND_MS / 1000.0))
+                        })
+                } else {
+                    self.portrait_transition
+                        .as_ref()
+                        .map(|transition| transition.spec())
+                        .unwrap_or_else(|| self.motion_tuning.physical(1.0, 30.0, 200.0, false))
+                };
+                self.motion.stage = Some(crate::motion::StageSpring::new_with_velocity(
+                    request.from,
+                    request.velocity,
+                    target,
+                    request.from_mode,
+                    request.to_mode,
+                    now,
+                    spec,
+                ));
+                if let Some(transition) = self.portrait_transition.as_mut() {
+                    transition.begin(now);
+                }
+            } else {
+                self.stage_request = Some(request);
+            }
+        } else if measured
+            && let Some(spring) = self.motion.stage.as_mut()
+            && spring.to_mode() == mode
+            && let Some(target) = self.stage_measurements.cached(mode)
+        {
+            spring.retarget(target, mode, now);
+        }
+
+        let dock_transition = self
+            .motion
+            .dock
+            .as_ref()
+            .is_some_and(|spring| spring.active(now));
+        if !dock_transition
+            && !self.motion.dock_collapsing
+            && self.stage_request.is_none()
+            && self
+                .motion
+                .stage
+                .as_ref()
+                .is_some_and(|spring| spring.to_mode() != mode)
+        {
+            self.request_stage_to(mode, mode, now, cx);
+        }
+
+        let origin = if self.immersive && !measure_mode.is_source() {
+            let p = self.immersive_dock_progress(now, self.viewport_height);
+            let full = StageRect {
+                x: 0.0,
+                y: 0.0,
+                w: self.viewport_width,
+                h: self.viewport_height,
+            };
+            let card = full.lerp(self.current_dock_rect(), p);
+            (card.x, card.y)
+        } else {
+            (0.0, 0.0)
+        };
+        let force = self.stage_request.is_some();
+        let measurement_scale = if force {
+            requested_cover_scale
+        } else {
+            live_cover_scale
+        };
+        self.stage_measurements.begin(
+            measure_mode,
+            self.viewport_width,
+            self.viewport_height,
+            measurement_scale,
+            idle_shift,
+            origin,
+            force,
+        );
     }
 
     /// 当前是否使用布局 1（宽屏/类平板 + 歌词可见）。
@@ -269,6 +516,16 @@ impl ChordialApp {
         self.stage_split_active(cx, self.viewport_width, self.viewport_height)
     }
 
+    /// 当前界面实际展示的视图。手机壳播放页只有主播放列，歌词/队列/音频
+    /// 详情由同一个选择器跳转到对应页面。
+    pub(super) fn visible_stage_view(&self) -> StageView {
+        if self.phone_shell_active() {
+            StageView::MainOnly
+        } else {
+            self.stage_view
+        }
+    }
+
     /// 右下角选择器的唯一入口。切换视图时保留共享元素的 FLIP 补间，
     /// 并让歌词开关的两个旧状态位跟新视图保持一致。
     pub(super) fn set_stage_view(&mut self, view: StageView, cx: &mut Context<Self>) {
@@ -276,8 +533,38 @@ impl ChordialApp {
             self.show_portrait_toast("暂无歌词", cx);
             return;
         }
+        if self.phone_shell_active() {
+            self.stage_view_menu_open = false;
+            match view {
+                StageView::MainOnly => {
+                    self.phone_page = PhonePage::Player;
+                    self.open_phone_sheet(cx);
+                }
+                StageView::Lyrics => self.open_lyrics_immersive(cx),
+                StageView::Queue => {
+                    self.phone_page = PhonePage::Browse;
+                    self.page = None;
+                    self.view_tab = ViewTab::Library;
+                    self.library_filter = LibraryFilter::Queue;
+                    self.source_route = None;
+                    self.phone_sheet = None;
+                    self.motion.phone_sheet = None;
+                    self.phone_sheet_anchor = None;
+                    self.selection = None;
+                }
+                StageView::Audio => {
+                    self.open_portrait(cx);
+                    self.set_stage_view(StageView::Audio, cx);
+                }
+            }
+            self.note_stage_interaction(cx);
+            cx.notify();
+            return;
+        }
         let now = Instant::now();
         let old_split = self.stage_split_active_viewport(cx);
+        let old_page = self.portrait_page;
+        let old_mode = self.immersive_stage_mode(cx, self.viewport_width, self.viewport_height);
         self.stage_view = view;
         self.stage_view_menu_open = false;
         self.wide_lyrics_hidden = view != StageView::Lyrics;
@@ -287,18 +574,10 @@ impl ChordialApp {
             self.portrait_transition = None;
         }
         let new_split = self.stage_split_active_viewport(cx);
-        if old_split != new_split {
-            let from = if old_split {
-                StageMode::WideSplit
-            } else {
-                StageMode::CompactArt
-            };
-            let to = if new_split {
-                StageMode::WideSplit
-            } else {
-                StageMode::CompactArt
-            };
-            self.stage_motion = Some(self.layout_motion_to(to, from, now, 320.0));
+        if old_split != new_split || old_page != PortraitPage::Art {
+            let from = old_mode;
+            let to = self.immersive_stage_mode(cx, self.viewport_width, self.viewport_height);
+            self.request_stage_to(to, from, now, cx);
             self.ensure_ui_anim_ticker(cx);
         }
         self.note_stage_interaction(cx);
@@ -362,11 +641,12 @@ impl ChordialApp {
         if self.is_phone() {
             self.phone_page = PhonePage::Browse;
             self.phone_sheet = None;
-            self.phone_sheet_spring = None;
+            self.motion.phone_sheet = None;
             self.phone_sheet_anchor = None;
             self.phone_edge_swipe = None;
             self.selection = None;
             self.track_menu = None;
+            self.stage_view_menu_open = false;
         }
     }
 
@@ -385,8 +665,8 @@ impl ChordialApp {
         if let Some(drag) = self.phone_sheet.as_ref() {
             return drag.progress(now);
         }
-        if let Some(spring) = self.phone_sheet_spring {
-            return spring.position(now).clamp(0.0, 1.0);
+        if let Some(spring) = self.motion.phone_sheet.as_ref() {
+            return spring.value(now).clamp(0.0, 1.0);
         }
         if self.phone_page == PhonePage::Player {
             1.0
@@ -396,10 +676,14 @@ impl ChordialApp {
     }
 
     pub(super) fn phone_sheet_animating(&self, now: Instant) -> bool {
-        self.phone_sheet.is_some_and(|drag| drag.animating(now))
+        self.phone_sheet
+            .as_ref()
+            .is_some_and(|drag| drag.animating(now))
             || self
-                .phone_sheet_spring
-                .is_some_and(|spring| !spring.settled(now))
+                .motion
+                .phone_sheet
+                .as_ref()
+                .is_some_and(|spring| spring.active(now))
     }
 
     /// 点击 mini player / 从曲库选歌：从当前位置弹性展开播放页。
@@ -415,7 +699,15 @@ impl ChordialApp {
         self.track_menu = None;
         self.selection = None;
         if from < 0.999 {
-            self.phone_sheet_spring = Some(SpringSettle::new(from, 1.0, 0.0, now, 25.0, 190.0));
+            self.motion.phone_sheet = Some(self.motion_tuning.spring(
+                Duration::from_millis(200),
+                from,
+                1.0,
+                0.0,
+                now,
+                PROGRESS_TOL.0,
+                PROGRESS_TOL.1,
+            ));
             self.ensure_ui_anim_ticker(cx);
         }
         cx.notify();
@@ -429,18 +721,26 @@ impl ChordialApp {
         let now = Instant::now();
         let from = self.phone_sheet_progress(now);
         self.phone_sheet = None;
-        self.phone_sheet_spring = Some(SpringSettle::new(from, 0.0, 0.0, now, 26.0, 190.0));
+        self.motion.phone_sheet = Some(self.motion_tuning.spring(
+            Duration::from_millis(200),
+            from,
+            0.0,
+            0.0,
+            now,
+            PROGRESS_TOL.0,
+            PROGRESS_TOL.1,
+        ));
         self.ensure_ui_anim_ticker(cx);
         cx.notify();
     }
 
     pub(super) fn begin_phone_sheet_drag(&mut self, y: f32, cx: &mut Context<Self>) {
-        if !self.is_phone() || matches!(self.phone_page, PhonePage::Lyrics) {
+        if !self.is_phone() || self.phone_page != PhonePage::Player {
             return;
         }
         let now = Instant::now();
         let start = self.phone_sheet_progress(now);
-        self.phone_sheet_spring = None;
+        self.motion.phone_sheet = None;
         self.phone_sheet = Some(SheetSwipe::begin(start, y, now));
         // 从 mini player 起手先把播放页挂出来，让第一帧就跟手；收起时
         // 页面会停在 Player，等 spring/手势落点决定是否回 Browse。
@@ -465,7 +765,7 @@ impl ChordialApp {
         let height = self.viewport_height.max(1.0);
         let now = Instant::now();
         if let Some(drag) = &mut self.phone_sheet {
-            if drag.release(height, now) {
+            if drag.release(height, now, self.motion_tuning) {
                 self.ensure_ui_anim_ticker(cx);
             } else if !drag.engaged() {
                 // 只是按住/轻点：按当前进度落在最近的一端，不留下一个
@@ -500,7 +800,7 @@ impl ChordialApp {
         }
         self.phone_sheet_anchor = None;
         let now = Instant::now();
-        self.phone_sheet_spring = None;
+        self.motion.phone_sheet = None;
         self.phone_page = PhonePage::Player;
         self.phone_sheet = Some(SheetSwipe::begin(0.0, start, now));
         self.update_phone_sheet_drag(y, cx);
@@ -620,7 +920,27 @@ impl ChordialApp {
             return;
         }
         self.row_click_suppress_until = Some(Instant::now() + Duration::from_millis(300));
-        self.queue_move(drag.from, drag.to, cx);
+        let mut queue = self.queue.as_ref().clone();
+        if drag.from < queue.len() {
+            let track = queue.remove(drag.from);
+            let to = drag.to.min(queue.len());
+            queue.insert(to, track);
+            self.queue = Arc::new(queue);
+            self.shuffle_plan = None;
+            self.queue_pos = self.queue_pos.map(|pos| {
+                if pos == drag.from {
+                    to
+                } else if drag.from < pos && to >= pos {
+                    pos - 1
+                } else if drag.from > pos && to <= pos {
+                    pos + 1
+                } else {
+                    pos
+                }
+            });
+            self.show_portrait_toast("已调整播放顺序", cx);
+        }
+        cx.notify();
     }
 
     // ---- 封面 ⇄ 歌词 ----
@@ -628,7 +948,6 @@ impl ChordialApp {
     pub(super) fn begin_phone_edge_swipe(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         let (forward, back) = match self.phone_page {
             PhonePage::Player => (true, false),
-            PhonePage::Lyrics => (false, true),
             PhonePage::Browse => return,
         };
         self.phone_edge_swipe = Some(EdgeSwipe::begin(x, y, Instant::now(), forward, back));
@@ -652,7 +971,7 @@ impl ChordialApp {
             if swipe.engaged() {
                 self.phone_swipe_suppress_click = Some(now);
             }
-            if swipe.release(width, now) {
+            if swipe.release(width, now, self.motion_tuning) {
                 self.ensure_ui_anim_ticker(cx);
                 cx.notify();
             } else if !swipe.engaged() {
@@ -668,9 +987,8 @@ impl ChordialApp {
 
     // ---- 曲目菜单 / 多选 ----
 
-    /// 当前可见列表的快照。所有来源（搜索/曲库/队列/集合/歌单/推荐流）
-    /// 共用这一个解析器，`play_from_list` 与曲目菜单都走这里。
-    pub(super) fn snapshot_list(&self, list: &QueueList) -> Arc<Vec<Track>> {
+    /// 当前可见列表的快照（与 `play_from_list` 同源）。
+    pub(super) fn snapshot_list(&self, list: QueueList) -> Arc<Vec<Track>> {
         match list {
             QueueList::Search => match &self.source_route {
                 Some(route) => Arc::new(
@@ -689,29 +1007,6 @@ impl ChordialApp {
                 .as_ref()
                 .map(|c| c.tracks.clone())
                 .unwrap_or_else(|| Arc::new(Vec::new())),
-            QueueList::Playlist(id) => self
-                .playlists
-                .get(id)
-                .map(|playlist| {
-                    Arc::new(
-                        playlist
-                            .entries
-                            .iter()
-                            .map(|entry| entry.track.clone())
-                            .collect(),
-                    )
-                })
-                .unwrap_or_else(|| Arc::new(Vec::new())),
-            QueueList::Feed { source, kind } => self
-                .source_feeds
-                .get(source)
-                .map(|feed| match kind {
-                    SourceFeedKind::Daily => Arc::new(feed.daily.clone()),
-                    SourceFeedKind::Fm => Arc::new(feed.fm.clone()),
-                    SourceFeedKind::Recommended | SourceFeedKind::Radar => Arc::new(Vec::new()),
-                })
-                .unwrap_or_else(|| Arc::new(Vec::new())),
-            QueueList::Snapshot(tracks) => tracks.clone(),
         }
     }
 
@@ -723,7 +1018,7 @@ impl ChordialApp {
         y: f32,
         cx: &mut Context<Self>,
     ) {
-        let tracks = self.snapshot_list(&list);
+        let tracks = self.snapshot_list(list);
         let Some(track) = tracks.get(index).cloned() else {
             return;
         };
@@ -757,13 +1052,12 @@ impl ChordialApp {
     }
 
     fn prefetch_dock_queue_covers(&mut self, cx: &mut Context<Self>) {
-        let tracks = self.queue.clone();
-        let start = self.queue_pos.map(|pos| pos + 1).unwrap_or(0);
-        let end = (start + 3).min(tracks.len());
-        if start < end {
-            let indices: Vec<usize> = (start..end).collect();
-            self.request_track_covers(&indices, tracks.as_slice(), cx);
+        let indices = self.upcoming_queue_indices(3);
+        if indices.is_empty() {
+            return;
         }
+        let tracks = self.queue.clone();
+        self.request_track_covers(&indices, tracks.as_slice(), cx);
     }
 
     pub(super) fn toggle_dock_menu(&mut self, menu: DockMenu, cx: &mut Context<Self>) {
@@ -775,6 +1069,7 @@ impl ChordialApp {
         self.track_menu = None;
         self.dock_menu = Some(menu);
         if menu == DockMenu::Queue {
+            self.sync_shuffle_plan();
             self.prefetch_dock_queue_covers(cx);
         }
         cx.notify();
@@ -796,37 +1091,29 @@ impl ChordialApp {
     }
 
     /// 下一首播放：插在当前曲目之后（没有当前曲目则排到队首）。
-    /// 按身份键去重，写入统一走 `set_queue`。
     pub(super) fn queue_play_next(&mut self, track: Track, cx: &mut Context<Self>) {
         let mut queue = self.queue.as_ref().clone();
         let insert_at = self
             .queue_pos
-            .map(|pos| pos + 1)
-            .unwrap_or(0)
-            .min(queue.len());
-        if queue
-            .iter()
-            .any(|existing| existing.identity_key() == track.identity_key())
-        {
-            self.info_message = Some("这首歌已经在播放队列里".into());
-            cx.notify();
-            return;
-        }
+            .map(|pos| (pos + 1).min(queue.len()))
+            .unwrap_or(0);
         queue.insert(insert_at, track);
-        self.set_queue(Arc::new(queue), self.queue_refill.clone());
+        if self.queue_pos.is_none() {
+            // 未在播放时仅入队，不抢占播放。
+            self.queue_pos = None;
+        }
+        self.queue = Arc::new(queue);
+        self.shuffle_plan = None;
         self.show_portrait_toast("已设为下一首播放", cx);
         cx.notify();
     }
 
-    /// 追加到播放队列末尾（按身份键去重）。
+    /// 追加到播放队列末尾。
     pub(super) fn queue_append(&mut self, track: Track, cx: &mut Context<Self>) {
         let mut queue = self.queue.as_ref().clone();
-        if Self::append_unique_tracks(&mut queue, vec![track]) == 0 {
-            self.info_message = Some("这首歌已经在播放队列里".into());
-            cx.notify();
-            return;
-        }
-        self.set_queue(Arc::new(queue), self.queue_refill.clone());
+        queue.push(track);
+        self.queue = Arc::new(queue);
+        self.shuffle_plan = None;
         self.show_portrait_toast("已添加到播放队列", cx);
         cx.notify();
     }
@@ -849,7 +1136,7 @@ impl ChordialApp {
         index: usize,
         cx: &mut Context<Self>,
     ) {
-        let tracks = self.snapshot_list(&list);
+        let tracks = self.snapshot_list(list);
         if index >= tracks.len() {
             return;
         }
@@ -904,33 +1191,36 @@ impl ChordialApp {
             }
             SelectionAction::PlayNext => {
                 let mut queue = self.queue.as_ref().clone();
-                let mut seen: HashSet<String> = queue.iter().map(|t| t.identity_key()).collect();
-                let fresh: Vec<Track> = tracks
-                    .into_iter()
-                    .filter(|track| seen.insert(track.identity_key()))
-                    .collect();
-                let at = self.queue_pos.map(|pos| pos + 1).unwrap_or(0).min(queue.len());
-                queue.splice(at..at, fresh);
-                self.set_queue(Arc::new(queue), self.queue_refill.clone());
+                let at = self
+                    .queue_pos
+                    .map(|pos| (pos + 1).min(queue.len()))
+                    .unwrap_or(0);
+                for (offset, track) in tracks.into_iter().enumerate() {
+                    queue.insert(at + offset, track);
+                }
+                self.queue = Arc::new(queue);
+                self.shuffle_plan = None;
                 self.show_portrait_toast("已设为下一首播放", cx);
             }
             SelectionAction::Append => {
                 let mut queue = self.queue.as_ref().clone();
-                Self::append_unique_tracks(&mut queue, tracks);
-                self.set_queue(Arc::new(queue), self.queue_refill.clone());
+                queue.extend(tracks);
+                self.queue = Arc::new(queue);
+                self.shuffle_plan = None;
                 self.show_portrait_toast("已添加到播放队列", cx);
             }
             SelectionAction::Remove => {
-                let keys: HashSet<String> = tracks.iter().map(|t| t.identity_key()).collect();
+                let ids = tracks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
                 let mut queue = self.queue.as_ref().clone();
                 let current_id = self
                     .queue_pos
                     .and_then(|pos| queue.get(pos))
                     .map(|t| t.id.clone());
-                queue.retain(|t| !keys.contains(&t.identity_key()));
-                let pos = current_id.and_then(|id| queue.iter().position(|t| t.id == id));
-                self.set_queue(Arc::new(queue), self.queue_refill.clone());
-                self.queue_pos = pos;
+                queue.retain(|t| !ids.contains(&t.id));
+                self.queue = Arc::new(queue);
+                self.shuffle_plan = None;
+                self.queue_pos =
+                    current_id.and_then(|id| self.queue.iter().position(|t| t.id == id));
                 self.show_portrait_toast("已从队列移除", cx);
             }
         }
@@ -1007,13 +1297,12 @@ impl ChordialApp {
         cx.notify();
     }
 
-    /// 手机壳与沉浸层共用 `lyric_view`。这里把「播放页背景 / 歌词页 /
-    /// 不占用」收敛成一次显式迁移，避免每帧重置或两个页面同时渲染。
+    /// 手机壳与沉浸层共用 `lyric_view`。这里把「播放页背景 / 不占用」
+    /// 收敛成一次显式迁移，避免每帧重置或两个页面同时渲染。
     pub(super) fn sync_phone_backdrop(&mut self, cx: &mut Context<Self>) {
         let mode = if self.phone_shell_active() && self.current_track.is_some() {
             match self.phone_page {
                 PhonePage::Player => PhoneBackdrop::Player,
-                PhonePage::Lyrics => PhoneBackdrop::Lyrics,
                 PhonePage::Browse => PhoneBackdrop::Off,
             }
         } else {
@@ -1029,24 +1318,14 @@ impl ChordialApp {
             let no_bg = self.no_bg;
             let no_blur = self.no_blur;
             let sweep = self.lyric_sweep_fade_em;
-            let theme = Theme::get(cx).clone();
-            let show_text = mode == PhoneBackdrop::Lyrics;
-            let style = if show_text {
-                phone_lyric_style(&theme, width, height, sweep)
-            } else {
-                immersive_lyric_style(width, height, sweep)
-            };
+            let style = immersive_lyric_style(width, height, sweep);
             let white = gpui::white();
             self.lyric_view.update(cx, |view, _| {
-                view.set_text_visible(show_text);
-                view.set_click_seek_enabled(show_text);
+                view.set_text_visible(false);
+                view.set_click_seek_enabled(false);
                 view.set_player_config(LyricPlayerConfig {
-                    align_anchor: if show_text {
-                        AlignAnchor::Center
-                    } else {
-                        AlignAnchor::Top
-                    },
-                    align_position: if show_text { 0.5 } else { 0.1 },
+                    align_anchor: AlignAnchor::Top,
+                    align_position: 0.1,
                     enable_blur: !no_blur,
                     ..LyricPlayerConfig::default()
                 });
@@ -1097,5 +1376,53 @@ impl ChordialApp {
                 view.set_text_style(compact_lyric_style(&theme, self.lyric_sweep_fade_em));
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phone_source_mode_matches_the_visible_shell() {
+        assert_eq!(
+            source_mode_for_phone(false, PhonePage::Browse, true),
+            StageMode::Dock
+        );
+        assert_eq!(
+            source_mode_for_phone(true, PhonePage::Player, true),
+            StageMode::PhonePlayer
+        );
+        assert_eq!(
+            source_mode_for_phone(true, PhonePage::Browse, true),
+            StageMode::MiniPlayer
+        );
+    }
+
+    #[test]
+    fn first_immersive_enter_starts_at_dock_not_fullscreen() {
+        let now = Instant::now();
+        let (from, velocity) = dock_enter_start(None, 1.0);
+        assert_eq!(from, 1.0);
+        assert_eq!(velocity, 0.0);
+        let spring = MotionTuning::default().spring(
+            Duration::from_millis(320),
+            from,
+            0.0,
+            velocity,
+            now,
+            PROGRESS_TOL.0,
+            PROGRESS_TOL.1,
+        );
+        assert_eq!(spring.value(now), 1.0);
+        assert!(spring.active(now));
+        let mid = spring.value(now + Duration::from_millis(120));
+        assert!(mid > 0.0 && mid < 1.0, "mid={mid}");
+        assert_eq!(spring.value(now + Duration::from_secs(2)), 0.0);
+    }
+
+    #[test]
+    fn interrupted_enter_inherits_current_position_and_velocity() {
+        assert_eq!(dock_enter_start(Some((0.37, -420.0)), 1.0), (0.37, -420.0));
     }
 }

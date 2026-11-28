@@ -8,6 +8,14 @@ use super::*;
 const FM_REFILL_AHEAD: usize = 5;
 
 impl ChordialApp {
+    pub(super) fn playback_status_label(&self) -> &'static str {
+        playback_state_label(&self.player_status.state)
+    }
+
+    pub(super) fn playback_action_label(&self) -> &'static str {
+        playback_action_label(&self.player_status.state)
+    }
+
     /// 解析播放句柄（可能跨源网络请求）后交给播放线程。
     pub(super) fn resolve_and_play(&mut self, cx: &mut Context<Self>) {
         self.resolve_and_play_impl(true, cx);
@@ -170,44 +178,61 @@ impl ChordialApp {
     }
 
     /// 点击列表行：把当前可见列表设为队列并播放。
-    /// 所有来源共用 [`Self::snapshot_list`] 解析曲目，私人 FM 保留续接追踪。
-    pub(super) fn play_from_list(
-        &mut self,
-        list: &QueueList,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let tracks = self.snapshot_list(list);
+    pub(super) fn play_from_list(&mut self, list: QueueList, index: usize, cx: &mut Context<Self>) {
+        let tracks: Arc<Vec<Track>> = match list {
+            QueueList::Search => match &self.source_route {
+                // 路由到单源时，"播放全部"与行点击都只在可见结果内流转。
+                Some(route) => Arc::new(
+                    self.search_tracks
+                        .iter()
+                        .filter(|t| &t.id.source == route)
+                        .cloned()
+                        .collect(),
+                ),
+                None => self.search_tracks.clone(),
+            },
+            QueueList::Library => self.library.clone(),
+            QueueList::Queue => self.queue.clone(),
+            QueueList::Collection => self
+                .collection
+                .as_ref()
+                .map(|c| c.tracks.clone())
+                .unwrap_or_else(|| Arc::new(Vec::new())),
+        };
         if index >= tracks.len() {
             return;
         }
-        let refill = match list {
-            QueueList::Feed { source, kind: SourceFeedKind::Fm } => Some(QueueRefill {
-                source: source.clone(),
-                in_flight: false,
-                last_empty_at: None,
-            }),
-            _ => None,
-        };
-        let is_fm = refill.is_some();
-        self.set_queue(tracks, refill);
+        self.set_queue(tracks, None);
         self.queue_pos = Some(index);
         self.status_message = None;
-        self.dock_menu = None;
-        self.track_menu = None;
         self.resolve_and_play(cx);
         // 手机壳：选歌的最终目的是播放，直接回到播放页，避免用户还要
         // 再找一次返回入口。宽屏三栏同时可见，不需要这一步。
         self.show_phone_player(cx);
-        if is_fm {
-            self.maybe_refill_fm_queue(cx);
-        }
         cx.notify();
     }
 
-    /// 从播放队列移除一项；统一委托给 `queue_remove_index`。
+    /// 从播放队列移除一项；不打断当前播放，只修正 queue_pos。
     pub(super) fn remove_queue_at(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.queue_remove_index(index, cx);
+        if index >= self.queue.len() {
+            return;
+        }
+        let mut queue = self.queue.as_ref().clone();
+        queue.remove(index);
+        self.queue = Arc::new(queue);
+        self.queue_pos = match self.queue_pos {
+            Some(pos) if pos > index => Some(pos - 1),
+            Some(pos) if pos == index => {
+                if self.queue.is_empty() {
+                    None
+                } else {
+                    Some(pos.min(self.queue.len() - 1))
+                }
+            }
+            other => other,
+        };
+        self.shuffle_plan = None;
+        cx.notify();
     }
 
     /// 私人 FM 接近末尾时向所追踪的音源再拉一批（同一时刻最多一个在途请求）。
@@ -233,7 +258,7 @@ impl ChordialApp {
         self.refill_fm_queue(cx);
     }
 
-    /// 自动播完：单曲循环原地重播；随机模式随机下一首；否则顺序下一首。
+    /// 自动播完：单曲循环原地重播；随机模式按随机轮次推进；否则顺序下一首。
     pub(super) fn on_track_ended(&mut self, cx: &mut Context<Self>) {
         match self.play_mode {
             PlayMode::RepeatOne => {
@@ -241,7 +266,7 @@ impl ChordialApp {
                     self.resolve_and_play_impl(false, cx);
                 }
             }
-            PlayMode::Shuffle => self.play_random(cx),
+            PlayMode::Shuffle => self.play_shuffle_next(cx),
             PlayMode::RepeatAll | PlayMode::Sequential => self.play_next(cx),
         }
     }
@@ -249,13 +274,19 @@ impl ChordialApp {
     /// F5：没有当前曲目时从本地库第一首开始；否则等价于播放/暂停。
     pub fn play_first(&mut self, cx: &mut Context<Self>) {
         if self.queue_pos.is_none() && !self.library.is_empty() {
-            self.play_from_list(&QueueList::Library, 0, cx);
+            self.play_from_list(QueueList::Library, 0, cx);
         } else {
             self.toggle_playback(cx);
         }
     }
 
     pub fn play_next(&mut self, cx: &mut Context<Self>) {
+        // 随机模式必须与自动播完走同一套顺序；手动下一首原先会按队列
+        // 顺序前进一步，导致“随机播放”看起来没有生效。
+        if self.play_mode == PlayMode::Shuffle {
+            self.play_shuffle_next(cx);
+            return;
+        }
         let Some(pos) = self.queue_pos else { return };
         if pos + 1 < self.queue.len() {
             self.queue_pos = Some(pos + 1);
@@ -271,10 +302,12 @@ impl ChordialApp {
     }
 
     pub(super) fn play_prev(&mut self, cx: &mut Context<Self>) {
-        let Some(pos) = self.queue_pos else { return };
         if self.play_mode == PlayMode::Shuffle {
-            self.play_random(cx);
-        } else if pos == 0 && self.play_mode == PlayMode::RepeatAll && !self.queue.is_empty() {
+            self.play_shuffle_prev(cx);
+            return;
+        }
+        let Some(pos) = self.queue_pos else { return };
+        if pos == 0 && self.play_mode == PlayMode::RepeatAll && !self.queue.is_empty() {
             self.queue_pos = Some(self.queue.len() - 1);
             self.resolve_and_play(cx);
         } else {
@@ -284,32 +317,87 @@ impl ChordialApp {
         cx.notify();
     }
 
-    pub(super) fn play_random(&mut self, cx: &mut Context<Self>) {
-        let len = self.queue.len();
-        if len == 0 {
+    /// 保证随机计划对应当前队列与曲目；退出随机模式时丢弃计划。
+    pub(super) fn sync_shuffle_plan(&mut self) {
+        if self.play_mode != PlayMode::Shuffle {
+            self.shuffle_plan = None;
             return;
         }
-        let current = self.queue_pos.unwrap_or(0);
-        let mut seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        let mut next = (seed as usize) % len;
-        if len > 1 && next == current {
-            next = (next + 1) % len;
+        let len = self.queue.len();
+        let Some(current) = self.queue_pos.filter(|pos| *pos < len) else {
+            self.shuffle_plan = None;
+            return;
+        };
+        if self
+            .shuffle_plan
+            .as_ref()
+            .is_some_and(|plan| plan.matches(len, current))
+        {
+            return;
         }
+        self.shuffle_plan = Some(ShufflePlan::new(len, current));
+    }
+
+    /// 接下来 `count` 首的队列下标。随机模式与真实播放顺序同源，
+    /// 顺序模式保持原有队列顺序。
+    pub(super) fn upcoming_queue_indices(&self, count: usize) -> Vec<usize> {
+        if self.play_mode == PlayMode::Shuffle {
+            let len = self.queue.len();
+            let Some(current) = self.queue_pos.filter(|pos| *pos < len) else {
+                return Vec::new();
+            };
+            return self
+                .shuffle_plan
+                .as_ref()
+                .filter(|plan| plan.matches(len, current))
+                .map(|plan| plan.preview(count))
+                .unwrap_or_default();
+        }
+        let start = self.queue_pos.map(|pos| pos + 1).unwrap_or(0);
+        (start..self.queue.len()).take(count).collect()
+    }
+
+    /// 随机模式下的“下一首”：手动点击、键盘与自动播完共用。
+    pub(super) fn play_shuffle_next(&mut self, cx: &mut Context<Self>) {
+        let Some(current) = self.queue_pos else {
+            return;
+        };
+        self.sync_shuffle_plan();
+        let Some(next) = self
+            .shuffle_plan
+            .as_mut()
+            .and_then(|plan| plan.advance(current))
+        else {
+            return;
+        };
         self.queue_pos = Some(next);
         self.resolve_and_play(cx);
         self.maybe_refill_fm_queue(cx);
         cx.notify();
     }
 
+    /// 随机模式下的“上一首”：按真实播放历史回退，而不是重新抽签。
+    pub(super) fn play_shuffle_prev(&mut self, cx: &mut Context<Self>) {
+        let Some(current) = self.queue_pos else {
+            return;
+        };
+        self.sync_shuffle_plan();
+        let Some(prev) = self
+            .shuffle_plan
+            .as_mut()
+            .and_then(|plan| plan.retreat(current))
+        else {
+            return;
+        };
+        self.queue_pos = Some(prev);
+        self.resolve_and_play(cx);
+        cx.notify();
+    }
+
     pub(super) fn stop_playback(&mut self, cx: &mut Context<Self>) {
         self.player.stop();
         self.queue_pos = None;
+        self.shuffle_plan = None;
         self.play_gen = self.play_gen.wrapping_add(1);
         self.current_track = None;
         self.lyrics_status = None;
@@ -327,68 +415,35 @@ impl ChordialApp {
         cx.notify();
     }
 
-    pub(super) fn toggle_source(&mut self, id: &SourceId, cx: &mut Context<Self>) {
-        let registry = self.registry.clone();
-        let id2 = id.clone();
-        let is_netease = id.as_str() == "netease";
-        if registry.get(id).is_some() {
-            cx.spawn(async move |weak, cx| {
-                let _ = registry.unload(&id2).await;
-                let _ = weak.update(cx, |app, cx| {
-                    if is_netease {
-                        app.account_state = AccountState::Unknown;
-                        let old_avatar = app.account_avatar.take();
-                        app.retire_image(old_avatar);
-                        app.user_playlists = Arc::new(Vec::new());
-                        app.login_open = false;
-                    }
-                    if app.collection.as_ref().is_some_and(|c| c.id.source == id2) {
-                        app.collection = None;
-                        let old_cover = app.collection_cover.take();
-                        app.retire_image(old_cover);
-                        if app.view_tab == ViewTab::Collection {
-                            app.view_tab = ViewTab::Library;
-                        }
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
-        } else {
-            // builder 捕获了预构建实例（本地源卸载后索引仍在内存，重载零成本）。
-            let builder = cx.global::<Globals>().builders.get(id).cloned();
-            if let Some(build) = builder {
-                cx.spawn(async move |weak, cx| {
-                    let result = registry.load(&id2, |info| build(info));
-                    let _ = weak.update(cx, |app, cx| {
-                        if let Err(e) = &result {
-                            app.status_message = Some(format!("加载源失败：{e}"));
-                        } else if is_netease {
-                            app.spawn_netease_warmup(cx);
-                            app.spawn_account_bootstrap(cx);
-                        }
-                        cx.notify();
-                    });
-                })
-                .detach();
-            }
-        }
-    }
-
-    // ---------- 网易云账号 / 集合页 ----------
+    // ---------- 账号源 / 集合页 ----------
 
     pub(super) fn netease_source(&self) -> Option<Arc<dyn MusicSource>> {
         self.primary_netease_id()
             .and_then(|id| self.registry.get(&id))
     }
 
-    /// 登录浮层当前绑定的实例：优先用户点开的实例，否则首个网易云实例。
+    /// 登录浮层当前绑定的实例：优先用户点开的实例，否则首个支持账号的已启用实例。
     pub(super) fn login_source_id(&self) -> Option<SourceId> {
         let selected = self.login_source.as_ref().filter(|id| {
             self.source_config_by_id(&id.0)
-                .is_some_and(|source| source.is_netease() && source.enabled)
+                .is_some_and(|source| source.enabled)
+                && self
+                    .registry
+                    .get(id)
+                    .is_some_and(|source| source.account().is_some())
         });
-        selected.cloned().or_else(|| self.primary_netease_id())
+        selected.cloned().or_else(|| {
+            self.source_configs
+                .iter()
+                .filter(|source| source.enabled)
+                .find_map(|config| {
+                    let id = SourceId::new(config.id.clone());
+                    self.registry
+                        .get(&id)
+                        .filter(|source| source.account().is_some())
+                        .map(|_| id)
+                })
+        })
     }
 
     pub(super) fn login_source(&self) -> Option<Arc<dyn MusicSource>> {
@@ -398,11 +453,51 @@ impl ChordialApp {
     pub(super) fn save_cookie(&mut self, cookie: Option<String>) {
         // 旧入口没有实例上下文：写回首个网易云实例。
         let Some(id) = self.login_source_id().or_else(|| self.primary_netease_id()) else {
-            let mut cfg = crate::config::load_or_default();
+            let mut cfg = self.config.clone();
             cfg.netease.cookie = cookie;
-            crate::config::save(&cfg);
+            self.commit_config(&cfg);
             return;
         };
         self.set_source_cookie(&id, cookie);
+    }
+}
+
+fn playback_state_label(state: &PlayerState) -> &'static str {
+    match state {
+        PlayerState::Playing => "正在播放",
+        PlayerState::Paused => "已暂停",
+        PlayerState::Loading => "加载中",
+        PlayerState::Failed(_) => "播放失败 · 重试",
+        PlayerState::Stopped => "等待播放",
+    }
+}
+
+fn playback_action_label(state: &PlayerState) -> &'static str {
+    match state {
+        PlayerState::Playing => "暂停",
+        PlayerState::Failed(_) => "重试",
+        PlayerState::Loading => "加载中",
+        _ => "播放",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_labels_distinguish_failure_and_loading() {
+        assert_eq!(playback_state_label(&PlayerState::Playing), "正在播放");
+        assert_eq!(playback_state_label(&PlayerState::Paused), "已暂停");
+        assert_eq!(playback_state_label(&PlayerState::Loading), "加载中");
+        assert_eq!(
+            playback_state_label(&PlayerState::Failed("decoder".into())),
+            "播放失败 · 重试"
+        );
+        assert_eq!(
+            playback_action_label(&PlayerState::Failed("decoder".into())),
+            "重试"
+        );
+        assert_eq!(playback_action_label(&PlayerState::Loading), "加载中");
     }
 }

@@ -34,6 +34,133 @@ pub(crate) struct Scene {
     pub(crate) surfaces: Vec<PaintSurface>,
 }
 
+/// Applies a uniform scale, translation, opacity, and small blur kernel to a
+/// subtree's paint primitives.
+///
+/// This is a scene-level filter: it does not introduce a render target or a
+/// platform-specific shader path. Blur is approximated by replaying the
+/// subtree's primitives at eight low-alpha offsets. Hitboxes are transformed
+/// separately during prepaint so interaction stays aligned with the visual.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaintFilter {
+    /// Opacity multiplier applied to the subtree.
+    pub opacity: f32,
+    /// Uniform scale applied around `origin`.
+    pub scale: f32,
+    /// Scale anchor in logical window pixels.
+    pub origin: Point<Pixels>,
+    /// Blur radius (standard deviation) in logical pixels.
+    pub blur_radius: Pixels,
+}
+
+impl Default for PaintFilter {
+    fn default() -> Self {
+        Self {
+            opacity: 1.0,
+            scale: 1.0,
+            origin: Point::default(),
+            blur_radius: Pixels::ZERO,
+        }
+    }
+}
+
+impl PaintFilter {
+    fn is_identity(self) -> bool {
+        (self.opacity - 1.0).abs() < f32::EPSILON
+            && (self.scale - 1.0).abs() < f32::EPSILON
+            && self.blur_radius.0.abs() < f32::EPSILON
+    }
+
+    pub(crate) fn transform_point(self, point: Point<Pixels>) -> Point<Pixels> {
+        let dx = point.x.0 - self.origin.x.0;
+        let dy = point.y.0 - self.origin.y.0;
+        Point::new(
+            (self.origin.x.0 + dx * self.scale).into(),
+            (self.origin.y.0 + dy * self.scale).into(),
+        )
+    }
+
+    pub(crate) fn transform_bounds(self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        Bounds {
+            origin: self.transform_point(bounds.origin),
+            size: crate::size(
+                (bounds.size.width.0 * self.scale).into(),
+                (bounds.size.height.0 * self.scale).into(),
+            ),
+        }
+    }
+}
+
+/// Snapshot of scene-vector lengths before a filtered subtree paints.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SceneCheckpoint {
+    paint_operations: usize,
+    shadows: usize,
+    quads: usize,
+    paths: usize,
+    underlines: usize,
+    monochrome_sprites: usize,
+    polychrome_sprites: usize,
+    surfaces: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PrimitiveFilter {
+    scale: f32,
+    origin: Point<ScaledPixels>,
+    opacity: f32,
+    dx: f32,
+    dy: f32,
+}
+
+impl PrimitiveFilter {
+    fn new(filter: PaintFilter, scale_factor: f32) -> Self {
+        Self {
+            scale: filter.scale.clamp(0.01, 4.0),
+            origin: Point::new(
+                (filter.origin.x.0 * scale_factor).into(),
+                (filter.origin.y.0 * scale_factor).into(),
+            ),
+            opacity: filter.opacity.clamp(0.0, 1.0),
+            dx: 0.0,
+            dy: 0.0,
+        }
+    }
+
+    fn translated(mut self, dx: f32, dy: f32) -> Self {
+        self.dx = dx;
+        self.dy = dy;
+        self
+    }
+
+    fn point(self, point: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        let dx = point.x.0 - self.origin.x.0;
+        let dy = point.y.0 - self.origin.y.0;
+        Point::new(
+            (self.origin.x.0 + dx * self.scale + self.dx).into(),
+            (self.origin.y.0 + dy * self.scale + self.dy).into(),
+        )
+    }
+
+    fn bounds(self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: self.point(bounds.origin),
+            size: crate::size(
+                (bounds.size.width.0 * self.scale).into(),
+                (bounds.size.height.0 * self.scale).into(),
+            ),
+        }
+    }
+
+    fn corners(self, corners: Corners<ScaledPixels>) -> Corners<ScaledPixels> {
+        corners.map(|value| (value.0 * self.scale).into())
+    }
+
+    fn edges(self, edges: Edges<ScaledPixels>) -> Edges<ScaledPixels> {
+        edges.map(|value| (value.0 * self.scale).into())
+    }
+}
+
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
@@ -50,6 +177,119 @@ impl Scene {
 
     pub fn len(&self) -> usize {
         self.paint_operations.len()
+    }
+
+    pub(crate) fn checkpoint(&self) -> SceneCheckpoint {
+        SceneCheckpoint {
+            paint_operations: self.paint_operations.len(),
+            shadows: self.shadows.len(),
+            quads: self.quads.len(),
+            paths: self.paths.len(),
+            underlines: self.underlines.len(),
+            monochrome_sprites: self.monochrome_sprites.len(),
+            polychrome_sprites: self.polychrome_sprites.len(),
+            surfaces: self.surfaces.len(),
+        }
+    }
+
+    /// Transform the primitives added since `checkpoint`, then optionally
+    /// append a low-alpha multi-sample blur pass. The original primitives stay
+    /// in place so hit testing and the sharp centre remain crisp.
+    pub(crate) fn apply_filter(
+        &mut self,
+        checkpoint: SceneCheckpoint,
+        filter: PaintFilter,
+        scale_factor: f32,
+    ) {
+        if filter.is_identity() {
+            return;
+        }
+        let blur_radius = filter.blur_radius.0;
+        let filter = PrimitiveFilter::new(filter, scale_factor);
+
+        for shadow in &mut self.shadows[checkpoint.shadows..] {
+            filter_shadow(shadow, filter, 1.0);
+        }
+        for quad in &mut self.quads[checkpoint.quads..] {
+            filter_quad(quad, filter, 1.0);
+        }
+        for path in &mut self.paths[checkpoint.paths..] {
+            filter_path(path, filter, 1.0);
+        }
+        for underline in &mut self.underlines[checkpoint.underlines..] {
+            filter_underline(underline, filter, 1.0);
+        }
+        for sprite in &mut self.monochrome_sprites[checkpoint.monochrome_sprites..] {
+            filter_monochrome_sprite(sprite, filter, 1.0);
+        }
+        for sprite in &mut self.polychrome_sprites[checkpoint.polychrome_sprites..] {
+            filter_polychrome_sprite(sprite, filter, 1.0);
+        }
+        for surface in &mut self.surfaces[checkpoint.surfaces..] {
+            surface.bounds = filter.bounds(surface.bounds);
+        }
+
+        let operations = &mut self.paint_operations[checkpoint.paint_operations..];
+        for operation in operations.iter_mut() {
+            filter_operation(operation, filter);
+        }
+
+        let radius = blur_radius * scale_factor.max(1.0);
+        if radius <= 0.01 || filter.opacity <= 0.001 {
+            return;
+        }
+        let samples = operations.to_vec();
+        // Eight offsets around the centre. Total sample alpha is kept well
+        // below the sharp copy so the group softens without visibly doubling.
+        const DIRECTIONS: [(f32, f32); 8] = [
+            (1.0, 0.0),
+            (0.707_106_8, 0.707_106_8),
+            (0.0, 1.0),
+            (-0.707_106_8, 0.707_106_8),
+            (-1.0, 0.0),
+            (-0.707_106_8, -0.707_106_8),
+            (0.0, -1.0),
+            (0.707_106_8, -0.707_106_8),
+        ];
+        const SAMPLE_ALPHA: f32 = 0.04;
+        let distance = radius * 0.75;
+        for (dx, dy) in DIRECTIONS {
+            let sample = PrimitiveFilter {
+                scale: 1.0,
+                origin: Point::default(),
+                opacity: 1.0,
+                dx: dx * distance,
+                dy: dy * distance,
+            };
+            self.replay_filtered_operations(&samples, sample, SAMPLE_ALPHA);
+        }
+    }
+
+    fn replay_filtered_operations(
+        &mut self,
+        operations: &[PaintOperation],
+        filter: PrimitiveFilter,
+        opacity: f32,
+    ) {
+        for operation in operations {
+            match operation {
+                PaintOperation::Primitive(primitive) => match primitive {
+                    // Shadows already carry a blurred kernel, and surfaces are
+                    // platform-owned textures. Duplicating either is expensive
+                    // and visually muddy; transform the original only.
+                    Primitive::Shadow(_) | Primitive::Surface(_) => {}
+                    _ => {
+                        let mut primitive = primitive.clone();
+                        filter_primitive(&mut primitive, filter, opacity);
+                        self.insert_primitive(primitive);
+                    }
+                },
+                PaintOperation::StartLayer(bounds) => {
+                    self.push_layer(filter.bounds(*bounds));
+                }
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
@@ -170,6 +410,74 @@ impl Scene {
     }
 }
 
+fn filter_operation(operation: &mut PaintOperation, filter: PrimitiveFilter) {
+    match operation {
+        PaintOperation::Primitive(primitive) => filter_primitive(primitive, filter, 1.0),
+        PaintOperation::StartLayer(bounds) => *bounds = filter.bounds(*bounds),
+        PaintOperation::EndLayer => {}
+    }
+}
+
+fn filter_primitive(primitive: &mut Primitive, filter: PrimitiveFilter, opacity: f32) {
+    match primitive {
+        Primitive::Shadow(shadow) => filter_shadow(shadow, filter, opacity),
+        Primitive::Quad(quad) => filter_quad(quad, filter, opacity),
+        Primitive::Path(path) => filter_path(path, filter, opacity),
+        Primitive::Underline(underline) => filter_underline(underline, filter, opacity),
+        Primitive::MonochromeSprite(sprite) => filter_monochrome_sprite(sprite, filter, opacity),
+        Primitive::PolychromeSprite(sprite) => filter_polychrome_sprite(sprite, filter, opacity),
+        Primitive::Surface(surface) => surface.bounds = filter.bounds(surface.bounds),
+    }
+}
+
+fn filter_shadow(shadow: &mut Shadow, filter: PrimitiveFilter, opacity: f32) {
+    shadow.bounds = filter.bounds(shadow.bounds);
+    shadow.corner_radii = filter.corners(shadow.corner_radii);
+    shadow.blur_radius = (shadow.blur_radius.0 * filter.scale).into();
+    shadow.color = shadow.color.opacity(filter.opacity * opacity);
+}
+
+fn filter_quad(quad: &mut Quad, filter: PrimitiveFilter, opacity: f32) {
+    quad.bounds = filter.bounds(quad.bounds);
+    quad.corner_radii = filter.corners(quad.corner_radii);
+    quad.border_widths = filter.edges(quad.border_widths);
+    quad.background = quad.background.opacity(filter.opacity * opacity);
+    quad.border_color = quad.border_color.opacity(filter.opacity * opacity);
+}
+
+fn filter_path(path: &mut Path<ScaledPixels>, filter: PrimitiveFilter, opacity: f32) {
+    path.bounds = filter.bounds(path.bounds);
+    for vertex in &mut path.vertices {
+        vertex.xy_position = filter.point(vertex.xy_position);
+    }
+    path.start = filter.point(path.start);
+    path.current = filter.point(path.current);
+    path.color = path.color.opacity(filter.opacity * opacity);
+}
+
+fn filter_underline(underline: &mut Underline, filter: PrimitiveFilter, opacity: f32) {
+    underline.bounds = filter.bounds(underline.bounds);
+    underline.thickness = (underline.thickness.0 * filter.scale).into();
+    underline.color = underline.color.opacity(filter.opacity * opacity);
+}
+
+fn filter_monochrome_sprite(sprite: &mut MonochromeSprite, filter: PrimitiveFilter, opacity: f32) {
+    sprite.bounds = filter.bounds(sprite.bounds);
+    sprite.color = sprite.color.opacity(filter.opacity * opacity);
+    if sprite.mask != SpriteMask::NONE {
+        let light = filter.point(point(sprite.mask.light_from.into(), 0.0.into()));
+        let dark = filter.point(point(sprite.mask.dark_from.into(), 0.0.into()));
+        sprite.mask.light_from = light.x.0;
+        sprite.mask.dark_from = dark.x.0;
+    }
+}
+
+fn filter_polychrome_sprite(sprite: &mut PolychromeSprite, filter: PrimitiveFilter, opacity: f32) {
+    sprite.bounds = filter.bounds(sprite.bounds);
+    sprite.corner_radii = filter.corners(sprite.corner_radii);
+    sprite.opacity *= filter.opacity * opacity;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
 #[cfg_attr(
     all(
@@ -189,6 +497,7 @@ pub(crate) enum PrimitiveKind {
     Surface,
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
@@ -900,5 +1209,122 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::{point, px, size};
+
+    fn scaled(value: f32) -> ScaledPixels {
+        value.into()
+    }
+
+    fn test_quad(x: f32, y: f32, width: f32, height: f32) -> Quad {
+        Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: point(scaled(x), scaled(y)),
+                size: size(scaled(width), scaled(height)),
+            },
+            content_mask: ContentMask {
+                bounds: Bounds {
+                    origin: point(scaled(-1000.0), scaled(-1000.0)),
+                    size: size(scaled(2000.0), scaled(2000.0)),
+                },
+            },
+            background: crate::solid_background(crate::white()),
+            border_color: crate::white(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    fn filter(scale: f32, opacity: f32, blur: f32) -> PaintFilter {
+        PaintFilter {
+            opacity,
+            scale,
+            origin: point(px(110.0), px(20.0)),
+            blur_radius: px(blur),
+        }
+    }
+
+    #[test]
+    fn scale_keeps_the_anchor_fixed() {
+        let mut scene = Scene::default();
+        let checkpoint = scene.checkpoint();
+        scene.insert_primitive(test_quad(10.0, 20.0, 100.0, 50.0));
+        scene.apply_filter(checkpoint, filter(0.5, 1.0, 0.0), 1.0);
+
+        let bounds = scene.quads[0].bounds;
+        assert_eq!(bounds.origin.x.0, 60.0);
+        assert_eq!(bounds.origin.y.0, 20.0);
+        assert_eq!(bounds.size.width.0, 50.0);
+        assert_eq!(bounds.size.height.0, 25.0);
+        assert_eq!(bounds.origin.x.0 + bounds.size.width.0, 110.0);
+    }
+
+    #[test]
+    fn opacity_multiplies_primitive_alpha() {
+        let mut scene = Scene::default();
+        let checkpoint = scene.checkpoint();
+        scene.insert_primitive(test_quad(0.0, 0.0, 10.0, 10.0));
+        scene.apply_filter(checkpoint, filter(1.0, 0.5, 0.0), 1.0);
+
+        assert!((scene.quads[0].background.solid.a - 0.5).abs() < 1e-6);
+        assert!((scene.quads[0].border_color.a - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zero_blur_does_not_add_samples() {
+        let mut scene = Scene::default();
+        let checkpoint = scene.checkpoint();
+        scene.insert_primitive(test_quad(0.0, 0.0, 10.0, 10.0));
+        scene.apply_filter(checkpoint, filter(1.0, 0.8, 0.0), 1.0);
+
+        assert_eq!(scene.paint_operations.len(), 1);
+        assert_eq!(scene.quads.len(), 1);
+    }
+
+    #[test]
+    fn blur_adds_eight_low_alpha_samples() {
+        let mut scene = Scene::default();
+        let checkpoint = scene.checkpoint();
+        scene.insert_primitive(test_quad(0.0, 0.0, 10.0, 10.0));
+        scene.apply_filter(checkpoint, filter(1.0, 0.5, 2.0), 1.0);
+
+        assert_eq!(scene.paint_operations.len(), 9);
+        assert_eq!(scene.quads.len(), 9);
+        for sample in &scene.quads[1..] {
+            assert!((sample.background.solid.a - 0.02).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn blur_replays_layers_in_balanced_pairs() {
+        let mut scene = Scene::default();
+        let checkpoint = scene.checkpoint();
+        scene.push_layer(Bounds {
+            origin: point(scaled(0.0), scaled(0.0)),
+            size: size(scaled(10.0), scaled(10.0)),
+        });
+        scene.insert_primitive(test_quad(0.0, 0.0, 10.0, 10.0));
+        scene.pop_layer();
+        scene.apply_filter(checkpoint, filter(1.0, 0.5, 2.0), 1.0);
+
+        let starts = scene
+            .paint_operations
+            .iter()
+            .filter(|operation| matches!(operation, PaintOperation::StartLayer(_)))
+            .count();
+        let ends = scene
+            .paint_operations
+            .iter()
+            .filter(|operation| matches!(operation, PaintOperation::EndLayer))
+            .count();
+        assert_eq!(starts, 9);
+        assert_eq!(starts, ends);
     }
 }

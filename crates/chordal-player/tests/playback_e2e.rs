@@ -206,16 +206,25 @@ fn beat_level_tracks_configured_band() {
     let dir = std::env::temp_dir().join(format!("chordial-player-beat-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("beat.wav");
-    // 6 kHz 落在默认鼓点频段（4–10 kHz）中央。
+    // 6 kHz 落在本次配置的鼓点频段（4–10 kHz）中央。
     write_wav_tones(&path, 2.0, 48_000, 6_000.0, 6_000.0);
 
     let player = Player::with_sink_factory(
         Box::new(|rate, _| Ok(Box::new(chordal_player::RealtimeNullSink::new(rate)) as Box<_>)),
         "realtime-null",
     );
-    player.set_beat_band(4_000.0, 10_000.0);
+    let mut ranges = chordal_player::AudioBandRanges::default();
+    ranges.set(
+        chordal_player::AudioBandKind::Kick,
+        chordal_player::FrequencyRange {
+            low_hz: 4_000.0,
+            high_hz: 10_000.0,
+        },
+    );
+    player.set_audio_band_ranges(ranges);
     assert_eq!(player.beat_band(), (4_000.0, 10_000.0));
     assert_eq!(player.beat_level(), 0.0);
+    assert_eq!(player.audio_bands(), chordal_player::AudioBands::default());
 
     player.play(StreamHandle::File(path.clone()), "beat", 0);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -227,7 +236,7 @@ fn beat_level_tracks_configured_band() {
     let mut peak = 0.0f32;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        peak = peak.max(player.beat_level());
+        peak = peak.max(player.audio_bands().kick);
         if peak > 0.5 {
             break;
         }
@@ -241,6 +250,7 @@ fn beat_level_tracks_configured_band() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(player.beat_level(), 0.0);
+    assert_eq!(player.audio_bands(), chordal_player::AudioBands::default());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

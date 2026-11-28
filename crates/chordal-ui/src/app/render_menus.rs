@@ -62,12 +62,11 @@ impl ChordialApp {
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>()
             .join(" / ");
-        let (list, index) = (menu.list.clone(), menu.index);
+        let (list, index) = (menu.list, menu.index);
         let menu_is_current = menu.is_current;
         let mut rows: Vec<AnyElement> = Vec::new();
         {
             let weak = weak.clone();
-            let list = list.clone();
             let playing = self.player_status.state == PlayerState::Playing;
             let (icon, label) = if menu.is_current && playing {
                 (crate::icons::Icon::Pause, "暂停")
@@ -84,7 +83,7 @@ impl ChordialApp {
                         if app.current_track.is_some() && menu_is_current {
                             app.toggle_playback(cx);
                         } else {
-                            app.play_from_list(&list, index, cx);
+                            app.play_from_list(list, index, cx);
                         }
                     });
                 }),
@@ -172,7 +171,6 @@ impl ChordialApp {
         }
         {
             let weak = weak.clone();
-            let list = list.clone();
             rows.push(item(
                 crate::icons::Icon::Check,
                 "多选",
@@ -180,14 +178,13 @@ impl ChordialApp {
                 Box::new(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
                         app.track_menu = None;
-                        app.enter_selection(list.clone(), index, cx);
+                        app.enter_selection(list, index, cx);
                     });
                 }),
             ));
         }
         if menu.in_queue {
             let weak = weak.clone();
-            let sort_weak = weak.clone();
             let id = menu.track.id.clone();
             rows.push(item(
                 crate::icons::Icon::Close,
@@ -201,37 +198,6 @@ impl ChordialApp {
                     });
                 }),
             ));
-            // 队列排序放在 ⋮ 菜单里，保持截图中的页头按钮不变。
-            for (icon, label, key) in [
-                (
-                    crate::icons::Icon::Note,
-                    "按标题排序",
-                    queue_ops::QueueSortKey::Title,
-                ),
-                (
-                    crate::icons::Icon::Person,
-                    "按艺人排序",
-                    queue_ops::QueueSortKey::Artist,
-                ),
-                (
-                    crate::icons::Icon::Clock,
-                    "按时长排序",
-                    queue_ops::QueueSortKey::Duration,
-                ),
-            ] {
-                let weak = sort_weak.clone();
-                rows.push(item(
-                    icon,
-                    label,
-                    false,
-                    Box::new(move |_, _, cx| {
-                        let _ = weak.update(cx, |app, cx| {
-                            app.track_menu = None;
-                            app.queue_sort(key, cx);
-                        });
-                    }),
-                ));
-            }
         }
 
         div()
@@ -347,14 +313,12 @@ impl ChordialApp {
 
         let (panel_w, panel): (f32, AnyElement) = match menu {
             DockMenu::Queue => {
-                let start = self.queue_pos.map(|pos| pos + 1).unwrap_or(0);
+                // 随机模式下“接下来播放”必须展示真实随机顺序，而不是
+                // 队列里的物理下一项。
                 let upcoming: Vec<(usize, Track)> = self
-                    .queue
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(3)
-                    .map(|(index, track)| (index, track.clone()))
+                    .upcoming_queue_indices(3)
+                    .into_iter()
+                    .filter_map(|index| self.queue.get(index).cloned().map(|track| (index, track)))
                     .collect();
                 let mut rows = div().flex().flex_col().gap(px(1.0));
                 if upcoming.is_empty() {
@@ -366,37 +330,93 @@ impl ChordialApp {
                             .text_color(theme.text_faint)
                             .child(if self.queue.is_empty() {
                                 "播放队列为空"
+                            } else if self.play_mode == PlayMode::Shuffle {
+                                "随机播放中"
                             } else {
                                 "已经是队列最后一首"
                             }),
                     );
                 }
-                // Dock 预览与完整队列共用同一行渲染器，只是密度更紧凑。
-                let covers = self.track_covers.clone();
-                let queue_snapshot = self.queue.clone();
                 for (index, track) in upcoming {
-                    let row_text = TrackRowText::new(index, &track);
+                    let cover_image = track_cover_key(&track).and_then(|key| {
+                        self.track_covers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .images
+                            .get(&key)
+                            .cloned()
+                    });
+                    let title = SharedString::from(track.title.clone());
+                    let artist = SharedString::from(
+                        track
+                            .artists
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" / "),
+                    );
+                    let duration = SharedString::from(fmt_ms(track.duration_ms.unwrap_or(0)));
+                    let weak_row = weak.clone();
                     rows = rows.child(
                         div()
                             .id(gpui::ElementId::named_usize("dock-queue-row", index))
-                            .child(ChordialApp::render_track_row(
+                            .h(px(38.0))
+                            .px(px(8.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(9.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.hover))
+                            .child(crate::widgets::cover_thumb(
                                 &theme,
-                                index,
-                                &row_text,
-                                &covers,
-                                QueueList::Queue,
-                                self.queue_pos,
-                                self.queue_pos.and_then(|p| queue_snapshot.get(p)).map(|t| &t.id),
-                                weak.clone(),
-                                queue_snapshot.clone(),
-                                false,
-                                false,
-                                false,
-                                None,
-                                None,
-                                &TrackRowStyle::compact(),
-                                None,
-                            )),
+                                cover_image,
+                                30.0,
+                                1.0,
+                                crate::icons::icon(
+                                    crate::icons::Icon::Note,
+                                    12.0,
+                                    theme.text_faint,
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .text_ellipsis()
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(theme.text_faint)
+                                            .text_ellipsis()
+                                            .child(artist),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(30.0))
+                                    .flex_none()
+                                    .text_size(px(9.0))
+                                    .text_color(theme.text_faint)
+                                    .text_align(gpui::TextAlign::Right)
+                                    .child(duration),
+                            )
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_row.update(cx, |app, cx| {
+                                    app.dock_menu = None;
+                                    app.play_from_list(QueueList::Queue, index, cx);
+                                });
+                            }),
                     );
                 }
 
@@ -788,7 +808,7 @@ impl ChordialApp {
             crate::widgets::icon_button(
                 &theme,
                 crate::icons::icon(crate::icons::Icon::Menu, 16.0, fg),
-                30.0,
+                40.0,
                 "菜单",
                 move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
@@ -806,7 +826,7 @@ impl ChordialApp {
             crate::widgets::icon_button(
                 &theme,
                 crate::icons::icon(crate::icons::Icon::ChevronLeft, 16.0, fg),
-                30.0,
+                40.0,
                 "返回播放",
                 move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
@@ -905,119 +925,15 @@ impl ChordialApp {
         bar.into_any_element()
     }
 
-    /// 手机播放页底部：全屏 / 曲库 / 队列 / 歌词。
-    /// 抽屉仍由标题栏菜单与曲目信息「…」进入。
+    /// 手机播放页底部与沉浸层共用同一组全屏 / 视图选择器。
     pub(super) fn phone_bottom_row(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
-        let white = gpui::white();
-        let weak = cx.entity().downgrade();
-        let btn =
-            |icon: crate::icons::Icon,
-             id: &'static str,
-             active: bool,
-             on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>| {
-                div()
-                    .id(id)
-                    .size(px(40.0))
-                    .rounded(px(20.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .opacity(if active { 1.0 } else { 0.45 })
-                    .hover(|s| s.opacity(1.0).bg(white.opacity(0.133)))
-                    .child(crate::icons::icon(icon, 18.0, white))
-                    .on_click(on_click)
-                    .into_any_element()
-            };
-
-        let fullscreen = btn(
-            crate::icons::Icon::Expand,
-            "phone-fullscreen",
-            false,
-            Box::new(|_, window, _| window.toggle_fullscreen()),
-        );
-        let library = {
-            let weak = weak.clone();
-            let active = self.phone_page == PhonePage::Browse
-                && self.view_tab == ViewTab::Library
-                && self.library_filter == LibraryFilter::All;
-            btn(
-                crate::icons::Icon::Note,
-                "phone-library",
-                active,
-                Box::new(move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        app.view_tab = ViewTab::Library;
-                        app.library_filter = LibraryFilter::All;
-                        app.close_phone_sheet(cx);
-                        cx.notify();
-                    });
-                }),
-            )
-        };
-        let queue = {
-            let weak = weak.clone();
-            let active = self.phone_page == PhonePage::Browse
-                && self.view_tab == ViewTab::Library
-                && self.library_filter == LibraryFilter::Queue;
-            btn(
-                crate::icons::Icon::Queue,
-                "phone-queue",
-                active,
-                Box::new(move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        app.view_tab = ViewTab::Library;
-                        app.library_filter = LibraryFilter::Queue;
-                        app.close_phone_sheet(cx);
-                        cx.notify();
-                    });
-                }),
-            )
-        };
-        let lyrics = {
-            let weak = weak.clone();
-            btn(
-                crate::icons::Icon::Lyrics,
-                "phone-lyrics",
-                false,
-                Box::new(move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        app.phone_page = PhonePage::Lyrics;
-                        app.phone_sheet = None;
-                        app.phone_sheet_spring = None;
-                        app.phone_sheet_anchor = None;
-                        app.phone_edge_swipe = None;
-                        cx.notify();
-                    });
-                }),
-            )
-        };
-
-        div()
-            .w(px(width))
-            .h(px(40.0))
-            .flex()
-            .items_center()
-            .justify_between()
-            .occlude()
-            .child(fullscreen)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    // 最小窗口时 cover 列只有 ~184px，4 个 40px 按钮需要
-                    // 收紧间距，否则会顶出封面列。
-                    .gap(px(if width < 240.0 { 8.0 } else { 14.0 }))
-                    .child(library)
-                    .child(queue)
-                    .child(lyrics),
-            )
-            .into_any_element()
+        self.immersive_bottom_row(width, cx)
     }
 
     /// 手机壳底部导航高度。曲库页常驻一条，mini player 悬浮在它上方。
-    pub(super) const PHONE_NAV_H: f32 = 54.0;
+    pub(super) const PHONE_NAV_H: f32 = crate::layout_morph::PHONE_NAV_H;
 
-    /// 手机壳底部导航：曲库 / 队列 / 搜索 / 设置。
+    /// 手机壳底部导航：曲库 / 队列 / 搜索 / 音源。
     ///
     /// 一级导航必须常驻可见，不能只藏在标题栏的汉堡菜单里；抽屉保留给
     /// 睡眠定时、均衡器、音频信息等次级操作，以及播放页/歌词页的跳转。
@@ -1027,14 +943,25 @@ impl ChordialApp {
 
         let browsing = self.phone_page == PhonePage::Browse;
         let library_active = browsing
-            && (self.view_tab == ViewTab::Collection
+            && (matches!(self.page, Some(MainPage::Playlist(_)))
+                || self.view_tab == ViewTab::Collection
                 || (self.view_tab == ViewTab::Library
                     && self.library_filter == LibraryFilter::All));
         let queue_active = browsing
+            && self.page.is_none()
             && self.view_tab == ViewTab::Library
             && self.library_filter == LibraryFilter::Queue;
-        let search_active = browsing && self.view_tab == ViewTab::Search;
-        let settings_active = self.settings_open;
+        let search_active = browsing && self.page.is_none() && self.view_tab == ViewTab::Search;
+        let sources_active = browsing
+            && matches!(
+                self.page,
+                Some(
+                    MainPage::Source(_)
+                        | MainPage::ManageSources
+                        | MainPage::NewSource
+                        | MainPage::EditSource(_)
+                )
+            );
 
         let tab =
             |icon: crate::icons::Icon,
@@ -1079,6 +1006,7 @@ impl ChordialApp {
                 Box::new(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
                         app.phone_page = PhonePage::Browse;
+                        app.page = None;
                         app.view_tab = ViewTab::Library;
                         app.library_filter = LibraryFilter::All;
                         app.source_route = None;
@@ -1097,6 +1025,7 @@ impl ChordialApp {
                 Box::new(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| {
                         app.phone_page = PhonePage::Browse;
+                        app.page = None;
                         app.view_tab = ViewTab::Library;
                         app.library_filter = LibraryFilter::Queue;
                         cx.notify();
@@ -1114,6 +1043,7 @@ impl ChordialApp {
                 Box::new(move |_, window, cx| {
                     let _ = weak.update(cx, |app, cx| {
                         app.phone_page = PhonePage::Browse;
+                        app.page = None;
                         app.view_tab = ViewTab::Search;
                         app.source_route = None;
                         // 搜索框在切页后的下一帧才挂载，聚焦必须延后一拍。
@@ -1126,15 +1056,18 @@ impl ChordialApp {
                 }),
             )
         };
-        let settings = {
+        let sources = {
             let weak = weak.clone();
             tab(
-                crate::icons::Icon::Settings,
-                "设置",
-                "phone-nav-settings",
-                settings_active,
+                crate::icons::Icon::Layers,
+                "音源",
+                "phone-nav-sources",
+                sources_active,
                 Box::new(move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| app.open_settings(cx));
+                    let _ = weak.update(cx, |app, cx| {
+                        app.phone_page = PhonePage::Browse;
+                        app.open_source_manager(cx);
+                    });
                 }),
             )
         };
@@ -1152,7 +1085,7 @@ impl ChordialApp {
             .child(library)
             .child(queue)
             .child(search)
-            .child(settings)
+            .child(sources)
             .into_any_element()
     }
 

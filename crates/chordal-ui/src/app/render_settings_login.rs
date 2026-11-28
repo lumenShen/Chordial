@@ -7,7 +7,20 @@ use super::*;
 impl ChordialApp {
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let _ = cx;
-        self.settings_view.clone().into_any_element()
+        // 设置页是独立视图：未通知（无点击/输入/滚轮/内存采样刷新）时，
+        // 复用上一帧的布局与绘制记录。否则即使主界面只是在跑动画，GPUI
+        // 仍会每帧重排整棵设置静态树（300Hz 实测 prepaint ~1.6ms）。
+        // 鼠标悬停/点击会通过 window.refresh 或实体 notify 自动绕过缓存。
+        if std::env::var_os("CHORDIAL_NO_VIEW_CACHE").is_some() {
+            return self.settings_view.clone().into_any_element();
+        }
+        let style = gpui::StyleRefinement::default()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full();
+        let view: gpui::AnyView = self.settings_view.clone().into();
+        view.cached(style).into_any_element()
     }
 
     /// 旧版设置面板：已由 `settings.rs` 的独立实体取代，保留一版用于对照，
@@ -115,33 +128,6 @@ impl ChordialApp {
                 })
         };
 
-        let band_btn = |label: &'static str, low: f32, high: f32| {
-            let weak = weak.clone();
-            let active = self.beat_band == (low, high);
-            div()
-                .id(SharedString::from(format!("beat-preset-{label}")))
-                .h(px(26.0))
-                .px(px(9.0))
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(if active { theme.text } else { theme.border })
-                .bg(if active {
-                    theme.active
-                } else {
-                    gpui::transparent_black()
-                })
-                .flex()
-                .items_center()
-                .text_size(px(10.5))
-                .text_color(if active { theme.text } else { theme.text_dim })
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
-                .child(label)
-                .on_click(move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| app.set_beat_band_preset(low, high, cx));
-                })
-        };
-
         let clear_btn = {
             let weak = weak.clone();
             div()
@@ -174,6 +160,57 @@ impl ChordialApp {
                 },
             )
         };
+
+        let band_rows: Vec<AnyElement> = AudioBandKind::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let range = self.audio_band_ranges.get(kind);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(hint(format!(
+                        "{} · 当前 {:.0}–{:.0} Hz",
+                        kind.label(),
+                        range.low_hz,
+                        range.high_hz
+                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(hint("频率".into()))
+                            .child(
+                                div()
+                                    .w(px(110.0))
+                                    .child(self.settings_audio_low_views[index].clone()),
+                            )
+                            .child(hint("–".into()))
+                            .child(
+                                div()
+                                    .w(px(110.0))
+                                    .child(self.settings_audio_high_views[index].clone()),
+                            )
+                            .child(hint("Hz".into())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(hint("控制点".into()))
+                            .child(
+                                div()
+                                    .w(px(260.0))
+                                    .child(self.settings_audio_control_views[index].clone()),
+                            )
+                            .child(hint("1–25，仅内部点".into())),
+                    )
+                    .into_any_element()
+            })
+            .collect();
 
         let card = div()
             .id("settings-card")
@@ -261,48 +298,16 @@ impl ChordialApp {
                         "音质优先：仅当本地更高时才播本地；在线优先：除已下载外始终在线".into(),
                     )),
             )
-            .child(section("背景鼓点监听"))
+            .child(section("背景音频反应"))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.0))
-                    .child(hint(format!(
-                        "当前 {:.0} Hz – {:.0} Hz · 沉浸歌词背景的网格随该频段能量跳动；回车应用",
-                        self.beat_band.0, self.beat_band.1
-                    )))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(hint("下限".into()))
-                            .child(
-                                div()
-                                    .w(px(110.0))
-                                    .child(self.settings_beat_low_view.clone()),
-                            )
-                            .child(hint("Hz".into()))
-                            .child(div().w(px(12.0)))
-                            .child(hint("上限".into()))
-                            .child(
-                                div()
-                                    .w(px(110.0))
-                                    .child(self.settings_beat_high_view.clone()),
-                            )
-                            .child(hint("Hz".into())),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(band_btn("低音 80–2k", 80.0, 2_000.0))
-                            .child(band_btn("鼓点 4–10k", 4_000.0, 10_000.0))
-                            .child(band_btn("高频 8–16k", 8_000.0, 16_000.0))
-                            .child(div().flex_1())
-                            .child(hint("默认 4000–10000 Hz（鼓点/镲片）".into())),
-                    ),
+                    .gap(px(8.0))
+                    .child(hint(
+                        "五路频率可分别编辑；控制点每行 5 个：1–5 / 6–10 / 11–15 / 16–20 / 21–25，仅内部点可分配。".into(),
+                    ))
+                    .children(band_rows),
             )
             .child(section("均衡器"))
             .child({
@@ -386,6 +391,12 @@ impl ChordialApp {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let tab = self.login_tab;
+        let source_name = self
+            .login_source_id()
+            .and_then(|id| self.source_config_by_id(&id.0))
+            .map(|source| source.name.clone())
+            .unwrap_or_else(|| "音源".into());
+        let phone = self.is_phone();
         let status = self.login_status.clone().unwrap_or_else(|| match tab {
             LoginTab::Qr => "等待扫码".into(),
             LoginTab::Phone => "输入手机号并获取验证码".into(),
@@ -395,7 +406,7 @@ impl ChordialApp {
             crate::widgets::icon_button(
                 &theme,
                 crate::icons::icon(crate::icons::Icon::Close, 12.0, theme.text_dim),
-                26.0,
+                if phone { 44.0 } else { 26.0 },
                 "关闭登录",
                 move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| app.close_login(cx));
@@ -407,7 +418,7 @@ impl ChordialApp {
             let active = tab == target;
             div()
                 .id(SharedString::from(format!("login-tab-{label}")))
-                .h(px(26.0))
+                .h(px(if phone { 44.0 } else { 26.0 }))
                 .px(px(10.0))
                 .rounded(px(6.0))
                 .bg(if active {
@@ -449,16 +460,17 @@ impl ChordialApp {
                 let qr = crate::widgets::cover_thumb(
                     &theme,
                     self.login_qr.clone(),
-                    216.0,
+                    if phone { 180.0 } else { 216.0 },
                     10.0,
                     placeholder,
                 );
                 let refresh_btn = {
                     let weak = weak.clone();
-                    crate::widgets::text_button(
+                    crate::widgets::text_button_with_height(
                         &theme,
                         "刷新二维码",
                         false,
+                        if phone { 40.0 } else { 30.0 },
                         move |_, _, cx| {
                             let _ = weak.update(cx, |app, cx| app.refresh_login(cx));
                         },
@@ -482,7 +494,7 @@ impl ChordialApp {
                             .text_size(px(10.0))
                             .text_color(theme.text_faint)
                             .text_center()
-                            .child("使用网易云音乐 App 扫码登录；Cookie 只保存在本机配置中"),
+                            .child("按音源提示完成扫码登录；登录状态只保存在本机"),
                     )
                     .child(refresh_btn)
                     .into_any_element()
@@ -498,15 +510,27 @@ impl ChordialApp {
                     } else {
                         "发送验证码"
                     };
-                    crate::widgets::text_button(&theme, label, false, move |_, _, cx| {
-                        let _ = weak.update(cx, |app, cx| app.send_login_captcha(cx));
-                    })
+                    crate::widgets::text_button_with_height(
+                        &theme,
+                        label,
+                        false,
+                        if phone { 40.0 } else { 30.0 },
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| app.send_login_captcha(cx));
+                        },
+                    )
                 };
                 let login_btn = {
                     let weak = weak.clone();
-                    crate::widgets::text_button(&theme, "登录", true, move |_, _, cx| {
-                        let _ = weak.update(cx, |app, cx| app.submit_phone_login(cx));
-                    })
+                    crate::widgets::text_button_with_height(
+                        &theme,
+                        "登录",
+                        true,
+                        if phone { 40.0 } else { 30.0 },
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |app, cx| app.submit_phone_login(cx));
+                        },
+                    )
                 };
                 div()
                     .w_full()
@@ -534,7 +558,7 @@ impl ChordialApp {
                         div()
                             .text_size(px(10.0))
                             .text_color(theme.text_faint)
-                            .child("验证码 5 分钟内有效；Cookie 只保存在本机配置中"),
+                            .child("验证码 5 分钟内有效；登录状态只保存在本机"),
                     )
                     .into_any_element()
             }
@@ -575,7 +599,7 @@ impl ChordialApp {
                             .text_size(px(17.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text)
-                            .child("登录网易云"),
+                            .child(format!("登录{}", source_name)),
                     )
                     .child(close_btn),
             )

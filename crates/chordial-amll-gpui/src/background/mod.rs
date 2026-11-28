@@ -11,10 +11,10 @@
 //!   配置类型对应的运行时包装（选择具体渲染器并转发调用）。
 //!
 //! 性能设计：
-//! - 请求分辨率 = viewport × render_scale，硬上限 200k 像素；此外再按实测
-//!   光栅耗时反推「本帧预算像素数」，避免 ÷1 在大窗口/debug 构建下把光栅
-//!   时间顶到几十毫秒、阻塞 UI 线程（分辨率自适应，除数只是上限请求）。
-//! - 三角形网格在专辑/宽高比变化时才重建；每帧只做光栅化 + 合成。
+//! - 光栅分辨率严格等于 viewport × render_scale；`render_scale = 1 / 除数`，
+//!   不再按实测耗时偷偷缩小分辨率，保证设置档位与实际画面一致。
+//! - 三角形拓扑在专辑/宽高比变化时才重建；音频活跃时只复用拓扑更新顶点，
+//!   每帧仍只做一次光栅化 + 合成。
 //! - 低于目标 FPS 的帧直接复用上一张 `RenderImage`（零分配、零光栅化）。
 //! - 所有热路径埋 `amll.bg.raster` 检查点。
 
@@ -22,14 +22,17 @@ use std::sync::Arc;
 
 use chordal_core::mem::{self, Gauge};
 use chordal_core::perf::PerfScope;
+use chordal_core::{AudioBandKind, AudioBands, AudioControlMapping};
 use gpui::{Hsla, RenderImage};
 use image::{Frame, RgbaImage};
 
 mod palette;
 mod raster;
+mod worker;
 
 pub use palette::*;
 use raster::*;
+pub(crate) use worker::{BackgroundController, FrameOutput};
 
 /// 可选的歌词背景渲染器（对应 AMLL `lyricBackgroundRendererAtom` 的配置）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,26 +116,19 @@ impl ControlPointPreset {
 }
 
 const TEXTURE_SIZE: usize = 32;
-const MAX_OUTPUT_PIXELS: usize = 200_000;
 /// 交给 GPU 放大前的展示分辨率预算。除数较大时先把光栅结果用 Cubic 重建
 /// 到接近该预算，GPU 那一步双线性拉伸的斜率突变就落在更细的网格上，
 /// 渐变更连续；CPU 开销仍远低于按除数直接提高光栅分辨率。
 const MAX_PRESENT_PIXELS: usize = 130_000;
 /// 预放大的上限倍率，避免展示缓冲过度膨胀。
 const MAX_UPSCALE: f32 = 4.0;
-/// 单帧允许花在「软件光栅 + 展示放大」上的时间。背景通常按 24/30fps 更新，
-/// 但这两步都发生在 UI 线程上；控制在 10ms 以内，才能在 300Hz 屏幕上仍
-/// 留出绘制余量，避免 ÷1 把帧率拖到 24fps。
-const RASTER_FRAME_BUDGET_US: u64 = 10_000;
-/// 自适应分辨率的下限，保证网格仍有足够像素表达颜色过渡，不会退化成色块。
-const MIN_ADAPTIVE_PIXELS: usize = 6_000;
 const SUBDIVISIONS: usize = 12;
 /// 封面交叉淡入淡出的时长（毫秒）。使用真实墙钟时间推进，与视图帧率解耦：
 /// 高刷屏上视图可能每秒调用 200+ 次 `render`，但光栅只有 30fps。
 const CROSSFADE_MS: f32 = 420.0;
-/// 鼓点包络的跟随时间常数：起音快、回落慢，脉冲轮廓清晰。
-const BEAT_ATTACK_SECS: f32 = 0.035;
-const BEAT_RELEASE_SECS: f32 = 0.18;
+/// 五路视觉包络的跟随时间常数（秒）：顺序为 rumble / kick / vocals / instruments / air。
+const BAND_ATTACK_SECS: [f32; 5] = [0.08, 0.012, 0.035, 0.025, 0.008];
+const BAND_RELEASE_SECS: [f32; 5] = [0.24, 0.12, 0.18, 0.2, 0.1];
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Vertex {
@@ -144,6 +140,8 @@ struct Vertex {
 
 #[derive(Debug, Clone)]
 struct MeshLayer {
+    /// 不被音频修改的随机网格，作为每帧反应式形变的起点。
+    base_preset: ControlPointPreset,
     preset: ControlPointPreset,
     texture: Vec<u8>, // RGBA, 32x32
     vertices: Vec<Vertex>,
@@ -152,11 +150,15 @@ struct MeshLayer {
     alpha: f32,
     /// 是否已经从画面中淡出。
     fading_out: bool,
+    /// 当前顶点是否包含音频形变；归零后需要恢复一次 base 网格。
+    audio_deformed: bool,
 }
 
 impl MeshLayer {
-    fn rebuild_vertices(&mut self, aspect: f32) {
-        if (self.vertex_aspect - aspect).abs() < 0.001 && !self.vertices.is_empty() {
+    fn rebuild_vertices(&mut self, aspect: f32, force: bool) {
+        let topology_dirty =
+            (self.vertex_aspect - aspect).abs() >= 0.001 || self.vertices.is_empty();
+        if !force && !topology_dirty {
             return;
         }
         self.vertex_aspect = aspect;
@@ -207,16 +209,18 @@ impl MeshLayer {
             }
         }
 
-        self.indices.clear();
-        self.indices.reserve((x_count - 1) * (y_count - 1) * 6);
-        for gy in 0..y_count.saturating_sub(1) {
-            for gx in 0..x_count.saturating_sub(1) {
-                let i00 = (gx + gy * x_count) as u32;
-                let i10 = (gx + 1 + gy * x_count) as u32;
-                let i01 = (gx + (gy + 1) * x_count) as u32;
-                let i11 = (gx + 1 + (gy + 1) * x_count) as u32;
-                self.indices
-                    .extend_from_slice(&[i00, i10, i11, i00, i11, i01]);
+        if topology_dirty || self.indices.is_empty() {
+            self.indices.clear();
+            self.indices.reserve((x_count - 1) * (y_count - 1) * 6);
+            for gy in 0..y_count.saturating_sub(1) {
+                for gx in 0..x_count.saturating_sub(1) {
+                    let i00 = (gx + gy * x_count) as u32;
+                    let i10 = (gx + 1 + gy * x_count) as u32;
+                    let i01 = (gx + (gy + 1) * x_count) as u32;
+                    let i11 = (gx + 1 + (gy + 1) * x_count) as u32;
+                    self.indices
+                        .extend_from_slice(&[i00, i10, i11, i00, i11, i01]);
+                }
             }
         }
     }
@@ -347,8 +351,10 @@ impl Rng {
 }
 
 fn generate_preset(rng: &mut Rng) -> ControlPointPreset {
-    let w = 4 + (rng.next() % 2) as usize;
-    let h = 4 + (rng.next() % 2) as usize;
+    // 5×5 提供九个内部锚点，足够让五路频段分别控制不同区域；边界仍保持
+    // 规则网格，避免音频形变把封面推出视口。
+    let w = 5;
+    let h = 5;
     let mut preset = ControlPointPreset::grid(w, h);
     for y in 1..h.saturating_sub(1) {
         for x in 1..w.saturating_sub(1) {
@@ -403,6 +409,72 @@ fn generate_preset(rng: &mut Rng) -> ControlPointPreset {
     preset
 }
 
+const CONTROL_EPSILON: f32 = 0.0005;
+
+/// 从 base 控制点重新计算反应式网格。函数不累加历史形变，因此长时间播放
+/// 也不会漂移；边界点始终保持不变，保证网格继续覆盖整个视口。
+fn apply_audio_controls(
+    layer: &mut MeshLayer,
+    bands: AudioBands,
+    mapping: AudioControlMapping,
+    time: f32,
+) {
+    let MeshLayer {
+        base_preset,
+        preset,
+        ..
+    } = layer;
+    preset.points.copy_from_slice(&base_preset.points);
+    if !bands.is_active(CONTROL_EPSILON) {
+        return;
+    }
+
+    let rumble_phase = time * 2.4;
+    let vocal_phase = time * 0.55;
+    let instrument_phase = time * 0.8;
+    let air_phase = time * 9.0;
+    for y in 1..preset.height.saturating_sub(1) {
+        for x in 1..preset.width.saturating_sub(1) {
+            let index = y * preset.width + x;
+            let base = base_preset.points[index];
+            let rumble = mapping.get(AudioBandKind::Rumble).contains(index) as u8 as f32;
+            let kick = mapping.get(AudioBandKind::Kick).contains(index) as u8 as f32;
+            let vocals = mapping.get(AudioBandKind::Vocals).contains(index) as u8 as f32;
+            let instruments = mapping.get(AudioBandKind::Instruments).contains(index) as u8 as f32;
+            let air = mapping.get(AudioBandKind::Air).contains(index) as u8 as f32;
+
+            let expansion = 1.0
+                + rumble * bands.rumble * 0.018
+                + kick * bands.kick * 0.14
+                + vocals * bands.vocals * 0.07;
+            let p = &mut preset.points[index];
+            p.x = base.x * expansion
+                + rumble * bands.rumble * (rumble_phase + base.y * 2.2).sin() * 0.018
+                + vocals * bands.vocals * vocal_phase.sin() * 0.025
+                + instruments * bands.instruments * (0.5 - base.y) * 0.035
+                + air * bands.air * (air_phase + base.x * 5.0 + base.y * 3.0).sin() * 0.006;
+            p.y = base.y * expansion
+                + rumble * bands.rumble * (rumble_phase * 0.73).cos() * 0.012
+                + vocals * bands.vocals * 0.035
+                + instruments * bands.instruments * instrument_phase.sin() * 0.018
+                + air * bands.air * (air_phase + base.x * 3.0 - base.y * 4.0).cos() * 0.005;
+            p.u_scale *= 1.0 + kick * bands.kick * 0.22 + vocals * bands.vocals * 0.12
+                - air * bands.air * 0.05;
+            p.v_scale *= 1.0 + kick * bands.kick * 0.16 + instruments * bands.instruments * 0.1;
+            p.u_rot += vocals * bands.vocals * 6.0 + instruments * bands.instruments * 5.0;
+            p.v_rot += air * bands.air * (air_phase + base.x * 4.0 + base.y * 2.0).sin() * 4.0
+                + instruments * bands.instruments * 3.0;
+        }
+    }
+}
+
+fn restore_base_controls(layer: &mut MeshLayer) {
+    layer
+        .preset
+        .points
+        .copy_from_slice(&layer.base_preset.points);
+}
+
 /// 生成 32×32 专辑调色纹理（BGRA 字节），供渲染层/视图缓存。
 ///
 /// 相比保留整幅封面 RGBA（512² ≈ 1 MiB），调色纹理只有 4 KiB；切换背景
@@ -434,23 +506,21 @@ pub struct MeshGradientRenderer {
     fps: u32,
     fps_accum_ms: f32,
     frame_time: f32,
-    /// 外部鼓点包络目标（0..1）。
-    beat_target: f32,
-    /// 经过起音/回落平滑后的鼓点强度（0..1），供光栅化使用。
-    beat_volume: f32,
-    /// 鼓点视觉效果的整体倍率（0..=1.5，1.0 = 原始幅度）。
+    /// 外部五频段包络目标。
+    band_targets: AudioBands,
+    /// 经过独立起音/回落平滑后的五频段强度。
+    band_values: AudioBands,
+    /// 与 flow_speed 解耦的反应式相位，flow_speed=0 时音频仍可驱动网格。
+    reactive_time: f32,
+    /// 五路频段分别控制哪些内部点。
+    control_mapping: AudioControlMapping,
+    /// 全部音频反应视觉的整体倍率（0..=1.5，1.0 = 原始幅度）。
     beat_strength: f32,
     paused: bool,
     static_mode: bool,
     last_image: Option<Arc<RenderImage>>,
     empty_image: Option<Arc<RenderImage>>,
     needs_clear: bool,
-    /// 每光栅像素的实测总耗时（光栅 + 放大，微秒）。按帧平滑，作为自适应
-    /// 分辨率的依据：它与请求尺寸无关，能同时适配构建 profile、CPU 与图层数。
-    raster_us_per_pixel: f64,
-    /// 由实测耗时反推出的当前像素预算。变化幅度小的时候保持不变，避免
-    /// 每帧微调 w/h 触发 needs_clear、反而绕过 FPS 门控变成全速光栅。
-    pixel_budget: usize,
     disposed: bool,
 }
 
@@ -486,16 +556,16 @@ impl MeshGradientRenderer {
             fps: 30,
             fps_accum_ms: 0.0,
             frame_time: 0.0,
-            beat_target: 0.0,
-            beat_volume: 0.0,
+            band_targets: AudioBands::default(),
+            band_values: AudioBands::default(),
+            reactive_time: 0.0,
+            control_mapping: AudioControlMapping::default(),
             beat_strength: 1.0,
             paused: false,
             static_mode: false,
             last_image: None,
             empty_image: None,
             needs_clear: false,
-            raster_us_per_pixel: 0.0,
-            pixel_budget: MAX_OUTPUT_PIXELS,
             disposed: false,
         }
     }
@@ -529,21 +599,30 @@ impl MeshGradientRenderer {
     }
 
     pub fn set_low_freq_volume(&mut self, volume: f32) {
-        self.beat_target = volume.clamp(0.0, 1.0) / 10.0;
+        self.band_targets.rumble = volume.clamp(0.0, 1.0) / 10.0;
     }
 
-    /// 0..1 的鼓点包络，驱动网格的呼吸、缩放、旋转与提亮。
-    ///
-    /// 映射到内部 0..1：起音阶段由 [`Self::render`] 用约 35ms 时间常数快速
-    /// 跟随，回落约 180ms，因此 30fps 光栅也能看清每一次击打。视觉幅度
-    /// 进一步乘以 [`Self::set_beat_strength`]，默认倍率由界面设置决定。
+    /// 一次设置五路频段目标；渲染层会在现有光栅帧预算内独立平滑。
+    pub fn set_audio_bands(&mut self, bands: AudioBands) {
+        self.band_targets = bands.sanitized();
+    }
+
+    /// 更新五路频段到内部控制点的分配；边界点始终由渲染器保留。
+    pub fn set_audio_control_mapping(&mut self, mapping: AudioControlMapping) {
+        let mapping = mapping.sanitized();
+        if mapping != self.control_mapping {
+            self.control_mapping = mapping;
+            self.needs_clear = true;
+        }
+    }
+
+    /// 0..1 的鼓点包络，兼容旧 API；只驱动 `kick` 通道。
     pub fn set_beat_level(&mut self, level: f32) {
-        self.beat_target = level.clamp(0.0, 1.0);
+        self.band_targets.kick = level.clamp(0.0, 1.0);
     }
 
-    /// 鼓点视觉效果的整体倍率：0 = 完全关闭（网格仍会缓慢流动），
-    /// 1.0 = 原始幅度，上限 1.5。只缩放呼吸/旋转/缩放/提亮，不改变包络
-    /// 的时序，因此调低后鼓点仍然跟手，只是幅度更克制。
+    /// 全部音频反应视觉的整体倍率：0 = 完全关闭（网格仍会缓慢流动），
+    /// 1.0 = 原始幅度，上限 1.5。只缩放五路视觉控制，不改变包络时序。
     pub fn set_beat_strength(&mut self, strength: f32) {
         self.beat_strength = strength.clamp(0.0, 1.5);
     }
@@ -569,7 +648,8 @@ impl MeshGradientRenderer {
 
     /// 直接使用已烘焙的 32×32 BGRA 调色纹理（避免重复缩放/滤镜）。
     pub fn set_album_palette(&mut self, texture: Vec<u8>) {
-        let preset = generate_preset(&mut self.rng);
+        let base_preset = generate_preset(&mut self.rng);
+        let preset = base_preset.clone();
         let aspect = if self.viewport_h > 0 {
             self.viewport_w as f32 / self.viewport_h as f32
         } else if self.out_h > 0 {
@@ -580,6 +660,7 @@ impl MeshGradientRenderer {
         // 暂停时没有下一帧来推进淡入，直接让新封面可见。
         let instant = self.paused;
         let mut layer = MeshLayer {
+            base_preset,
             preset,
             texture,
             vertices: Vec::new(),
@@ -587,8 +668,9 @@ impl MeshGradientRenderer {
             vertex_aspect: 0.0,
             alpha: if instant { 1.0 } else { 0.0 },
             fading_out: false,
+            audio_deformed: false,
         };
-        layer.rebuild_vertices(aspect);
+        layer.rebuild_vertices(aspect, false);
         if instant {
             self.layers.clear();
         } else {
@@ -638,27 +720,22 @@ impl MeshGradientRenderer {
     }
 
     fn ensure_output(&mut self) {
-        let mut w = ((self.viewport_w as f32) * self.render_scale).ceil() as usize;
-        let mut h = ((self.viewport_h as f32) * self.render_scale).ceil() as usize;
-        w = w.max(2);
-        h = h.max(2);
-        // 请求分辨率（viewport × render_scale）先按实测预算收缩，再套硬上限。
-        // 只缩小不放大，保证用户设置的除数始终是「最多请求多少像素」。
-        let cap = self.pixel_budget.min(MAX_OUTPUT_PIXELS);
-        let pixels = w.saturating_mul(h);
-        if pixels > cap {
-            let scale = (cap as f32 / pixels as f32).sqrt();
-            w = ((w as f32 * scale).floor() as usize).max(2);
-            h = ((h as f32 * scale).floor() as usize).max(2);
-        }
-        self.raster_w = w;
-        self.raster_h = h;
+        // 设置除数就是唯一的光栅尺寸依据。先取整到像素，再保留渲染所需的
+        // 最小 2×2；不能套像素预算或按耗时继续缩小，否则 ÷1/÷2 会悄悄
+        // 变成更大的有效除数，用户看到的清晰度与设置不一致。
+        let w = ((self.viewport_w as f32) * self.render_scale).ceil() as usize;
+        let h = ((self.viewport_h as f32) * self.render_scale).ceil() as usize;
+        self.raster_w = w.max(2);
+        self.raster_h = h.max(2);
 
         // 光栅像素太少时，先做一次 Cubic 重建再交给 GPU 拉伸。
         // 展示预算与光栅预算相互独立：大除数下一张 ~480×270 的重建图
         // 足以消除双线性接缝，而真正的网格光栅仍只花 1/N² 的成本。
         let raster_pixels = w.saturating_mul(h) as f32;
-        let factor = (MAX_PRESENT_PIXELS as f32 / raster_pixels).sqrt().min(MAX_UPSCALE).max(1.0);
+        let factor = (MAX_PRESENT_PIXELS as f32 / raster_pixels)
+            .sqrt()
+            .min(MAX_UPSCALE)
+            .max(1.0);
         let mut pw = ((w as f32 * factor).round() as usize).max(w);
         let mut ph = ((h as f32 * factor).round() as usize).max(h);
         // 四舍五入可能略微越过预算，等比缩回一档即可；最多两次迭代。
@@ -670,7 +747,9 @@ impl MeshGradientRenderer {
             pw = ((pw as f32 * k).floor() as usize).max(w);
             ph = ((ph as f32 * k).floor() as usize).max(h);
         }
-        let upscale = pw as f32 / w as f32;
+        // 两个轴独立四舍五入，宽度倍率可能正好是 1.0 而高度多出 1 像素。
+        // 取两轴较大值，保证倍率准确反映展示缓冲是否真的与光栅同尺寸。
+        let upscale = (pw as f32 / w as f32).max(ph as f32 / h as f32);
         // 只有尺寸或放大倍率变化才需要重清缓冲；帧缓冲被 take 走（零拷贝交帧）后
         // 下一帧只需补容量，不能借此触发 needs_clear，否则会绕过 FPS 门控
         // 变成每帧全量光栅。
@@ -692,7 +771,11 @@ impl MeshGradientRenderer {
         }
         if self.output.len() != present_len {
             // 优先复用刚从旧 RenderImage 回收的整帧缓冲（零分配 + 零清零）。
-            if self.recycled.last().is_some_and(|buf| buf.len() == present_len) {
+            if self
+                .recycled
+                .last()
+                .is_some_and(|buf| buf.len() == present_len)
+            {
                 self.output = self.recycled.pop().expect("checked");
             } else {
                 self.output.resize(present_len, 0);
@@ -726,16 +809,6 @@ impl MeshGradientRenderer {
         self.recycled.len()
     }
 
-    #[doc(hidden)]
-    pub fn debug_pixel_budget(&self) -> usize {
-        self.pixel_budget
-    }
-
-    #[doc(hidden)]
-    pub fn debug_us_per_pixel(&self) -> f64 {
-        self.raster_us_per_pixel
-    }
-
     /// 推进与“真实时间”相关的状态。
     ///
     /// 必须在 FPS 门控**之前**调用：视图在 200Hz+ 屏幕上可能每 3ms 调用一次
@@ -750,6 +823,7 @@ impl MeshGradientRenderer {
         if !(dt_ms > 0.0) {
             return;
         }
+        self.reactive_time = (self.reactive_time + dt_ms * 0.001).rem_euclid(10_000.0);
         let fade = dt_ms / CROSSFADE_MS;
         for layer in &mut self.layers {
             if layer.fading_out {
@@ -776,48 +850,41 @@ impl MeshGradientRenderer {
             self.layers.drain(0..self.layers.len() - 1);
         }
 
-        let target = self.beat_target;
-        let tau = if target > self.beat_volume {
-            BEAT_ATTACK_SECS
-        } else {
-            BEAT_RELEASE_SECS
+        let targets = [
+            self.band_targets.rumble,
+            self.band_targets.kick,
+            self.band_targets.vocals,
+            self.band_targets.instruments,
+            self.band_targets.air,
+        ];
+        let mut values = [
+            self.band_values.rumble,
+            self.band_values.kick,
+            self.band_values.vocals,
+            self.band_values.instruments,
+            self.band_values.air,
+        ];
+        let dt = dt_ms * 0.001;
+        for index in 0..5 {
+            let tau = if targets[index] > values[index] {
+                BAND_ATTACK_SECS[index]
+            } else {
+                BAND_RELEASE_SECS[index]
+            };
+            let k = 1.0 - (-dt / tau).exp();
+            values[index] += (targets[index] - values[index]) * k;
+            if !values[index].is_finite() {
+                values[index] = 0.0;
+            }
+            values[index] = values[index].clamp(0.0, 1.0);
+        }
+        self.band_values = AudioBands {
+            rumble: values[0],
+            kick: values[1],
+            vocals: values[2],
+            instruments: values[3],
+            air: values[4],
         };
-        let k = 1.0 - (-(dt_ms / 1000.0) / tau).exp();
-        self.beat_volume += (target - self.beat_volume) * k;
-        if !self.beat_volume.is_finite() {
-            self.beat_volume = 0.0;
-        }
-        self.beat_volume = self.beat_volume.clamp(0.0, 1.0);
-    }
-
-    /// 用一帧真实的光栅 + 展示放大耗时修正像素预算。
-    ///
-    /// `elapsed_us` 包含网格光栅与 Cubic 重建（两者都在 UI 线程上），
-    /// `raster_pixels` 是本帧的光栅像素数。用「每光栅像素总耗时」做比例控制：
-    /// 图层数、展示放大倍率等因素都体现在实测值里，不需要另行估算。
-    fn adapt_pixel_budget(&mut self, elapsed_us: f64, raster_pixels: u64) {
-        if raster_pixels == 0 || !(elapsed_us > 0.0) || !elapsed_us.is_finite() {
-            return;
-        }
-        let sample = elapsed_us / raster_pixels as f64;
-        // 首帧直接采用；之后指数平滑，避免单次调度抖动造成大幅缩放。
-        self.raster_us_per_pixel = if self.raster_us_per_pixel > 0.0 {
-            self.raster_us_per_pixel * 0.75 + sample * 0.25
-        } else {
-            sample
-        };
-        let per_pixel = self.raster_us_per_pixel;
-        if !(per_pixel > 0.0) || !per_pixel.is_finite() {
-            return;
-        }
-        let affordable = (RASTER_FRAME_BUDGET_US as f64 / per_pixel) as usize;
-        let affordable = affordable.clamp(MIN_ADAPTIVE_PIXELS, MAX_OUTPUT_PIXELS);
-        // 变化不足 12% 时保持原值：输出尺寸每变一次都会清空缓冲并绕过
-        // FPS 门控，若逐帧微调反而会把省下的时间全赔进去。
-        let old = self.pixel_budget;
-        if affordable.abs_diff(old) as f64 > old as f64 * 0.12 {
-            self.pixel_budget = affordable;
-        }
     }
 
     /// 渲染一帧。返回 `None` 表示本帧无需更新（调用方保留上一张图）。
@@ -867,15 +934,33 @@ impl MeshGradientRenderer {
         }
 
         let aspect = self.raster_w as f32 / self.raster_h as f32;
-        // 包络只决定“什么时候跳”，强度决定“跳多大幅度”。
-        let volume = self.beat_volume * self.beat_strength;
+        // 包络只决定“什么时候跳”，强度决定“跳多大幅度”。五路共用同一个
+        // 全局倍率，设置为 0 时几何与光栅效果同时归零。
+        let strength = self.beat_strength;
+        let controls = AudioBands {
+            rumble: self.band_values.rumble * strength,
+            kick: self.band_values.kick * strength,
+            vocals: self.band_values.vocals * strength,
+            instruments: self.band_values.instruments * strength,
+            air: self.band_values.air * strength,
+        };
+        let reactive_time = self.reactive_time;
         let scope = PerfScope::enter("amll.bg.raster");
-        let raster_start = std::time::Instant::now();
         self.raster.fill(0);
         let mut used = 0u64;
 
         for layer in &mut self.layers {
-            layer.rebuild_vertices(aspect);
+            if controls.is_active(CONTROL_EPSILON) {
+                apply_audio_controls(layer, controls, self.control_mapping, reactive_time);
+                layer.audio_deformed = true;
+                layer.rebuild_vertices(aspect, true);
+            } else if layer.audio_deformed {
+                restore_base_controls(layer);
+                layer.audio_deformed = false;
+                layer.rebuild_vertices(aspect, true);
+            } else {
+                layer.rebuild_vertices(aspect, false);
+            }
             self.scratch.fill(0);
             rasterize_layer(
                 layer,
@@ -883,17 +968,18 @@ impl MeshGradientRenderer {
                 self.raster_w,
                 self.raster_h,
                 self.frame_time,
-                volume,
+                controls,
             );
-            blend_over(&mut self.raster, &self.scratch);
+            blend_over(&mut self.raster, &mut self.scratch);
             used += (self.raster_w * self.raster_h) as u64;
         }
         scope.finish(used);
 
         // 低分辨率光栅 → Cubic 重建 → GPU 双线性到全屏。
-        // 只有除数较大（光栅像素远少于展示预算）时才走重建，否则一次 memcpy 即可。
+        // 只有展示缓冲与光栅缓冲尺寸完全一致时才走 memcpy；不能用倍率阈值判断，
+        // 因为宽高分别取整后可能只差 1 像素而倍率仍接近 1.0。
         let upscale_scope = PerfScope::enter("amll.bg.upscale");
-        if self.upscale > 1.001 {
+        if self.out_w != self.raster_w || self.out_h != self.raster_h {
             upscale_catmull_rom(
                 &self.raster,
                 &mut self.output,
@@ -907,10 +993,6 @@ impl MeshGradientRenderer {
             self.output.copy_from_slice(&self.raster);
         }
         upscale_scope.finish((self.out_w * self.out_h) as u64);
-        // 预算按「光栅 + 放大」总耗时计算；只统计光栅会让 debug 构建下
-        // Cubic 重建的十几毫秒漏算，除数调小依然会卡。
-        let elapsed_us = raster_start.elapsed().as_secs_f64() * 1_000_000.0;
-        self.adapt_pixel_budget(elapsed_us, (self.raster_w * self.raster_h) as u64);
         self.needs_clear = false;
         self.fps_accum_ms = 0.0;
 
@@ -1065,6 +1147,18 @@ impl LyricBackgroundRenderer {
             r.set_beat_level(level);
         }
     }
+    /// 一次设置五路频段包络，见 [`MeshGradientRenderer::set_audio_bands`]。
+    pub fn set_audio_bands(&mut self, bands: AudioBands) {
+        if let Self::Mesh(r) = self {
+            r.set_audio_bands(bands);
+        }
+    }
+    /// 五路频段到控制点的映射，见 [`MeshGradientRenderer::set_audio_control_mapping`]。
+    pub fn set_audio_control_mapping(&mut self, mapping: AudioControlMapping) {
+        if let Self::Mesh(r) = self {
+            r.set_audio_control_mapping(mapping);
+        }
+    }
     /// 鼓点视觉效果倍率，见 [`MeshGradientRenderer::set_beat_strength`]。
     pub fn set_beat_strength(&mut self, strength: f32) {
         if let Self::Mesh(r) = self {
@@ -1095,6 +1189,12 @@ impl LyricBackgroundRenderer {
             Self::Css(_) | Self::None => None,
         }
     }
+    pub fn dispose(&mut self) {
+        if let Self::Mesh(renderer) = self {
+            renderer.dispose();
+        }
+    }
+
     pub fn is_animating(&self) -> bool {
         match self {
             Self::Mesh(r) => r.is_animating(),

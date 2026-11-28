@@ -57,6 +57,8 @@ impl ChordialApp {
             // Esc 在手机壳里兼作「关抽屉 / 返回播放」，与系统返回键同义。
             if app.quality_dialog_open {
                 app.quality_dialog_open = false;
+            } else if app.stage_view_menu_open {
+                app.stage_view_menu_open = false;
             } else if app.settings_open {
                 app.close_settings(cx);
             } else if app.drawer_open {
@@ -74,7 +76,7 @@ impl ChordialApp {
             } else if app.is_phone() && app.phone_page == PhonePage::Player {
                 app.close_phone_sheet(cx);
             } else if app.is_phone()
-                && matches!(app.phone_page, PhonePage::Browse | PhonePage::Lyrics)
+                && app.phone_page == PhonePage::Browse
                 && app.current_track.is_some()
             {
                 app.open_phone_sheet(cx);
@@ -109,6 +111,7 @@ impl ChordialApp {
             cx.notify();
         }))
         .on_action(cx.listener(|app, _: &Quit, _, cx| {
+            app.flush_persistence();
             app.cache.flush();
             // 先停掉托管 sidecar（不清理缓存、不注销账号），再退出。
             let registry = app.registry.clone();
@@ -165,34 +168,56 @@ impl ChordialApp {
             .min_h_0()
             .overflow_hidden()
             .when(self.sidebar_open, |d| {
-                d.child(gpui::batch_layer(
-                    self.render_sidebar(window.mouse_position(), cx),
-                ))
+                let start = Instant::now();
+                let sidebar = self.render_sidebar(window.mouse_position(), cx);
+                crate::frame_trace::add("main.sidebar", start.elapsed());
+                d.child(gpui::batch_layer(sidebar))
             })
             .when(!covered_by_eq, |d| {
+                let start = Instant::now();
                 if self.page.is_some() {
                     // 音源页 / 管理音源 / 本地歌单：整块主内容区。
-                    d.child(gpui::batch_layer(self.render_main_page(cx)))
+                    let page = self.render_main_page(cx);
+                    crate::frame_trace::add("main.page", start.elapsed());
+                    d.child(gpui::batch_layer(page))
                 } else {
-                    d.child(gpui::batch_layer(self.render_list_panel(list_width, cx)))
-                        .when(show_now, |d| {
-                            d.child(gpui::batch_layer(self.render_now_playing(cx)))
-                        })
+                    let list = self.render_list_panel(list_width, cx);
+                    crate::frame_trace::add("main.list", start.elapsed());
+                    d.child(gpui::batch_layer(list)).when(show_now, |d| {
+                        let start = Instant::now();
+                        let now_playing = self.render_now_playing(cx);
+                        crate::frame_trace::add("main.now_playing", start.elapsed());
+                        d.child(gpui::batch_layer(now_playing))
+                    })
                 }
             });
 
+        let titlebar_start = Instant::now();
+        let titlebar = self.render_titlebar(cx);
+        crate::frame_trace::add("main.titlebar", titlebar_start.elapsed());
+        let dock_start = Instant::now();
+        let dock = self.render_dock(cx);
+        crate::frame_trace::add("main.dock", dock_start.elapsed());
         let view = self
             .main_root(background, cx)
-            .child(self.render_titlebar(window, cx))
+            .child(titlebar)
             .child(middle)
-            .child(gpui::batch_layer(self.render_dock(cx)))
+            .child(gpui::batch_layer(dock))
             .when(self.dock_menu.is_some(), |d| {
                 d.child(self.render_dock_menu(cx))
             })
-            .when(self.settings_open, |d| d.child(self.render_settings(cx)))
+            .when(self.settings_open, |d| {
+                let start = Instant::now();
+                let settings = self.render_settings(cx);
+                crate::frame_trace::add("main.settings", start.elapsed());
+                d.child(settings)
+            })
             .when(self.login_open, |d| d.child(self.render_login(cx)))
             .when(self.eq_open, |d| {
-                d.child(gpui::batch_layer(self.render_eq(window, cx)))
+                let start = Instant::now();
+                let eq = self.render_eq(window, cx);
+                crate::frame_trace::add("main.eq", start.elapsed());
+                d.child(gpui::batch_layer(eq))
             })
             .when(self.track_menu.is_some(), |d| {
                 d.child(self.render_track_menu(cx))
@@ -223,7 +248,9 @@ impl ChordialApp {
             })
             .children(Self::resize_handles());
         scope.finish(1);
-        view.into_any_element()
+        self.stage_measurements
+            .observe(StageMode::Dock, view, &[(2, MeasurePart::Card)])
+            .into_any_element()
     }
 
     // ================= 手机壳（单列） =================
@@ -245,30 +272,32 @@ impl ChordialApp {
         self.sync_phone_backdrop(cx);
         let width = self.viewport_width;
         let height = self.viewport_height;
+        let theme = Theme::get(cx).clone();
         let progress = self.phone_sheet_progress(now);
 
         // 播放页是覆盖在曲库页上的卡片：拖动时曲库页留下做背景，
         // 松手后完全展开/收起。歌词页仍是独立整页（共用同一个
         // lyric_view，不能和播放页背景同时挂载）。
         let mut content = div().size_full().relative().overflow_hidden();
-        match self.phone_page {
-            PhonePage::Lyrics if self.current_track.is_some() => {
-                content = content.child(self.render_phone_lyrics(cx));
-            }
-            PhonePage::Player if self.current_track.is_some() => {
-                if progress < 0.999 {
-                    content = content.child(self.render_phone_browse(cx)).child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .occlude()
-                            .bg(gpui::black().opacity(0.42 * progress)),
-                    );
+        if self.page.is_some() {
+            content = content.child(self.render_phone_full_page(cx));
+        } else {
+            match self.phone_page {
+                PhonePage::Player if self.current_track.is_some() => {
+                    if progress < 0.999 {
+                        content = content.child(self.render_phone_browse(cx)).child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .occlude()
+                                .bg(gpui::black().opacity(0.42 * progress)),
+                        );
+                    }
+                    content = content.child(self.render_phone_player(progress, window, cx));
                 }
-                content = content.child(self.render_phone_player(progress, window, cx));
-            }
-            _ => {
-                content = content.child(self.render_phone_browse(cx));
+                _ => {
+                    content = content.child(self.render_phone_browse(cx));
+                }
             }
         }
 
@@ -330,13 +359,80 @@ impl ChordialApp {
             );
         }
 
+        let phone_message = self
+            .status_message
+            .clone()
+            .or_else(|| self.info_message.clone());
+        if let Some(message) = phone_message {
+            let weak_dismiss = cx.entity().downgrade();
+            content = content.child(
+                div()
+                    .absolute()
+                    .top(px(48.0))
+                    .left(px(12.0))
+                    .right(px(12.0))
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .bg(theme.surface_alt)
+                    .shadow(vec![BoxShadow {
+                        color: theme.shadow,
+                        offset: point(px(0.0), px(4.0)),
+                        blur_radius: px(14.0),
+                        spread_radius: px(0.0),
+                    }])
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(crate::icons::icon(
+                        crate::icons::Icon::Alert,
+                        14.0,
+                        theme.text_dim,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(11.5))
+                            .text_color(theme.text)
+                            .child(message),
+                    )
+                    .child(
+                        div()
+                            .id("dismiss-phone-message")
+                            .size(px(32.0))
+                            .flex_none()
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.hover))
+                            .child(crate::icons::icon(
+                                crate::icons::Icon::Close,
+                                12.0,
+                                theme.text_dim,
+                            ))
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_dismiss.update(cx, |app, cx| {
+                                    app.status_message = None;
+                                    app.info_message = None;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            );
+        }
+
         if let Some((text, started)) = self.portrait_toast.clone()
             && started.elapsed() < Duration::from_millis(1800)
         {
             content = content.child(
                 div()
                     .absolute()
-                    .bottom(px(86.0))
+                    .bottom(px(126.0))
                     .left(px(((width - 300.0) / 2.0).max(12.0)))
                     .w(px(300.0_f32.min(width - 24.0)))
                     .flex()
@@ -344,17 +440,30 @@ impl ChordialApp {
                     .child(
                         div()
                             .rounded(px(16.0))
-                            .bg(gpui::rgba(0x000000AA))
+                            .bg(theme.surface_alt)
+                            .border_1()
+                            .border_color(theme.border_strong)
                             .px(px(14.0))
                             .py(px(7.0))
                             .text_size(px(11.5))
-                            .text_color(gpui::white().opacity(0.92))
+                            .text_color(theme.text)
                             .child(SharedString::from(text)),
                     ),
             );
         }
 
-        let view = self
+        if self.page.is_none()
+            && self.phone_page == PhonePage::Player
+            && self.current_track.is_some()
+        {
+            let sheet_index = if progress < 0.999 { 2 } else { 0 };
+            content = self.stage_measurements.observe(
+                StageMode::PhonePlayer,
+                content,
+                &[(sheet_index, MeasurePart::Card)],
+            );
+        }
+        let mut view = self
             .main_root(background, cx)
             .child(div().flex_1().min_h_0().overflow_hidden().child(content))
             .when(!background && self.drawer_visible(), |d| {
@@ -373,6 +482,28 @@ impl ChordialApp {
                 d.child(self.render_track_menu(cx))
             })
             .children(Self::resize_handles());
+        if !background && self.stage_view_menu_open {
+            let bottom_rect =
+                stage_bottom_rect(width, height, false, stable_lyric_pad(width, height));
+            let menu_right = (width - bottom_rect.x - bottom_rect.w).max(0.0);
+            let menu_bottom = (height - bottom_rect.y + 8.0).max(0.0);
+            view = view
+                .child(
+                    div()
+                        .id("phone-stage-view-scrim")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|app, _, _, cx| {
+                                app.stage_view_menu_open = false;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(self.render_stage_view_menu(menu_right, menu_bottom, cx));
+        }
         scope.finish(1);
         view.into_any_element()
     }
@@ -396,13 +527,48 @@ impl ChordialApp {
 
         let cover = compact_cover_size(sheet_width, height);
         let left = ((sheet_width - cover) * 0.5).max(0.0);
-        let available = (height
-            - COMPACT_TOP
-            - crate::layout_morph::COMPACT_BOTTOM
-            - crate::layout_morph::COMPACT_DOCK_H
-            - 8.0)
-            .max(0.0);
-        let controls_h = (available - cover - COMPACT_COVER_GAP).max(0.0);
+        let visual = crate::stage_chrome::StageChromeVisual::from_progress(1.0);
+        let label_font = (height * 0.012).max(12.8);
+        let btn = stage_button_size(cover);
+        let bottom_rect = StageRect {
+            x: left,
+            y: height - crate::layout_morph::COMPACT_BOTTOM - 44.0,
+            w: cover,
+            h: 44.0,
+        };
+        let controls_top = COMPACT_TOP + cover + COMPACT_COVER_GAP;
+        let controls_h = (bottom_rect.y - controls_top).max(0.0);
+        let volume_h = if stage_volume_visible(height) {
+            STAGE_VOLUME_H
+        } else {
+            0.0
+        };
+        let gap_count = if volume_h > 0.0 { 4 } else { 3 };
+        let controls_layout = render_stage::stage_controls_layout(
+            controls_top,
+            controls_h,
+            amll_info_height(self.viewport_width, height),
+            gap_count,
+            left,
+            cover,
+            btn,
+            volume_h,
+            bottom_rect,
+        );
+        let bottom_row = div()
+            .w(px(bottom_rect.w))
+            .h(px(bottom_rect.h))
+            .child(self.phone_bottom_row(cover, cx))
+            .into_any_element();
+        let controls_group = self.stage_controls_group(
+            controls_layout,
+            height,
+            label_font,
+            btn,
+            visual,
+            bottom_row,
+            cx,
+        );
 
         // 不在手机播放/歌词态时，绝不能再把同一个 lyric_view 塞进第二
         // 棵树里。用静态渐变兜底，等沉浸层交还后再切回 Mesh。
@@ -433,238 +599,146 @@ impl ChordialApp {
             .unwrap_or(0.0);
         let suppress_click = self.phone_swipe_click_suppressed();
 
-        let sheet = div()
-            .absolute()
-            .top(px(top))
-            .left(px(inset))
-            .right(px(inset))
-            .bottom(px(0.0))
-            .rounded_t(px(radius))
-            .overflow_hidden()
-            .shadow(vec![BoxShadow {
-                color: gpui::black().opacity(0.35 * (1.0 - p)),
-                blur_radius: px(28.0),
-                spread_radius: px(0.0),
-                offset: point(px(0.0), px(-8.0)),
-            }])
-            .child(backdrop)
-            .child(self.render_phone_titlebar(true, false, cx))
-            // 标题栏不再整条注册窗口拖动，改由把手两侧的窄带承担；
-            // 这样把手、收起按钮和菜单都能收到真实点击。
-            .child(Self::window_drag_area(
-                div()
-                    .id("phone-sheet-window-drag-right")
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px((sheet_width + 140.0) * 0.5 + 6.0))
-                    .right(px(44.0))
-                    .h(px(36.0))
-                    .cursor(CursorStyle::OpenHand),
-            ))
-            .children(((sheet_width - 140.0) * 0.5 > 116.0).then(|| {
-                Self::window_drag_area(
-                    div()
-                        .id("phone-sheet-window-drag-left")
-                        .absolute()
-                        .top(px(0.0))
-                        .left(px(104.0))
-                        .w(px((sheet_width - 140.0) * 0.5 - 108.0))
-                        .h(px(36.0))
-                        .cursor(CursorStyle::OpenHand),
-                )
-            }))
-            // 收起播放页：把手之外再给一个明确的按钮，触屏/鼠标都能用。
-            .child(
-                div()
-                    .id("phone-sheet-collapse")
-                    .absolute()
-                    .left(px(72.0))
-                    .top(px(4.0))
-                    .size(px(30.0))
-                    .rounded(px(15.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .opacity(0.75)
-                    .hover(|s| s.bg(gpui::white().opacity(0.12)).opacity(1.0))
-                    .child(crate::icons::icon(
-                        crate::icons::Icon::ChevronDown,
-                        16.0,
-                        gpui::white(),
-                    ))
-                    .on_click(cx.listener(|app, _, _, cx| app.close_phone_sheet(cx))),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(left + swipe_offset))
-                    .top(px(COMPACT_TOP))
-                    .w(px(cover))
-                    .child(self.amll_player_column(
-                        cover, height, controls_h, true, 1.0, false, false, window, cx,
-                    )),
-            )
-            // 封面是手机播放页最自然的「打开歌词」入口；横向拖动则切换
-            // 封面 ⇄ 歌词（与参考视频的横滑一致）。
-            .child(
-                div()
-                    .id("phone-cover-lyrics")
-                    .absolute()
-                    .left(px(left + swipe_offset))
-                    .top(px(COMPACT_TOP))
-                    .w(px(cover))
-                    .h(px(cover))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|app, event: &MouseDownEvent, _, cx| {
-                            app.begin_phone_edge_swipe(
-                                f32::from(event.position.x),
-                                f32::from(event.position.y),
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_mouse_up(
-                        gpui::MouseButton::Left,
-                        cx.listener(|app, _: &MouseUpEvent, _, cx| {
-                            if app.phone_edge_swipe.is_some() {
-                                app.release_phone_edge_swipe(cx);
-                            }
-                        }),
-                    )
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        if suppress_click || app.phone_swipe_click_suppressed() {
-                            return;
-                        }
-                        app.phone_page = PhonePage::Lyrics;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .bottom(px(crate::layout_morph::COMPACT_BOTTOM))
-                    .w(px(cover))
-                    .child(self.phone_bottom_row(cover, cx)),
-            )
-            // 顶部把手：只接管一条 140×36 的命中区，避免和红绿灯、
-            // Windows 原生窗口拖动区打架。
-            .child(
-                div()
-                    .id("phone-sheet-handle")
-                    .absolute()
-                    .top(px(2.0))
-                    .left(px((sheet_width - 140.0) * 0.5))
-                    .w(px(140.0))
-                    .h(px(36.0))
-                    .flex()
-                    .justify_center()
-                    .cursor(CursorStyle::OpenHand)
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|app, event: &MouseDownEvent, _, cx| {
-                            app.begin_phone_sheet_drag(f32::from(event.position.y), cx);
-                        }),
-                    )
-                    .on_mouse_up(
-                        gpui::MouseButton::Left,
-                        cx.listener(|app, _: &MouseUpEvent, _, cx| {
-                            if app.phone_sheet.is_some() {
-                                app.release_phone_sheet_drag(cx);
-                            }
-                        }),
-                    ),
-            );
-
-        sheet.into_any_element()
-    }
-
-    /// 手机歌词页：同一个 Mesh 背景 + 可滚动/可点击 seek 的歌词。
-    /// 标题栏叠加在顶部，返回键回到播放页。
-    pub(super) fn render_phone_lyrics(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::get(cx).clone();
-        let width = self.viewport_width;
-        let height = self.viewport_height;
-        let sweep = self.lyric_sweep_fade_em;
-        self.lyric_view.update(cx, |view, _| {
-            view.set_text_style(phone_lyric_style(&theme, width, height, sweep));
-        });
-        let has_lyrics = self.lyric_view.read(cx).has_lyrics();
-        let empty = (!has_lyrics).then(|| {
-            let message = self
-                .lyrics_status
-                .clone()
-                .unwrap_or_else(|| "暂无歌词".into());
+        let sheet =
             div()
                 .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .px(px(40.0))
+                .top(px(top))
+                .left(px(inset))
+                .right(px(inset))
+                .bottom(px(0.0))
+                .rounded_t(px(radius))
+                .overflow_hidden()
+                .shadow(vec![BoxShadow {
+                    color: gpui::black().opacity(0.35 * (1.0 - p)),
+                    blur_radius: px(28.0),
+                    spread_radius: px(0.0),
+                    offset: point(px(0.0), px(-8.0)),
+                }])
+                .child(backdrop)
+                .child(self.render_phone_titlebar(true, false, cx))
+                // 标题栏不再整条注册窗口拖动，改由把手两侧的窄带承担；
+                // 这样把手、收起按钮和菜单都能收到真实点击。
+                .child(Self::window_drag_area(
+                    div()
+                        .id("phone-sheet-window-drag-right")
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px((sheet_width + 140.0) * 0.5 + 6.0))
+                        .right(px(44.0))
+                        .h(px(36.0))
+                        .cursor(CursorStyle::OpenHand),
+                ))
+                .children(((sheet_width - 140.0) * 0.5 > 116.0).then(|| {
+                    Self::window_drag_area(
+                        div()
+                            .id("phone-sheet-window-drag-left")
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(104.0))
+                            .w(px((sheet_width - 140.0) * 0.5 - 108.0))
+                            .h(px(36.0))
+                            .cursor(CursorStyle::OpenHand),
+                    )
+                }))
+                // 收起播放页：把手之外再给一个明确的按钮，触屏/鼠标都能用。
                 .child(
                     div()
-                        .text_size(px(13.0))
-                        .line_height(px(20.0))
-                        .text_center()
-                        .text_color(gpui::white().opacity(0.60))
-                        .child(SharedString::from(message)),
+                        .id("phone-sheet-collapse")
+                        .absolute()
+                        .left(px(66.0))
+                        .top(px(0.0))
+                        .size(px(44.0))
+                        .rounded(px(22.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .opacity(0.75)
+                        .hover(|s| s.bg(gpui::white().opacity(0.12)).opacity(1.0))
+                        .child(crate::icons::icon(
+                            crate::icons::Icon::ChevronDown,
+                            16.0,
+                            gpui::white(),
+                        ))
+                        .on_click(cx.listener(|app, _, _, cx| app.close_phone_sheet(cx))),
                 )
-        });
-
-        div()
-            .size_full()
-            .relative()
-            .overflow_hidden()
-            .bg(gpui::black())
-            .child(div().absolute().inset_0().child(self.lyric_view.clone()))
-            .child(self.render_phone_titlebar(true, true, cx))
-            // 覆盖态标题栏不注册整条拖动区；在返回键与菜单之间留一条
-            // 可拖动窗口的空白带。
-            .child(Self::window_drag_area(
-                div()
-                    .id("phone-lyrics-window-drag")
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(104.0))
-                    .right(px(44.0))
-                    .h(px(40.0))
-                    .cursor(CursorStyle::OpenHand),
-            ))
-            // 左缘右滑返回播放页；整窗口捕获层在 render_phone_main。
-            .child(
-                div()
-                    .id("phone-lyrics-back-edge")
-                    .absolute()
-                    .left_0()
-                    .top(px(40.0))
-                    .bottom(px(0.0))
-                    .w(px(22.0))
-                    .cursor(CursorStyle::OpenHand)
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|app, event: &MouseDownEvent, _, cx| {
-                            app.begin_phone_edge_swipe(
-                                f32::from(event.position.x),
-                                f32::from(event.position.y),
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_mouse_up(
-                        gpui::MouseButton::Left,
-                        cx.listener(|app, _: &MouseUpEvent, _, cx| {
-                            if app.phone_edge_swipe.is_some() {
-                                app.release_phone_edge_swipe(cx);
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(left + swipe_offset))
+                        .top(px(COMPACT_TOP))
+                        .w(px(cover))
+                        .child(self.amll_player_column(
+                            cover, height, true, visual, false, false, window, cx,
+                        )),
+                )
+                .child(controls_group)
+                // 封面是手机播放页最自然的「打开歌词」入口；横向拖动则切换
+                // 封面 ⇄ 歌词（与参考视频的横滑一致）。
+                .child(
+                    div()
+                        .id("phone-cover-lyrics")
+                        .absolute()
+                        .left(px(left + swipe_offset))
+                        .top(px(COMPACT_TOP))
+                        .w(px(cover))
+                        .h(px(cover))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|app, event: &MouseDownEvent, _, cx| {
+                                app.begin_phone_edge_swipe(
+                                    f32::from(event.position.x),
+                                    f32::from(event.position.y),
+                                    cx,
+                                );
+                            }),
+                        )
+                        .on_mouse_up(
+                            gpui::MouseButton::Left,
+                            cx.listener(|app, _: &MouseUpEvent, _, cx| {
+                                if app.phone_edge_swipe.is_some() {
+                                    app.release_phone_edge_swipe(cx);
+                                }
+                            }),
+                        )
+                        .on_click(cx.listener(move |app, _, _, cx| {
+                            if suppress_click || app.phone_swipe_click_suppressed() {
+                                return;
                             }
-                        }),
-                    ),
-            )
-            .children(empty)
-            .into_any_element()
+                            app.open_lyrics_immersive(cx);
+                        })),
+                )
+                // 顶部把手：只接管一条 140×36 的命中区，避免和红绿灯、
+                // Windows 原生窗口拖动区打架。
+                .child(
+                    div()
+                        .id("phone-sheet-handle")
+                        .absolute()
+                        .top(px(2.0))
+                        .left(px((sheet_width - 140.0) * 0.5))
+                        .w(px(140.0))
+                        .h(px(36.0))
+                        .flex()
+                        .justify_center()
+                        .cursor(CursorStyle::OpenHand)
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|app, event: &MouseDownEvent, _, cx| {
+                                app.begin_phone_sheet_drag(f32::from(event.position.y), cx);
+                            }),
+                        )
+                        .on_mouse_up(
+                            gpui::MouseButton::Left,
+                            cx.listener(|app, _: &MouseUpEvent, _, cx| {
+                                if app.phone_sheet.is_some() {
+                                    app.release_phone_sheet_drag(cx);
+                                }
+                            }),
+                        ),
+                );
+
+        sheet.into_any_element()
     }
 
     /// 手机曲库页：桌面曲目板直接铺满，外层只负责标题栏与返回播放。
@@ -723,23 +797,52 @@ impl ChordialApp {
                     ),
             );
         }
+        if !selecting && self.current_track.is_some() {
+            root = self.stage_measurements.observe(
+                StageMode::MiniPlayer,
+                root,
+                &[(2, MeasurePart::Card)],
+            );
+        }
         root.into_any_element()
+    }
+
+    fn render_phone_full_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let root = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.surface)
+            .child(self.render_phone_titlebar(false, false, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.render_main_page(cx)),
+            )
+            .when(self.current_track.is_some(), |d| {
+                d.child(self.render_phone_mini_player(cx))
+            })
+            .child(self.render_phone_bottom_nav(cx));
+        if self.current_track.is_some() {
+            self.stage_measurements
+                .observe(StageMode::MiniPlayer, root, &[(2, MeasurePart::Card)])
+                .into_any_element()
+        } else {
+            root.into_any_element()
+        }
     }
 
     /// 手机壳底部 mini player。上滑/点击展开播放页，右键打开曲目菜单。
     pub(super) fn render_phone_mini_player(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
-        let text = self.now_playing_text();
-        let title = text.title.clone();
-        let artist = if !text.artists.is_empty() {
-            text.artists.clone()
-        } else if !text.album.is_empty() {
-            text.album.clone()
-        } else {
-            SharedString::from("未知艺人")
-        };
+        let (title, artist) = self.dock_track_text();
         let playing = self.player_status.state == PlayerState::Playing;
+        let failed = matches!(self.player_status.state, PlayerState::Failed(_));
+        let loading = self.player_status.state == PlayerState::Loading;
         let duration = self.player_status.duration_ms.unwrap_or(0);
         let position = self.display_position_ms().min(duration.max(1));
         let progress = if duration > 0 {
@@ -758,7 +861,6 @@ impl ChordialApp {
         let open_index = current_index.or_else(|| (!self.queue.is_empty()).then_some(0));
         let body = {
             div()
-                .id("phone-mini-body")
                 .flex_1()
                 .min_w_0()
                 .h_full()
@@ -784,7 +886,11 @@ impl ChordialApp {
                         .child(
                             div()
                                 .text_size(px(10.0))
-                                .text_color(theme.text_faint)
+                                .text_color(if failed {
+                                    theme.danger
+                                } else {
+                                    theme.text_faint
+                                })
                                 .text_ellipsis()
                                 .child(artist),
                         ),
@@ -815,21 +921,37 @@ impl ChordialApp {
                         }
                     }),
                 )
-                .on_click(cx.listener(|app, _, _, cx| {
-                    app.open_phone_sheet(cx);
-                }))
         };
+        let body = self.stage_measurements.observe(
+            StageMode::MiniPlayer,
+            body,
+            &[(0, MeasurePart::Cover), (1, MeasurePart::Info)],
+        );
         let play = {
             let weak = weak.clone();
             div()
                 .id("phone-mini-play")
-                .size(px(32.0))
-                .rounded(px(16.0))
+                .size(px(44.0))
+                .rounded(px(22.0))
+                .when(failed, |d| d.bg(theme.danger))
+                .when(loading, |d| d.bg(theme.disabled_bg))
                 .flex()
                 .items_center()
                 .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
+                .cursor(if loading {
+                    CursorStyle::Arrow
+                } else {
+                    CursorStyle::PointingHand
+                })
+                .hover(|s| {
+                    if failed {
+                        s.bg(theme.danger.opacity(0.85))
+                    } else if loading {
+                        s
+                    } else {
+                        s.bg(theme.hover)
+                    }
+                })
                 .child(crate::icons::icon(
                     if playing {
                         crate::icons::Icon::Pause
@@ -837,7 +959,13 @@ impl ChordialApp {
                         crate::icons::Icon::Play
                     },
                     14.0,
-                    theme.text,
+                    if failed {
+                        gpui::white()
+                    } else if loading {
+                        theme.disabled_fg
+                    } else {
+                        theme.text
+                    },
                 ))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
@@ -848,8 +976,9 @@ impl ChordialApp {
             let weak = weak.clone();
             div()
                 .id("phone-mini-queue")
-                .size(px(30.0))
-                .rounded(px(8.0))
+                .size(px(44.0))
+                .flex_none()
+                .rounded(px(10.0))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -867,7 +996,7 @@ impl ChordialApp {
                         app.view_tab = ViewTab::Library;
                         app.library_filter = LibraryFilter::Queue;
                         app.phone_sheet = None;
-                        app.phone_sheet_spring = None;
+                        app.motion.phone_sheet = None;
                         cx.notify();
                     });
                 })
@@ -875,8 +1004,9 @@ impl ChordialApp {
         let more = {
             div()
                 .id("phone-mini-more")
-                .size(px(30.0))
-                .rounded(px(8.0))
+                .size(px(44.0))
+                .flex_none()
+                .rounded(px(10.0))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -901,6 +1031,7 @@ impl ChordialApp {
                         }
                     }),
                 )
+                .on_click(|_, _, cx| cx.stop_propagation())
         };
         div()
             .id("phone-mini-player")
@@ -908,14 +1039,14 @@ impl ChordialApp {
             .left(px(12.0))
             .right(px(12.0))
             .bottom(px(Self::PHONE_NAV_H + 8.0))
-            .h(px(58.0))
+            .h(px(62.0))
             .rounded(px(16.0))
             .overflow_hidden()
             .bg(theme.surface.opacity(0.96))
             .border_1()
             .border_color(theme.border)
             .shadow(vec![BoxShadow {
-                color: gpui::black().opacity(0.32),
+                color: theme.shadow_strong,
                 blur_radius: px(24.0),
                 spread_radius: px(0.0),
                 offset: point(px(0.0), px(-4.0)),
@@ -944,6 +1075,7 @@ impl ChordialApp {
                             .bg(theme.accent.opacity(0.72)),
                     ),
             )
+            .on_click(cx.listener(|app, _, _, cx| app.open_phone_sheet(cx)))
             .into_any_element()
     }
 }

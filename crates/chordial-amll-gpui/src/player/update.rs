@@ -260,6 +260,49 @@ impl LyricPlayer {
         self.prefix_dirty = false;
     }
 
+    /// AMLL core 0.5.2 `computeLinePosYSpringParams` 的纯计算形式。
+    /// 当前/上一行均指主歌词行；背景行不参与间隔计算。
+    pub(super) fn compute_pos_y_spring_params(
+        current_start: Option<u64>,
+        previous_start: Option<u64>,
+        seeking: bool,
+        interlude_active: bool,
+    ) -> Option<SpringParams> {
+        if seeking || interlude_active {
+            return Some(SpringParams::new(0.9, 15.0, 90.0));
+        }
+        let (current, previous) = (current_start?, previous_start?);
+        let interval = current.saturating_sub(previous).clamp(100, 800) as f64;
+        let ratio = 1.0 - (interval - 100.0) / 700.0;
+        let ratio = ratio.powf(0.2);
+        let stiffness = 170.0 + 50.0 * ratio;
+        Some(SpringParams::new(0.9, 2.2 * stiffness.sqrt(), stiffness))
+    }
+
+    fn update_pos_y_params(&mut self, params: SpringParams) {
+        if self.pos_y_params == params {
+            return;
+        }
+        self.pos_y_params = params;
+        for springs in &mut self.springs {
+            springs.pos_y.update_params(params, 0.0);
+        }
+    }
+
+    fn aligned_main_line_starts(&self) -> (Option<u64>, Option<u64>) {
+        let lines = &self.doc.lines;
+        let align = self.scroll_to_index.min(lines.len());
+        let current_index = (align..lines.len()).find(|&i| !lines[i].is_bg);
+        let current = current_index.map(|i| lines[i].start_time);
+        let previous = current_index.and_then(|i| {
+            (0..i)
+                .rev()
+                .find(|&j| !lines[j].is_bg)
+                .map(|j| lines[j].start_time)
+        });
+        (current, previous)
+    }
+
     /// 计算所有行的目标位置/缩放/透明度/模糊。O(n)，只在换行/跳转/尺寸变化时调用。
     pub(super) fn calc_layout(&mut self, force: bool) {
         if self.doc.lines.is_empty() || self.metrics.height <= 1.0 || self.metrics.width <= 1.0 {
@@ -270,6 +313,16 @@ impl LyricPlayer {
 
         let interlude = self.get_current_interlude();
         self.set_interlude(interlude);
+        let first_layout = !self.initial_layout_finished;
+        let (current_start, previous_start) = self.aligned_main_line_starts();
+        if let Some(params) = Self::compute_pos_y_spring_params(
+            current_start,
+            previous_start,
+            self.is_seeking || first_layout,
+            interlude.is_some(),
+        ) {
+            self.update_pos_y_params(params);
+        }
 
         let font_size = if self.metrics.base_font_size > 0.0 {
             self.metrics.base_font_size
@@ -332,7 +385,7 @@ impl LyricPlayer {
             .max()
             .unwrap_or(self.scroll_to_index);
         let mut delay = 0.0f32;
-        let mut base_delay = if force { 0.0 } else { 0.05 };
+        let mut base_delay = if force || first_layout { 0.0 } else { 0.05 };
         let mut dots: Option<InterludeDotsFrame> = None;
         let mut visible_start = self.doc.lines.len();
         let mut visible_end = 0usize;
@@ -449,7 +502,25 @@ impl LyricPlayer {
                 frame_line.opacity = target_opacity;
                 frame_line.blur = blur_level;
                 self.animated.remove(&i);
-            } else if force || !self.initial_layout_finished {
+            } else if first_layout {
+                // AMLL DomLyricPlayer 的每个 group 构造时位于 2*window.height，
+                // 首次布局只提交 target，因此可见首行从屏外进入。视口外行仍按
+                // 上面的性能策略直接吸附，这是本实现的有意差异。
+                let entry_top = self.metrics.height * 2.0;
+                self.springs[i].pos_y.set_position(entry_top as f64);
+                self.springs[i].scale.set_position(100.0);
+                frame_line.top = entry_top;
+                frame_line.scale = 100.0;
+                frame_line.opacity = target_opacity;
+                frame_line.blur = blur_level;
+                self.springs[i]
+                    .pos_y
+                    .set_target_position(cur_pos as f64, delay as f64);
+                self.springs[i]
+                    .scale
+                    .set_target_position(target_scale as f64, 0.0);
+                self.animated.insert(i);
+            } else if force {
                 self.springs[i].pos_y.set_position(cur_pos as f64);
                 self.springs[i].scale.set_position(target_scale as f64);
                 frame_line.top = cur_pos;

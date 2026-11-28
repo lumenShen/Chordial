@@ -76,6 +76,85 @@ impl SettingsView {
             )
         };
 
+        let motion_preset = {
+            let mut items: Vec<(
+                &'static str,
+                bool,
+                Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+            )> = Vec::new();
+            for preset in [
+                MotionPreset::Compact,
+                MotionPreset::Balanced,
+                MotionPreset::Soft,
+                MotionPreset::Bouncy,
+            ] {
+                let weak = weak.clone();
+                let active = self.motion_preset == preset;
+                items.push((
+                    preset.label(),
+                    active,
+                    Box::new(move |_, window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.apply_motion_preset(preset, window, cx);
+                        });
+                    }),
+                ));
+            }
+            segmented(theme, "settings-motion-preset", items)
+        };
+
+        let duration_preset = |label: &'static str, value: f32| {
+            let weak = weak.clone();
+            let active = (self.animation_duration_multiplier - value).abs() < 0.001;
+            chip(theme, label, active, move |_, window, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.set_motion_duration_preset(value, window, cx);
+                });
+            })
+        };
+        let duration_controls = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .w(px(56.0))
+                    .child(self.motion_duration_field.view.clone()),
+            )
+            .child(hint(theme, "×"))
+            .child(div().w(px(8.0)))
+            .child(duration_preset("时长 0.5", 0.5))
+            .child(duration_preset("时长 1.0", 1.0))
+            .child(duration_preset("时长 1.5", 1.5))
+            .child(duration_preset("时长 2.0", 2.0))
+            .into_any_element();
+
+        let overshoot_preset = |label: &'static str, value: f32| {
+            let weak = weak.clone();
+            let active = (self.animation_overshoot_multiplier - value).abs() < 0.001;
+            chip(theme, label, active, move |_, window, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.set_motion_overshoot_preset(value, window, cx);
+                });
+            })
+        };
+        let overshoot_controls = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .w(px(56.0))
+                    .child(self.motion_overshoot_field.view.clone()),
+            )
+            .child(hint(theme, "×"))
+            .child(div().w(px(8.0)))
+            .child(overshoot_preset("回弹 0.5", 0.5))
+            .child(overshoot_preset("回弹 1.0", 1.0))
+            .child(overshoot_preset("回弹 1.5", 1.5))
+            .child(overshoot_preset("回弹 2.0", 2.0))
+            .into_any_element();
+
         let perf_overlay = {
             let weak = weak.clone();
             toggle(
@@ -137,6 +216,34 @@ impl SettingsView {
         ))
         .child(section(
             theme,
+            "动画",
+            Some("弹簧手感即刻生效；已开始的动画保持创建时的参数，改动只影响新动画。"),
+            vec![group(
+                theme,
+                vec![
+                    setting_row(
+                        theme,
+                        "手感预设",
+                        Some("紧凑起步快、几乎不过冲；柔和临界阻尼不过冲；弹性有克制的回弹".into()),
+                        motion_preset,
+                    ),
+                    setting_row(
+                        theme,
+                        "时长倍率",
+                        Some("大于 1 慢放、小于 1 加速；范围 0.25–3.0，回车应用".into()),
+                        duration_controls,
+                    ),
+                    setting_row(
+                        theme,
+                        "回弹倍率",
+                        Some("大于 1 回弹更明显、小于 1 更稳；范围 0.25–2.0，回车应用".into()),
+                        overshoot_controls,
+                    ),
+                ],
+            )],
+        ))
+        .child(section(
+            theme,
             "诊断",
             Some("浮窗置顶悬浮于桌面，实时显示帧率、帧耗时与进程占用。"),
             vec![group(
@@ -162,40 +269,42 @@ impl SettingsView {
         weak: &gpui::WeakEntity<Self>,
         _cx: &mut Context<Self>,
     ) -> AnyElement {
-        let preset = |label: &'static str, low: f32, high: f32| {
-            let weak = weak.clone();
-            let active = self.beat_band == (low, high);
-            chip(theme, label, active, move |_, window, cx| {
-                let _ = weak.update(cx, |view, cx| {
-                    view.beat_band = (low, high);
-                    view.beat_low_field.set(format!("{low:.0}"), cx);
-                    view.beat_high_field.set(format!("{high:.0}"), cx);
-                    view.emit(SettingsAction::SetBeatBand(low, high), window, cx);
-                    view.notice_ok(format!("背景鼓点频段 {low:.0}–{high:.0} Hz"), cx);
-                });
+        let mut band_rows: Vec<AnyElement> = AudioBandKind::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let controls = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .w(px(78.0))
+                            .child(self.audio_band_low_fields[index].view.clone()),
+                    )
+                    .child(hint(theme, "Hz"))
+                    .child(
+                        div()
+                            .w(px(78.0))
+                            .child(self.audio_band_high_fields[index].view.clone()),
+                    )
+                    .child(hint(theme, "Hz"))
+                    .child(div().w(px(8.0)))
+                    .child(hint(theme, "点"))
+                    .child(
+                        div()
+                            .w(px(176.0))
+                            .child(self.audio_band_control_fields[index].view.clone()),
+                    )
+                    .into_any_element();
+                setting_row(
+                    theme,
+                    kind.label(),
+                    Some("监听范围 / 控制点编号，回车应用".into()),
+                    controls,
+                )
             })
-        };
-
-        let band_controls = div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .child(div().w(px(92.0)).child(self.beat_low_field.view.clone()))
-            .child(hint(theme, "Hz"))
-            .child(div().w(px(10.0)))
-            .child(div().w(px(92.0)).child(self.beat_high_field.view.clone()))
-            .child(hint(theme, "Hz"))
-            .into_any_element();
-
-        let preset_row = div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .child(preset("低音 80–2k", 80.0, 2_000.0))
-            .child(preset("鼓点 4–10k", 4_000.0, 10_000.0))
-            .child(preset("高频 8–16k", 8_000.0, 16_000.0))
-            .child(div().flex_1())
-            .into_any_element();
+            .collect();
 
         let strength_preset = |label: &'static str, value: f32| {
             let weak = weak.clone();
@@ -313,39 +422,27 @@ impl SettingsView {
             )
         };
 
+        band_rows.push(setting_row(
+            theme,
+            "效果强度",
+            Some("0–150%：五路频段控制的呼吸/旋转/缩放/提亮总倍率，回车应用".into()),
+            strength_controls,
+        ));
+        band_rows.push(setting_row(
+            theme,
+            "渲染分辨率除数",
+            Some(
+                "光栅分辨率 = 背景区域设备像素 ÷ N；N 越大越省性能、越模糊，默认 2。÷1 按背景区域原始分辨率渲染，回车应用"
+                    .into(),
+            ),
+            divisor_controls,
+        ));
+
         section(
             theme,
             "背景律动",
-            Some("沉浸歌词背景的网格随该频段能量做呼吸/旋转/提亮；默认 4000–10000 Hz、强度 50%。"),
-            vec![
-                group(
-                    theme,
-                    vec![
-                        setting_row(
-                            theme,
-                            "监听频段",
-                            Some("支持 4000 / 4k / 10khz 写法，回车应用".into()),
-                            band_controls,
-                        ),
-                        setting_row(
-                            theme,
-                            "效果强度",
-                            Some("0–150%：呼吸/旋转/缩放/提亮的整体倍率，回车应用".into()),
-                            strength_controls,
-                        ),
-                        setting_row(
-                            theme,
-                            "渲染分辨率除数",
-                            Some(
-                                "光栅分辨率 = 背景区域 ÷ N；N 越大越省性能、越模糊，默认 2（更接近真实流体细节），回车应用"
-                                    .into(),
-                            ),
-                            divisor_controls,
-                        ),
-                    ],
-                ),
-                preset_row,
-            ],
+            Some("编号每行 5 个：1–5 / 6–10 / 11–15 / 16–20 / 21–25；仅 7,8,9,12,13,14,17,18,19 内部点可分配。"),
+            vec![group(theme, band_rows)],
         )
         .child(section(
             theme,

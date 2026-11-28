@@ -10,8 +10,11 @@
 # 需要时从 .cargo/config.toml 复制到自己的环境。
 .cargo/
 # 本地临时产物 / 截图 / 录屏 / 工具目录，不入库。
-.tmp-*/
-.tmp_*/
+.tmp-*
+.tmp_*
 .effibuddy/
+.impeccable/
 .v2c/
 .zcode/
+
+vibe_images/

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use chordal_cache::{CacheTags, ObjectCache, now_secs, object_key};
+use chordal_cache::{CacheTags, ObjectCache, ObjectMeta, PutOutcome, now_secs, object_key};
 use chordal_core::error::{CoreError, CoreResult};
 use chordal_core::model::{
     AccountProfile, AccountState, Capabilities, CollectionId, CollectionKind, CollectionPage,
@@ -30,6 +30,7 @@ use chordal_core::model::{
 };
 use chordal_core::perf::PerfScope;
 use chordal_core::source::{AccountSource, CatalogSource, MusicSource, SourceInfo};
+use serde::Serialize;
 
 mod inner;
 mod inner_account;
@@ -194,7 +195,82 @@ where
     T: Send + 'static,
     F: std::future::Future<Output = T> + Send + 'static,
 {
-    shared_runtime().spawn(make()).await
+    AbortOnDrop(shared_runtime().spawn(make())).await
+}
+
+/// 外层 future 被取消时同步 abort 内层 Tokio task，避免 detached 请求继续写缓存。
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T: 'static> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+struct CachedJson<T> {
+    value: T,
+    meta: ObjectMeta,
+}
+
+/// 在 Tokio blocking pool 中一次性读取 bytes+meta，避免 meta/get 之间发生替换。
+async fn get_cached_json<T>(cache: Option<&Arc<ObjectCache>>, key: &str) -> Option<CachedJson<T>>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    let cache = cache?.clone();
+    let key = key.to_string();
+    shared_runtime()
+        .spawn_blocking(move || {
+            let object = cache.get(&key)?;
+            let value = serde_json::from_slice(&object.bytes).ok()?;
+            Some(CachedJson {
+                value,
+                meta: object.meta,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+}
+
+/// JSON 序列化与磁盘写入都在 blocking pool，不占用 2 个异步 worker。
+async fn put_cached_json<T>(
+    cache: &Arc<ObjectCache>,
+    key: &str,
+    value: T,
+    tags: CacheTags,
+) -> PutOutcome
+where
+    T: Serialize + Send + 'static,
+{
+    let cache = cache.clone();
+    let key = key.to_string();
+    shared_runtime()
+        .spawn_blocking(move || cache.put_json(&key, &value, tags))
+        .await
+        .unwrap_or(PutOutcome::Failed)
+}
+
+struct RefreshGuard {
+    inner: Arc<Inner>,
+    key: String,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.inner.end_refresh(&self.key);
+    }
 }
 
 fn join_error(source: &str, e: tokio::task::JoinError) -> CoreError {

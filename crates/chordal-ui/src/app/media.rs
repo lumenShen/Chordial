@@ -38,9 +38,17 @@ impl ChordialApp {
             // 让写进文件的标签与在线页看到的一致。
             let detail = source.track(&track.id).await.ok();
             let track_for_download = detail.unwrap_or_else(|| track.clone());
-            let lyrics_lrc = source
-                .lyrics(&track.id)
-                .await
+            let source_for_lyrics = source.clone();
+            let lyric_id = track.id.clone();
+            let lyrics = match ChordialApp::run_background(async move {
+                source_for_lyrics.lyrics(&lyric_id).await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(chordal_core::CoreError::Other("后台任务繁忙".into())),
+            };
+            let lyrics_lrc = lyrics
                 .ok()
                 .flatten()
                 .and_then(|lyrics| lyrics_to_lrc(&lyrics));
@@ -69,23 +77,25 @@ impl ChordialApp {
                     return;
                 }
             };
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    // 封面字节只取一次：嵌入标签 + 写边车都由 DownloadExtras 消费。
-                    let cover = cover_url.and_then(crate::lyrics::fetch_cover_raw_blocking);
-                    let extras = DownloadExtras {
-                        cover,
-                        lyrics: lyrics_lrc,
-                    };
-                    downloads.download_blocking(
-                        &track_for_download,
-                        &url,
-                        format_hint.as_deref(),
-                        &extras,
-                    )
-                })
-                .await;
+            let result = match ChordialApp::run_background(async move {
+                // 封面字节只取一次：嵌入标签 + 写边车都由 DownloadExtras 消费。
+                let cover = cover_url.and_then(crate::lyrics::fetch_cover_raw_blocking);
+                let extras = DownloadExtras {
+                    cover,
+                    lyrics: lyrics_lrc,
+                };
+                downloads.download_blocking(
+                    &track_for_download,
+                    &url,
+                    format_hint.as_deref(),
+                    &extras,
+                )
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("后台任务繁忙，请稍后重试".to_string()),
+            };
             let _ = weak.update(cx, |app, cx| {
                 match result {
                     Ok(path) => {
@@ -141,20 +151,35 @@ impl ChordialApp {
             let effective = detail.clone().unwrap_or_else(|| track.clone());
             let duration = effective.duration_ms.or(track.duration_ms);
 
-            // 封面下载与歌词请求并行：封面先查对象缓存，未命中再抓取；
-            // 命中后后台做条件刷新（ETag/Last-Modified/内容摘要）。
+            // 封面下载与歌词读取/转换并行：两者都提交到有界后台池，UI 只等待结果。
             let cover_cache = app_cache.clone();
             let cover_ns = track.id.source.clone();
             let cover_task = cover_url(&effective).map(|url| {
                 let cover_cache = cover_cache.clone();
                 let cover_ns = cover_ns.clone();
-                cx.background_executor()
-                    .spawn(async move { fetch_cover_blocking(Some(cover_cache), &cover_ns, url) })
+                ChordialApp::run_background(async move {
+                    fetch_cover_blocking(Some(cover_cache), &cover_ns, url)
+                })
             });
-            let lyrics = source.lyrics(&track.id).await;
-            let cover = match cover_task {
-                Some(task) => task.await,
-                None => None,
+            let source_for_lyrics = source.clone();
+            let lyric_id = track.id.clone();
+            let lyrics_task = ChordialApp::run_background(async move {
+                source_for_lyrics
+                    .lyrics(&lyric_id)
+                    .await
+                    .map(|lyrics| lyrics.map(|lyrics| Self::prepare_lyrics(lyrics, duration)))
+            });
+            let (lyrics, cover) = futures::future::join(lyrics_task, async move {
+                let cover: Option<(u32, u32, Vec<u8>)> = match cover_task {
+                    Some(task) => task.await.ok().flatten(),
+                    None => None,
+                };
+                cover
+            })
+            .await;
+            let lyrics = match lyrics {
+                Ok(result) => result,
+                Err(_) => Err(chordal_core::CoreError::Other("后台任务繁忙".into())),
             };
 
             let _ = weak.update(cx, |app, cx| {
@@ -178,29 +203,8 @@ impl ChordialApp {
                 }
 
                 match lyrics {
-                    Ok(Some(lyrics)) => {
-                        let lines = to_amll_lyrics(&lyrics, duration);
-                        let preview: Vec<PreviewLyric> = lines
-                            .iter()
-                            .filter_map(|line| {
-                                let text = line
-                                    .words
-                                    .iter()
-                                    .map(|w| w.word.as_str())
-                                    .collect::<String>();
-                                let text = SharedString::from(text.trim().to_string());
-                                let translation =
-                                    SharedString::from(line.translated_lyric.trim().to_string());
-                                (!text.is_empty() || !translation.is_empty()).then_some(
-                                    PreviewLyric {
-                                        start_ms: line.start_time,
-                                        text,
-                                        translation,
-                                    },
-                                )
-                            })
-                            .collect();
-                        app.lyric_preview = Arc::new(preview);
+                    Ok(Some((lines, preview))) => {
+                        app.lyric_preview = preview;
                         if lines.is_empty() {
                             view.update(cx, |view, _| view.clear_lyrics());
                             mem::set_gauge(Gauge::Lyrics, 0);
@@ -231,6 +235,34 @@ impl ChordialApp {
             });
         })
         .detach();
+    }
+
+    fn prepare_lyrics(
+        lyrics: chordal_core::model::Lyrics,
+        duration_ms: Option<u64>,
+    ) -> (
+        Vec<chordial_amll_gpui::model::LyricLine>,
+        Arc<Vec<PreviewLyric>>,
+    ) {
+        let lines = to_amll_lyrics(&lyrics, duration_ms);
+        let preview: Vec<PreviewLyric> = lines
+            .iter()
+            .filter_map(|line| {
+                let text = line
+                    .words
+                    .iter()
+                    .map(|word| word.word.as_str())
+                    .collect::<String>();
+                let text = SharedString::from(text.trim().to_string());
+                let translation = SharedString::from(line.translated_lyric.trim().to_string());
+                (!text.is_empty() || !translation.is_empty()).then_some(PreviewLyric {
+                    start_ms: line.start_time,
+                    text,
+                    translation,
+                })
+            })
+            .collect();
+        (lines, Arc::new(preview))
     }
 
     /// 把不再绘制的图片排队，下一帧统一从 gpui sprite atlas 移除。
@@ -287,32 +319,59 @@ impl ChordialApp {
         tracks: &[Track],
         cx: &mut Context<Self>,
     ) {
-        let mut to_load = Vec::new();
-        {
+        let requests = indices
+            .iter()
+            .filter_map(|&index| {
+                let track = tracks.get(index)?;
+                let url = cover_url(track)?;
+                Some((
+                    track_cover_key_from_url(track, &url),
+                    track.id.source.clone(),
+                    url,
+                ))
+            })
+            .collect();
+        let to_load = self
+            .track_covers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_pending_requests(requests);
+        self.start_track_cover_loads(to_load, cx);
+    }
+
+    pub(super) fn request_track_row_covers(
+        &mut self,
+        indices: &[usize],
+        rows: &[TrackRowText],
+        cx: &mut Context<Self>,
+    ) {
+        let to_load = {
             let mut covers = self.track_covers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut accepted = Vec::new();
             for &index in indices {
-                // 后台下载会阻塞执行器线程；限制在途数量，避免滚动时堆积
-                // 数百个阻塞线程把 Windows 线程池耗到配额上限。
                 if covers.pending.len() >= MAX_INFLIGHT_TRACK_COVERS {
                     break;
                 }
-                let Some(track) = tracks.get(index) else {
+                let Some(row) = rows.get(index) else {
                     continue;
                 };
-                let Some(url) = cover_url(track) else {
+                let (Some(key), Some(url)) = (&row.cover_key, &row.cover_url) else {
                     continue;
                 };
-                let key = track_cover_key(track).expect("cover URL present");
-                if covers.images.contains_key(&key)
-                    || covers.pending.contains(&key)
-                    || covers.failed.contains(&key)
-                {
-                    continue;
+                if let Some(request) = covers.accept_pending_request(key, &row.id.source, url) {
+                    accepted.push(request);
                 }
-                covers.pending.insert(key.clone());
-                to_load.push((key, track.id.source.clone(), url));
             }
-        }
+            accepted
+        };
+        self.start_track_cover_loads(to_load, cx);
+    }
+
+    fn start_track_cover_loads(
+        &mut self,
+        to_load: Vec<(String, SourceId, String)>,
+        cx: &mut Context<Self>,
+    ) {
         if to_load.is_empty() {
             return;
         }
@@ -322,10 +381,12 @@ impl ChordialApp {
                 let cache = cache.clone();
                 let source = source.clone();
                 let url = url.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { fetch_cover_blocking(Some(cache), &source, url) })
-                    .await;
+                let result = ChordialApp::run_background(async move {
+                    fetch_cover_blocking(Some(cache), &source, url)
+                })
+                .await
+                .ok()
+                .flatten();
                 let _ = weak.update(cx, |app, cx| app.finish_track_cover(key, result, cx));
             }
         })

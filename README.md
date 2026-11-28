@@ -48,7 +48,8 @@ crates/
 └── chordal-ui          # gpui 前端
     ├── app.rs          #   三栏 / 悬浮 Dock / 共用 AMLL 播放器列 / 宽屏沉浸层
     ├── player_page.rs  #   竖屏页面模型与队列纵向过渡
-    ├── layout_morph.rs #   宽屏/竖屏共享元素 FLIP 几何与补间
+    ├── layout_morph.rs #   宽屏/竖屏共享元素 FLIP 几何真值源
+    ├── motion.rs       #   状态型动画的统一解析弹簧与帧事件
     ├── eq_page.rs      #   均衡器桌面控制台 / 紧凑布局
     ├── input.rs        #   支持中文 IME 的单行输入框（EntityInputHandler 全实现）
     ├── lyrics.rs       #   Lyrics → AMLL 模型、封面下载/解码（后台线程）
@@ -175,22 +176,32 @@ query ──┬──> source A (timeout 6s) ──┐
   `CHORDIAL_CONFIG_DIR`/`CHORDIAL_CONFIG` 可隔离配置做可重复压测；
   `CHORDIAL_AUTOPLAY=1` 在本地库扫描完成后自动播放第一首并进入沉浸页，
   用于真实歌词 / 播放路径验证。
-- **实测参考**（release，Windows，RTX 5060，`GPUI_BENCH_HZ=300` 合成节奏，
-  1455×929 逻辑窗口，统计窗口为最近 240 帧）：
-  - 真实本地 WAV + LRC 播放（沉浸歌词）：299.2Hz，draw p50 0.40ms /
-    p99 1.6–2.2ms，total p99 ~2.0ms，miss ~0.3%；
-  - 桌面主界面 300 曲目列表连续平滑滚动：299.5Hz，prepaint p50 1.03ms、
-    paint p50 0.28ms、present p50 0.10ms，total p50 1.52ms / p95 2.35ms /
-    p99 2.65ms，0 miss；
-  - 均衡器 AutoEQ 列表连续平滑滚动（索引 6000+ 条，视图虚拟化，仅渲染
-    可视行）：299.4Hz，total p50 2.2ms / p95 2.8ms / p99 3.7ms（被 EQ
-    面板完全遮挡的主列表/正在播放不再绘制；预览曲线的 biquad 采样已按
-    设置与画布几何缓存，p99 的剩余波动来自右侧预览面板的元素重建，
-    是当前唯一略高于 3.0ms 目标的表面）；
-  - 设置中心滚动/交互：total p50 1.87ms / p99 2.34ms。
+  `CHORDIAL_FRAME_TRACE=1` 额外输出各渲染区块的 p50/p95/p99；
+  `CHORDIAL_NO_VIEW_CACHE=1` / `CHORDIAL_NO_RETAINED=1` 可分别关闭
+  设置页视图缓存与 EQ 保留缓存，用于同二进制 A/B 对照。
+- **实测参考**（release，Windows 11，2560×1600 @ 300Hz，
+  RTX 5060 Laptop，1455×929 窗口，`CHORDIAL_BENCH_ANIM=1` 连续重绘）：
+  - 真实 DWM 300Hz 垂直同步（非合成计时）：
+    - 沉浸歌词：300.3fps，total p50 0.54ms / p95 0.96ms / p99 1.19ms；
+    - 桌面主界面：301.1fps，total p50 1.05ms / p95 1.50ms / p99 1.76ms；
+    - 设置中心：301.6fps，total p50 1.14ms / p95 1.63ms / p99 2.04ms；
+    - 均衡器：299.9fps，total p50 1.66ms / p95 2.84ms / p99 3.73ms。
+    前三个页面 p99 均在 3.33ms 帧预算内；EQ 的 p99 偶有 1% 长帧
+    略超预算，但持续帧率仍保持约 300fps。
+  - 300Hz 连续滚动（每 90ms 注入滚轮，持续 6s）：
+    设置中心 299.5fps（p50 1.24ms / p99 2.87ms），
+    EQ 信号链 299.6fps（p50 1.83ms / p99 3.52ms）。
+  - `GPUI_BENCH_HZ=600` 主线程容量压测（无真实 600Hz 上屏）：
+    沉浸 598.6fps、主界面 598.5fps、设置中心 598.1fps、均衡器 594.3fps，
+    四页均在 300–600fps 区间内。
+  - 同二进制 A/B（关闭缓存 vs 开启）：
+    设置页 300Hz p50 1.94→1.14ms，600Hz 有效帧率 525→598fps；
+    EQ 300Hz p50 2.52→1.99ms，600Hz 有效帧率 401→525fps、p99 3.23→2.45ms。
   以上为“每帧都重绘”的最坏情况；空闲或仅局部交互时成本更低。
-  侧栏歌单区使用版本化保留缓存（`gpui::retained`）：数据、滚动偏移与
-  鼠标位置未变时直接复用上一帧的布局/绘制范围。
+  设置页使用 `AnyView::cached`，未通知时复用整棵视图的布局/绘制；
+  EQ 曲线图与信号链使用版本化 `gpui::retained`，设置、选中、滚动、
+  鼠标位置、主题或几何变化立即失效。三者都把“静态页面每帧全量
+  prepaint”降为 O(1) 复用，同时保留原有输入命中与交互回调。
 - **检查点系统**（`chordal-core/src/perf.rs`）：所有热点路径埋 `PerfScope`
   （合并、扫描、过滤、HTTP 请求、解码 warmup、seek、UI 渲染 pass）。
   每个检查点有微秒预算，超预算 `tracing::warn`；账本是定容环形缓冲
@@ -206,9 +217,11 @@ query ──┬──> source A (timeout 6s) ──┐
   - 主键查找：HashMap **O(1)**
   - 直链 LRU：HashMap + 惰性淘汰队列，**均摊 O(1)**，容量恒定
   - UI：`uniform_list` 只渲染可视行；播放状态 200ms 轮询、变化才重绘
+  - 设置页 / EQ 静态帧：保留缓存命中时 **O(1)** 复用布局与绘制；
+    控件状态变化时仍回退到 **O(页面节点数)** 重建，不改变行为语义
   - 歌词：每帧只整形/绘制 `visible_range()`（含 300px overscan），
     状态机 `update` 只遍历可见 + 未收敛行；文本整形按行 LRU（≤256 行）
-  - 歌词背景：光栅化像素硬上限 200k，缓冲区跨帧复用，30FPS 默认
+  - 歌词背景：光栅化像素 = 显示区域设备像素 ÷ 除数²，缓冲区跨帧复用，30FPS 默认
   - 播放循环：逐 packet O(帧数)，音量内联乘法，状态写锁 100ms 节流
 
 ## 环境要求
@@ -228,6 +241,16 @@ query ──┬──> source A (timeout 6s) ──┐
 > 注：`.cargo/config.toml` 是**本机可选配置，不入库**。若仓库放在 NTFS/FUSE
 > 挂载盘，请自行创建该文件把 `build.target-dir` 指到本地磁盘（例如
 > `~/.cache/chordial-target`），避免链接器 EOVERFLOW；正常 ext4/btrfs 无需此步。
+
+## Android
+
+Kotlin 壳 + Rust cdylib（gpui 直接渲染到 `SurfaceView`）。构建管线、模拟器
+调试与已知限制见 **[docs/android.md](docs/android.md)**：
+
+```bash
+./android/scripts/build.sh        # debug + x86_64（模拟器）
+./android/scripts/run.sh          # 启动 AVD → 构建 → 安装 → logcat
+```
 
 ## 使用
 
@@ -268,7 +291,10 @@ cargo run --release -p chordal-ui
   "beat_band_high_hz": 10000.0,
   "beat_strength": 0.5,
   "background_render_divisor": 4,
-  "lyric_sweep_fade_em": 0.6
+  "lyric_sweep_fade_em": 0.6,
+  "motion_preset": "balanced",
+  "animation_duration_multiplier": 1.0,
+  "animation_overshoot_multiplier": 1.0
 }
 ```
 
@@ -278,11 +304,18 @@ cargo run --release -p chordal-ui
 沉浸歌词背景的鼓点监听频段（默认 4000–10000 Hz）与视觉效果强度
 （`beat_strength`，0–150%，默认 50%）同样可在「设置 → 播放 → 背景律动」里调整，
 播放线程按该频段的瞬态能量驱动背景网格的呼吸缩放/旋转/提亮（响应延迟约 40ms）。
-流体背景的光栅分辨率同样在该分组里调整：输出 = 显示区域 ÷
-`background_render_divisor`（1–20，默认 2，更接近真实流体细节；光栅像素仍有
-20 万硬上限）；除数越大越省 CPU、放大后越模糊。
+流体背景的光栅分辨率同样在该分组里调整：输出 = 显示区域设备像素 ÷
+`background_render_divisor`（1–20，默认 2，更接近真实流体细节；除数严格决定
+光栅尺寸，不再按耗时自动缩小）；除数越大越省 CPU、放大后越模糊。
 动态歌词整行扫光的渐变带宽度（`lyric_sweep_fade_em`，0.1–4.0em，默认 0.6）
 在「设置 → 播放 → 歌词」中即时调整。
+
+界面状态动画统一走解析弹簧（`motion.rs`）：`motion_preset` 取 `compact` /
+`balanced` / `soft` / `bouncy`（默认 `balanced`），`animation_duration_multiplier`
+（0.25–3，默认 1）用于整体慢放/加速，`animation_overshoot_multiplier`（0.25–2，
+默认 1）用于加强或抑制回弹；三者都在「设置 → 通用 → 动画」中即时调整，
+新动画生效，已在途的动画保持创建时的参数。手势交接与连续点击会继承当前
+位置与速度，不再重新起一条时间曲线。
 
 ### 对象缓存与下载
 

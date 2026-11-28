@@ -1,4 +1,4 @@
-//! EQ 页面区块：compact_shell（由 eq_page.rs 拆分，行为不变）。
+//! EQ 页面区块：compact_shell（竖屏 / 窄窗触控布局）。
 
 use super::controls::*;
 use super::*;
@@ -20,9 +20,8 @@ impl ChordialApp {
         let nav = self.eq_nav_compact(pal, cx);
         let body: AnyElement = match self.eq.tab {
             EqTab::Edit => self.eq_editor_compact(pal, content_w, cx),
-            EqTab::V4 => self.eq_library_compact(pal, v4_presets(), cx),
             EqTab::AutoEq => self.eq_autoeq_compact(pal, cx),
-            EqTab::Builtin => self.eq_library_compact(pal, builtin_presets(), cx),
+            EqTab::Builtin => self.eq_builtin_compact(pal, cx),
             EqTab::Personal => self.eq_saved_compact(pal, cx),
         };
         div()
@@ -115,10 +114,34 @@ impl ChordialApp {
                     .gap(px(1.0))
                     .child(
                         div()
-                            .text_size(px(16.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(pal.text)
-                            .child("均衡器"),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(pal.text)
+                                    .child("均衡器"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(16.0))
+                                    .px(px(6.0))
+                                    .rounded(px(8.0))
+                                    .bg(pal.chip)
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(8.0))
+                                    .font_family(pal.mono.clone())
+                                    .text_color(pal.text_faint)
+                                    .child(SharedString::from(format!(
+                                        "{} 档案 · {} 预设 · {} 自定义",
+                                        self.eq.profile_band_count(),
+                                        self.eq.enabled_block_count(),
+                                        self.eq.custom.len()
+                                    ))),
+                            ),
                     )
                     .child(
                         div()
@@ -138,10 +161,7 @@ impl ChordialApp {
                                     .child(SharedString::from(self.eq.display_name())),
                             )
                             .child(div().text_size(px(10.0)).text_color(pal.text_faint).child(
-                                SharedString::from(format!(
-                                    "· {} 个频段",
-                                    self.eq.settings.bands.len()
-                                )),
+                                SharedString::from(format!("· {} 个节点", self.eq.total_bands())),
                             )),
                     ),
             )
@@ -168,164 +188,335 @@ impl ChordialApp {
             .flex_col()
             .gap(px(12.0))
             .child(self.eq_graph(pal, content_w, graph_h, true, cx))
-            .child(self.eq_band_chips(pal, cx))
+            .child(self.eq_chain_compact(pal, cx))
             .child(self.eq_inspector_compact(pal, cx))
             .into_any_element()
     }
 
-    pub(super) fn eq_band_chips(&self, pal: &EqPalette, cx: &mut Context<Self>) -> AnyElement {
+    /// 紧凑布局的信号链：与桌面同一套语义，纵向铺开。
+    pub(super) fn eq_chain_compact(&self, pal: &EqPalette, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
-        if self.eq.settings.bands.is_empty() {
-            let weak_add = weak.clone();
-            return div()
-                .id("eq-chips-empty")
-                .w_full()
-                .h(px(66.0))
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(pal.accent_line)
-                .bg(pal.accent_soft)
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(6.0))
-                .cursor_pointer()
-                .on_click(move |_, _, cx| {
-                    let _ = weak_add.update(cx, |app, cx| app.add_eq_band(cx));
-                })
-                .child(icons::icon(Icon::Plus, 15.0, pal.accent))
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(pal.accent)
-                        .child("点按曲线或此处添加频段"),
-                )
-                .into_any_element();
-        }
-
-        let mut row = div()
-            .id("eq-chips")
+        let mut panel = div()
             .w_full()
-            .h(px(66.0))
-            .flex_none()
+            .rounded(px(16.0))
+            .bg(pal.panel)
+            .border_1()
+            .border_color(pal.border_strong)
+            .p(px(12.0))
             .flex()
-            .items_center()
-            .gap(px(8.0))
-            .overflow_x_scroll()
-            .when(self.smooth_scroll, |d| d.smooth_scroll());
-        for (index, band) in self.eq.settings.bands.iter().enumerate() {
-            let weak_select = weak.clone();
-            let selected = self.eq.selected == Some(index);
-            row = row.child(
+            .flex_col()
+            .gap(px(5.0))
+            .child(
                 div()
-                    .id(SharedString::from(format!("eq-chip-band-{index}")))
-                    .w(px(64.0))
-                    .h(px(64.0))
-                    .flex_none()
-                    .rounded(px(12.0))
-                    .border_1()
-                    .border_color(if selected {
-                        pal.accent_line
-                    } else {
-                        pal.border
-                    })
-                    .bg(if selected { pal.selected_bg } else { pal.panel })
-                    .p(px(9.0))
+                    .h(px(20.0))
                     .flex()
-                    .flex_col()
-                    .justify_between()
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        let _ = weak_select.update(cx, |app, cx| app.select_eq_band(index, cx));
-                    })
+                    .items_center()
+                    .gap(px(6.0))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(8.0))
-                                    .font_family(pal.mono.clone())
-                                    .text_color(if selected { pal.accent } else { pal.text_faint })
-                                    .child(SharedString::from(format!("{:02}", index + 1))),
-                            )
-                            .child(div().size(px(4.0)).rounded(px(2.0)).bg(if band.enabled {
-                                pal.accent
-                            } else {
-                                pal.text_faint
-                            })),
+                            .text_size(px(10.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(pal.text_dim)
+                            .child("信号链"),
                     )
                     .child(
                         div()
+                            .text_size(px(8.5))
+                            .font_family(pal.mono.clone())
+                            .text_color(pal.text_faint)
+                            .child(SharedString::from(format!(
+                                "{} / {} 节点",
+                                self.eq.total_bands(),
+                                EQ_MAX_BANDS
+                            ))),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(8.5))
+                            .text_color(pal.text_faint)
+                            .child("点选后在下方调整"),
+                    ),
+            );
+
+        // ---- 耳机档案 ----
+        {
+            let weak_open = weak.clone();
+            panel = panel.child(eq_stage_header(
+                pal,
+                Icon::Headphones,
+                "耳机档案",
+                self.eq.profile_band_count(),
+                Some(
+                    div()
+                        .id("eq-chain-c-profile-open")
+                        .h(px(22.0))
+                        .px(px(7.0))
+                        .rounded(px(6.0))
+                        .bg(pal.chip)
+                        .flex()
+                        .items_center()
+                        .gap(px(3.0))
+                        .cursor_pointer()
+                        .text_size(px(8.5))
+                        .text_color(pal.text_dim)
+                        .child("更换")
+                        .child(icons::icon(Icon::ChevronRight, 10.0, pal.text_faint))
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_open.update(cx, |app, cx| {
+                                app.select_eq_tab(EqTab::AutoEq, cx);
+                            });
+                        })
+                        .into_any_element(),
+                ),
+            ));
+            match self.eq.profile.clone() {
+                Some(profile) => {
+                    let weak_select = weak.clone();
+                    let weak_clear = weak.clone();
+                    let selected = self.eq.selected == Some(EqSelection::Profile);
+                    panel = panel.child(
+                        div()
+                            .id("eq-chain-c-profile")
+                            .h(px(40.0))
+                            .w_full()
+                            .px(px(8.0))
+                            .rounded(px(9.0))
                             .flex()
-                            .flex_col()
-                            .gap(px(1.0))
+                            .items_center()
+                            .gap(px(8.0))
+                            .cursor_pointer()
+                            .bg(if selected { pal.selected_bg } else { pal.chip })
+                            .child(icons::icon(Icon::Headphones, 14.0, pal.accent))
                             .child(
                                 div()
-                                    .text_size(px(11.5))
-                                    .font_family(pal.mono.clone())
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(pal.text)
-                                    .child(SharedString::from(fmt_freq(band.freq_hz))),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(if selected {
+                                                pal.accent
+                                            } else {
+                                                pal.text
+                                            })
+                                            .text_ellipsis()
+                                            .child(profile.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(pal.text_faint)
+                                            .child(SharedString::from(profile.subtitle())),
+                                    ),
+                            )
+                            .child(eq_mini_icon_button(
+                                pal,
+                                Icon::Trash,
+                                26.0,
+                                SharedString::from("eq-chain-c-profile-remove"),
+                                pal.text_faint,
+                                pal.danger_soft,
+                                move |_, _, cx| {
+                                    let _ = weak_clear.update(cx, |app, cx| {
+                                        app.clear_eq_profile(cx);
+                                    });
+                                },
+                            ))
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_select.update(cx, |app, cx| {
+                                    app.select_eq_profile(cx);
+                                });
+                            }),
+                    );
+                }
+                None => {
+                    let weak_open = weak.clone();
+                    panel = panel.child(
+                        div()
+                            .id("eq-chain-c-profile-empty")
+                            .h(px(36.0))
+                            .w_full()
+                            .px(px(8.0))
+                            .rounded(px(9.0))
+                            .border_1()
+                            .border_color(pal.border)
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_pointer()
+                            .child(icons::icon(Icon::Headphones, 13.0, pal.text_faint))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(10.0))
+                                    .text_color(pal.text_faint)
+                                    .child("未加载耳机档案"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(9.0))
-                                    .font_family(pal.mono.clone())
-                                    .text_color(if band.kind.uses_gain() && band.enabled {
-                                        pal.accent
-                                    } else {
-                                        pal.text_faint
-                                    })
-                                    .child(SharedString::from(if band.kind.uses_gain() {
-                                        db_num(band.gain_db)
-                                    } else {
-                                        band.kind.label().to_string()
-                                    })),
-                            ),
-                    ),
-            );
+                                    .text_size(px(9.5))
+                                    .text_color(pal.accent)
+                                    .child("去选择 >"),
+                            )
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_open.update(cx, |app, cx| {
+                                    app.select_eq_tab(EqTab::AutoEq, cx);
+                                });
+                            }),
+                    );
+                }
+            }
+            panel = panel.child(eq_divider(pal));
         }
-        let weak_add = weak.clone();
-        let full = self.eq.settings.bands.len() >= EQ_MAX_BANDS;
-        row = row.child(
-            div()
-                .id("eq-chip-add")
-                .w(px(64.0))
-                .h(px(64.0))
-                .flex_none()
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(pal.border)
-                .bg(pal.chip)
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(2.0))
-                .cursor(if full {
-                    gpui::CursorStyle::Arrow
-                } else {
-                    gpui::CursorStyle::PointingHand
-                })
-                .when(!full, |d| {
-                    d.on_click(move |_, _, cx| {
-                        let _ = weak_add.update(cx, |app, cx| app.add_eq_band(cx));
-                    })
-                })
-                .child(icons::icon(
-                    Icon::Plus,
-                    15.0,
-                    if full { pal.text_faint } else { pal.accent },
-                ))
-                .child(
+
+        // ---- 内置预设 ----
+        {
+            let weak_add = weak.clone();
+            panel = panel.child(eq_stage_header(
+                pal,
+                Icon::Layers,
+                "内置预设",
+                self.eq.blocks.len(),
+                Some(
                     div()
-                        .text_size(px(8.0))
-                        .text_color(pal.text_faint)
-                        .child("添加"),
+                        .id("eq-chain-c-block-add")
+                        .h(px(22.0))
+                        .px(px(7.0))
+                        .rounded(px(6.0))
+                        .bg(pal.chip)
+                        .flex()
+                        .items_center()
+                        .gap(px(3.0))
+                        .cursor_pointer()
+                        .text_size(px(8.5))
+                        .text_color(pal.text_dim)
+                        .child("添加")
+                        .child(icons::icon(Icon::Plus, 10.0, pal.text_faint))
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_add.update(cx, |app, cx| {
+                                app.select_eq_tab(EqTab::Builtin, cx);
+                            });
+                        })
+                        .into_any_element(),
                 ),
-        );
-        row.into_any_element()
+            ));
+            if self.eq.blocks.is_empty() {
+                panel = panel.child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(5.0))
+                        .text_size(px(9.0))
+                        .text_color(pal.text_faint)
+                        .child("还没有启用预设 · 从「内置预设」加入"),
+                );
+            }
+            for index in 0..self.eq.blocks.len() {
+                let Some(preset) = self.eq.block_preset(index) else {
+                    continue;
+                };
+                let block = self.eq.blocks[index].clone();
+                let selected = self.eq.selected == Some(EqSelection::Block(index));
+                let weak_select = weak.clone();
+                let weak_toggle = weak.clone();
+                let weak_remove = weak.clone();
+                panel = panel.child(eq_chain_block_row(
+                    pal,
+                    preset,
+                    &block,
+                    selected,
+                    move |_, _, cx| {
+                        let _ = weak_select.update(cx, |app, cx| {
+                            app.select_eq_block(index, cx);
+                        });
+                    },
+                    move |_, _, cx| {
+                        let _ = weak_toggle.update(cx, |app, cx| {
+                            app.set_eq_block_enabled(index, !block.enabled, cx);
+                        });
+                    },
+                    move |_, _, cx| {
+                        let _ = weak_remove.update(cx, |app, cx| {
+                            app.remove_eq_block(index, cx);
+                        });
+                    },
+                ));
+            }
+            panel = panel.child(eq_divider(pal));
+        }
+
+        // ---- 自定义滤波器 ----
+        {
+            let weak_add = weak.clone();
+            panel = panel.child(eq_stage_header(
+                pal,
+                Icon::Sliders,
+                "自定义滤波器",
+                self.eq.custom.len(),
+                Some(
+                    div()
+                        .id("eq-chain-c-custom-add")
+                        .h(px(22.0))
+                        .px(px(7.0))
+                        .rounded(px(6.0))
+                        .bg(pal.chip)
+                        .flex()
+                        .items_center()
+                        .gap(px(3.0))
+                        .cursor_pointer()
+                        .text_size(px(8.5))
+                        .text_color(pal.text_dim)
+                        .child("添加")
+                        .child(icons::icon(Icon::Plus, 10.0, pal.text_faint))
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_add.update(cx, |app, cx| app.add_eq_band(cx));
+                        })
+                        .into_any_element(),
+                ),
+            ));
+            if self.eq.custom.is_empty() {
+                panel = panel.child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(5.0))
+                        .text_size(px(9.0))
+                        .text_color(pal.text_faint)
+                        .child("点按曲线空白处添加第一个自定义频段"),
+                );
+            }
+            for (index, band) in self.eq.custom.iter().enumerate() {
+                let band = band.clone();
+                let selected = self.eq.selected == Some(EqSelection::Custom(index));
+                let weak_select = weak.clone();
+                let weak_toggle = weak.clone();
+                let weak_remove = weak.clone();
+                panel = panel.child(eq_chain_custom_row(
+                    pal,
+                    index,
+                    &band,
+                    selected,
+                    move |_, _, cx| {
+                        let _ = weak_select.update(cx, |app, cx| {
+                            app.select_eq_band(index, cx);
+                        });
+                    },
+                    move |_, _, cx| {
+                        let _ = weak_toggle.update(cx, |app, cx| {
+                            app.set_eq_band_enabled(index, !band.enabled, cx);
+                        });
+                    },
+                    move |_, _, cx| {
+                        let _ = weak_remove.update(cx, |app, cx| {
+                            app.eq.remove_custom(index);
+                            app.apply_eq(cx);
+                        });
+                    },
+                ));
+            }
+        }
+        panel.into_any_element()
     }
 }

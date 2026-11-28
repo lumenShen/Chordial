@@ -187,10 +187,10 @@ impl ChordialApp {
         let source = track
             .map(|t| match &t.origin {
                 TrackOrigin::Local { .. } => "本地音乐".to_string(),
-                TrackOrigin::Remote { source } => match source.0.as_str() {
-                    "netease" => "网易云音乐".to_string(),
-                    other => other.to_string(),
-                },
+                TrackOrigin::Remote { source } => self
+                    .source_config_by_id(source.as_str())
+                    .map(|config| config.name.clone())
+                    .unwrap_or_else(|| source.0.clone()),
             })
             .unwrap_or_else(|| "—".into());
         let badge = track.and_then(|t| t.quality.clone()).unwrap_or_default();

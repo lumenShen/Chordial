@@ -730,10 +730,8 @@ impl DirectWriteState {
             dx: 0.0,
             dy: 0.0,
         };
-        let baseline_origin_x =
-            params.subpixel_shift().x / params.scale_factor;
-        let baseline_origin_y =
-            params.subpixel_shift().y / params.scale_factor;
+        let baseline_origin_x = params.subpixel_shift().x / params.scale_factor;
+        let baseline_origin_y = params.subpixel_shift().y / params.scale_factor;
 
         let mut rendering_mode = DWRITE_RENDERING_MODE1::default();
         let mut grid_fit_mode = DWRITE_GRID_FIT_MODE::default();

@@ -561,6 +561,7 @@ pub(super) fn speaker_bounce_scale(progress: f32, part: usize) -> f32 {
 }
 
 /// 三次贝塞尔缓动（CSS `cubic-bezier(x1,y1,x2,y2)`），y 允许超出 [0,1]。
+/// 放在图标模块内，独立探针通过 `#[path]` 引入图标时也能复用。
 pub(crate) fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
     if x <= 0.0 {
         return 0.0;
@@ -580,9 +581,9 @@ pub(crate) fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
 
     let (mut low, mut high) = (0.0f32, 1.0f32);
     let mut t = x;
-    for _ in 0..10 {
+    for _ in 0..16 {
         let sx = sample_x(t);
-        if (sx - x).abs() < 1e-4 {
+        if (sx - x).abs() < 1e-6 {
             break;
         }
         if sx < x {

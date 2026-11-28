@@ -1,29 +1,9 @@
 //! 本地/订阅歌单操作：创建、重命名、删除、追加、排序、订阅与刷新。
 
 use super::*;
-use chordal_core::playlist::{
-    PlaylistEditCapabilities, PlaylistId, PlaylistMutation, SavedPlaylist,
-};
+use chordal_core::playlist::{PlaylistId, PlaylistMutation};
 
 impl ChordialApp {
-    /// 按歌单来源查询可用的编辑能力：本地歌单全开；订阅歌单看源是否实现
-    /// `PlaylistEditor` 以及对应集合类型是否可写。UI 据此显示编辑按钮。
-    pub(super) fn playlist_capabilities(
-        &self,
-        playlist: &SavedPlaylist,
-    ) -> PlaylistEditCapabilities {
-        let Some(collection) = playlist.kind.subscribed_collection() else {
-            return PlaylistEditCapabilities::local();
-        };
-        let Some(source) = self.registry.get(&collection.source) else {
-            return PlaylistEditCapabilities::read_only();
-        };
-        let Some(editor) = source.playlist_editor() else {
-            return PlaylistEditCapabilities::read_only();
-        };
-        editor.playlist_edit_capabilities(collection.kind)
-    }
-
     /// 统一编辑入口：本地歌单直接写本地存储；订阅歌单交给源的
     /// `PlaylistEditor`（网易云实现为远端路由），UI 不再按源分叉。
     pub(super) fn apply_playlist_mutation(
@@ -40,9 +20,9 @@ impl ChordialApp {
             return self.apply_local_playlist_mutation(id, mutation, cx);
         };
         // 取消订阅永远只影响本地缓存，绝不删除远端歌单。
-        // 直接走本地分支，避免与 delete_playlist 形成递归。
         if matches!(mutation, PlaylistMutation::Delete) {
-            return self.apply_local_playlist_mutation(id, mutation, cx);
+            self.delete_playlist(id, cx);
+            return true;
         }
         let Some(source) = self.registry.get(&collection.source) else {
             self.info_message = Some("订阅来源已关闭，暂时无法编辑该歌单".into());
@@ -139,8 +119,7 @@ impl ChordialApp {
     }
 
     pub(super) fn delete_playlist(&mut self, id: &PlaylistId, cx: &mut Context<Self>) {
-        // Delete 在统一入口里对订阅歌单只退订本地缓存，不删除远端歌单。
-        if self.apply_playlist_mutation(id, PlaylistMutation::Delete, cx) {
+        if self.playlists.delete(id) {
             if self.page == Some(MainPage::Playlist(id.clone())) {
                 self.page = None;
             }
@@ -148,21 +127,15 @@ impl ChordialApp {
         }
     }
 
-    /// 以下写操作全部收口到 [`Self::apply_playlist_mutation`]：
-    /// 本地歌单直接落盘，订阅歌单交给远端 `PlaylistEditor`。
     pub(super) fn rename_playlist(
         &mut self,
         id: &PlaylistId,
         title: impl Into<String>,
         cx: &mut Context<Self>,
     ) {
-        self.apply_playlist_mutation(
-            id,
-            PlaylistMutation::Rename {
-                title: title.into(),
-            },
-            cx,
-        );
+        if self.playlists.rename(id, title) {
+            cx.notify();
+        }
     }
 
     pub(super) fn add_tracks_to_playlist(
@@ -171,12 +144,11 @@ impl ChordialApp {
         tracks: Vec<Track>,
         cx: &mut Context<Self>,
     ) -> usize {
-        let before = self.playlists.get(id).map(|p| p.count()).unwrap_or(0);
-        if !self.apply_playlist_mutation(id, PlaylistMutation::AddTracks { tracks }, cx) {
-            return 0;
+        let added = self.playlists.add_tracks(id, tracks);
+        if added > 0 {
+            cx.notify();
         }
-        let after = self.playlists.get(id).map(|p| p.count()).unwrap_or(0);
-        after.saturating_sub(before)
+        added
     }
 
     pub(super) fn remove_track_from_playlist(
@@ -185,26 +157,9 @@ impl ChordialApp {
         identity_key: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(track) = self
-            .playlists
-            .get(id)
-            .and_then(|playlist| {
-                playlist
-                    .entries
-                    .iter()
-                    .find(|entry| entry.identity_key == identity_key)
-                    .map(|entry| entry.track.clone())
-            })
-        else {
-            return;
-        };
-        self.apply_playlist_mutation(
-            id,
-            PlaylistMutation::RemoveTracks {
-                tracks: vec![track],
-            },
-            cx,
-        );
+        if self.playlists.remove_identity(id, identity_key) {
+            cx.notify();
+        }
     }
 
     pub(super) fn reorder_playlist(
@@ -214,18 +169,9 @@ impl ChordialApp {
         to: usize,
         cx: &mut Context<Self>,
     ) {
-        let ordered = self
-            .playlists
-            .get(id)
-            .map(|playlist| {
-                playlist
-                    .entries
-                    .iter()
-                    .map(|entry| entry.track.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.apply_playlist_mutation(id, PlaylistMutation::Reorder { from, to, ordered }, cx);
+        if self.playlists.reorder(id, from, to) {
+            cx.notify();
+        }
     }
 
     /// 把当前播放队列整体追加到歌单（跨源曲目会保留各自的源实例 ID）。
@@ -239,21 +185,16 @@ impl ChordialApp {
             .playlists
             .get(id)
             .is_some_and(|playlist| playlist.kind.is_subscribed());
-        let before = self.playlists.get(id).map(|p| p.count()).unwrap_or(0);
-        if !self.apply_playlist_mutation(id, PlaylistMutation::AddTracks { tracks }, cx) {
-            return 0;
-        }
         if subscribed {
-            self.info_message = Some("已提交到音源歌单，正在后台同步".into());
+            self.apply_playlist_mutation(id, PlaylistMutation::AddTracks { tracks }, cx);
             return 0;
         }
-        let after = self.playlists.get(id).map(|p| p.count()).unwrap_or(0);
-        let added = after.saturating_sub(before);
-        self.info_message = Some(if added > 0 {
-            format!("已添加 {added} 首到歌单")
+        let added = self.add_tracks_to_playlist(id, tracks, cx);
+        if added > 0 {
+            self.info_message = Some(format!("已添加 {added} 首到歌单"));
         } else {
-            "队列中的曲目都已在歌单里".into()
-        });
+            self.info_message = Some("队列中的曲目都已在歌单里".into());
+        }
         cx.notify();
         added
     }
@@ -289,17 +230,11 @@ impl ChordialApp {
     /// 替换当前队列：统一递增代数并更新续接追踪，避免过期请求写回新队列。
     pub(super) fn set_queue(&mut self, tracks: Arc<Vec<Track>>, refill: Option<QueueRefill>) {
         self.queue = tracks;
+        // 下标含义已变化，随机轮次必须按新队列重建。
+        self.shuffle_plan = None;
         self.queue_gen = self.queue_gen.wrapping_add(1);
         self.queue_refill = refill;
-    }
-
-    /// 清空播放队列：停止播放并重置位置与多选态（唯一的清除入口）。
-    pub(super) fn clear_queue(&mut self, cx: &mut Context<Self>) {
-        self.stop_playback(cx);
-        self.set_queue(Arc::new(Vec::new()), None);
-        self.queue_pos = None;
-        self.selection = None;
-        cx.notify();
+        self.queue_clear_confirm = false;
     }
 
     /// 按 identity_key 去重后把新曲目追加到列表末尾，返回实际追加数量。
@@ -392,21 +327,17 @@ impl ChordialApp {
             .playlists
             .get(playlist_id)
             .is_some_and(|playlist| playlist.kind.is_subscribed());
-        let before = self.playlists.get(playlist_id).map(|p| p.count()).unwrap_or(0);
-        if !self.apply_playlist_mutation(
-            playlist_id,
-            PlaylistMutation::AddTracks {
-                tracks: vec![picker.track],
-            },
-            cx,
-        ) {
-            return;
-        }
         if subscribed {
-            self.info_message = Some("已提交到音源歌单，正在后台同步".into());
+            self.apply_playlist_mutation(
+                playlist_id,
+                PlaylistMutation::AddTracks {
+                    tracks: vec![picker.track],
+                },
+                cx,
+            );
         } else {
-            let after = self.playlists.get(playlist_id).map(|p| p.count()).unwrap_or(0);
-            self.info_message = Some(if after > before {
+            let added = self.playlists.add_tracks(playlist_id, vec![picker.track]);
+            self.info_message = Some(if added > 0 {
                 "已添加到歌单".into()
             } else {
                 "这首歌已经在歌单里".into()
@@ -432,48 +363,6 @@ impl ChordialApp {
         cx.notify();
     }
 
-    /// 把当前曲目加入指定歌单（本地歌单直接写盘；订阅歌单走统一编辑契约）。
-    /// 返回是否真的新增了条目，供抽屉内提示区分「已添加」与「已在歌单里」。
-    pub(super) fn add_current_track_to_playlist(
-        &mut self,
-        id: &PlaylistId,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(track) = self.current_track.clone() else {
-            return false;
-        };
-        let subscribed = self
-            .playlists
-            .get(id)
-            .is_some_and(|playlist| playlist.kind.is_subscribed());
-        if subscribed {
-            return self.apply_playlist_mutation(
-                id,
-                PlaylistMutation::AddTracks {
-                    tracks: vec![track],
-                },
-                cx,
-            );
-        }
-        let added = self.playlists.add_tracks(id, vec![track]);
-        if added > 0 {
-            cx.notify();
-        }
-        added > 0
-    }
-
-    /// 新建本地歌单并加入当前曲目；返回新歌单标题。
-    pub(super) fn create_playlist_for_current(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        let track = self.current_track.clone()?;
-        let id = self.playlists.create_local("", vec![track]);
-        let title = self
-            .playlists
-            .get(&id)
-            .map(|playlist| playlist.title.clone())?;
-        cx.notify();
-        Some(title)
-    }
-
     pub(super) fn apply_playlist_rename(&mut self, text: String, cx: &mut Context<Self>) {
         let Some(MainPage::Playlist(id)) = self.page.clone() else {
             return;
@@ -482,7 +371,20 @@ impl ChordialApp {
         if title.is_empty() {
             return;
         }
-        self.rename_playlist(&id, title, cx);
+        self.apply_playlist_mutation(&id, PlaylistMutation::Rename { title }, cx);
+    }
+
+    pub(super) fn playlist_summaries(&self) -> Arc<Vec<chordal_core::playlist::PlaylistSummary>> {
+        let revision = self.playlists.revision();
+        let mut cache = self.playlist_summaries.borrow_mut();
+        match cache.as_ref() {
+            Some((cached_revision, summaries)) if *cached_revision == revision => summaries.clone(),
+            _ => {
+                let summaries = Arc::new(self.playlists.summaries());
+                *cache = Some((revision, summaries.clone()));
+                summaries
+            }
+        }
     }
 
     /// 歌单页行快照：按 identity 判定源可用性 / 本地替代，缓存到
@@ -582,9 +484,19 @@ impl ChordialApp {
         };
         let playlist_id = id.clone();
         cx.spawn(async move |weak, cx| {
-            let fetched = match source.catalog() {
-                Some(catalog) => catalog.collection(&collection).await,
-                None => return,
+            let collection_for_task = collection.clone();
+            let fetched = match ChordialApp::run_background(async move {
+                let Some(catalog) = source.catalog() else {
+                    return Err(chordal_core::CoreError::Config("该音源不支持集合页".into()));
+                };
+                catalog.collection(&collection_for_task).await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(chordal_core::CoreError::Other(
+                    "后台任务繁忙，请稍后重试".into(),
+                )),
             };
             let _ = weak.update(cx, |app, cx| {
                 match fetched {

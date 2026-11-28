@@ -27,3 +27,17 @@ jobs:
         run: cargo test --workspace
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Concurrency-sensitive tests
+        run: cargo test -p chordal-core -p chordal-cache -p chordal-local -p chordal-netease -p chordal-amll-gpui
+      - name: UI check
+        run: cargo check -p chordal-ui

@@ -1,7 +1,7 @@
 //! 本地源：source（由 lib.rs 拆分，行为不变）。
 
-use super::*;
 use super::tags::*;
+use super::*;
 
 #[async_trait]
 impl MusicSource for LocalSource {
@@ -25,7 +25,7 @@ impl MusicSource for LocalSource {
         let scope = PerfScope::enter("local.search.filter");
         let index = self.index.read().expect("local index lock poisoned");
         let mut hits: Vec<&Track> = Vec::new();
-        for track in &index.tracks {
+        for track in index.tracks.iter() {
             // 预计算键上的单次 substring 匹配。提前终止：命中数达到
             // offset+limit 即止，典型复杂度 O(命中数·m) 而非 O(n·m)。
             if track.search_key.contains(&needle) {

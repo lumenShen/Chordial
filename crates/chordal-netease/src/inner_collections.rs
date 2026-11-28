@@ -83,18 +83,17 @@ impl Inner {
             return Err(CoreError::Config("尚未登录网易云".into()));
         };
         let key = self.account_key(&profile.uid, "playlists", "all");
-        if let Some(cache) = &self.cache
-            && let Some(meta) = cache.meta(&key)
-            && let Some(list) = cache.get_json::<Vec<CollectionSummary>>(&key)
+        if let Some(cached) =
+            get_cached_json::<Vec<CollectionSummary>>(self.cache.as_ref(), &key).await
         {
-            if now_secs().saturating_sub(meta.fetched_at) >= ACCOUNT_REFRESH_AFTER_SECS {
+            if now_secs().saturating_sub(cached.meta.fetched_at) >= ACCOUNT_REFRESH_AFTER_SECS {
                 self.spawn_user_playlists_refresh(profile.uid, key);
             }
-            return Ok(list);
+            return Ok(cached.value);
         }
         let list = self.fetch_user_playlists(&profile.uid).await?;
         if let Some(cache) = &self.cache {
-            cache.put_json(&key, &list, CacheTags::default());
+            put_cached_json(cache, &key, list.clone(), CacheTags::default()).await;
         }
         Ok(list)
     }
@@ -104,13 +103,18 @@ impl Inner {
             return;
         }
         let inner = self.clone();
+        let guard = RefreshGuard {
+            inner: inner.clone(),
+            key: key.clone(),
+        };
         shared_runtime().spawn(async move {
+            let _guard = guard;
             // 账号切换后旧 uid 的结果不得写回新会话。
             let epoch = inner.session_epoch.load(Ordering::Acquire);
             match inner.fetch_user_playlists(&uid).await {
                 Ok(list) if inner.session_epoch.load(Ordering::Acquire) == epoch => {
                     if let Some(cache) = &inner.cache {
-                        cache.put_json(&key, &list, CacheTags::default());
+                        put_cached_json(cache, &key, list, CacheTags::default()).await;
                     }
                 }
                 Ok(_) => {}
@@ -121,7 +125,6 @@ impl Inner {
                     "user playlists background refresh failed"
                 ),
             }
-            inner.end_refresh(&key);
         });
     }
 
@@ -181,18 +184,15 @@ impl Inner {
         id: &CollectionId,
     ) -> CoreResult<CollectionPage> {
         let key = self.collection_key(id);
-        if let Some(cache) = &self.cache
-            && let Some(meta) = cache.meta(&key)
-            && let Some(page) = cache.get_json::<CollectionPage>(&key)
-        {
-            if now_secs().saturating_sub(meta.fetched_at) >= COLLECTION_REFRESH_AFTER_SECS {
+        if let Some(cached) = get_cached_json::<CollectionPage>(self.cache.as_ref(), &key).await {
+            if now_secs().saturating_sub(cached.meta.fetched_at) >= COLLECTION_REFRESH_AFTER_SECS {
                 self.spawn_collection_refresh(id.clone(), key);
             }
-            return Ok(page);
+            return Ok(cached.value);
         }
         let page = self.fetch_collection_page(id).await?;
         if let Some(cache) = &self.cache {
-            cache.put_json(&key, &page, CacheTags::default());
+            put_cached_json(cache, &key, page.clone(), CacheTags::default()).await;
         }
         Ok(page)
     }
@@ -202,12 +202,17 @@ impl Inner {
             return;
         }
         let inner = self.clone();
+        let guard = RefreshGuard {
+            inner: inner.clone(),
+            key: key.clone(),
+        };
         shared_runtime().spawn(async move {
+            let _guard = guard;
             let epoch = inner.session_epoch.load(Ordering::Acquire);
             match inner.fetch_collection_page(&id).await {
                 Ok(page) if inner.session_epoch.load(Ordering::Acquire) == epoch => {
                     if let Some(cache) = &inner.cache {
-                        cache.put_json(&key, &page, CacheTags::default());
+                        put_cached_json(cache, &key, page, CacheTags::default()).await;
                     }
                 }
                 Ok(_) => {}
@@ -218,7 +223,6 @@ impl Inner {
                     "collection background refresh failed"
                 ),
             }
-            inner.end_refresh(&key);
         });
     }
 

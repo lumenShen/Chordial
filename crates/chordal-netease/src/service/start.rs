@@ -1,7 +1,7 @@
 //! 托管服务：start（由 service.rs 拆分，行为不变）。
 
-use super::*;
 use super::helpers::*;
+use super::*;
 
 impl NeteaseService {
     pub(super) fn has_local_managed(&self) -> bool {

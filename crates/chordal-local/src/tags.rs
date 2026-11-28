@@ -268,4 +268,3 @@ pub(super) fn read_tags_symphonia(path: &Path) -> Option<TrackMeta> {
     meta.artists.dedup();
     Some(meta)
 }
-

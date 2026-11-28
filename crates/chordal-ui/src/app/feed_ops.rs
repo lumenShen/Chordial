@@ -84,7 +84,7 @@ impl ChordialApp {
                     if let Some(state) = app.source_feeds.get_mut(&source_id) {
                         match result {
                             Ok(tracks) => {
-                                state.daily = tracks;
+                                state.daily = Arc::new(tracks);
                                 state.daily_error = None;
                             }
                             Err(e) => {
@@ -103,7 +103,7 @@ impl ChordialApp {
                     if let Some(state) = app.source_feeds.get_mut(&source_id) {
                         match result {
                             Ok(tracks) => {
-                                state.fm = tracks;
+                                state.fm = Arc::new(tracks);
                                 state.fm_error = None;
                             }
                             Err(e) => {
@@ -236,11 +236,10 @@ impl ChordialApp {
                     if let Some(refill) = self.queue_refill.as_mut() {
                         refill.last_empty_at = None;
                     }
-                    // 续接也走统一写入口，保持 queue_gen 递增。
-                    let refill = self.queue_refill.clone();
-                    self.set_queue(Arc::new(queue), refill);
+                    self.queue = Arc::new(queue);
+                    self.shuffle_plan = None;
                     if let Some(state) = self.source_feeds.get_mut(source) {
-                        Self::append_unique_tracks(&mut state.fm, incoming);
+                        Self::append_unique_tracks(Arc::make_mut(&mut state.fm), incoming);
                         state.fm_error = None;
                     }
                     cx.notify();

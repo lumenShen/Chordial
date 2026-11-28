@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Chordial 2.0 desktop UI (gpui)"
+description = "Chordial 2.0 GPUI application"
+
+[lib]
+name = "chordal_ui"
+path = "src/lib.rs"
 
 [[bin]]
 name = "chordial"
@@ -30,6 +34,9 @@ futures = { workspace = true }
 unicode-segmentation = { workspace = true }
 dirs = { workspace = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+gpui = { workspace = true, features = ["android"] }
+
 # 崩溃兜底：Unix 安装致命信号处理，Windows 安装 unhandled exception filter。
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -39,7 +46,10 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
-    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_WindowsAndMessaging"
 ] }
 # 性能浮窗用原始 HWND 调 SetWindowPos 置顶；版本与 gpui 依赖保持一致。
 raw-window-handle = "0.6"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

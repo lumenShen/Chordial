@@ -2,6 +2,10 @@ mod app_menu;
 mod keyboard;
 mod keystroke;
 
+/// Android native window, renderer, input, and JNI bridge.
+#[cfg(all(target_os = "android", feature = "android"))]
+pub mod android;
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod linux;
 
@@ -13,7 +17,8 @@ mod mac;
         any(target_os = "linux", target_os = "freebsd"),
         any(feature = "x11", feature = "wayland")
     ),
-    all(target_os = "macos", feature = "macos-blade")
+    all(target_os = "macos", feature = "macos-blade"),
+    all(target_os = "android", feature = "android")
 ))]
 mod blade;
 
@@ -72,6 +77,8 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
+#[cfg(all(target_os = "android", feature = "android"))]
+pub(crate) use android::*;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) use linux::*;
 #[cfg(target_os = "macos")]
@@ -88,6 +95,11 @@ pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream}
 /// Returns a background executor for the current platform.
 pub fn background_executor() -> BackgroundExecutor {
     current_platform(true).background_executor()
+}
+
+#[cfg(all(target_os = "android", feature = "android"))]
+pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
+    Rc::new(AndroidPlatform::new())
 }
 
 #[cfg(target_os = "macos")]

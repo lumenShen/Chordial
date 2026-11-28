@@ -116,10 +116,7 @@ impl Element for Retained {
                 ((layout_id, hit, child), cache)
             });
 
-        (
-            layout_id,
-            RetainedFrameState { child },
-        )
+        (layout_id, RetainedFrameState { child })
     }
 
     fn prepaint(

@@ -3,6 +3,7 @@
 //! 从 app.rs 拆分而来；仅做代码搬移，行为不变。
 
 use super::*;
+use chordal_core::FrequencyRange;
 
 impl ChordialApp {
     pub(super) fn open_settings(&mut self, cx: &mut Context<Self>) {
@@ -21,8 +22,9 @@ impl ChordialApp {
             eq_enabled: self.eq.settings.enabled,
             backend: self.player.backend_name().to_string(),
         };
+        let config = self.config.clone();
         self.settings_view.update(cx, |view, cx| {
-            view.sync(runtime, cx);
+            view.sync(&config, runtime, cx);
             view.sync_memory(mem::snapshot(), cx);
         });
 
@@ -63,10 +65,10 @@ impl ChordialApp {
     /// 设置页开关 → 持久化配置 + 开/关独立浮窗。
     pub(super) fn set_perf_overlay(&mut self, on: bool, cx: &mut Context<Self>) {
         self.perf_overlay_on = on;
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         if cfg.perf_overlay != on {
             cfg.perf_overlay = on;
-            crate::config::save(&cfg);
+            self.commit_config(&cfg);
         }
         if on {
             self.open_perf_overlay(cx);
@@ -93,10 +95,10 @@ impl ChordialApp {
                 tracing::warn!(%error, "perf overlay window open failed");
                 self.perf_overlay_on = false;
                 self.perf_window = None;
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 if cfg.perf_overlay {
                     cfg.perf_overlay = false;
-                    crate::config::save(&cfg);
+                    self.commit_config(&cfg);
                 }
                 self.settings_view
                     .update(cx, |view, cx| view.set_perf_overlay(false, cx));
@@ -121,10 +123,10 @@ impl ChordialApp {
         self.perf_window = None;
         self.perf_overlay_on = false;
         crate::perf_overlay::set_enabled(false);
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         if cfg.perf_overlay {
             cfg.perf_overlay = false;
-            crate::config::save(&cfg);
+            self.commit_config(&cfg);
         }
         self.settings_view
             .update(cx, |view, cx| view.set_perf_overlay(false, cx));
@@ -148,21 +150,48 @@ impl ChordialApp {
             }
             SettingsAction::SetSmoothScroll(on) => {
                 self.smooth_scroll = on;
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 cfg.smooth_scroll = on;
-                crate::config::save(&cfg);
+                self.commit_config(&cfg);
                 cx.notify();
             }
             SettingsAction::SetPerfOverlay(on) => self.set_perf_overlay(on, cx),
             SettingsAction::SetSourcePreference(pref) => {
                 self.set_source_preference(pref, cx);
             }
-            SettingsAction::SetBeatBand(low, high) => self.commit_beat_band(low, high, cx),
+            SettingsAction::SetAudioBandRanges(ranges) => self.commit_audio_band_ranges(ranges, cx),
+            SettingsAction::SetAudioBandControls(controls) => {
+                self.commit_audio_band_controls(controls, cx)
+            }
             SettingsAction::SetBeatStrength(value) => self.commit_beat_strength(value, cx),
             SettingsAction::SetBackgroundRenderDivisor(divisor) => {
                 self.commit_background_render_divisor(divisor, cx)
             }
             SettingsAction::SetLyricSweepFade(value) => self.commit_lyric_sweep_fade(value, cx),
+            SettingsAction::SetMotionPreset(preset) => self.commit_motion_tuning(
+                MotionTuning::new(
+                    preset,
+                    self.motion_tuning.duration,
+                    self.motion_tuning.overshoot,
+                ),
+                cx,
+            ),
+            SettingsAction::SetMotionDuration(value) => self.commit_motion_tuning(
+                MotionTuning::new(
+                    self.motion_tuning.preset,
+                    value,
+                    self.motion_tuning.overshoot,
+                ),
+                cx,
+            ),
+            SettingsAction::SetMotionOvershoot(value) => self.commit_motion_tuning(
+                MotionTuning::new(
+                    self.motion_tuning.preset,
+                    self.motion_tuning.duration,
+                    value,
+                ),
+                cx,
+            ),
             SettingsAction::SetEqEnabled(on) => self.set_eq_enabled(on, cx),
             SettingsAction::OpenEqualizer => {
                 self.settings_open = false;
@@ -178,40 +207,40 @@ impl ChordialApp {
             }
             SettingsAction::SetSearchTimeout(ms) => {
                 self.search_timeout_ms = ms.clamp(500, 60_000);
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 cfg.search_timeout_ms = self.search_timeout_ms;
-                crate::config::save(&cfg);
+                self.commit_config(&cfg);
                 cx.notify();
             }
             SettingsAction::SetNeteaseMode(mode) => {
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 cfg.netease.mode = mode;
-                crate::config::save(&cfg);
+                self.commit_config(&cfg);
                 cx.notify();
             }
             SettingsAction::SetNeteaseQuality(level) => {
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 cfg.netease.level = Some(level);
-                crate::config::save(&cfg);
+                self.commit_config(&cfg);
                 cx.notify();
             }
             SettingsAction::SetNeteaseBaseUrl(url) => {
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 cfg.netease.base_url = url;
-                crate::config::save(&cfg);
+                self.commit_config(&cfg);
                 cx.notify();
             }
             SettingsAction::SetPlayerDevice(device) => {
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 cfg.player_device = device;
-                crate::config::save(&cfg);
+                self.commit_config(&cfg);
                 cx.notify();
             }
             SettingsAction::AddLocalRoot(path) => {
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 if !cfg.local_roots.contains(&path) {
                     cfg.local_roots.push(path);
-                    crate::config::save(&cfg);
+                    self.commit_config(&cfg);
                 }
                 let local = self.local_source.clone();
                 if let Some(local) = local {
@@ -220,10 +249,10 @@ impl ChordialApp {
                 }
             }
             SettingsAction::RemoveLocalRoot(index) => {
-                let mut cfg = crate::config::load_or_default();
+                let mut cfg = self.config.clone();
                 if cfg.local_roots.len() > 1 && index < cfg.local_roots.len() {
                     cfg.local_roots.remove(index);
-                    crate::config::save(&cfg);
+                    self.commit_config(&cfg);
                     let local = self.local_source.clone();
                     if let Some(local) = local {
                         local.set_roots(cfg.local_roots.clone());
@@ -237,22 +266,43 @@ impl ChordialApp {
         }
     }
 
+    /// 动画手感：同步进程级全局、宿主快照与配置三处；改动只影响新动画。
+    pub(super) fn commit_motion_tuning(&mut self, tuning: MotionTuning, cx: &mut Context<Self>) {
+        // 动作可能来自输入框之外的调用方，这里再夹一次范围。
+        let tuning = MotionTuning::new(
+            tuning.preset,
+            crate::config::clamp_animation_duration_multiplier(tuning.duration),
+            crate::config::clamp_animation_overshoot_multiplier(tuning.overshoot),
+        );
+        cx.global_mut::<Globals>().motion_tuning = tuning;
+        self.motion_tuning = tuning;
+        let mut cfg = self.config.clone();
+        cfg.motion_preset = tuning.preset;
+        cfg.animation_duration_multiplier = tuning.duration;
+        cfg.animation_overshoot_multiplier = tuning.overshoot;
+        self.commit_config(&cfg);
+        cx.notify();
+    }
+
     pub(super) fn apply_cache_dir(&mut self, text: String, cx: &mut Context<Self>) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
         let path = std::path::PathBuf::from(text);
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.cache_dir = path.clone();
-        crate::config::save(&cfg);
+        self.commit_config(&cfg);
         let cache = self.cache.clone();
         let limit = cfg.cache_limit_bytes;
         let path_for_task = path.clone();
         cx.spawn(async move |weak, cx| {
-            cx.background_executor()
-                .spawn(async move { cache.reconfigure(path_for_task, limit) })
-                .await;
+            let result =
+                ChordialApp::run_background(async move { cache.reconfigure(path_for_task, limit) })
+                    .await;
+            if result.is_err() {
+                tracing::warn!("cache reconfigure task failed");
+            }
             let _ = weak.update(cx, |_app, cx| cx.notify());
         })
         .detach();
@@ -266,23 +316,39 @@ impl ChordialApp {
             return;
         }
         let path = std::path::PathBuf::from(text);
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.download_dir = path.clone();
-        crate::config::save(&cfg);
-        self.downloads = Arc::new(DownloadStore::open(path.clone()));
+        self.commit_config(&cfg);
+        let path_for_task = path.clone();
+        cx.spawn(async move |weak, cx| {
+            let opened =
+                ChordialApp::run_background(async move { DownloadStore::open(path_for_task) })
+                    .await;
+            let _ = weak.update(cx, |app, cx| {
+                match opened {
+                    Ok(store) => app.downloads = Arc::new(store),
+                    Err(_) => {
+                        app.status_message = Some("后台任务繁忙，下载目录将在重启后生效".into())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         self.info_message = Some(format!("下载目录：{}", path.display()));
         cx.notify();
     }
 
     pub(super) fn set_cache_limit_bytes(&mut self, bytes: u64, cx: &mut Context<Self>) {
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.cache_limit_bytes = bytes;
-        crate::config::save(&cfg);
+        self.commit_config(&cfg);
         let cache = self.cache.clone();
         cx.spawn(async move |weak, cx| {
-            cx.background_executor()
-                .spawn(async move { cache.set_limit(bytes) })
-                .await;
+            let result = ChordialApp::run_background(async move { cache.set_limit(bytes) }).await;
+            if result.is_err() {
+                tracing::warn!("cache limit task failed");
+            }
             let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
             let _ = weak.update(cx, |app, cx| {
                 app.info_message = Some(format!("缓存上限：{gb:.1} GB"));
@@ -299,10 +365,17 @@ impl ChordialApp {
         self.info_message = Some("正在清空对象缓存…".into());
         cx.notify();
         cx.spawn(async move |weak, cx| {
-            let removed = cx
-                .background_executor()
-                .spawn(async move { cache.purge_all() })
-                .await;
+            let removed = match ChordialApp::run_background(async move { cache.purge_all() }).await
+            {
+                Ok(removed) => removed,
+                Err(_) => {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.info_message = Some("后台任务繁忙，缓存清空未执行".into());
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
             let _ = weak.update(cx, |app, cx| {
                 app.info_message = Some(format!("已清空对象缓存（{removed} 项）"));
                 let stats = app.cache.stats();
@@ -318,9 +391,9 @@ impl ChordialApp {
 
     pub(super) fn set_source_preference(&mut self, pref: SourcePreference, cx: &mut Context<Self>) {
         self.source_preference = pref;
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.source_preference = pref;
-        crate::config::save(&cfg);
+        self.commit_config(&cfg);
         self.info_message = Some(format!("播放来源：{}", pref.label()));
         cx.notify();
     }
@@ -329,12 +402,21 @@ impl ChordialApp {
         self.set_source_preference(self.source_preference.next(), cx);
     }
 
-    /// 设置面板提交：解析「下限 / 上限」两个输入框并应用频段。
-    pub(super) fn apply_beat_band(&mut self, cx: &mut Context<Self>) {
-        let low_text = self.settings_beat_low_input.read(cx).content().to_string();
-        let high_text = self.settings_beat_high_input.read(cx).content().to_string();
+    /// 设置面板提交：解析指定频段的「下限 / 上限」并应用。
+    pub(super) fn apply_audio_band(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(kind) = AudioBandKind::ALL.get(index).copied() else {
+            return;
+        };
+        let low_text = self.settings_audio_low_inputs[index]
+            .read(cx)
+            .content()
+            .to_string();
+        let high_text = self.settings_audio_high_inputs[index]
+            .read(cx)
+            .content()
+            .to_string();
         let invalid =
-            || "鼓点频段无效：需满足 20 ≤ 下限 < 上限 ≤ 22050 Hz（支持 4k / 10khz）".to_string();
+            || "频段无效：需满足 20 ≤ 下限 < 上限 ≤ 22050 Hz（支持 4k / 10khz）".to_string();
         let (Some(low), Some(high)) = (parse_hz_input(&low_text), parse_hz_input(&high_text))
         else {
             self.status_message = Some(invalid());
@@ -347,40 +429,104 @@ impl ChordialApp {
             cx.notify();
             return;
         }
-        self.commit_beat_band(low, high, cx);
+        let mut ranges = self.audio_band_ranges;
+        ranges.set(
+            kind,
+            FrequencyRange {
+                low_hz: low,
+                high_hz: high,
+            },
+        );
+        self.commit_audio_band_ranges(ranges, cx);
     }
 
-    pub(super) fn commit_beat_band(&mut self, low: f32, high: f32, cx: &mut Context<Self>) {
-        let (low, high) = chordal_player::normalize_band(low, high);
-        self.beat_band = (low, high);
-        self.player.set_beat_band(low, high);
-        let mut cfg = crate::config::load_or_default();
-        cfg.beat_band_low_hz = low;
-        cfg.beat_band_high_hz = high;
-        crate::config::save(&cfg);
-        self.settings_beat_low_input.update(cx, |state, cx| {
-            state.set_content(format!("{low:.0}"), cx);
-        });
-        self.settings_beat_high_input.update(cx, |state, cx| {
-            state.set_content(format!("{high:.0}"), cx);
-        });
-        self.info_message = Some(format!("背景鼓点频段：{low:.0}–{high:.0} Hz"));
+    pub(super) fn commit_audio_band_ranges(
+        &mut self,
+        ranges: AudioBandRanges,
+        cx: &mut Context<Self>,
+    ) {
+        let ranges = ranges.sanitized();
+        self.audio_band_ranges = ranges;
+        self.player.set_audio_band_ranges(ranges);
+        let mut cfg = self.config.clone();
+        cfg.audio_band_ranges = ranges;
+        let kick = ranges.get(AudioBandKind::Kick);
+        cfg.beat_band_low_hz = kick.low_hz;
+        cfg.beat_band_high_hz = kick.high_hz;
+        self.commit_config(&cfg);
+        self.sync_audio_band_inputs(cx);
+        self.info_message = Some("五路监听频段已更新".into());
         cx.notify();
     }
 
-    pub(super) fn set_beat_band_preset(&mut self, low: f32, high: f32, cx: &mut Context<Self>) {
-        self.commit_beat_band(low, high, cx);
+    pub(super) fn apply_audio_band_controls(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(kind) = AudioBandKind::ALL.get(index).copied() else {
+            return;
+        };
+        let text = self.settings_audio_control_inputs[index]
+            .read(cx)
+            .content()
+            .to_string();
+        let controls = match chordal_core::parse_control_point_set(&text) {
+            Ok(controls) => controls,
+            Err(chordal_core::ControlPointParseError::InvalidNumber) => {
+                self.status_message = Some("控制点编号需用逗号分隔，如 7,8,12,13".into());
+                cx.notify();
+                return;
+            }
+            Err(chordal_core::ControlPointParseError::BoundaryOrOutOfRange(_)) => {
+                self.status_message =
+                    Some("仅可分配内部点 7,8,9,12,13,14,17,18,19；边界点保持固定".into());
+                cx.notify();
+                return;
+            }
+        };
+        let mut mapping = self.audio_band_controls;
+        mapping.set(kind, controls);
+        self.commit_audio_band_controls(mapping, cx);
     }
 
-    /// 应用背景鼓点的视觉倍率（0..=1.5），立即更新渲染器并持久化。
+    pub(super) fn commit_audio_band_controls(
+        &mut self,
+        controls: AudioControlMapping,
+        cx: &mut Context<Self>,
+    ) {
+        let controls = controls.sanitized();
+        self.audio_band_controls = controls;
+        self.lyric_view
+            .update(cx, |view, _| view.set_audio_control_mapping(controls));
+        let mut cfg = self.config.clone();
+        cfg.audio_band_controls = controls;
+        self.commit_config(&cfg);
+        self.sync_audio_band_inputs(cx);
+        self.info_message = Some("频段控制点映射已更新".into());
+        cx.notify();
+    }
+
+    fn sync_audio_band_inputs(&self, cx: &mut Context<Self>) {
+        for (index, kind) in AudioBandKind::ALL.into_iter().enumerate() {
+            let range = self.audio_band_ranges.get(kind);
+            self.settings_audio_low_inputs[index].update(cx, |state, cx| {
+                state.set_content(format!("{:.0}", range.low_hz), cx);
+            });
+            self.settings_audio_high_inputs[index].update(cx, |state, cx| {
+                state.set_content(format!("{:.0}", range.high_hz), cx);
+            });
+            self.settings_audio_control_inputs[index].update(cx, |state, cx| {
+                state.set_content(self.audio_band_controls.get(kind).display(), cx);
+            });
+        }
+    }
+
+    /// 应用全部音频反应背景的视觉倍率（0..=1.5），立即更新渲染器并持久化。
     pub(super) fn commit_beat_strength(&mut self, value: f32, cx: &mut Context<Self>) {
         let value = value.clamp(0.0, 1.5);
         self.lyric_view
             .update(cx, |view, _| view.set_background_beat_strength(value));
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.beat_strength = value;
-        crate::config::save(&cfg);
-        self.info_message = Some(format!("背景鼓点强度：{:.0}%", value * 100.0));
+        self.commit_config(&cfg);
+        self.info_message = Some(format!("背景音频反应强度：{:.0}%", value * 100.0));
         cx.notify();
     }
 
@@ -400,9 +546,9 @@ impl ChordialApp {
         let scale = self.background_render_scale();
         self.lyric_view
             .update(cx, |view, _| view.set_background_render_scale(scale));
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.background_render_divisor = divisor;
-        crate::config::save(&cfg);
+        self.commit_config(&cfg);
         self.info_message = Some(format!("流体背景分辨率：1/{divisor}"));
         cx.notify();
     }
@@ -414,9 +560,6 @@ impl ChordialApp {
         let theme = Theme::get(cx).clone();
         // 手机播放页把歌词视图当背景，使用沉浸样式；其余按当前是否沉浸选择。
         let style = match self.phone_backdrop {
-            PhoneBackdrop::Lyrics => {
-                phone_lyric_style(&theme, self.viewport_width, self.viewport_height, value)
-            }
             PhoneBackdrop::Player => {
                 immersive_lyric_style(self.viewport_width, self.viewport_height, value)
             }
@@ -427,9 +570,9 @@ impl ChordialApp {
         };
         self.lyric_view
             .update(cx, |view, _| view.set_text_style(style));
-        let mut cfg = crate::config::load_or_default();
+        let mut cfg = self.config.clone();
         cfg.lyric_sweep_fade_em = value;
-        crate::config::save(&cfg);
+        self.commit_config(&cfg);
         self.info_message = Some(format!("歌词扫光宽度：{value:.2}em"));
         cx.notify();
     }

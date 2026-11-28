@@ -3,6 +3,22 @@
 use super::*;
 
 #[test]
+fn background_viewport_uses_device_pixels() {
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(682.5), px(480.25)));
+    for (scale, want) in [
+        (1.0, (683, 481)),
+        (1.25, (854, 601)),
+        (1.5, (1024, 721)),
+        (2.0, (1365, 961)),
+    ] {
+        assert_eq!(background_viewport_size(bounds, scale), want);
+    }
+    // 平台尚未报告缩放时回退到逻辑像素，不能除以零或产生空视口。
+    assert_eq!(background_viewport_size(bounds, 0.0), (683, 481));
+    assert_eq!(background_viewport_size(bounds, f32::NAN), (683, 481));
+}
+
+#[test]
 fn cjk_detection() {
     assert!(is_cjk_char('海'));
     assert!(!is_cjk_char('a'));
@@ -322,6 +338,45 @@ fn rapid_song_switch_keeps_exactly_one_outgoing_layer() {
 }
 
 #[test]
+fn song_switch_rebinds_viewport_when_bounds_do_not_change() {
+    let mut inner = Inner::new();
+    inner.sync_viewport(390.0, 844.0);
+    install_one_line(&mut inner);
+
+    // 切歌会替换整份 TextLayoutCache；新缓存从 1280×720 兜底视口开始。
+    inner.begin_switch();
+    let long_text = "很长的一句歌词".repeat(80);
+    LyricPlayerView::install_lyrics(
+        &mut inner,
+        vec![LyricLine {
+            words: vec![LyricWord::new(long_text, 0, 1_000)],
+            start_time: 0,
+            end_time: 1_000,
+            ..Default::default()
+        }],
+        0,
+    );
+
+    // 真实 prepaint 的 bounds 没变，也必须把新缓存重新绑定到窄窗尺寸。
+    inner.sync_viewport(390.0, 844.0);
+    let doc = inner.player.document();
+    let mut narrow = TextLayoutCache::new(inner.text.style().clone());
+    narrow.set_viewport(390.0, 844.0);
+    narrow.set_lyrics(doc);
+    let mut fallback = TextLayoutCache::new(inner.text.style().clone());
+    fallback.set_lyrics(doc);
+
+    assert!(narrow.heights()[0] > fallback.heights()[0]);
+    assert!(
+        (inner.text.heights()[0] - narrow.heights()[0]).abs() < 0.01,
+        "switched lyrics must use the current viewport: actual={}, narrow={}, fallback={}",
+        inner.text.heights()[0],
+        narrow.heights()[0],
+        fallback.heights()[0]
+    );
+}
+
+#[test]
 fn clear_lyrics_does_not_keep_outgoing_layer() {
     let mut inner = Inner::new();
     install_one_line(&mut inner);
@@ -329,4 +384,66 @@ fn clear_lyrics_does_not_keep_outgoing_layer() {
     assert!(inner.outgoing.is_some());
     inner.finish_switch();
     assert!(inner.outgoing.is_none());
+}
+
+#[test]
+fn background_worker_keeps_raf_until_current_output_arrives() {
+    let mut inner = Inner::new();
+    inner.background_visible = true;
+    inner.background.set_kind(BackgroundRendererKind::Css);
+    inner
+        .background
+        .publish((8, 8), AudioBands::default(), true);
+    assert!(inner.animation_state().background_animating);
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if matches!(inner.background.poll(), Some(FrameOutput::Clear { .. })) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "worker did not publish clear");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(!inner.animation_state().background_animating);
+}
+
+#[test]
+fn paused_prepare_started_spring_still_wants_animation_frame() {
+    let mut inner = Inner::new();
+    inner.background_visible = false;
+    inner.playing = false;
+    install_one_line(&mut inner);
+
+    // 模拟 render 在 prepare 前留下的静止快照；prepare 的布局阶段随后才
+    // 安装首次入场弹簧。暂停不能成为丢掉下一帧的理由。
+    inner.animating = false;
+    inner.sync_metrics(1_000.0, 600.0);
+    inner.advance_animation();
+    let state = inner.animation_state();
+    assert!(
+        state.lyric_animating,
+        "paused first-entry spring must stay active"
+    );
+    assert_eq!(state.interval_ms(), Some(0.0));
+    assert!(state.wants_frame(0.0));
+}
+
+#[test]
+fn frame_animation_state_composes_sources_and_background_throttle() {
+    let idle = FrameAnimationState::default();
+    assert_eq!(idle.interval_ms(), None);
+    assert!(!idle.wants_frame(1_000.0));
+
+    let lyrics = FrameAnimationState::new(true, false, 0.0);
+    assert_eq!(lyrics.interval_ms(), Some(0.0));
+    assert!(lyrics.wants_frame(0.0));
+
+    let background = FrameAnimationState::new(false, true, 1000.0 / 30.0);
+    assert!(!background.wants_frame(29.0));
+    assert!(background.wants_frame(31.0));
+    assert_eq!(lyrics.merge(background).interval_ms(), Some(0.0));
+
+    let slower = FrameAnimationState::new(false, true, 50.0);
+    assert_eq!(background.merge(slower).interval_ms(), Some(1000.0 / 30.0));
+    assert_eq!(idle.merge(lyrics), lyrics);
 }

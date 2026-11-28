@@ -24,6 +24,7 @@ impl LyricPlayer {
             prefix_max_end: Vec::new(),
             prefix_dirty: true,
             springs: Vec::new(),
+            pos_y_params: SpringParams::new(0.9, 15.0, 90.0),
             targets: Vec::new(),
             frame: PlayerFrame::default(),
             active_scratch: Vec::new(),
@@ -125,6 +126,7 @@ impl LyricPlayer {
         let n = self.doc.lines.len();
         self.springs.clear();
         self.springs.reserve(n);
+        self.pos_y_params = SpringParams::new(0.9, 15.0, 90.0);
         self.targets.clear();
         self.targets.resize(
             n,
@@ -145,10 +147,15 @@ impl LyricPlayer {
         self.frame.interlude = None;
         self.visible_start = 0;
         self.visible_end = 0;
-        for _ in 0..n {
+        for line in &self.doc.lines {
+            let scale_params = if line.is_bg {
+                SpringParams::new(1.0, 20.0, 50.0)
+            } else {
+                SpringParams::new(2.0, 25.0, 100.0)
+            };
             self.springs.push(LineSprings {
-                pos_y: Spring::new(0.0).with_params(SpringParams::new(0.9, 15.0, 90.0)),
-                scale: Spring::new(100.0).with_params(SpringParams::new(2.0, 25.0, 100.0)),
+                pos_y: Spring::new(0.0).with_params(self.pos_y_params),
+                scale: Spring::new(100.0).with_params(scale_params),
             });
         }
 
@@ -157,7 +164,7 @@ impl LyricPlayer {
         self.prefix_dirty = true;
         self.rebuild_prefix();
 
-        // 与 AMLL 相同：先按初始时间找出活跃行，再强制布局一次。
+        // 与 AMLL 相同：先按初始时间找出活跃行，再提交一次布局目标。
         self.set_time(initial_time, true);
     }
 
@@ -175,6 +182,7 @@ impl LyricPlayer {
             self.metrics = metrics;
         }
         self.prefix_dirty = true;
+        // 首次测量仍从屏外进入；force 不再等同于 initial_layout_finished。
         self.calc_layout(force);
         self.initial_layout_finished = true;
     }

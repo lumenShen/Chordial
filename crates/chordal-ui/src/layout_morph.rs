@@ -1,32 +1,36 @@
 //! 共享元素布局动画（anime.js `createLayout` / FLIP 的 GPUI 等价实现）。
 //!
-//! GPUI 没有可查询的 DOM 布局树，因此这里不读取「变换前后」的真实 rect，而是
-//! 把每个沉浸模态的共享元素几何写成纯函数：
+//! GPUI 的元素树没有可查询的 DOM，但 `prepaint` 阶段能取得 Taffy 计算后的真实
+//! `Bounds`。共享元素因此在状态切换时测量静态组件的封面、文案块与 Dock 卡片，
+//! 缓存按视口、封面缩放和闲置位移失效；动画每帧只采样弹簧，不重新遍历布局。
 //!
-//! ```text
-//! immersive_geometry(mode, viewport) -> StageGeometry { cover, info, ... }
-//! ```
-//!
-//! 切换模态时记录 First（切换瞬间的插值几何）与 Last（目标模态几何），
-//! 渲染阶段用 `ease_out_quint` 插值一个覆盖层舞台。页面本身在动画期间把
-//! 自带的封面 / 曲名 / 艺人设为透明（只保留占位），结束后再由页面按同一份
-//! 几何函数绘制，保证「动画终点」与「静态布局」严格一致、不会跳动。
-//!
-//! 这对应 anime.js Layout 的 `layout.record()` + `layout.animate()`：
-//! 记录前态 → 改布局 → 在两者之间补间。区别只是这里共享的是封面与曲目文案，
-//! 而不是整个容器的 flex/grid 属性。
-
-use std::time::{Duration, Instant};
+//! 切换时先冻结当前可见几何，隐藏目标页面完成一次真实布局测量，再用同一份
+//! 覆盖层舞台在 First / Last 之间过渡。`immersive_geometry` 等纯函数只用于首次
+//! 测量前的兜底与几何单元测试，不再作为运行时动画终点的真值源。
 
 /// 沉浸层里共享元素几何不同的布局模态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageMode {
+    /// 桌面主面板底部 Dock。
+    Dock,
+    /// 手机曲库页底部 mini player。
+    MiniPlayer,
+    /// 手机全屏播放页。
+    PhonePlayer,
     /// 竖屏：封面态（大封面 + 标题在下方）。
     CompactArt,
+    /// 竖屏：全屏歌词（小封面 + 标题在页头）。
+    CompactLyrics,
     /// 竖屏：播放队列（54px 小封面 + 标题在页头）。
     CompactQueue,
     /// 宽屏：歌词打开，播放列位于左侧 45% 区域。这是布局 1。
     WideSplit,
+}
+
+impl StageMode {
+    pub fn is_source(self) -> bool {
+        matches!(self, Self::Dock | Self::MiniPlayer | Self::PhonePlayer)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -63,9 +67,9 @@ impl StageRect {
 
 /// 一个模态下共享元素的完整几何。
 ///
-/// `info` 是曲名/艺人文案块的左上角与可用宽度；高度由字号与行高推导，
-/// 因此动画期间文字会随封面一起连续缩放，而不是在两份文本之间硬切。
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `info` 是曲名/艺人文案块的实测左上角与可用宽度；字号、行重和间距来自
+/// 静态组件样式，动画期间文字随封面连续过渡，不在两层文本之间硬切。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StageGeometry {
     pub cover: StageRect,
     pub cover_radius: f32,
@@ -87,7 +91,7 @@ impl StageGeometry {
         !self.cover.is_zero() && self.info.w > 0.5 && self.title_size > 0.5
     }
 
-    /// 文案块总高度：两行各自 `字号 × 1.25`，中间加 `line_gap`。
+    /// 公式兜底的文案块总高度；运行时优先使用静态布局实测高度。
     pub fn info_height(self) -> f32 {
         self.title_size * INFO_LINE_RATIO + self.artist_size * INFO_LINE_RATIO + self.line_gap
     }
@@ -105,135 +109,12 @@ impl StageGeometry {
             artist_weight: lerp(self.artist_weight, target.artist_weight, t),
         }
     }
-
-    /// 把整块几何平移到另一个坐标空间（共享舞台画在缩小的卡片里时使用）。
-    pub fn translated(self, dx: f32, dy: f32) -> Self {
-        Self {
-            cover: self.cover.translated(dx, dy),
-            info: self.info.translated(dx, dy),
-            ..self
-        }
-    }
-}
-
-/// anime.js 默认的 `out(5)` 近似——起步快、收尾稳，适合位置/尺寸补间。
-pub fn ease_out_quint(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(5)
-}
-
-/// smoothstep（`3t² - 2t³`）：两端斜率都为 0，淡入淡出不会在起止帧突然
-/// 出现/消失。用于「只在某一段行程里存在」的控件。
-pub fn ease_smoothstep(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// 把 `value` 从 `[from, to]` 映射到 `0..=1` 并套 smoothstep。
-/// `from > to` 时表示反向区间（value 越小越接近 1），用于展开/收起共用。
-pub fn ramp(value: f32, from: f32, to: f32) -> f32 {
-    if (to - from).abs() < 1e-6 {
-        return if value >= to { 1.0 } else { 0.0 };
-    }
-    ease_smoothstep((value - from) / (to - from))
-}
-
-/// 一次布局补间：First / Last 两帧几何 + 起始时刻。
-#[derive(Clone, Copy, Debug)]
-pub struct LayoutMotion {
-    pub from: StageGeometry,
-    pub to: StageGeometry,
-    /// First / Last 对应的模态；用于判断这次补间接管的是宽屏列还是竖屏页面。
-    pub from_mode: StageMode,
-    pub to_mode: StageMode,
-    pub start: Instant,
-    pub duration: Duration,
-}
-
-impl LayoutMotion {
-    #[allow(dead_code)] // 测试与后续入场/退场复用
-    pub fn new(
-        from_mode: StageMode,
-        from: StageGeometry,
-        to_mode: StageMode,
-        to: StageGeometry,
-        duration_ms: f32,
-    ) -> Self {
-        Self::starting_at(from_mode, from, to_mode, to, Instant::now(), duration_ms)
-    }
-
-    /// 显式指定起始时刻，便于同一帧内先采样 First 再构造补间。
-    pub fn starting_at(
-        from_mode: StageMode,
-        from: StageGeometry,
-        to_mode: StageMode,
-        to: StageGeometry,
-        start: Instant,
-        duration_ms: f32,
-    ) -> Self {
-        Self {
-            from,
-            to,
-            from_mode,
-            to_mode,
-            start,
-            duration: Duration::from_secs_f32((duration_ms / 1000.0).max(0.001)),
-        }
-    }
-
-    /// 线性进度 0..=1（用于淡入淡出等不需要缓动的通道）。
-    pub fn progress(&self, now: Instant) -> f32 {
-        (now.saturating_duration_since(self.start).as_secs_f32() / self.duration.as_secs_f32())
-            .clamp(0.0, 1.0)
-    }
-
-    /// 缓动后的进度 0..=1（用于位置/尺寸通道）。
-    pub fn eased(&self, now: Instant) -> f32 {
-        ease_out_quint(self.progress(now))
-    }
-
-    pub fn geometry(&self, now: Instant) -> StageGeometry {
-        self.from.lerp(self.to, self.eased(now))
-    }
-
-    #[allow(dead_code)] // 测试使用；调用方通常用 settled() 判断是否交还静态布局
-    pub fn done(&self, now: Instant) -> bool {
-        self.progress(now) >= 1.0
-    }
-
-    /// 结束后再保留一小段「终点帧」，让静态页面接管前最后一帧确实画在目标位置。
-    pub fn settled(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.start) >= self.duration + SETTLE_GRACE
-    }
-
-    pub fn active(&self, now: Instant) -> bool {
-        !self.settled(now)
-    }
-
-    /// 目标模态是否是「宽屏」几何；用于判断一次补间是否接管宽屏播放列。
-    pub fn touches_wide(&self) -> bool {
-        matches!(self.to_mode, StageMode::WideSplit)
-            || matches!(self.from_mode, StageMode::WideSplit)
-    }
-
-    /// 目标模态是否是「竖屏」几何。
-    pub fn touches_compact(&self) -> bool {
-        matches!(
-            self.to_mode,
-            StageMode::CompactArt | StageMode::CompactQueue
-        ) || matches!(
-            self.from_mode,
-            StageMode::CompactArt | StageMode::CompactQueue
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
-// 几何常量与纯函数：渲染层与动画层共用，避免两套公式漂移。
+// 几何常量与纯函数：提供首次测量前的兜底，运行时以实测 Bounds 为准。
 // ---------------------------------------------------------------------------
 
-/// 动画结束后多留 ~3 帧再交还给静态布局，避免最后一帧被跳过。
-const SETTLE_GRACE: Duration = Duration::from_millis(48);
 /// 曲名 / 艺人行高比例（与 AMLL 播放器列一致）。
 pub const INFO_LINE_RATIO: f32 = 1.25;
 /// 圆钮与文案之间的固定间距（`amll_info_row` 里的 `ml(16)`）。
@@ -264,6 +145,53 @@ pub const COMPACT_DOCK_H: f32 = 40.0;
 pub const COMPACT_COVER_GAP: f32 = 28.0;
 pub const COMPACT_MIN_CONTROLS: f32 = 196.0;
 
+/// 进度条行高 / 音量行高。渲染层、竖屏歌词几何与宽屏封面反推共用同一份值，
+/// 避免任一布局单独改行高后其它布局的间距算错。
+pub const STAGE_PROGRESS_H: f32 = 45.2;
+pub const STAGE_VOLUME_H: f32 = 40.0;
+/// 信息 / 进度 / 传输 / 音量 / 底栏之间至少保留的呼吸间距。
+pub const STAGE_MIN_GAP: f32 = 10.0;
+/// 宽屏底栏距离窗口底部的空间（32）与按钮行高度（40）。
+pub const STAGE_BOTTOM_RESERVE: f32 = 72.0;
+/// 窗口高度低于此值时收起音量行。矮窗里音量不是播放必需操作，
+/// 把 40px + 一道间距让给封面/歌词，比把封面压小或把控件贴成一团更好。
+pub const STAGE_VOLUME_MIN_H: f32 = 700.0;
+/// 宽屏封面的下限；再矮的窗口交给 0 间距兜底，避免封面缩到不可见。
+const WIDE_COVER_MIN: f32 = 120.0;
+
+pub fn stage_volume_visible(height: f32) -> bool {
+    height >= STAGE_VOLUME_MIN_H
+}
+
+/// 沉浸层传输按钮的边长：5 个按钮共用列宽的 18%。
+pub fn stage_button_size(column_w: f32) -> f32 {
+    (column_w * 0.18).clamp(if column_w < 240.0 { 34.0 } else { 40.0 }, 88.0)
+}
+
+/// 曲名/艺人两行所需的垂直空间（也是控件区的 leading）。
+pub fn amll_info_height(viewport_width: f32, height: f32) -> f32 {
+    let font = (height * 0.02).max(16.0);
+    (font * INFO_LINE_RATIO * 2.0).max(info_action_side(viewport_width, height))
+}
+
+/// 沉浸歌词字号（AMLL Medium 档）。歌词视口的左右 padding 等于字号 ×
+/// `IMMERSIVE_LYRIC_PADDING_EM`，竖屏顶栏/控件必须按同一数值内缩，
+/// 才能与歌词正文共用一条对齐线。
+pub fn immersive_lyric_font_size(width: f32, height: f32) -> f32 {
+    if width <= 768.0 {
+        (width * 0.08).max(12.0)
+    } else {
+        (height * 0.05).max(width * 0.025).max(14.0)
+    }
+}
+
+/// 沉浸歌词正文的左右 padding（em）。样式与竖屏几何唯一真值源。
+pub const IMMERSIVE_LYRIC_PADDING_EM: f32 = 1.0;
+
+pub fn immersive_lyric_padding(width: f32, height: f32) -> f32 {
+    immersive_lyric_font_size(width, height) * IMMERSIVE_LYRIC_PADDING_EM
+}
+
 pub const QUEUE_TOP_PAD: f32 = 4.0;
 pub const QUEUE_HINT_H: f32 = 58.0;
 pub const QUEUE_COVER: f32 = 54.0;
@@ -272,33 +200,80 @@ pub const QUEUE_COVER_GAP: f32 = 12.0;
 
 /// 竖屏内容列宽（封面、信息、进度、传输、音量、底栏共用）。
 pub fn compact_content_w(width: f32, height: f32) -> f32 {
-    ((width * 0.82).min(height * 0.55).min(560.0)).max(260.0)
+    (width * 0.82).min(height * 0.55).clamp(260.0, 560.0)
 }
 
 /// 竖屏封面态的大封面边长。
 pub fn compact_cover_size(width: f32, height: f32) -> f32 {
     let content_w = compact_content_w(width, height);
     let available = (height - COMPACT_TOP - COMPACT_BOTTOM - COMPACT_DOCK_H - 8.0).max(0.0);
-    content_w.min((available - COMPACT_MIN_CONTROLS - COMPACT_COVER_GAP).max(160.0))
+    // 音量行被收起时，控件区的最小高度同步减少，封面可以把这部分空间拿回去。
+    let min_controls = if stage_volume_visible(height) {
+        COMPACT_MIN_CONTROLS
+    } else {
+        COMPACT_MIN_CONTROLS - STAGE_VOLUME_H
+    };
+    content_w.min((available - min_controls - COMPACT_COVER_GAP).max(160.0))
 }
 
 /// 宽屏封面边长（AMLL HorizontalLayout）。
+///
+/// 45vh / 50vh 只描述「高窗口」的理想比例。窗口较矮时封面会按比例吃掉
+/// 控件区，进度 / 传输 / 音量 / 底栏只能以 0 间距互相贴住（1310×850 以下的
+/// 实测就是标题压进度、音量贴底栏）。这里用控件区的最小高度反推封面上限：
+///
+/// ```text
+/// available = bottom_row_top − (cover_top(cover) + cover + 28)
+/// required  = info + progress + button(cover) + volume + 4 × min_gap
+/// ```
+///
+/// 封面每缩小 1px，available 增加 0.88px；按钮在中段再增加 0.18px。
+/// 迭代收敛后取与理想值的较小者，高窗口行为完全不变。
 pub fn wide_cover_size(width: f32, height: f32) -> f32 {
-    if height <= 1000.0 {
+    let preferred = if height <= 1000.0 {
         (height * 0.45).min(width * 0.38)
     } else {
         (height * 0.5).min(width * 0.38)
+    };
+    if !preferred.is_finite() || !width.is_finite() || !height.is_finite() {
+        return 0.0;
     }
+    if preferred <= 0.0 {
+        return 0.0;
+    }
+    let info_h = amll_info_height(width, height);
+    let bottom_top = height - STAGE_BOTTOM_RESERVE;
+    // 矮窗隐藏音量行后，少一行高度和一道间距，封面可以保持更大的尺寸。
+    let volume_h = if stage_volume_visible(height) {
+        STAGE_VOLUME_H
+    } else {
+        0.0
+    };
+    let gap_count = if volume_h > 0.0 { 4.0 } else { 3.0 };
+    let required_rows = info_h + STAGE_PROGRESS_H + volume_h + gap_count * STAGE_MIN_GAP;
+    let mut cover = preferred;
+    for _ in 0..12 {
+        let required = required_rows + stage_button_size(cover);
+        let available =
+            bottom_top - (wide_cover_top_for(cover, height) + cover + COMPACT_COVER_GAP);
+        if available + 0.01 >= required {
+            break;
+        }
+        cover = (cover - (required - available) / 1.06).max(WIDE_COVER_MIN);
+    }
+    cover.clamp(0.0, preferred)
+}
+
+fn wide_cover_top_for(cover: f32, height: f32) -> f32 {
+    let fr = (height - cover - 76.0).max(0.0);
+    fr * 0.12 + 8.0 + 36.0 + 8.0
 }
 
 /// 宽屏封面顶部 y。AMLL grid：drag(.45fr) / thumb(auto=2×2vh=36) /
 /// cover / music-info(3fr) / bottom(0fr) / spacer(.3fr)，gap 8。
 /// 剩余 fr 高度 = H - cover - 36 - 5×8。
 pub fn wide_cover_top(width: f32, height: f32) -> f32 {
-    let cover = wide_cover_size(width, height);
-    let fr = (height - cover - 76.0).max(0.0);
-    let drag = fr * 0.12;
-    drag + 8.0 + 36.0 + 8.0
+    wide_cover_top_for(wide_cover_size(width, height), height)
 }
 
 /// 宽屏播放列的 x：定位在左侧 45% 歌词分栏的中心。
@@ -343,10 +318,52 @@ pub fn stage_bottom_rect(width: f32, height: f32, wide: bool, lyric_pad: f32) ->
     }
 }
 
+/// 闲置收起后，保留可见组（顶部把手 → 进度条）离开窗口边缘的最小距离。
+pub const IDLE_CHROME_MARGIN: f32 = 8.0;
+
+/// 闲置收起后把可见组整体平移到窗口垂直中心所需的位移。
+///
+/// 组内保持完整布局里的原始间距（把手→封面、封面→信息、信息→进度都是
+/// 设计值），这里只返回一个刚体平移量，不做 `space-between` 式的重新分配。
+/// 组比窗口还高时退回贴顶，至少不把顶部把手推出窗口。
+pub fn idle_chrome_shift(height: f32, group_top: f32, group_bottom: f32) -> f32 {
+    if !height.is_finite() || !group_top.is_finite() || !group_bottom.is_finite() {
+        return 0.0;
+    }
+    let (group_top, group_bottom) = if group_top <= group_bottom {
+        (group_top, group_bottom)
+    } else {
+        (group_bottom, group_top)
+    };
+    let center = (group_top + group_bottom) * 0.5;
+    let shift = height * 0.5 - center;
+    // 允许的位移区间：组顶不低于上边距，组底不越过下边距。
+    let min_shift = IDLE_CHROME_MARGIN - group_top;
+    let max_shift = (height - IDLE_CHROME_MARGIN) - group_bottom;
+    if min_shift > max_shift {
+        // 组本身比可用高度还高：优先保证顶部把手可见。
+        min_shift
+    } else {
+        shift.clamp(min_shift, max_shift)
+    }
+}
+
+pub const PHONE_NAV_H: f32 = 54.0;
+pub const PHONE_MINI_H: f32 = 62.0;
+
+pub fn mini_player_rect(width: f32, height: f32) -> StageRect {
+    StageRect {
+        x: 12.0,
+        y: height - PHONE_NAV_H - 8.0 - PHONE_MINI_H,
+        w: (width - 24.0).max(1.0),
+        h: PHONE_MINI_H,
+    }
+}
+
 /// 底部悬浮 Dock 的宽度。渲染层和动画层必须调用同一个函数，避免任一端
 /// 改了尺寸后展开/收起动画停在错位的位置。
 pub fn dock_width(viewport_width: f32) -> f32 {
-    (viewport_width - 32.0).min(880.0).max(520.0)
+    (viewport_width - 32.0).clamp(520.0, 880.0)
 }
 
 /// 底部悬浮 Dock 的条状几何（与 `render_dock` 的绝对定位一致）。
@@ -424,10 +441,31 @@ pub fn dock_geometry(width: f32, height: f32) -> StageGeometry {
     }
 }
 
-/// 计算某个沉浸模态的共享元素几何。
+/// 计算某个模态的公式兜底几何；真实转场目标由 prepaint 测量提供。
 pub fn immersive_geometry(mode: StageMode, width: f32, height: f32) -> StageGeometry {
     match mode {
-        StageMode::CompactArt => {
+        StageMode::Dock => dock_geometry(width, height),
+        StageMode::MiniPlayer => StageGeometry {
+            cover: StageRect {
+                x: 20.0,
+                y: mini_player_rect(width, height).y + 10.0,
+                w: 42.0,
+                h: 42.0,
+            },
+            cover_radius: 1.0,
+            info: StageRect {
+                x: 72.0,
+                y: mini_player_rect(width, height).y + 15.0,
+                w: (width - 24.0 - 42.0 - 10.0 - 132.0 - 16.0).max(1.0),
+                h: 31.75,
+            },
+            title_size: 12.5,
+            artist_size: 10.0,
+            line_gap: 2.0,
+            title_weight: 500.0,
+            artist_weight: 400.0,
+        },
+        StageMode::PhonePlayer | StageMode::CompactArt | StageMode::CompactLyrics => {
             let cover_size = compact_cover_size(width, height);
             let cover_x = ((width - cover_size) * 0.5).max(0.0);
             let title_size = (height * 0.02).max(16.0);
@@ -529,14 +567,8 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn easing_endpoints_are_exact() {
-        assert_eq!(ease_out_quint(0.0), 0.0);
-        assert_eq!(ease_out_quint(1.0), 1.0);
-        // 单调且起步快：中点已经走过大半。
-        assert!(ease_out_quint(0.5) > 0.9);
-    }
+    use crate::motion::{MotionTuning, StageSpring, ramp};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn geometry_endpoints_match_modes() {
@@ -556,48 +588,62 @@ mod tests {
     }
 
     #[test]
-    fn motion_interpolates_and_finishes() {
+    fn spring_starts_at_first_and_converges_to_last() {
         let from = immersive_geometry(StageMode::CompactArt, 800.0, 1000.0);
         let to = immersive_geometry(StageMode::CompactQueue, 800.0, 1000.0);
-        let motion = LayoutMotion::new(
-            StageMode::CompactArt,
+        let start = Instant::now();
+        let motion = StageSpring::new(
             from,
-            StageMode::CompactQueue,
             to,
-            320.0,
+            StageMode::CompactArt,
+            StageMode::CompactQueue,
+            start,
+            MotionTuning::default().spec(Duration::from_millis(320)),
         );
 
-        assert_eq!(motion.progress(motion.start), 0.0);
-        assert_eq!(motion.geometry(motion.start).cover.x, from.cover.x);
-        assert!(!motion.done(motion.start));
+        assert_eq!(motion.sample(start), from);
+        assert!(!motion.done(start));
 
-        let end = motion.start + Duration::from_millis(320);
+        let end = start + Duration::from_secs(2);
+        let settled = motion.sample(end);
+        assert!((settled.cover.x - to.cover.x).abs() < 0.01);
+        assert!((settled.title_size - to.title_size).abs() < 0.01);
         assert!(motion.done(end));
-        assert!((motion.geometry(end).cover.x - to.cover.x).abs() < 0.01);
-        assert!((motion.geometry(end).title_size - to.title_size).abs() < 0.01);
     }
 
     #[test]
-    fn retarget_mid_flight_preserves_current_rect() {
+    fn retarget_mid_flight_preserves_rect_and_velocity() {
         let art = immersive_geometry(StageMode::CompactArt, 800.0, 1000.0);
         let queue = immersive_geometry(StageMode::CompactQueue, 800.0, 1000.0);
-        let motion = LayoutMotion::new(
-            StageMode::CompactArt,
+        let start = Instant::now();
+        let mut motion = StageSpring::new(
             art,
-            StageMode::CompactQueue,
             queue,
-            320.0,
-        );
-        let mid = motion.start + Duration::from_millis(160);
-        let current = motion.geometry(mid);
-        let next = LayoutMotion::new(
-            StageMode::CompactQueue,
-            current,
             StageMode::CompactArt,
-            art,
-            320.0,
+            StageMode::CompactQueue,
+            start,
+            MotionTuning::default().spec(Duration::from_millis(320)),
         );
-        assert_eq!(next.geometry(next.start), current);
+        let mid = start + Duration::from_millis(160);
+        let rect = motion.sample(mid);
+        let velocity = motion.velocity(mid);
+
+        motion.retarget(art, StageMode::CompactArt, mid);
+        // 位置与速度都必须连续；解析解重算会有浮点尾差，用像素/秒级容差。
+        assert!((motion.sample(mid).cover.x - rect.cover.x).abs() < 0.01);
+        assert!((motion.sample(mid).cover.w - rect.cover.w).abs() < 0.01);
+        assert!((motion.sample(mid).info.y - rect.info.y).abs() < 0.01);
+        assert!((motion.velocity(mid).cover.w - velocity.cover.w).abs() < 1.0);
+    }
+
+    #[test]
+    fn mini_player_fallback_matches_phone_shell_rect() {
+        let rect = mini_player_rect(390.0, 844.0);
+        assert_eq!(rect.x, 12.0);
+        assert_eq!(rect.w, 366.0);
+        assert_eq!(rect.y, 720.0);
+        assert_eq!(rect.h, 62.0);
+        assert!(immersive_geometry(StageMode::MiniPlayer, 390.0, 844.0).is_valid());
     }
 
     #[test]
@@ -700,6 +746,82 @@ mod tests {
                 (art.info.w - expected).abs() < 0.001,
                 "shared info width must match static layout: {w}x{h}"
             );
+        }
+    }
+
+    #[test]
+    fn short_windows_keep_control_gaps_and_drop_the_volume_row() {
+        // 1310×850 以下的实测窗口：45vh 封面会吃掉控件区，进度/传输/音量
+        // 只能以 0 间距互贴。反推出的封面上限必须给间距留够空间；
+        // 高度不足时优先收起音量行，少一行高度和一道间距。
+        for (w, h) in [
+            (903.0, 586.0),
+            (900.0, 600.0),
+            (1296.0, 700.0),
+            (900.0, 720.0),
+        ] {
+            let cover = wide_cover_size(w, h);
+            let info = amll_info_height(w, h);
+            let volume_h = if stage_volume_visible(h) {
+                STAGE_VOLUME_H
+            } else {
+                0.0
+            };
+            let gap_count = if volume_h > 0.0 { 4.0 } else { 3.0 };
+            let controls_top = wide_cover_top(w, h) + cover + COMPACT_COVER_GAP;
+            let available = (h - STAGE_BOTTOM_RESERVE) - controls_top;
+            let required = info
+                + STAGE_PROGRESS_H
+                + stage_button_size(cover)
+                + volume_h
+                + gap_count * STAGE_MIN_GAP;
+            assert!(
+                available + 0.1 >= required,
+                "{w}x{h}: cover={cover} available={available} required={required}"
+            );
+        }
+
+        // 高窗口保持 AMLL 的 45vh，不因短窗兜底而缩小。
+        assert!((wide_cover_size(1600.0, 1000.0) - 450.0).abs() < 0.001);
+        // 586 高属于「太矮」：收起音量行后封面仍应比 45vh 略小，
+        // 但不应再被压到原来的 196px。
+        assert!(wide_cover_size(903.0, 586.0) < 586.0 * 0.45 - 1.0);
+        assert!(wide_cover_size(903.0, 586.0) > 240.0);
+        assert!(stage_volume_visible(900.0));
+        assert!(!stage_volume_visible(STAGE_VOLUME_MIN_H - 1.0));
+    }
+
+    #[test]
+    fn idle_shift_centers_group_without_redistributing_gaps() {
+        // 1440×900：把手 84 / 进度条底 700，组中点偏上，整体下移。
+        let (top, bottom) = (84.0, 700.0);
+        let shift = idle_chrome_shift(900.0, top, bottom);
+        assert!(shift > 0.0);
+        let shifted_center = ((top + shift) + (bottom + shift)) * 0.5;
+        assert!((shifted_center - 450.0).abs() < 0.001);
+        // 刚体平移：组内每一段的间距都不变。
+        let gap = 120.0;
+        assert!(((top + shift + gap) - (top + shift)) - gap < 1e-6);
+
+        // 组本来就在中心时不做位移。
+        assert_eq!(idle_chrome_shift(800.0, 300.0, 500.0), 0.0);
+    }
+
+    #[test]
+    fn idle_shift_keeps_group_inside_short_windows() {
+        // 组高于可用高度：贴顶而不是把把手推出窗口。
+        let shift = idle_chrome_shift(300.0, 10.0, 400.0);
+        assert!((10.0 + shift - IDLE_CHROME_MARGIN).abs() < 0.001);
+
+        // 正常窗口：顶部与底部都留在安全边距内。
+        for (h, top, bottom) in [
+            (1000.0, 20.0, 750.0),
+            (586.0, 18.0, 410.0),
+            (900.0, 300.0, 620.0),
+        ] {
+            let shift = idle_chrome_shift(h, top, bottom);
+            assert!(top + shift >= IDLE_CHROME_MARGIN - 0.001, "{h}");
+            assert!(bottom + shift <= h - IDLE_CHROME_MARGIN + 0.001, "{h}");
         }
     }
 

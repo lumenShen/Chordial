@@ -1,0 +1,17 @@
+[package]
+name = "chordal-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Chordial 2.0 Android JNI entry point"
+
+[lib]
+name = "chordial_android"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+chordal-ui = { path = "../chordal-ui" }
+gpui = { path = "../../vendor/gpui", features = ["android"] }
+jni = "0.22"
+log = "0.4"

@@ -19,8 +19,8 @@ use crate::model::{LyricDocument, LyricLine};
 use crate::spring::{Spring, SpringParams};
 
 mod api;
-mod update;
 mod interlude;
+mod update;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AlignAnchor {
@@ -189,6 +189,8 @@ pub struct LyricPlayer {
     prefix_max_end: Vec<u64>,
     prefix_dirty: bool,
     springs: Vec<LineSprings>,
+    /// 当前已提交到全部 posY 弹簧的参数；相同参数不重复 resetSolver。
+    pos_y_params: SpringParams,
     targets: Vec<LineTarget>,
     frame: PlayerFrame,
     active_scratch: Vec<usize>,
@@ -210,7 +212,6 @@ impl Default for LyricPlayer {
         Self::new(LyricPlayerConfig::default())
     }
 }
-
 
 fn smooth_over(
     opacity: f32,
@@ -287,6 +288,149 @@ mod tests {
     }
 
     #[test]
+    fn first_visible_line_enters_from_twice_viewport_height() {
+        let mut p = LyricPlayer::new(LyricPlayerConfig::default());
+        p.set_lyrics(doc(10, 2_000), 0);
+        p.set_metrics(metrics(10));
+        let target = p.debug_target(0).unwrap().0;
+        let entered = p.frame().lines[0];
+        assert!(entered.visible);
+        assert_eq!(
+            p.springs[0].pos_y.params(),
+            SpringParams::new(0.9, 15.0, 90.0)
+        );
+        assert!(
+            (entered.top - 1_200.0).abs() < 1e-3,
+            "first frame top = {}, expected 2*height",
+            entered.top
+        );
+        assert!(target < entered.top);
+
+        p.update(16.0);
+        let moving = p.frame().lines[0].top;
+        assert!(moving < entered.top && moving > target);
+        assert_eq!(p.debug_target(0).unwrap().0, target);
+    }
+
+    #[test]
+    fn offscreen_lines_still_snap_directly_to_layout_targets() {
+        let mut p = LyricPlayer::new(LyricPlayerConfig::default());
+        p.set_lyrics(doc(20, 2_000), 0);
+        p.set_metrics(metrics(20));
+        let last = 19;
+        assert!(!p.frame().lines[last].visible);
+        assert_eq!(p.frame().lines[last].top, p.debug_target(last).unwrap().0);
+        assert_eq!(p.frame().lines[last].scale, p.debug_target(last).unwrap().1);
+    }
+
+    #[test]
+    fn ordinary_playback_uses_amll_dynamic_pos_y_params() {
+        let mut p = LyricPlayer::new(LyricPlayerConfig::default());
+        p.set_lyrics(doc(10, 2_000), 0);
+        p.set_metrics(metrics(10));
+        let interval = p.doc.lines[1].start_time - p.doc.lines[0].start_time;
+        let clamped = interval.clamp(100, 800) as f64;
+        let ratio = (1.0 - (clamped - 100.0) / 700.0).powf(0.2);
+        let stiffness = 170.0 + 50.0 * ratio;
+        let expected = SpringParams::new(0.9, 2.2 * stiffness.sqrt(), stiffness);
+
+        p.set_time(2_100, false);
+        assert_eq!(p.scroll_to_index, 1);
+        for springs in &p.springs {
+            let actual = springs.pos_y.params();
+            assert!((actual.mass - expected.mass).abs() < 1e-12);
+            assert!((actual.damping - expected.damping).abs() < 1e-12);
+            assert!((actual.stiffness - expected.stiffness).abs() < 1e-12);
+        }
+
+        let before = p.frame().lines[1].top;
+        let target = p.debug_target(1).unwrap().0;
+        assert!((before - target).abs() > 1.0);
+        p.update(16.0);
+        let after = p.frame().lines[1].top;
+        assert!(after < before && after > target);
+        assert_eq!(p.debug_target(1).unwrap().0, target);
+    }
+
+    #[test]
+    fn background_line_uses_its_own_scale_spring_params() {
+        let mut lines = vec![
+            LyricLine {
+                words: vec![LyricWord::new("main", 0, 1_000)],
+                start_time: 0,
+                end_time: 1_000,
+                ..Default::default()
+            },
+            LyricLine {
+                words: vec![LyricWord::new("bg", 0, 1_000)],
+                start_time: 0,
+                end_time: 1_000,
+                is_bg: true,
+                ..Default::default()
+            },
+            LyricLine {
+                words: vec![LyricWord::new("next", 6_000, 7_000)],
+                start_time: 6_000,
+                end_time: 7_000,
+                ..Default::default()
+            },
+        ];
+        let mut p = LyricPlayer::new(LyricPlayerConfig::default());
+        p.set_lyrics(std::mem::take(&mut lines), 0);
+        p.set_metrics(metrics(3));
+        assert_eq!(
+            p.springs[0].scale.params(),
+            SpringParams::new(2.0, 25.0, 100.0)
+        );
+        assert_eq!(
+            p.springs[1].scale.params(),
+            SpringParams::new(1.0, 20.0, 50.0)
+        );
+
+        p.set_time(2_000, false);
+        assert_eq!(p.debug_target(1).unwrap().1, 75.0);
+        let before = p.frame().lines[1].scale;
+        p.update(16.0);
+        let after = p.frame().lines[1].scale;
+        assert!(after < before && after > 75.0);
+    }
+
+    #[test]
+    fn pos_y_params_clamp_interval_and_match_amll_formula() {
+        for (interval, expected_stiffness) in [
+            (0u64, 220.0),
+            (100, 220.0),
+            (450, 170.0 + 50.0 * 0.5f64.powf(0.2)),
+            (800, 170.0),
+            (5_000, 170.0),
+        ] {
+            let params = LyricPlayer::compute_pos_y_spring_params(
+                Some(1_000 + interval),
+                Some(1_000),
+                false,
+                false,
+            )
+            .expect("dynamic params");
+            assert!((params.stiffness - expected_stiffness).abs() < 1e-12);
+            assert!((params.damping - 2.2 * expected_stiffness.sqrt()).abs() < 1e-12);
+            assert_eq!(params.mass, 0.9);
+        }
+        assert!(
+            LyricPlayer::compute_pos_y_spring_params(Some(1_000), None, false, false).is_none()
+        );
+
+        let stable = SpringParams::new(0.9, 15.0, 90.0);
+        assert_eq!(
+            LyricPlayer::compute_pos_y_spring_params(Some(2_000), Some(1_000), true, false),
+            Some(stable)
+        );
+        assert_eq!(
+            LyricPlayer::compute_pos_y_spring_params(Some(2_000), Some(1_000), false, true),
+            Some(stable)
+        );
+    }
+
+    #[test]
     fn advances_hot_line_on_time() {
         let mut p = LyricPlayer::new(LyricPlayerConfig::default());
         p.set_lyrics(doc(10, 2_000), 0);
@@ -299,14 +443,40 @@ mod tests {
     }
 
     #[test]
-    fn seek_jumps_without_animation() {
+    fn seek_updates_target_and_animates_current_frame() {
         let mut p = LyricPlayer::new(LyricPlayerConfig::default());
         p.set_lyrics(doc(100, 2_000), 0);
         p.set_metrics(metrics(100));
+        let before = p.frame().lines[50].top;
         p.set_time(100_000, true);
         assert_eq!(p.scroll_to_index, 50);
         let target = p.debug_target(50).unwrap();
         assert!((target.0 + 40.0 - 210.0).abs() < 1.0);
+        assert_eq!(
+            p.springs[50].pos_y.params(),
+            SpringParams::new(0.9, 15.0, 90.0)
+        );
+
+        // set_time/calc_layout 只提交只读 target；当前帧必须仍保留 seek 前的位置。
+        let committed = p.frame().lines[50].top;
+        assert_eq!(committed, before);
+        assert!((committed - target.0).abs() > 1.0);
+        assert_eq!(p.frame().lines[50].top, committed);
+
+        p.update(16.0);
+        let moving = p.frame().lines[50].top;
+        assert!(
+            (moving - committed) * (target.0 - committed) > 0.0
+                && (moving - target.0).abs() < (committed - target.0).abs(),
+            "committed={committed}, moving={moving}, target={}",
+            target.0
+        );
+        assert_eq!(p.debug_target(50).unwrap().0, target.0);
+
+        for _ in 0..600 {
+            p.update(16.0);
+        }
+        assert!((p.frame().lines[50].top - target.0).abs() < 0.1);
     }
 
     #[test]
@@ -331,7 +501,12 @@ mod tests {
         let mut p = LyricPlayer::new(LyricPlayerConfig::default());
         p.set_lyrics(doc(10, 2_000), 0);
         p.set_metrics(metrics(10));
-        let (top, ..) = p.debug_target(3).unwrap();
+        // 首次布局从屏外进入；命中测试必须使用当前绘制帧，而不是只读 target。
+        for _ in 0..120 {
+            p.update(16.0);
+        }
+        let top = p.frame().lines[3].top;
+        assert!(p.frame().lines[3].visible);
         assert_eq!(p.line_time_at_y(top + 1.0), Some(5_900));
         assert_eq!(p.line_time_at_y(-10_000.0), None);
     }
@@ -359,6 +534,9 @@ mod tests {
         });
         p.set_time(5_000, false);
         assert!(p.frame().interlude.is_some());
+        for springs in &p.springs {
+            assert_eq!(springs.pos_y.params(), SpringParams::new(0.9, 15.0, 90.0));
+        }
     }
 
     #[test]

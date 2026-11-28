@@ -40,11 +40,17 @@ pub(super) fn eq_polyline(window: &mut Window, points: &[(f32, f32)], thickness:
 }
 
 /// 频响网格、曲线与频段控制点。
+///
+/// `origins` 与 `settings.bands` 一一对应：耳机档案用弱化的文字色，内置
+/// 预设用半透明强调色，自定义频段用完整强调色，一眼能看出节点属于哪层。
+#[allow(clippy::too_many_arguments)] // 绘制入口：设置 / 来源 / 选中态 / 几何 / 缓存槽位
 pub(super) fn paint_eq_graph(
     bounds: Bounds<gpui::Pixels>,
     settings: &EqSettings,
-    selected: Option<usize>,
+    origins: &[BandOrigin],
+    selected: Option<EqSelection>,
     compact: bool,
+    slot: usize,
     pal: &EqPalette,
     window: &mut Window,
 ) {
@@ -97,7 +103,7 @@ pub(super) fn paint_eq_graph(
         pal.text_faint
     };
     let global = settings.input_gain_db + settings.output_gain_db;
-    let points = eq_curve_points(settings, &geom, ox, oy, width, height, compact);
+    let points = eq_curve_points(settings, &geom, ox, oy, width, height, compact, slot);
     // 一条折线就是整条曲线：之前每个采样点建 4 边形 + 一次 paint_path，
     // 260 点 × 3 层 = 780 条路径，每帧都会触发多次全屏 MSAA 路径通道。
     eq_polyline(window, points.as_slice(), 1.8, signal);
@@ -105,11 +111,29 @@ pub(super) fn paint_eq_graph(
     eq_polyline(window, points.as_slice(), 6.0, signal.opacity(0.07));
     eq_polyline(window, points.as_slice(), 3.0, signal.opacity(0.16));
 
+    let selected_index = selected.and_then(|selection| {
+        origins.iter().position(|origin| match (origin, selection) {
+            (BandOrigin::Profile(_), EqSelection::Profile) => true,
+            (BandOrigin::Block { block, .. }, EqSelection::Block(selected)) => *block == selected,
+            (BandOrigin::Custom(index), EqSelection::Custom(selected)) => *index == selected,
+            _ => false,
+        })
+    });
+
     let handle = if compact { 17.0 } else { 14.0 };
     for (index, band) in settings.bands.iter().enumerate() {
         let x = ox + geom.x(band.freq_hz);
         let y = oy + geom.y(band.gain_db + global);
-        let color = if band.enabled { signal } else { pal.text_faint };
+        let origin = origins.get(index).copied();
+        let color = if !band.enabled {
+            pal.text_faint
+        } else {
+            match origin {
+                Some(BandOrigin::Profile(_)) => pal.text_dim,
+                Some(BandOrigin::Block { .. }) => signal.opacity(0.72),
+                Some(BandOrigin::Custom(_)) | None => signal,
+            }
+        };
         // 控制点到 0 dB 的细线，帮助读取提升/衰减幅度。
         if band.enabled {
             let base_y = oy + geom.y(global);
@@ -122,7 +146,7 @@ pub(super) fn paint_eq_graph(
                 pal.grid,
             );
         }
-        if selected == Some(index) {
+        if selected_index == Some(index) {
             eq_circle(window, x, y, handle * 0.5 + 5.0, pal.text.opacity(0.16));
             eq_circle(window, x, y, handle * 0.5 + 2.0, pal.text.opacity(0.85));
         }
@@ -303,247 +327,4 @@ pub(super) fn paint_bipolar(
     }
     eq_circle(window, value_x, f32::from(cy), thumb_r + 1.5, colors.track);
     eq_circle(window, value_x, f32::from(cy), thumb_r, colors.thumb);
-}
-
-// ================= 频段推子 =================
-
-pub(super) struct FaderState {
-    bounds: Cell<Bounds<gpui::Pixels>>,
-    dragging: Cell<bool>,
-    view: Cell<Option<gpui::EntityId>>,
-}
-
-pub(super) fn notify_fader_view(state: &FaderState, cx: &mut App) {
-    if let Some(view) = state.view.get() {
-        cx.notify(view);
-    }
-}
-
-/// 桌面端竖向频段推子：中点 0 dB，向上提升、向下衰减。
-pub(super) fn eq_band_fader(
-    index: usize,
-    freq_hz: f32,
-    gain_db: f32,
-    enabled: bool,
-    uses_gain: bool,
-    kind_label: &'static str,
-    selected: bool,
-    pal: &EqPalette,
-    on_select: impl Fn(&mut App) + 'static,
-    on_change: impl FnMut(f32, &mut App) + 'static,
-) -> AnyElement {
-    let state = Rc::new(FaderState {
-        bounds: Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0)))),
-        dragging: Cell::new(false),
-        view: Cell::new(None),
-    });
-    let change = Rc::new(std::cell::RefCell::new(
-        Box::new(on_change) as Box<dyn FnMut(f32, &mut App)>
-    ));
-    let select = Rc::new(on_select);
-    let shown = Rc::new(Cell::new(gain_db));
-    let pal_paint = pal.clone();
-
-    let down_state = state.clone();
-    let down_select = select.clone();
-    let down_change = change.clone();
-    let down_shown = shown.clone();
-    let move_state = state.clone();
-    let move_change = change.clone();
-    let move_shown = shown.clone();
-    let up_state = state.clone();
-    let paint_state = state.clone();
-    let paint_state2 = state.clone();
-    let paint_shown = shown.clone();
-
-    let cursor = if uses_gain {
-        gpui::CursorStyle::ResizeUpDown
-    } else {
-        gpui::CursorStyle::PointingHand
-    };
-
-    div()
-        .id(SharedString::from(format!("eq-fader-{index}")))
-        .w(px(50.0))
-        .h_full()
-        .flex_none()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(3.0))
-        .rounded(px(9.0))
-        .cursor(cursor)
-        .hover(|s| s.bg(pal.chip))
-        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
-            (down_select)(cx);
-            if uses_gain {
-                if let Some(db) = fader_db_at(down_state.bounds.get(), event.position) {
-                    down_state.dragging.set(true);
-                    down_shown.set(db);
-                    (down_change.borrow_mut())(db, cx);
-                    notify_fader_view(&down_state, cx);
-                }
-            }
-        })
-        .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
-            if !move_state.dragging.get()
-                || !uses_gain
-                || event.pressed_button != Some(MouseButton::Left)
-            {
-                return;
-            }
-            if let Some(db) = fader_db_at(move_state.bounds.get(), event.position) {
-                move_shown.set(db);
-                (move_change.borrow_mut())(db, cx);
-                notify_fader_view(&move_state, cx);
-            }
-        })
-        .on_mouse_up(MouseButton::Left, move |_, _, _| {
-            up_state.dragging.set(false);
-        })
-        .child(
-            div()
-                .pt(px(5.0))
-                .text_size(px(9.0))
-                .font_family(pal.mono.clone())
-                .text_color(if selected { pal.accent } else { pal.text_dim })
-                .child(SharedString::from(fmt_freq(freq_hz))),
-        )
-        .child(
-            div().w(px(38.0)).flex_1().min_h_0().child(
-                canvas(
-                    move |bounds, window, _| {
-                        paint_state.bounds.set(bounds);
-                        paint_state.view.set(Some(window.current_view()));
-                        bounds
-                    },
-                    move |_bounds, bounds, window, _| {
-                        paint_fader(
-                            bounds,
-                            paint_shown.get(),
-                            selected,
-                            enabled,
-                            uses_gain,
-                            &pal_paint,
-                            paint_state2.dragging.get(),
-                            window,
-                        );
-                    },
-                )
-                .size_full(),
-            ),
-        )
-        .child(
-            div()
-                .pb(px(5.0))
-                .text_size(px(9.5))
-                .font_family(pal.mono.clone())
-                .text_color(if !uses_gain || !enabled {
-                    pal.text_faint
-                } else if selected {
-                    pal.accent
-                } else {
-                    pal.text_dim
-                })
-                .child(SharedString::from(if uses_gain {
-                    db_num(shown.get())
-                } else {
-                    kind_label.to_string()
-                })),
-        )
-        .into_any_element()
-}
-
-pub(super) fn fader_db_at(
-    bounds: Bounds<gpui::Pixels>,
-    position: gpui::Point<gpui::Pixels>,
-) -> Option<f32> {
-    let h = f32::from(bounds.size.height);
-    if h <= 12.0 {
-        return None;
-    }
-    let center = f32::from(bounds.top()) + h / 2.0;
-    let half = (h / 2.0 - 8.0).max(1.0);
-    let db = (center - f32::from(position.y)) / half * 24.0;
-    Some(db.clamp(EQ_MIN_GAIN_DB, EQ_MAX_GAIN_DB))
-}
-
-pub(super) fn paint_fader(
-    bounds: Bounds<gpui::Pixels>,
-    gain_db: f32,
-    selected: bool,
-    enabled: bool,
-    uses_gain: bool,
-    pal: &EqPalette,
-    dragging: bool,
-    window: &mut Window,
-) {
-    let h = f32::from(bounds.size.height);
-    if h <= 12.0 {
-        return;
-    }
-    let x = f32::from(bounds.center().x);
-    let top = f32::from(bounds.top()) + 6.0;
-    let bottom = f32::from(bounds.bottom()) - 6.0;
-    let center = (top + bottom) / 2.0;
-    let alpha = if enabled { 1.0 } else { 0.38 };
-    let track_color = pal
-        .fader_track
-        .opacity(if selected { 1.0 } else { 0.75 } * alpha);
-    eq_rect(window, x - 1.0, top, 2.0, bottom - top, track_color);
-    eq_rect(
-        window,
-        x - 10.0,
-        center - 0.5,
-        20.0,
-        1.0,
-        pal.grid_major.opacity(alpha),
-    );
-
-    let db = gain_db.clamp(EQ_MIN_GAIN_DB, EQ_MAX_GAIN_DB);
-    let half = (h / 2.0 - 8.0).max(1.0);
-    let y = center - db / 24.0 * half;
-    if uses_gain {
-        let (y0, y1) = if y <= center {
-            (y, center)
-        } else {
-            (center, y)
-        };
-        if y1 - y0 > 0.5 {
-            eq_rect(
-                window,
-                x - 1.5,
-                y0,
-                3.0,
-                y1 - y0,
-                if enabled {
-                    pal.accent.opacity(0.85)
-                } else {
-                    pal.text_faint.opacity(0.4)
-                },
-            );
-        }
-        if selected || dragging {
-            eq_circle(window, x, y, 8.0, pal.accent.opacity(0.16 * alpha));
-        }
-        eq_circle(
-            window,
-            x,
-            y,
-            5.0,
-            if enabled { pal.accent } else { pal.text_faint },
-        );
-        if selected {
-            eq_circle(window, x, y, 2.0, pal.inset);
-        }
-    } else {
-        eq_circle(
-            window,
-            x,
-            center,
-            7.0,
-            pal.fader_track.opacity(0.55 * alpha),
-        );
-        eq_circle(window, x, center, 3.0, pal.text_faint.opacity(alpha));
-    }
 }

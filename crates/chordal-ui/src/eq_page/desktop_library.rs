@@ -1,38 +1,44 @@
-//! EQ 页面区块：desktop_library（由 eq_page.rs 拆分，行为不变）。
+//! EQ 页面区块：预设库（内置预设 / AutoEQ 耳机档案 / 个人配置）。
 
 use super::controls::*;
 use super::*;
 
 impl ChordialApp {
-    pub(super) fn eq_library_desktop(
+    // ---------- 桌面：内置预设 ----------
+
+    pub(super) fn eq_builtin_desktop(
         &self,
         pal: &EqPalette,
-        entries: Vec<PresetEntry>,
         main_h: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let weak = cx.entity().downgrade();
-        let (title, subtitle) = tab_meta(self.eq.tab);
-        let filtered: Vec<PresetEntry> = entries;
+        let (title, subtitle) = tab_meta(EqTab::Builtin);
+        let entries = builtin_presets();
+        let filtered: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, preset)| {
+                self.eq
+                    .builtin_group
+                    .is_none_or(|group| preset.group == group)
+            })
+            .map(|(index, _)| index)
+            .collect();
 
-        let active_name = self.eq.preset_name.clone();
-        let preview_entry = self
+        let preview = self
             .eq
-            .preview
-            .filter(|entry| {
-                filtered
-                    .iter()
-                    .any(|candidate| candidate.name == entry.name)
+            .preview_builtin
+            .and_then(builtin_preset)
+            .filter(|preset| {
+                self.eq
+                    .builtin_group
+                    .is_none_or(|group| preset.group == group)
             })
-            .or_else(|| {
-                filtered
-                    .iter()
-                    .find(|entry| entry.name == active_name && !self.eq.dirty)
-                    .copied()
-            })
-            .or_else(|| filtered.first().copied());
+            .or_else(|| filtered.first().map(|&index| &entries[index]));
 
-        let mut head = div()
+        let added_count = self.eq.blocks.len();
+        let head = div()
             .h(px(38.0))
             .flex_none()
             .flex()
@@ -57,91 +63,132 @@ impl ChordialApp {
                             .child(subtitle),
                     ),
             )
-            .child(div().flex_1());
-        head = head.child(
+            .child(div().flex_1())
+            .child(
+                div()
+                    .h(px(24.0))
+                    .px(px(9.0))
+                    .rounded(px(12.0))
+                    .bg(if added_count > 0 {
+                        pal.accent_soft
+                    } else {
+                        pal.chip
+                    })
+                    .flex()
+                    .items_center()
+                    .text_size(px(9.5))
+                    .font_family(pal.mono.clone())
+                    .text_color(if added_count > 0 {
+                        pal.accent
+                    } else {
+                        pal.text_dim
+                    })
+                    .child(SharedString::from(format!(
+                        "{} / {} 已加入",
+                        added_count,
+                        entries.len()
+                    ))),
+            );
+
+        let mut chips = div()
+            .h(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0));
+        let weak_all = weak.clone();
+        chips = chips.child(eq_chip(
+            pal,
+            "全部",
+            self.eq.builtin_group.is_none(),
+            "eq-builtin-group-all",
+            move |_, _, cx| {
+                let _ = weak_all.update(cx, |app, cx| {
+                    app.eq.builtin_group = None;
+                    cx.notify();
+                });
+            },
+        ));
+        for group in PresetGroup::ALL {
+            let weak = weak.clone();
+            let active = self.eq.builtin_group == Some(group);
+            chips = chips.child(eq_chip(
+                pal,
+                group.label(),
+                active,
+                SharedString::from(format!("eq-builtin-group-{}", group.label())),
+                move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.eq.builtin_group = Some(group);
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+        chips = chips.child(div().flex_1()).child(
             div()
-                .h(px(24.0))
-                .px(px(9.0))
-                .rounded(px(12.0))
-                .bg(pal.chip)
-                .flex()
-                .items_center()
-                .text_size(px(9.5))
+                .text_size(px(9.0))
                 .font_family(pal.mono.clone())
-                .text_color(pal.text_dim)
-                .child(SharedString::from(format!("{} 个配置", filtered.len()))),
+                .text_color(pal.text_faint)
+                .child(SharedString::from(format!("{} 项", filtered.len()))),
         );
 
-        // 预设列表按需渲染可视行：内置/V4 条目在 EQ 打开、滚动时
-        // 不再全部进入布局与预绘制。
         let list: AnyElement = if filtered.is_empty() {
-            div()
-                .id("eq-library-list")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .overflow_y_scroll()
-                .when(self.smooth_scroll, |d| d.smooth_scroll())
-                .pr(px(4.0))
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(140.0))
-                        .rounded(px(12.0))
-                        .bg(pal.panel)
-                        .border_1()
-                        .border_color(pal.border)
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(5.0))
-                        .child(icons::icon(Icon::Headphones, 20.0, pal.text_faint))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(pal.text_dim)
-                                .child("没有匹配的配置"),
-                        ),
-                )
-                .into_any_element()
+            eq_notice(
+                pal,
+                Icon::Layers,
+                "这个分组还没有预设",
+                "切换到「全部」查看完整的单点增益列表。",
+                None,
+            )
         } else {
             let count = filtered.len();
-            let entries = filtered;
             let pal_list = pal.clone();
             let weak_list = weak.clone();
-            let dirty = self.eq.dirty;
-            let active_name = self.eq.preset_name.clone();
-            let preview_name = preview_entry.map(|entry| entry.name);
-            let icon = Icon::Equalizer;
+            let preview_id = preview.map(|preset| preset.id);
+            let blocks = self.eq.blocks.clone();
             let mut list =
-                gpui::uniform_list("eq-library-list", count, move |range, _window, _cx| {
+                gpui::uniform_list("eq-builtin-list", count, move |range, _window, _cx| {
                     range
-                        .map(|index| {
-                            if eq_probe("rows") {
-                                return div().h(px(60.0)).into_any_element();
-                            }
-                            let entry = entries[index];
+                        .map(|row| {
+                            let index = filtered[row];
+                            let preset = &entries[index];
+                            let block = blocks
+                                .iter()
+                                .find(|block| block.preset_id == preset.id)
+                                .cloned();
+                            let added = block.is_some();
+                            let enabled = block.as_ref().is_some_and(|block| block.enabled);
+                            let previewed = preview_id == Some(preset.id);
                             let weak_preview = weak_list.clone();
-                            let previewed = preview_name == Some(entry.name);
-                            let active = !dirty && active_name == entry.name;
+                            let weak_add = weak_list.clone();
+                            let weak_power = weak_list.clone();
+                            let preset_id = preset.id;
                             div()
-                                .h(px(60.0))
+                                .h(px(70.0))
                                 .pb(px(6.0))
-                                .child(eq_preset_row(
+                                .child(eq_builtin_row(
                                     &pal_list,
-                                    entry.name,
-                                    entry.subtitle(),
-                                    Some(icon),
-                                    None,
-                                    active,
+                                    index,
+                                    preset,
+                                    added,
+                                    enabled,
                                     previewed,
                                     false,
-                                    SharedString::from(format!("eq-preset-{index}")),
                                     move |_, _, cx| {
                                         let _ = weak_preview.update(cx, |app, cx| {
-                                            app.eq.preview_preset(entry);
+                                            app.eq.preview_builtin = Some(preset_id);
                                             cx.notify();
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        let _ = weak_add.update(cx, |app, cx| {
+                                            app.toggle_builtin_membership(preset_id, cx);
+                                        });
+                                    },
+                                    move |_, _, cx| {
+                                        let _ = weak_power.update(cx, |app, cx| {
+                                            app.toggle_builtin_power(preset_id, cx);
                                         });
                                     },
                                 ))
@@ -159,35 +206,50 @@ impl ChordialApp {
                 .into_any_element()
         };
 
-        let preview = if eq_probe("preview") {
-            div().w(px(292.0)).h_full().flex_none().into_any_element()
-        } else {
-            match preview_entry {
-                Some(entry) => {
-                    let settings = entry.to_settings();
-                    let active = !self.eq.dirty && self.eq.preset_name == entry.name;
-                    let weak_apply = weak.clone();
-                    let on_apply: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
-                        let _ = weak_apply.update(cx, |app, cx| {
-                            app.load_eq_preset(entry, cx);
-                            cx.notify();
-                        });
+        let preview: AnyElement = match preview {
+            Some(preset) => {
+                let block = self
+                    .eq
+                    .blocks
+                    .iter()
+                    .find(|block| block.preset_id == preset.id)
+                    .cloned();
+                let preset_id = preset.id;
+                let weak_add = weak.clone();
+                let on_add: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+                    let _ = weak_add.update(cx, |app, cx| {
+                        app.toggle_builtin_membership(preset_id, cx);
                     });
-                    eq_preview_panel(
-                        pal,
-                        &settings,
-                        entry.name,
-                        &entry.subtitle(),
-                        active,
-                        on_apply,
-                        None,
-                    )
-                }
-                None => eq_preview_empty(pal, "选择一个配置查看预览"),
+                });
+                let weak_power = weak.clone();
+                let on_power: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+                    let _ = weak_power.update(cx, |app, cx| {
+                        app.toggle_builtin_power(preset_id, cx);
+                    });
+                });
+                let weak_amount = weak.clone();
+                let on_amount: Rc<dyn Fn(f32, &mut App)> = Rc::new(move |amount, cx: &mut App| {
+                    let _ = weak_amount.update(cx, |app, cx| {
+                        if let Some(index) = app.eq.block_index(preset_id) {
+                            app.set_eq_block_amount(index, amount, cx);
+                        }
+                    });
+                });
+                eq_builtin_preview_panel(
+                    pal,
+                    preset,
+                    block.as_ref(),
+                    false,
+                    on_add,
+                    on_power,
+                    on_amount,
+                )
             }
+            None => eq_preview_empty(pal, "选择一个内置预设"),
         };
 
-        let mut body = div()
+        let _ = main_h;
+        div()
             .flex_1()
             .min_w_0()
             .h_full()
@@ -196,27 +258,27 @@ impl ChordialApp {
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .child(head);
-        body = body.child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .gap(px(12.0))
-                .child(list)
-                .child(
-                    div()
-                        .id("eq-preview-pane-presets")
-                        .w(px(292.0))
-                        .h_full()
-                        .flex_none()
-                        .overflow_y_scroll()
-                        .when(self.smooth_scroll, |d| d.smooth_scroll())
-                        .child(preview),
-                ),
-        );
-        let _ = main_h;
-        body.into_any_element()
+            .child(head)
+            .child(chips)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .gap(px(12.0))
+                    .child(list)
+                    .child(
+                        div()
+                            .id("eq-builtin-preview-pane")
+                            .w(px(300.0))
+                            .h_full()
+                            .flex_none()
+                            .overflow_y_scroll()
+                            .when(self.smooth_scroll, |d| d.smooth_scroll())
+                            .child(preview),
+                    ),
+            )
+            .into_any_element()
     }
 
     // ---------- 桌面：AutoEQ 耳机档案 ----------
@@ -234,8 +296,7 @@ impl ChordialApp {
         let total = entries.len();
         let filtered = lib.visible_indices(&self.eq.category, &self.eq.search);
         let filtered_count = filtered.len();
-        let active_name = self.eq.preset_name.clone();
-        let dirty = self.eq.dirty;
+        let profile_name = self.eq.profile.as_ref().map(|profile| profile.name.clone());
 
         let preview_index = self
             .eq
@@ -248,14 +309,12 @@ impl ChordialApp {
                     .find(|&index| entries[index].file == file)
             })
             .or_else(|| {
-                (!dirty)
-                    .then(|| {
-                        filtered
-                            .iter()
-                            .copied()
-                            .find(|&index| entries[index].name == active_name)
-                    })
-                    .flatten()
+                profile_name.as_ref().and_then(|name| {
+                    filtered
+                        .iter()
+                        .copied()
+                        .find(|&index| &entries[index].name == name)
+                })
             })
             .or_else(|| filtered.first().copied());
         let preview_file = preview_index.map(|index| entries[index].file.clone());
@@ -301,7 +360,12 @@ impl ChordialApp {
             },
         ));
 
-        let mut chips = div().h(px(28.0)).flex().items_center().gap(px(6.0));
+        let mut chips = div()
+            .h(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0));
         for label in ["全部", "头戴式", "入耳式", "耳塞式"] {
             let weak = weak.clone();
             let active = self.eq.category == label;
@@ -332,7 +396,7 @@ impl ChordialApp {
                 eq_notice(
                     pal,
                     Icon::Refresh,
-                    "正在从 AutoEq 仓库拉取…",
+                    "正在从 AutoEQ 仓库拉取…",
                     "索引约 500 KB，首次加载需要几秒；完成后会缓存到本地。",
                     None,
                 )
@@ -373,7 +437,7 @@ impl ChordialApp {
             let pal_rows = pal.clone();
             let weak_rows = weak.clone();
             let rows_preview = preview_file.clone();
-            let rows_active = active_name.clone();
+            let rows_profile = profile_name.clone();
             let mut list =
                 gpui::uniform_list("eq-autoeq-list", count, move |range, _window, _cx| {
                     range
@@ -387,7 +451,7 @@ impl ChordialApp {
                             let name = entry.name.clone();
                             let subtitle = entry.subtitle();
                             let previewed = rows_preview.as_deref() == Some(entry.file.as_str());
-                            let active = !dirty && rows_active == entry.name;
+                            let active = rows_profile.as_deref() == Some(entry.name.as_str());
                             let badge = if entry.loading {
                                 Some("拉取中".to_string())
                             } else if entry.error.is_some() {
@@ -435,7 +499,7 @@ impl ChordialApp {
             let preview: AnyElement = match preview_index {
                 Some(index) => {
                     let entry = &entries[index];
-                    let active = !dirty && active_name == entry.name;
+                    let active = profile_name.as_deref() == Some(entry.name.as_str());
                     match entry.to_settings() {
                         Some(settings) => {
                             let weak_apply = weak.clone();
@@ -458,7 +522,7 @@ impl ChordialApp {
                             pal,
                             Icon::Refresh,
                             "正在拉取校准曲线…",
-                            "从 AutoEq 仓库下载这个型号的 ParametricEQ.txt。",
+                            "从 AutoEQ 仓库下载这个型号的 ParametricEQ.txt。",
                             None,
                         ),
                         None => {
@@ -500,7 +564,7 @@ impl ChordialApp {
                 .child(
                     div()
                         .id("eq-autoeq-preview-pane")
-                        .w(px(292.0))
+                        .w(px(300.0))
                         .h_full()
                         .flex_none()
                         .overflow_y_scroll()
@@ -641,7 +705,7 @@ impl ChordialApp {
                         div()
                             .text_size(px(9.5))
                             .text_color(pal.text_faint)
-                            .child("在编辑器里调好曲线，然后点右上角「另存为」"),
+                            .child("在编辑器里调好链路，然后点右上角「另存为」"),
                     ),
             );
         }
@@ -684,27 +748,22 @@ impl ChordialApp {
             Some((index, preset)) => {
                 let active = !self.eq.dirty && self.eq.preset_name == preset.name;
                 let weak_apply = weak.clone();
-                let apply_preset = preset.clone();
                 let on_apply: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
                     let _ = weak_apply.update(cx, |app, cx| {
-                        app.eq.load_saved(&apply_preset);
-                        app.eq.preview_saved(index);
-                        app.apply_eq(cx);
-                        cx.notify();
+                        app.apply_saved_eq_preset(index, cx);
                     });
                 });
                 let weak_remove = weak.clone();
                 let on_remove: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
                     let _ = weak_remove.update(cx, |app, cx| {
                         app.remove_saved_preset(index, cx);
-                        app.eq.preview_saved = None;
                     });
                 });
                 eq_preview_panel(
                     pal,
                     &preset.settings,
                     &preset.name,
-                    "个人配置",
+                    "个人配置 · 完整链路",
                     active,
                     on_apply,
                     Some(on_remove),
@@ -734,7 +793,7 @@ impl ChordialApp {
                     .child(
                         div()
                             .id("eq-preview-pane-saved")
-                            .w(px(292.0))
+                            .w(px(300.0))
                             .h_full()
                             .flex_none()
                             .overflow_y_scroll()

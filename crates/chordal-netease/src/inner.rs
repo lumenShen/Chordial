@@ -23,7 +23,11 @@ impl Inner {
         mapping::map_search(source_id, &body)
     }
 
-    pub(super) async fn fetch_track(&self, source_id: &SourceId, id: &TrackId) -> CoreResult<Track> {
+    pub(super) async fn fetch_track(
+        &self,
+        source_id: &SourceId,
+        id: &TrackId,
+    ) -> CoreResult<Track> {
         let body = self
             .client
             .get_json("/song/detail", &[("ids", id.id.as_str())])
@@ -38,33 +42,41 @@ impl Inner {
         id: &TrackId,
     ) -> CoreResult<Track> {
         let key = object_key(source_id.as_str(), "track", &id.id);
-        if let Some(cache) = &self.cache
-            && let Some(meta) = cache.meta(&key)
-            && let Some(track) = cache.get_json::<Track>(&key)
-        {
-            if now_secs().saturating_sub(meta.fetched_at) >= TRACK_REFRESH_AFTER_SECS {
+        if let Some(cached) = get_cached_json::<Track>(self.cache.as_ref(), &key).await {
+            if now_secs().saturating_sub(cached.meta.fetched_at) >= TRACK_REFRESH_AFTER_SECS {
                 self.spawn_track_refresh(source_id.clone(), id.clone(), key);
             }
-            return Ok(track);
+            return Ok(cached.value);
         }
 
         let track = self.fetch_track(source_id, id).await?;
         if let Some(cache) = &self.cache {
-            cache.put_json(&key, &track, CacheTags::default());
+            put_cached_json(cache, &key, track.clone(), CacheTags::default()).await;
         }
         Ok(track)
     }
 
-    pub(super) fn spawn_track_refresh(self: &Arc<Self>, source_id: SourceId, id: TrackId, key: String) {
+    pub(super) fn spawn_track_refresh(
+        self: &Arc<Self>,
+        source_id: SourceId,
+        id: TrackId,
+        key: String,
+    ) {
         if self.cache.is_none() || !self.begin_refresh(&key) {
             return;
         }
         let inner = self.clone();
+        let guard = RefreshGuard {
+            inner: inner.clone(),
+            key: key.clone(),
+        };
         shared_runtime().spawn(async move {
+            let _guard = guard;
             match inner.fetch_track(&source_id, &id).await {
                 Ok(track) => {
                     if let Some(cache) = &inner.cache {
-                        let outcome = cache.put_json(&key, &track, CacheTags::default());
+                        let outcome =
+                            put_cached_json(cache, &key, track, CacheTags::default()).await;
                         tracing::debug!(
                             target: "chordial::cache",
                             key = %key,
@@ -80,7 +92,6 @@ impl Inner {
                     "netease track background refresh failed"
                 ),
             }
-            inner.end_refresh(&key);
         });
     }
 
@@ -102,20 +113,16 @@ impl Inner {
 
     pub(super) async fn lyrics_inner(self: &Arc<Self>, id: &TrackId) -> CoreResult<Option<Lyrics>> {
         let key = object_key(id.source.as_str(), "lyric", &id.id);
-        if let Some(cache) = &self.cache
-            && let Some(meta) = cache.meta(&key)
-            && let Some(obj) = cache.get(&key)
-            && let Ok(cached) = serde_json::from_slice::<Option<Lyrics>>(&obj.bytes)
-        {
-            if now_secs().saturating_sub(meta.fetched_at) >= LYRIC_REFRESH_AFTER_SECS {
+        if let Some(cached) = get_cached_json::<Option<Lyrics>>(self.cache.as_ref(), &key).await {
+            if now_secs().saturating_sub(cached.meta.fetched_at) >= LYRIC_REFRESH_AFTER_SECS {
                 self.spawn_lyric_refresh(id.clone(), key);
             }
-            return Ok(cached);
+            return Ok(cached.value);
         }
 
         let lyrics = self.fetch_lyrics(id).await?;
         if let Some(cache) = &self.cache {
-            cache.put_json(&key, &lyrics, CacheTags::default());
+            put_cached_json(cache, &key, lyrics.clone(), CacheTags::default()).await;
         }
         Ok(lyrics)
     }
@@ -125,11 +132,17 @@ impl Inner {
             return;
         }
         let inner = self.clone();
+        let guard = RefreshGuard {
+            inner: inner.clone(),
+            key: key.clone(),
+        };
         shared_runtime().spawn(async move {
+            let _guard = guard;
             match inner.fetch_lyrics(&id).await {
                 Ok(lyrics) => {
                     if let Some(cache) = &inner.cache {
-                        let outcome = cache.put_json(&key, &lyrics, CacheTags::default());
+                        let outcome =
+                            put_cached_json(cache, &key, lyrics, CacheTags::default()).await;
                         tracing::debug!(
                             target: "chordial::cache",
                             key = %key,
@@ -145,7 +158,6 @@ impl Inner {
                     "netease lyric background refresh failed"
                 ),
             }
-            inner.end_refresh(&key);
         });
     }
 
@@ -165,7 +177,10 @@ impl Inner {
     }
 
     /// 直链有时效：内存/磁盘都只在未过期时复用；临近过期后台续期。
-    pub(super) async fn resolve_stream_inner(self: &Arc<Self>, id: &TrackId) -> CoreResult<ResolvedStream> {
+    pub(super) async fn resolve_stream_inner(
+        self: &Arc<Self>,
+        id: &TrackId,
+    ) -> CoreResult<ResolvedStream> {
         let now = now_secs();
         let key = object_key(id.source.as_str(), "stream", &id.id);
 
@@ -183,31 +198,29 @@ impl Inner {
             return Ok(hit.resolved);
         }
 
-        if let Some(cache) = &self.cache
-            && let Some(meta) = cache.meta(&key)
-            && !meta.is_expired(now)
-            && let Some(resolved) = cache.get_json::<ResolvedStream>(&key)
+        if let Some(cached) = get_cached_json::<ResolvedStream>(self.cache.as_ref(), &key).await
+            && !cached.meta.is_expired(now)
         {
-            let expires_at = meta.expires_at.unwrap_or(now + URL_TTL_SECS);
+            let expires_at = cached.meta.expires_at.unwrap_or(now + URL_TTL_SECS);
             self.url_cache.lock().expect("url cache lock poisoned").put(
                 id.id.clone(),
                 CachedStream {
-                    resolved: resolved.clone(),
+                    resolved: cached.value.clone(),
                     expires_at,
                 },
             );
             if expires_at.saturating_sub(now) < URL_REFRESH_AHEAD_SECS {
                 self.spawn_stream_refresh(id.clone(), key);
             }
-            return Ok(resolved);
+            return Ok(cached.value);
         }
 
         let resolved = self.fetch_stream(id).await?;
-        self.store_stream(id, &key, &resolved);
+        self.store_stream(id, &key, &resolved).await;
         Ok(resolved)
     }
 
-    pub(super) fn store_stream(&self, id: &TrackId, key: &str, resolved: &ResolvedStream) {
+    pub(super) async fn store_stream(&self, id: &TrackId, key: &str, resolved: &ResolvedStream) {
         let expires_at = now_secs().saturating_add(URL_TTL_SECS);
         self.url_cache.lock().expect("url cache lock poisoned").put(
             id.id.clone(),
@@ -217,14 +230,16 @@ impl Inner {
             },
         );
         if let Some(cache) = &self.cache {
-            cache.put_json(
+            put_cached_json(
+                cache,
                 key,
-                resolved,
+                resolved.clone(),
                 CacheTags {
                     expires_at: Some(expires_at),
                     ..Default::default()
                 },
-            );
+            )
+            .await;
         }
     }
 
@@ -233,9 +248,14 @@ impl Inner {
             return;
         }
         let inner = self.clone();
+        let guard = RefreshGuard {
+            inner: inner.clone(),
+            key: key.clone(),
+        };
         shared_runtime().spawn(async move {
+            let _guard = guard;
             match inner.fetch_stream(&id).await {
-                Ok(resolved) => inner.store_stream(&id, &key, &resolved),
+                Ok(resolved) => inner.store_stream(&id, &key, &resolved).await,
                 Err(e) => tracing::debug!(
                     target: "chordial::cache",
                     key = %key,
@@ -243,7 +263,6 @@ impl Inner {
                     "netease stream background refresh failed"
                 ),
             }
-            inner.end_refresh(&key);
         });
     }
 }

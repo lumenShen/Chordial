@@ -115,7 +115,7 @@ impl ChordialApp {
         theme: &Theme,
         index: usize,
         row: &TrackRowText,
-        track_covers: &std::sync::Mutex<TrackCovers>,
+        cover_image: Option<Arc<RenderImage>>,
         list: QueueList,
         queue_pos: Option<usize>,
         queue_current_id: Option<&chordal_core::model::TrackId>,
@@ -126,8 +126,6 @@ impl ChordialApp {
         selected: bool,
         drag_from: Option<usize>,
         drag_to: Option<usize>,
-        style: &TrackRowStyle,
-        trailing: Option<AnyElement>,
     ) -> AnyElement {
         let is_current = queue_pos == Some(index) && queue_current_id == Some(&row.id);
         let drag_source = drag_from == Some(index);
@@ -165,27 +163,11 @@ impl ChordialApp {
                 .child(row.number.clone())
                 .into_any_element()
         };
-        let mut subtitle = match list {
+        let subtitle = match list {
             QueueList::Search => row.subtitle_search.clone(),
             _ => row.subtitle_default.clone(),
         };
-        if let Some(source) = &style.source_label {
-            subtitle = SharedString::from(format!("{subtitle}  ·  {source}"));
-        }
-        if style.unavailable {
-            subtitle = SharedString::from(format!("{subtitle}  ·  无法拉取"));
-        } else if style.local_substitute {
-            subtitle = SharedString::from(format!("{subtitle}  ·  本地替代"));
-        }
-        // 只读取当前可见行的缓存图片；未加载/无封面时回落到音符占位。
-        let cover_image = row.cover_key.as_ref().and_then(|key| {
-            track_covers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .images
-                .get(key)
-                .cloned()
-        });
+        // 可见行的图片由列表范围统一读取，未加载/无封面时回落到音符占位。
 
         // 队列列表的序号是拖拽把手；其它列表没有排序语义。
         let mut leading = div()
@@ -210,13 +192,13 @@ impl ChordialApp {
                     });
         }
 
-        let more = (!select_mode && style.show_menu).then(|| {
+        let more = (!select_mode).then(|| {
             let weak = weak.clone();
-            let list = list.clone();
             div()
                 .id(gpui::ElementId::named_usize("track-more", index))
-                .size(px(24.0))
-                .rounded(px(5.0))
+                .size(px(if phone { 40.0 } else { 24.0 }))
+                .flex_none()
+                .rounded(px(if phone { 8.0 } else { 5.0 }))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -234,7 +216,7 @@ impl ChordialApp {
                         cx.stop_propagation();
                         let _ = weak.update(cx, |app, cx| {
                             app.open_track_menu(
-                                list.clone(),
+                                list,
                                 index,
                                 f32::from(event.position.x),
                                 f32::from(event.position.y),
@@ -245,13 +227,14 @@ impl ChordialApp {
                 )
                 .into_any_element()
         });
-        let add = (phone && !select_mode && !style.compact).then(|| {
+        let add = (phone && !select_mode).then(|| {
             let weak = weak.clone();
             let track = tracks.get(index).cloned();
             div()
                 .id(gpui::ElementId::named_usize("track-add", index))
-                .size(px(24.0))
-                .rounded(px(5.0))
+                .size(px(40.0))
+                .flex_none()
+                .rounded(px(8.0))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -275,8 +258,8 @@ impl ChordialApp {
         div()
             .id(gpui::ElementId::named_usize("track", index))
             .w_full()
-            .h(px(style.height))
-            .px(px(if style.compact { 8.0 } else { 12.0 }))
+            .h(px(crate::theme::size::ROW))
+            .px(px(12.0))
             .flex()
             .items_center()
             .gap(px(10.0))
@@ -296,12 +279,11 @@ impl ChordialApp {
             .hover(|s| s.bg(theme.hover))
             .on_mouse_down(gpui::MouseButton::Left, {
                 let weak = weak.clone();
-                let list = list.clone();
                 move |event: &MouseDownEvent, _, cx: &mut App| {
                     if phone && !select_mode {
                         let _ = weak.update(cx, |app, cx| {
                             app.start_long_press(
-                                list.clone(),
+                                list,
                                 index,
                                 f32::from(event.position.x),
                                 f32::from(event.position.y),
@@ -332,12 +314,11 @@ impl ChordialApp {
             })
             .on_mouse_down(gpui::MouseButton::Right, {
                 let weak = weak.clone();
-                let list = list.clone();
                 move |event: &MouseDownEvent, _, cx: &mut App| {
                     let _ = weak.update(cx, |app, cx| {
                         app.cancel_long_press();
                         app.open_track_menu(
-                            list.clone(),
+                            list,
                             index,
                             f32::from(event.position.x),
                             f32::from(event.position.y),
@@ -346,26 +327,23 @@ impl ChordialApp {
                     });
                 }
             })
-            .on_click({
-                let list = list.clone();
-                move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        if app.row_click_suppressed() {
-                            return;
-                        }
-                        if app.selection.is_some() {
-                            app.toggle_selection(index, cx);
-                        } else {
-                            app.play_from_list(&list, index, cx);
-                        }
-                    });
-                }
+            .on_click(move |_, _, cx| {
+                let _ = weak.update(cx, |app, cx| {
+                    if app.row_click_suppressed() {
+                        return;
+                    }
+                    if app.selection.is_some() {
+                        app.toggle_selection(index, cx);
+                    } else {
+                        app.play_from_list(list, index, cx);
+                    }
+                });
             })
             .child(leading)
             .child(crate::widgets::cover_thumb(
                 theme,
                 cover_image,
-                style.cover,
+                34.0,
                 1.0,
                 crate::icons::icon(
                     crate::icons::Icon::Note,
@@ -405,7 +383,7 @@ impl ChordialApp {
                             .child(subtitle),
                     ),
             )
-            .when(!select_mode && style.show_duration, |d| {
+            .when(!select_mode, |d| {
                 d.child(
                     div()
                         .w(px(40.0))
@@ -415,13 +393,12 @@ impl ChordialApp {
                         .child(row.duration.clone()),
                 )
             })
-            .children(trailing)
             .children(add)
             .children(more)
             .into_any_element()
     }
 
-    pub(super) fn render_track_header(theme: &Theme, phone: bool) -> AnyElement {
+    pub(super) fn render_track_header(theme: &Theme, phone: bool, select_mode: bool) -> AnyElement {
         div()
             .w_full()
             .h(px(26.0))
@@ -441,17 +418,19 @@ impl ChordialApp {
                     .text_color(theme.text_faint)
                     .child("标题"),
             )
-            .child(
-                div()
-                    .w(px(40.0))
-                    .text_size(px(10.5))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_faint)
-                    .text_align(gpui::TextAlign::Right)
-                    .child("时长"),
-            )
-            // 行尾的「+ / ⋮」入口占位，保证表头与行内容对齐。
-            .child(div().w(px(if phone { 56.0 } else { 28.0 })))
+            .when(!select_mode, |d| {
+                d.child(
+                    div()
+                        .w(px(40.0))
+                        .text_size(px(10.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_faint)
+                        .text_align(gpui::TextAlign::Right)
+                        .child("时长"),
+                )
+                // 行尾的「+ / ⋮」入口占位，保证表头与行内容对齐。
+                .child(div().w(px(if phone { 90.0 } else { 28.0 })))
+            })
             .into_any_element()
     }
 
@@ -496,16 +475,29 @@ impl ChordialApp {
         let row_theme = theme.clone();
         let covers = self.track_covers.clone();
         let cover_weak = weak.clone();
-        let cover_tracks = tracks_arc.clone();
         let mut body = uniform_list("track-list", n, move |range, _window, cx| {
             let visible: Vec<usize> = range.collect();
             // 只为真正滚到屏上的行启动下载：列表可能有几千首曲目。
             let _ = cover_weak.update(cx, |app, cx| {
-                app.request_track_covers(&visible, &cover_tracks, cx);
+                app.request_track_row_covers(&visible, &rows, cx);
             });
+            let visible_covers: Vec<_> = {
+                let covers = covers.lock().unwrap_or_else(|e| e.into_inner());
+                visible
+                    .iter()
+                    .map(|&index| {
+                        rows.get(index).and_then(|row| {
+                            row.cover_key
+                                .as_ref()
+                                .and_then(|key| covers.images.get(key).cloned())
+                        })
+                    })
+                    .collect()
+            };
             visible
                 .into_iter()
-                .filter_map(|i| {
+                .zip(visible_covers)
+                .filter_map(|(i, cover_image)| {
                     rows.get(i).map(|row| {
                         let selected = selection
                             .as_ref()
@@ -515,8 +507,8 @@ impl ChordialApp {
                             &row_theme,
                             i,
                             row,
-                            &covers,
-                            list.clone(),
+                            cover_image,
+                            list,
                             queue_pos,
                             current_id.as_ref(),
                             weak.clone(),
@@ -526,8 +518,6 @@ impl ChordialApp {
                             selected,
                             drag.map(|d| d.from),
                             drag.map(|d| d.to),
-                            &TrackRowStyle::full(),
-                            None,
                         )
                     })
                 })
@@ -545,7 +535,11 @@ impl ChordialApp {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(Self::render_track_header(theme, self.is_phone()))
+            .child(Self::render_track_header(
+                theme,
+                self.is_phone(),
+                select_mode,
+            ))
             .child(body)
             .into_any_element()
     }

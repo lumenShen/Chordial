@@ -6,6 +6,7 @@
 //! - 所有去重使用 `Track::identity_key()`（歌名 + 分列艺人 + 专辑 + 曲序）。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chordal_core::model::{CollectionId, CollectionSummary, Track};
@@ -14,33 +15,40 @@ use chordal_core::playlist::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::storage::JsonWriter;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PlaylistFile {
     #[serde(default)]
     version: u32,
     #[serde(default)]
-    playlists: Vec<SavedPlaylist>,
+    playlists: Arc<Vec<SavedPlaylist>>,
 }
 
-/// 本地歌单存储。写盘采用临时文件 + rename，避免中途崩溃留下半截 JSON。
+/// 本地歌单存储。UI 持不可变快照，写盘由单一 writer 去抖并原子替换。
 pub struct PlaylistStore {
     path: PathBuf,
-    playlists: Vec<SavedPlaylist>,
+    playlists: Arc<Vec<SavedPlaylist>>,
+    revision: u64,
+    writer: Option<Arc<JsonWriter>>,
 }
 
 impl PlaylistStore {
     /// 默认路径：与 `config.json` 同目录。
-    pub fn load_default() -> Self {
+    pub fn load_default_with_writer(writer: Option<Arc<JsonWriter>>) -> Self {
         let path = crate::config::config_path()
             .parent()
             .map(|dir| dir.join("playlists.json"))
             .unwrap_or_else(|| PathBuf::from("playlists.json"));
-        Self::load_from(path)
+        Self::load_with_writer(path, writer)
     }
 
     pub fn load_from(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let mut playlists = match std::fs::read(&path) {
+        Self::load_with_writer(path.into(), None)
+    }
+
+    fn load_with_writer(path: PathBuf, writer: Option<Arc<JsonWriter>>) -> Self {
+        let mut playlists: Arc<Vec<SavedPlaylist>> = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<PlaylistFile>(&bytes) {
                 Ok(file) => file.playlists,
                 Err(e) => {
@@ -49,24 +57,29 @@ impl PlaylistStore {
                         error = %e,
                         "playlists.json parse failed; starting empty"
                     );
-                    Vec::new()
+                    Arc::new(Vec::new())
                 }
             },
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 tracing::warn!(path = %path.display(), error = %e, "playlists.json read failed");
-                Vec::new()
+                Arc::new(Vec::new())
             }
-            Err(_) => Vec::new(),
+            Err(_) => Arc::new(Vec::new()),
         };
         // 防御：手改文件可能留下重复 ID；保留首个，后续重新编号。
         let mut seen = std::collections::HashSet::new();
-        for playlist in &mut playlists {
+        for playlist in Arc::make_mut(&mut playlists) {
             if playlist.id.0.trim().is_empty() || !seen.insert(playlist.id.0.clone()) {
                 playlist.id = PlaylistId::new(new_playlist_id());
                 seen.insert(playlist.id.0.clone());
             }
         }
-        Self { path, playlists }
+        Self {
+            path,
+            playlists,
+            revision: 0,
+            writer,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -74,7 +87,15 @@ impl PlaylistStore {
     }
 
     pub fn playlists(&self) -> &[SavedPlaylist] {
-        &self.playlists
+        self.playlists.as_slice()
+    }
+
+    fn playlists_mut(&mut self) -> &mut Vec<SavedPlaylist> {
+        Arc::make_mut(&mut self.playlists)
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn summaries(&self) -> Vec<PlaylistSummary> {
@@ -86,7 +107,7 @@ impl PlaylistStore {
     }
 
     pub fn get_mut(&mut self, id: &PlaylistId) -> Option<&mut SavedPlaylist> {
-        self.playlists.iter_mut().find(|p| &p.id == id)
+        self.playlists_mut().iter_mut().find(|p| &p.id == id)
     }
 
     pub fn find_subscription(&self, collection: &CollectionId) -> Option<&SavedPlaylist> {
@@ -130,7 +151,7 @@ impl PlaylistStore {
         };
         playlist.add_tracks(tracks, now);
         let id = playlist.id.clone();
-        self.playlists.push(playlist);
+        self.playlists_mut().push(playlist);
         self.save();
         id
     }
@@ -148,7 +169,7 @@ impl PlaylistStore {
                 .subscribed_collection()
                 .is_some_and(|id| id == &collection.id)
         }) {
-            let playlist = &mut self.playlists[index];
+            let playlist = &mut self.playlists_mut()[index];
             let changed = playlist.title != collection.title
                 || playlist.cover != collection.cover
                 || playlist.creator != collection.creator
@@ -188,7 +209,7 @@ impl PlaylistStore {
         };
         playlist.replace_tracks(tracks, now);
         let id = playlist.id.clone();
-        self.playlists.push(playlist);
+        self.playlists_mut().push(playlist);
         self.save();
         id
     }
@@ -250,7 +271,7 @@ impl PlaylistStore {
 
     pub fn delete(&mut self, id: &PlaylistId) -> bool {
         let before = self.playlists.len();
-        self.playlists.retain(|playlist| &playlist.id != id);
+        self.playlists_mut().retain(|playlist| &playlist.id != id);
         let removed = self.playlists.len() != before;
         if removed {
             self.save();
@@ -293,27 +314,39 @@ impl PlaylistStore {
         moved
     }
 
-    fn save(&self) {
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+    fn save(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         let file = PlaylistFile {
             version: 1,
             playlists: self.playlists.clone(),
         };
-        let Ok(bytes) = serde_json::to_vec(&file) else {
-            return;
-        };
-        let tmp = self.path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            if let Err(e) = std::fs::rename(&tmp, &self.path) {
-                tracing::warn!(
+        if let Some(writer) = &self.writer {
+            writer.save_json(self.path.clone(), file);
+        } else {
+            match serde_json::to_vec(&file) {
+                Ok(bytes) => {
+                    if let Err(error) = chordal_core::fs::atomic_write(&self.path, &bytes) {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            %error,
+                            "playlists.json replace failed"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
                     path = %self.path.display(),
-                    error = %e,
-                    "playlists.json replace failed"
-                );
-                let _ = std::fs::remove_file(&tmp);
+                    %error,
+                    "playlists.json serialization failed"
+                ),
             }
+        }
+    }
+
+    pub fn flush(&self) {
+        if let Some(writer) = &self.writer
+            && let Err(error) = writer.flush()
+        {
+            tracing::warn!(path = %self.path.display(), %error, "playlists flush failed");
         }
     }
 }
@@ -388,6 +421,23 @@ mod tests {
         let reloaded = PlaylistStore::load_from(&path);
         assert_eq!(reloaded.get(&id).unwrap().title, "通勤");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn revision_changes_only_when_playlists_change() {
+        let mut store = temp_store();
+        assert_eq!(store.revision(), 0);
+        let id = store.create_local(" revision ", vec![]);
+        assert_eq!(store.revision(), 1);
+        assert!(!store.rename(&id, "   "));
+        assert_eq!(store.revision(), 1);
+        assert!(store.rename(&id, "renamed"));
+        assert_eq!(store.revision(), 2);
+        assert!(store.delete(&id));
+        assert_eq!(store.revision(), 3);
+        assert!(!store.delete(&id));
+        assert_eq!(store.revision(), 3);
+        let _ = std::fs::remove_file(store.path().to_path_buf());
     }
 
     #[test]

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Chordial</string>
+    <string name="playback_channel_name">播放</string>
+    <string name="playback_channel_description">后台播放时保持应用运行</string>
+    <string name="playback_notification_text">后台播放已启用</string>
+</resources>

@@ -13,6 +13,8 @@ impl ChordialApp {
         // 与沉浸层共享舞台共用同一份文案，动画收口时不会换成另一串字。
         let (title, artist_line) = self.dock_track_text();
         let playing = status.state == PlayerState::Playing;
+        let failed = matches!(status.state, PlayerState::Failed(_));
+        let loading = status.state == PlayerState::Loading;
         // 未开始播放时播放器还没有 duration；退回曲目元数据，Dock 也能显示
         // 真实总时长，而不是一条空轨 + “--:--”。
         let duration = status
@@ -52,51 +54,57 @@ impl ChordialApp {
                 });
             }
         };
-        let track = div()
-            .id("dock-track")
-            .h_full()
-            .flex_1()
-            .min_w_0()
-            .px(px(DOCK_TRACK_PAD_X))
-            .rounded(px(11.0))
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .gap(px(DOCK_COVER_GAP))
-            .hover(|s| s.bg(theme.hover))
-            .child(cover)
-            .child(
+        let track = self
+            .stage_measurements
+            .observe(
+                StageMode::Dock,
                 div()
+                    .h_full()
                     .flex_1()
                     .min_w_0()
+                    .px(px(DOCK_TRACK_PAD_X))
+                    .rounded(px(11.0))
+                    .cursor_pointer()
                     .flex()
-                    .flex_col()
-                    .justify_center()
-                    .gap(px(DOCK_LINE_GAP))
+                    .items_center()
+                    .gap(px(DOCK_COVER_GAP))
+                    .hover(|s| s.bg(theme.hover))
+                    .child(cover)
                     .child(
                         div()
-                            .text_size(px(DOCK_TITLE_SIZE))
-                            // 与共享舞台同一行高，动画终点逐像素重合。
-                            .line_height(px(DOCK_TITLE_SIZE * INFO_LINE_RATIO))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(if self.current_track.is_some() {
-                                theme.text
-                            } else {
-                                theme.text_dim
-                            })
-                            .text_ellipsis()
-                            .child(title),
-                    )
-                    .child(
-                        div()
+                            .flex_1()
                             .min_w_0()
-                            .text_size(px(DOCK_ARTIST_SIZE))
-                            .line_height(px(DOCK_ARTIST_SIZE * INFO_LINE_RATIO))
-                            .text_color(theme.text_faint)
-                            .text_ellipsis()
-                            .child(artist_line),
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(DOCK_LINE_GAP))
+                            .child(
+                                div()
+                                    .text_size(px(DOCK_TITLE_SIZE))
+                                    // 与共享舞台同一行高，动画终点逐像素重合。
+                                    .line_height(px(DOCK_TITLE_SIZE * INFO_LINE_RATIO))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(if self.current_track.is_some() {
+                                        theme.text
+                                    } else {
+                                        theme.text_dim
+                                    })
+                                    .text_ellipsis()
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_size(px(DOCK_ARTIST_SIZE))
+                                    .line_height(px(DOCK_ARTIST_SIZE * INFO_LINE_RATIO))
+                                    .text_color(theme.text_faint)
+                                    .text_ellipsis()
+                                    .child(artist_line),
+                            ),
                     ),
+                &[(0, MeasurePart::Cover), (1, MeasurePart::Info)],
             )
+            .id("dock-track")
             .on_click(open_immersive);
 
         let prev = {
@@ -126,7 +134,17 @@ impl ChordialApp {
         let play_icon = if playing {
             crate::icons::icon(crate::icons::Icon::Pause, 17.0, theme.on_accent)
         } else {
-            crate::icons::icon(crate::icons::Icon::Play, 17.0, theme.on_accent)
+            crate::icons::icon(
+                crate::icons::Icon::Play,
+                17.0,
+                if failed {
+                    gpui::white()
+                } else if loading {
+                    theme.disabled_fg
+                } else {
+                    theme.on_accent
+                },
+            )
         };
         let play = {
             let weak = weak.clone();
@@ -134,12 +152,30 @@ impl ChordialApp {
                 .id("dock-play")
                 .size(px(DOCK_PLAY_BTN))
                 .rounded(px(DOCK_PLAY_BTN * 0.5))
-                .bg(theme.accent)
-                .cursor_pointer()
+                .bg(if failed {
+                    theme.danger
+                } else if loading {
+                    theme.disabled_bg
+                } else {
+                    theme.accent
+                })
+                .cursor(if loading {
+                    CursorStyle::Arrow
+                } else {
+                    CursorStyle::PointingHand
+                })
                 .flex()
                 .items_center()
                 .justify_center()
-                .hover(|s| s.bg(theme.accent_hover))
+                .hover(|s| {
+                    if failed {
+                        s.bg(theme.danger.opacity(0.85))
+                    } else if loading {
+                        s
+                    } else {
+                        s.bg(theme.accent_hover)
+                    }
+                })
                 .child(play_icon)
                 .on_click(move |_, _, cx| {
                     let _ = weak.update(cx, |app, cx| app.toggle_playback(cx));
@@ -336,6 +372,12 @@ impl ChordialApp {
     pub(super) fn dock_track_text(&self) -> (SharedString, SharedString) {
         let text = self.now_playing_text();
         let title = text.title.clone();
+        if matches!(self.player_status.state, PlayerState::Failed(_)) {
+            return (title, SharedString::from("播放失败 · 点击重试"));
+        }
+        if self.player_status.state == PlayerState::Loading {
+            return (title, SharedString::from("正在加载…"));
+        }
         let artist = if self.current_track.is_some() {
             if !text.artists.is_empty() {
                 text.artists.clone()

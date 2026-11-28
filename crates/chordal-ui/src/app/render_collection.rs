@@ -90,7 +90,7 @@ impl ChordialApp {
                 chips = chips.child(
                     div()
                         .id(SharedString::from(format!("coll-album-{}", album.id.id)))
-                        .h(px(20.0))
+                        .h(px(if self.is_phone() { 44.0 } else { 20.0 }))
                         .px(px(6.0))
                         .rounded(px(4.0))
                         .border_1()
@@ -120,13 +120,13 @@ impl ChordialApp {
             && !view.tracks.is_empty()
             && self
                 .source_config_by_id(&view.id.source.0)
-                .is_some_and(|source| source.is_netease())
+                .is_some_and(|source| !source.is_local())
         {
             let subscribed = self.playlists.is_subscribed(&view.id);
             let weak = weak.clone();
             let trigger = div()
                 .id("collection-subscribe-trigger")
-                .h(px(24.0))
+                .h(px(if self.is_phone() { 44.0 } else { 24.0 }))
                 .px(px(8.0))
                 .rounded(px(6.0))
                 .border_1()
@@ -208,7 +208,7 @@ impl ChordialApp {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("search-kind-{label}")))
-                    .h(px(24.0))
+                    .h(px(if self.is_phone() { 44.0 } else { 24.0 }))
                     .px(px(9.0))
                     .rounded(px(5.0))
                     .bg(if active {
@@ -244,17 +244,22 @@ impl ChordialApp {
     ) -> AnyElement {
         let theme = theme.clone();
         let weak = cx.entity().downgrade();
+        let source_names = Arc::new(
+            self.source_configs
+                .iter()
+                .map(|source| (source.id.clone(), source.name.clone()))
+                .collect::<std::collections::HashMap<_, _>>(),
+        );
         let n = collections.len();
         let mut results = uniform_list("collection-results", n, move |range, _window, _cx| {
             range
                 .filter_map(|i| {
                     let collection = collections.get(i)?;
                     let weak = weak.clone();
-                    let source_label = match collection.id.source.as_str() {
-                        "netease" => "网易云",
-                        "local" => "本地",
-                        other => other,
-                    };
+                    let source_label = source_names
+                        .get(collection.id.source.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| collection.id.source.0.clone());
                     let meta = match (collection.creator.as_deref(), collection.track_count) {
                         (Some(creator), Some(count)) => {
                             format!("{} · {} · {count} 首", collection.kind.label(), creator)
@@ -276,7 +281,7 @@ impl ChordialApp {
                                 collection.id.source, collection.id.kind, collection.id.id
                             )))
                             .w_full()
-                            .h(px(crate::theme::size::ROW))
+                            .h(px(56.0))
                             .px(px(12.0))
                             .flex()
                             .items_center()

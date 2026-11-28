@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chordal_core::perf::PerfScope;
+use chordal_core::{AudioBands, AudioControlMapping};
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ContentMask, Context, Corners, Element, ElementId, GlobalElementId, Hsla,
@@ -23,7 +24,7 @@ use gpui::{
     RenderImage, SpriteMask, Style, Window, div, fill, point, px, relative,
 };
 
-use crate::background::{BackgroundRendererKind, LyricBackgroundRenderer};
+use crate::background::{BackgroundController, BackgroundRendererKind, FrameOutput};
 use crate::model::{LyricLine, LyricWord};
 use crate::player::{
     InterludeDotsFrame, LayoutMetrics, LineFrameState, LyricPlayer, LyricPlayerConfig,
@@ -149,6 +150,66 @@ impl LyricSwitch {
     }
 }
 
+/// 下一帧请求的纯状态。各个动画源只贡献布尔/间隔，不持有 gpui RAF 或时钟。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct FrameAnimationState {
+    lyric_animating: bool,
+    background_animating: bool,
+    background_interval_ms: f32,
+}
+
+impl FrameAnimationState {
+    const fn new(
+        lyric_animating: bool,
+        background_animating: bool,
+        background_interval_ms: f32,
+    ) -> Self {
+        Self {
+            lyric_animating,
+            background_animating,
+            background_interval_ms,
+        }
+    }
+
+    /// 组合多个来源；歌词动画优先，背景动画取更短的有效间隔。
+    fn merge(self, other: Self) -> Self {
+        let background_interval_ms = match (self.background_animating, other.background_animating) {
+            (true, true) => self
+                .background_interval_ms
+                .min(other.background_interval_ms),
+            (true, false) => self.background_interval_ms,
+            (false, true) => other.background_interval_ms,
+            (false, false) => 0.0,
+        };
+        Self::new(
+            self.lyric_animating || other.lyric_animating,
+            self.background_animating || other.background_animating,
+            background_interval_ms,
+        )
+    }
+
+    fn interval_ms(self) -> Option<f32> {
+        if self.lyric_animating {
+            Some(0.0)
+        } else if self.background_animating {
+            Some(if self.background_interval_ms.is_finite() {
+                self.background_interval_ms.max(0.0)
+            } else {
+                0.0
+            })
+        } else {
+            None
+        }
+    }
+
+    fn wants_frame(self, elapsed_ms: f32) -> bool {
+        let Some(interval_ms) = self.interval_ms() else {
+            return false;
+        };
+        interval_ms <= 0.5 || elapsed_ms >= interval_ms * 0.9
+    }
+}
+
 /// 正在淡出的上一首歌词：播放器状态与排版缓存整体冻结，跟随切换时间线绘制。
 /// 背景仍是当前层唯一的，不参与淡出（避免切换时背景闪一下）。
 struct OutgoingLyrics {
@@ -159,16 +220,13 @@ struct OutgoingLyrics {
 struct Inner {
     player: LyricPlayer,
     text: TextLayoutCache,
-    background: LyricBackgroundRenderer,
+    background: BackgroundController,
     time_ms: u64,
     playing: bool,
     last_instant: Instant,
     dt_ms: f32,
     colors: LyricRenderColors,
     bg_image: Option<Arc<RenderImage>>,
-    /// 已烘焙的 32×32 BGRA 调色纹理（4 KiB）。切换背景渲染器时用它
-    /// 重建，避免长期保留整幅封面 RGBA（512² ≈ 1 MiB）。
-    album_palette: Option<Vec<u8>>,
     last_heights: Vec<f32>,
     last_width: f32,
     last_height: f32,
@@ -199,8 +257,10 @@ struct Inner {
     background_bounds: Option<Bounds<Pixels>>,
     last_bounds: Bounds<Pixels>,
     seek_handler: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-    /// 鼓点包络来源（0..1）。每帧读取，避免外层再维护定时器。
-    beat_source: Option<Arc<dyn Fn() -> f32 + Send + Sync>>,
+    /// 五路频段包络来源。每帧读取一次，避免外层再维护定时器。
+    audio_source: Option<Arc<dyn Fn() -> AudioBands + Send + Sync>>,
+    /// 五路频段到内部控制点的映射，切换背景渲染器时保留。
+    audio_control_mapping: AudioControlMapping,
     /// 已经不再绘制的背景帧。下一帧 `prepare` 里从 gpui sprite atlas 移除，
     /// 否则 30fps 的背景每帧都会永久占用一个纹理图块（图集只增不减）。
     retired_images: Vec<Arc<RenderImage>>,
@@ -217,6 +277,20 @@ struct Inner {
     switch: Option<LyricSwitch>,
 }
 
+/// gpui 的布局 bounds 使用逻辑像素，而背景除数面向最终屏幕像素。
+/// 先换算成设备像素再交给渲染器，否则 200% 缩放下 ÷2 会实际变成 ÷4。
+fn background_viewport_size(bounds: Bounds<Pixels>, scale_factor: f32) -> (u32, u32) {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    (
+        (f32::from(bounds.size.width) * scale).ceil().max(1.0) as u32,
+        (f32::from(bounds.size.height) * scale).ceil().max(1.0) as u32,
+    )
+}
+
 impl Inner {
     fn new() -> Self {
         let text = TextLayoutCache::new(LyricTextStyle::default());
@@ -228,14 +302,13 @@ impl Inner {
         Self {
             player: LyricPlayer::new(config),
             text,
-            background: LyricBackgroundRenderer::new(BackgroundRendererKind::MeshGradient),
+            background: BackgroundController::new(BackgroundRendererKind::MeshGradient),
             time_ms: 0,
             playing: false,
             last_instant: Instant::now(),
             dt_ms: 16.0,
             colors: LyricRenderColors::default(),
             bg_image: None,
-            album_palette: None,
             last_heights: Vec::new(),
             last_width: 0.0,
             last_height: 0.0,
@@ -255,7 +328,8 @@ impl Inner {
             background_bounds: None,
             last_bounds: Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(0.0), px(0.0))),
             seek_handler: None,
-            beat_source: None,
+            audio_source: None,
+            audio_control_mapping: AudioControlMapping::default(),
             retired_images: Vec::new(),
             last_clock_pos: 0,
             display_time_ms: 0.0,
@@ -320,18 +394,25 @@ impl Inner {
     /// 队列/音频详情）画布仍可能换成整窗尺寸并改写缓存的 viewport；若这里
     /// 不记录新尺寸，切回原列宽时 `last_width` 会误判为未变化，跳过
     /// `set_viewport`，缓存继续按整窗宽度换行，歌词就会溢出且不换行。
+    ///
+    /// 外层尺寸相同也不代表缓存已经同步：切歌交叉淡化会整体替换
+    /// `TextLayoutCache`，新缓存从 1280×720 兜底值开始。因此每次都委托缓存
+    /// 自己去重，并用 generation 捕获内部视口变化，避免新层沿用错误宽度。
     fn sync_viewport(&mut self, width: f32, height: f32) {
         if !width.is_finite() || !height.is_finite() || width <= 1.0 || height <= 1.0 {
             return;
         }
-        if (width - self.last_width).abs() < 0.01 && (height - self.last_height).abs() < 0.01 {
-            return;
-        }
+        let bounds_changed =
+            (width - self.last_width).abs() >= 0.01 || (height - self.last_height).abs() >= 0.01;
+        let generation = self.text.generation();
+        self.text.set_viewport(width, height);
+        let cache_changed = self.text.generation() != generation;
         self.last_width = width;
         self.last_height = height;
-        self.text.set_viewport(width, height);
-        self.last_heights.clear();
-        self.metrics_dirty = true;
+        if bounds_changed || cache_changed {
+            self.last_heights.clear();
+            self.metrics_dirty = true;
+        }
     }
 
     fn sync_metrics(&mut self, width: f32, height: f32) {
@@ -359,6 +440,21 @@ impl Inner {
         }
 
         self.sync_viewport(width, height);
+
+        // 先发布最新背景快照，让 worker 与 UI 文本整形并行。输入始终覆盖旧输入，
+        // 不在后台建立 300Hz 任务队列。
+        let bg = self.background_bounds.unwrap_or(bounds);
+        let (viewport_w, viewport_h) = background_viewport_size(bg, window.scale_factor());
+        let audio = if self.background_visible {
+            self.audio_source
+                .as_ref()
+                .map(|source| source())
+                .unwrap_or_default()
+        } else {
+            AudioBands::default()
+        };
+        self.background
+            .publish((viewport_w, viewport_h), audio, self.background_visible);
 
         // 竖屏播放页把歌词视图当纯背景使用：不整形、不测量，避免每帧
         // 对不可见文本做无用工作。沉浸页则把 `layout_when_hidden` 打开，
@@ -441,31 +537,34 @@ impl Inner {
         for image in std::mem::take(&mut self.retired_images) {
             self.retire_bg_frame(window, image);
         }
-        if self.background_visible {
-            // 背景网格按「绘制区域」生成（沉浸层为整个窗口），光栅分辨率由
-            // render_scale 决定；屏幕上由 GPU 双线性放大。
-            let bg = self.background_bounds.unwrap_or(bounds);
-            self.background.set_viewport(
-                f32::from(bg.size.width) as u32,
-                f32::from(bg.size.height) as u32,
-            );
-            if let Some(source) = &self.beat_source {
-                let level = source();
-                self.background.set_beat_level(level);
-            }
-            // `None` 表示没有图层/无封面，必须同步清掉旧图，避免残留上一首封面。
-            let next = self.background.render(self.dt_ms);
-            let same = match (&self.bg_image, &next) {
-                (Some(old), Some(new)) => old.id == new.id,
-                _ => false,
-            };
-            if !same {
-                if let Some(old) = self.bg_image.take() {
-                    self.retire_bg_frame(window, old);
+        if let Some(output) = self.background.poll() {
+            match output {
+                FrameOutput::Frame { image, .. } => {
+                    let same = self.bg_image.as_ref().is_some_and(|old| old.id == image.id);
+                    if !same {
+                        if let Some(old) = self.bg_image.take() {
+                            self.retire_bg_frame(window, old);
+                        }
+                        self.bg_image = Some(image);
+                    }
                 }
-                self.bg_image = next;
+                FrameOutput::Clear { .. } => {
+                    if let Some(old) = self.bg_image.take() {
+                        self.retire_bg_frame(window, old);
+                    }
+                }
+                FrameOutput::Unchanged { .. } => {}
+                FrameOutput::Failed { .. } => {
+                    self.background_visible = false;
+                    if let Some(old) = self.bg_image.take() {
+                        self.retire_bg_frame(window, old);
+                    }
+                }
             }
-        } else if let Some(old) = self.bg_image.take() {
+        }
+        if !self.background_visible
+            && let Some(old) = self.bg_image.take()
+        {
             self.retire_bg_frame(window, old);
         }
     }
@@ -485,36 +584,34 @@ impl Inner {
         }
     }
 
-    /// 当前是否需要继续请求动画帧，以及允许的请求间隔。
-    ///
-    /// - 歌词/弹簧/扫光在动：`0`，即每个显示刷新周期都请求；
-    /// - 只有背景网格在流动：按背景光栅帧率请求，避免为 30fps 的纹理做
-    ///   300Hz 的无效重绘；
-    /// - 全部静止：`None`，泵自动停止。
-    fn animation_interval_ms(&self) -> Option<f32> {
+    /// prepaint 的布局/整形完成后才推进弹簧，确保本帧新启动的动画也会
+    /// 参与下一帧请求判断。暂停时同样调用，让已启动的弹簧完成收敛。
+    fn advance_animation(&mut self) {
+        self.animating = self.player.update(self.dt_ms);
+    }
+
+    fn animation_state(&self) -> FrameAnimationState {
         let has_lyrics = !self.player.document().is_empty();
-        let lyric_animating =
-            self.animating || self.switch.is_some() || (self.playing && has_lyrics);
-        if lyric_animating {
-            return Some(0.0);
-        }
-        let background_animating = self.background_visible && self.background.is_animating();
-        if background_animating {
-            return Some(1000.0 / self.bg_fps.max(1) as f32);
-        }
-        None
+        let lyrics = FrameAnimationState::new(
+            self.animating || self.switch.is_some() || (self.playing && has_lyrics),
+            false,
+            0.0,
+        );
+        let background = FrameAnimationState::new(
+            false,
+            self.background_visible && self.background.is_animating(),
+            1000.0 / self.bg_fps.max(1) as f32,
+        );
+        lyrics.merge(background)
     }
 
     /// 按当前动画源限速判断本帧是否要请求下一帧。
     fn wants_animation_frame(&mut self, now: Instant) -> bool {
-        let Some(interval_ms) = self.animation_interval_ms() else {
-            return false;
-        };
         let elapsed_ms = now
             .saturating_duration_since(self.last_frame_request)
             .as_secs_f32()
             * 1000.0;
-        if interval_ms <= 0.5 || elapsed_ms >= interval_ms * 0.9 {
+        if self.animation_state().wants_frame(elapsed_ms) {
             self.last_frame_request = now;
             true
         } else {
@@ -623,10 +720,32 @@ impl LyricPlayerView {
         inner.bottom_mask = value;
     }
 
-    /// 鼓点包络来源（0..1）。视图每帧读取一次，驱动 Mesh 背景的跳动；
+    /// 五频段包络来源。视图每帧读取一次，驱动 Mesh 背景的不同控制点。
     /// 传 `None` 则背景保持静态流动。
+    pub fn set_audio_source(&mut self, source: Option<Arc<dyn Fn() -> AudioBands + Send + Sync>>) {
+        self.inner.borrow_mut().audio_source = source;
+    }
+
+    /// 设置五路频段分别驱动哪些 1–25 编号的控制点；边界点会被自动过滤。
+    pub fn set_audio_control_mapping(&mut self, mapping: AudioControlMapping) {
+        let mut inner = self.inner.borrow_mut();
+        let mapping = mapping.sanitized();
+        if mapping == inner.audio_control_mapping {
+            return;
+        }
+        inner.audio_control_mapping = mapping;
+        inner.background.set_audio_control_mapping(mapping);
+    }
+
+    /// 旧单鼓点 API 的兼容包装：标量只映射到 `kick`，其余通道为 0。
     pub fn set_beat_source(&mut self, source: Option<Arc<dyn Fn() -> f32 + Send + Sync>>) {
-        self.inner.borrow_mut().beat_source = source;
+        let source = source.map(|source| {
+            Arc::new(move || AudioBands {
+                kick: source(),
+                ..AudioBands::default()
+            }) as Arc<dyn Fn() -> AudioBands + Send + Sync>
+        });
+        self.set_audio_source(source);
     }
 
     fn handle_click(&self, position: gpui::Point<Pixels>) {
@@ -660,6 +779,7 @@ impl LyricPlayerView {
     pub fn set_playing(&mut self, playing: bool) {
         let mut inner = self.inner.borrow_mut();
         inner.playing = playing;
+        inner.background.set_playing(playing);
         inner.player.set_playing(playing);
     }
 
@@ -697,27 +817,11 @@ impl LyricPlayerView {
 
     pub fn set_background_kind(&mut self, kind: BackgroundRendererKind) {
         let mut inner = self.inner.borrow_mut();
-        let (fps, scale, flow, static_mode) = (
-            inner.bg_fps,
-            inner.bg_scale,
-            inner.bg_flow_speed,
-            inner.bg_static,
-        );
-        let beat_strength = inner.bg_beat_strength;
-        let old_last = inner.background.take_last_image();
-        inner.background = LyricBackgroundRenderer::new(kind);
-        inner.background.set_fps(fps);
-        inner.background.set_render_scale(scale);
-        inner.background.set_flow_speed(flow);
-        inner.background.set_static_mode(static_mode);
-        inner.background.set_beat_strength(beat_strength);
-        if let Some(palette) = inner.album_palette.clone() {
-            inner.background.set_album_palette(palette);
+        if inner.background.kind() == kind {
+            return;
         }
-        // 旧渲染器的缓存帧也要回收，否则每切换一次背景种类就泄漏一张纹理。
-        if let Some(old) = old_last {
-            inner.retired_images.push(old);
-        }
+        inner.background.set_kind(kind);
+        // 旧可见帧先退休；worker 会在下一次快照中重建 renderer 并恢复 palette/config。
         if let Some(old) = inner.bg_image.take() {
             inner.retired_images.push(old);
         }
@@ -789,15 +893,12 @@ impl LyricPlayerView {
             return;
         };
         let mut inner = self.inner.borrow_mut();
-        inner.album_palette = Some(palette.clone());
         inner.background.set_album_palette(palette);
         // 旧帧保留到下一帧 `prepare`：新帧渲染出来后在那里统一从图集释放。
     }
 
     pub fn clear_album(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.album_palette = None;
-        inner.background.clear_album();
+        self.inner.borrow_mut().background.clear_album();
         // 停止/无封面时背景淡出到透明，由 `prepare` 回收旧帧。
     }
 
@@ -809,13 +910,13 @@ impl LyricPlayerView {
         !self.inner.borrow().player.document().is_empty()
     }
 
-    /// 只读判断：外部轮询不能推进动画状态（推进只在每帧 `Render` 中发生）。
+    /// 只读判断：外部轮询不能推进动画状态（推进只在每帧 `prepaint` 中发生）。
     pub fn is_animating(&self) -> bool {
-        let inner = self.inner.borrow();
-        inner.animating
-            || inner.switch.is_some()
-            || (inner.playing && !inner.player.document().is_empty())
-            || (inner.background_visible && inner.background.is_animating())
+        self.inner
+            .borrow()
+            .animation_state()
+            .interval_ms()
+            .is_some()
     }
 }
 
@@ -850,12 +951,8 @@ impl Render for LyricPlayerView {
                 let time = inner.display_time_ms.round() as u64;
                 if playing != inner.playing {
                     inner.playing = playing;
+                    inner.background.set_playing(playing);
                     inner.player.set_playing(playing);
-                    if playing {
-                        inner.background.resume();
-                    } else {
-                        inner.background.pause();
-                    }
                 }
                 if time != inner.player.current_time() {
                     let seek = time.abs_diff(inner.player.current_time()) > 1_500;
@@ -868,7 +965,6 @@ impl Render for LyricPlayerView {
                 let seek = time.abs_diff(inner.player.current_time()) > 1_500;
                 inner.player.set_time(time, seek);
             }
-            let playing = inner.playing;
             let dt = inner.dt_ms;
             // 切换动画只依赖帧间隔推进；暂停/后台返回时 dt 已被钳到 100ms，
             // 600ms  lifecycle 不会被一帧跳过。到点立即释放淡出层与其整形缓存。
@@ -879,13 +975,9 @@ impl Render for LyricPlayerView {
             if !switching {
                 inner.finish_switch();
             }
-            inner.animating = inner.player.update(dt);
-            // 暂停时也让弹簧收敛（AMLL 暂停后仍会完成当前动画）。
-            let bg_anim = inner.background_visible && inner.background.is_animating();
             let has_lyrics = !inner.player.document().is_empty();
-            // `animating` 只用于帧请求判断（`is_animating` 读取），
-            // 这里不再请求 `request_animation_frame`。
-            let _ = inner.animating || bg_anim || (playing && has_lyrics);
+            // 弹簧推进与 animating 求值延后到 prepaint：那时 prepare 已完成
+            // 文本测量/布局，不会漏掉本帧刚创建的弹簧。
             (has_lyrics, inner.text_visible, inner.colors.text)
         };
 
@@ -964,6 +1056,8 @@ impl Element for LyricCanvas {
         let mut inner = self.inner.borrow_mut();
         inner.last_bounds = bounds;
         inner.prepare(bounds, window);
+        // prepare 可能安装新的布局/弹簧；必须先推进并求值，再决定 RAF。
+        inner.advance_animation();
         inner.wants_animation_frame(Instant::now())
     }
 
@@ -1203,7 +1297,6 @@ impl LyricPlayerView {
             switch.elapsed_ms = t.clamp(0.0, 1.0) * LYRIC_SWITCH_MS;
         }
     }
-
 }
 
 #[cfg(test)]

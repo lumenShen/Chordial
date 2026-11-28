@@ -359,10 +359,7 @@ impl CosmicTextSystemState {
             let offset_x = image.placement.left - glyph_bounds.origin.x.0;
             let offset_y = -image.placement.top - glyph_bounds.origin.y.0;
 
-            if offset_x == 0
-                && offset_y == 0
-                && src_width == dst_width
-                && src_height == dst_height
+            if offset_x == 0 && offset_y == 0 && src_width == dst_width && src_height == dst_height
             {
                 return Ok((bitmap_size, image.data));
             }

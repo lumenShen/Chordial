@@ -1,8 +1,9 @@
 # gpui 0.2.2 本地补丁
 
-上游 crate：`gpui 0.2.2`（Zed，crates.io）。这里加了三项歌词渲染需要的能力：
-**字形模糊**、**平滑字形定位/缩放**与**水平渐变扫光遮罩**，并保持
-`paint_glyph` 的行为不变。升级 gpui 时需要把下面几处重新应用。
+上游 crate：`gpui 0.2.2`（Zed，crates.io）。这里加入了歌词渲染需要的
+**字形模糊**、**平滑字形定位/缩放**、**水平渐变扫光遮罩**，以及播放器次要
+控件使用的**场景级分组滤镜**；`paint_glyph` 的行为保持不变。升级 gpui 时
+需要把下面几处重新应用。
 
 ## 动机
 
@@ -201,6 +202,22 @@ Blade/Metal shader 同步修改但未在本机运行。
    等所有切片都先按上一帧实际长度夹取，越界时（例如区间来自更早的帧）
    只少复用条目并打一条 `gpui::window` debug 日志，不再 panic。
 
+## 场景级分组滤镜
+
+播放器右上「更多」与底部进度/传输/音量/底栏需要作为两个整体淡出，但上游
+没有内容滤镜，也没有元素级 transform。`src/scene.rs` 新增公开
+`PaintFilter { opacity, scale, origin, blur_radius }` 与场景检查点：
+
+- `Window::paint_with_filter` 只处理当前子树新增的 `paint_operations` 和
+  primitive 数组；围绕 `origin` 统一缩放、乘 alpha，并在 `blur_radius > 0`
+  时以 8 个低 alpha 偏移样本重放绘制操作。
+- 模糊是场景层的多重采样，不引入离屏纹理或平台 shader；阴影与平台
+  surface 只变换原图，不参与重复采样。
+- `Window::prepaint_with_filter` 用相同缩放/锚点变换该子树新增的 hitbox
+  与 window-control hitbox，不复制监听器、焦点或 dispatch 节点。
+- `src/scene.rs` 末尾 `filter_tests` 覆盖锚点不位移、alpha 相乘、零模糊不
+  复制、八样本数量与 layer 配对。
+
 ## 重新应用
 
 - `Cargo.toml` 末尾追加了空 `[workspace]`：让 vendored 包可以独立
@@ -213,3 +230,15 @@ Blade/Metal shader 同步修改但未在本机运行。
   macOS/Linux 路径尚未在本机验证；
 - 若上游以后提供原生内容模糊 / 变换字形 API，删除 `[patch.crates-io] gpui` 和
   `vendor/gpui`，把 `render.rs` 的 `paint_glyph_blurred` 指向新 API。
+
+## Android 平台补丁
+
+- `src/platform/android/text_system.rs`：`CosmicTextSystem::new` 在
+  `FontSystem::new()` 之后手动 `db_mut().load_fonts_dir("/system/fonts")`。
+  fontdb 的 `load_system_fonts` 在 unix 分支显式排除了 Android，不手动扫描
+  时字体库为空，`.SystemUIFont`（Android 映射到 Roboto）与整个回退栈都会
+  在 `resolve_font` panic。
+
+- `src/platform/android/window.rs`：`on_touch` 把 MotionEvent 的物理像素除以
+  `state.scale` 再交给 gpui。gpui 的窗口坐标是逻辑像素，不换算时所有点击都会
+  落在窗口外，UI 看得到但点不动。

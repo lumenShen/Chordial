@@ -16,6 +16,13 @@
 > 行为与视觉参数参考 AMLL（GPL-3.0）的公开实现与文档，本 crate 为独立
 > Rust 重写，未复制其源码。AMLL 项目地址：https://github.com/Steve-xmh/applemusic-like-lyrics
 
+## 基准版本
+
+参数与行为以本机 `amll-player` 实际锁定的 **`@applemusic-like-lyrics/core 0.5.2` /
+`@applemusic-like-lyrics/react-full 0.4.2`** 为准（参考 checkout `0f3a9a24`），
+不混用其他版本（例如 0.7.1）的公式。`react-full` 的 `PrebuiltLyricPlayer` 使用
+`DomLyricPlayer`，首次布局、动态弹簧参数和背景行缩放均按该锁定版本核对。
+
 ## 与 AMLL 的对应关系
 
 | AMLL | 本 crate |
@@ -35,7 +42,7 @@
   文本整形结果按行 LRU 缓存（默认 256 行），淘汰后保留高度估算。
 - 弹簧是解析解，`update` 只遍历"可见 + 未收敛"的行集合，与歌词总行数无关。
 - `set_time` 用二分 + 前缀最大结束时间定位活跃行，避免每帧 O(n) 扫描。
-- 背景光栅化输出分辨率受 `render_scale` 与 200k 像素硬上限约束，
+- 背景光栅化输出分辨率严格由 `render_scale` 决定，不按耗时或像素预算缩小；
   光栅化/合成缓冲跨帧复用；每帧仅最终 BGRA 上传缓冲分配一次；
   低于目标 FPS 时复用上一帧 `RenderImage`。
 - 所有热点路径有 `amll.*` 性能检查点（见 `chordal-core/src/perf.rs`），
@@ -47,14 +54,14 @@
 | --- | --- |
 | 文本整形缓存 | 256 行（按行 LRU） |
 | 专辑调色纹理 | 32×32 RGBA = 4 KB |
-| 背景光栅缓冲 | 200k 像素 × 4B × 2（合成 + scratch）≈ 1.6 MB |
-| 背景上传帧 | 200k × 4B ≈ 0.8 MB/帧（由 gpui 持有） |
+| 背景光栅缓冲 | 默认显示设备像素 ÷ 4 × 4B × 2（合成 + scratch） |
+| 背景上传帧 | max(130k, 光栅像素) × 4B（由 gpui 持有） |
 | 封面 RGBA | 最长边 512 → 1 MB（由 UI 侧持有一次） |
 | 播放器行状态 | O(歌词行数)，约 200 B/行 |
 
 ## 等价范围
 
-**语义/参数完全对齐**：热行/缓冲行状态机、弹簧参数与解析解、滚动偏移与逐行
+**语义/参数完全对齐（除下方明确差异）**：热行/缓冲行状态机、滚动偏移与逐行
 delay、间奏判定（≥4s、下一行前 250ms）、对齐锚点、隐藏已播放行、模糊/缩放
 阈值（`blur = 1 + 距离`，窄视口 ×0.8）、逐词上浮（0.05em / 背景行 0.1em，
 `max(1s, 词时长)`、`ease-out`、离场倒放）、强调词条件与缓动（含
@@ -63,6 +70,21 @@ Mesh 的 BHP 矩阵、UV 映射、旋转/音量/暗角/抖动公式、32×32 调
 扫光改为**整行一条 mask 前沿**（软边默认 0.6em，设置 → 播放 → 歌词可调），
 不再按词各自重播。
 
+**弹簧参数（core 0.5.2）**：
+
+| 用途 | mass | damping | stiffness |
+| --- | --- | --- | --- |
+| 普通播放 posY | 0.9 | `2.2 * sqrt(stiffness)` | `170 + 50 * ratio^0.2` |
+| seek / 间奏 posY | 0.9 | 15 | 90 |
+| 主行 scale | 2 | 25 | 100 |
+| 背景行 scale | 1 | 20 | 50 |
+
+普通播放的 `interval = clamp(当前主行起点 - 上一主行起点, 100, 800)`，
+`ratio = 1 - (interval - 100) / 700`。参数只在计算结果真正变化时更新，
+重切解析解会保留当前位置与速度。首次可见行从 `2 * height` 屏外进入。
+`soft` 仍按 AMLL 语义强制临界阻尼；非 soft 且 ζ>1 时使用真正的双实根解析解，
+修正参考 0.5.2 把该分支也送入临界阻尼公式的问题。
+
 **背景的刻意差异**：鼓点包络在本实现里额外驱动网格顶点的整体呼吸（NDC
 向外扩张）与 RGB 提亮，让低分辨率、平滑封面上也能看清击打；AMLL 只做
 UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0–1.5，
@@ -70,9 +92,9 @@ UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0
 交叉淡出，退场层保持不透明，避免高刷屏上多层 alpha 叠加导致背景变暗；
 旧背景帧会主动从 gpui sprite atlas 移除。
 
-**逐像素对照（2026-11，amll-player `main`）**：在 1600×1000 与 800×1000 两个
-窗口下逐元素测量真实 AMLL Player（react-full `PrebuiltLyricPlayer`，
-`DomLyricPlayer`），并将下列数值写入实现：
+**逐像素对照（2026-11，amll-player 锁定 core 0.5.2 / react-full 0.4.2）**：
+在 1600×1000 与 800×1000 两个窗口下逐元素测量真实 AMLL Player
+（react-full `PrebuiltLyricPlayer`，`DomLyricPlayer`），并将下列数值写入实现：
 
 | 项 | 实测值（已实现） |
 | --- | --- |
@@ -90,13 +112,13 @@ UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0
 | 逐词浮动 | 每词 `0 → -0.05em`（BG ×2），`max(1s, 词时长)`、delay = 词起点、`ease-out`；离场 `playbackRate=-1` 回退 |
 | 强调分组 | `chunkAndSplitLyricWords`：非 CJK 合并无空白相邻词；CJK 先拆单字，按时长 ≥1s 判断 |
 | 强调辉光 | `text-shadow: 0 0 min(0.3, blur*0.3)em`，alpha = `empEasing(x) * blur`（真高斯模糊，σ=R/2） |
-| 弹簧 | posY m0.9 d15 s90；scale m2 d25 s100 |
+| 弹簧 | posY 普通播放按行间隔动态计算；seek/间奏 m0.9 d15 s90；主行 scale m2 d25 s100；背景行 scale m1 d20 s50 |
 
 **GPU 渲染路径（2026-11 优化）**：
 
 - **背景**：沉浸层背景 = 动画 Mesh Gradient，铺满整个窗口。光栅分辨率由
-  调用方 `set_background_render_scale` 控制（Chordial 默认按显示区域 ÷ 4，
-  并受 200k 像素硬上限约束；30fps 时约 6M px/s），由 `paint_image`
+  调用方 `set_background_render_scale` 控制（Chordial 默认按显示区域 ÷ 2，
+  除数严格决定光栅尺寸；30fps），由 `paint_image`
   交给 GPU **双线性采样放大到全窗** —— 屏幕上每个输出像素的采样/混合都在
   GPU 上完成。光栅内循环做了三处优化：增量重心坐标递推、位运算镜像重复
   采样（去掉逐像素 `rem_euclid`）、调色板 BGRA 预转换（帧缓冲零拷贝）。
@@ -127,10 +149,10 @@ UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0
   0.1em），行离开热行集合时按 AMLL 的 `playbackRate = -1` 回退；强调词改用
   字符级 float（`sin(πx)·up + x·up`，按字符 stagger），并与辉光/缩放动画
   共用同一条时间线。
-- **帧节奏**：由视图内部的 60fps 定时泵驱动（不跟随显示器刷新率）。
-  在 120/144Hz 屏上，`request_animation_frame` 会让整个 gpui 场景按刷新率
-  提交（实测 CPU 翻倍以上）；60fps 泵只在播放/弹簧未收敛/背景流动时唤醒，
-  暂停后完全空闲（实测沉浸页 CPU：~115% → ~24% 单核）。
+- **帧节奏**：由 gpui 真实 `request_animation_frame` 驱动，不伪造定时 RAF。
+  `prepaint` 先完成测量/布局并启动新弹簧，再推进动画、组合各动画源并决定
+  是否请求下一帧；歌词动画跟随显示器刷新率，仅背景流动时按 `bg_fps` 限速，
+  全部静止后停止。暂停时已启动的弹簧仍会收敛并持续请求帧。
 
 **实现载体差异（仍为近似，非逐像素相同）**：
 
@@ -151,7 +173,17 @@ UV 缩放/旋转。所有鼓点视觉幅度乘以 `set_beat_strength` 倍率（0
 > Windows/Blade/Metal 三个 fragment shader 按设备像素 x 插值亮暗 alpha。
 > 补丁说明见 `vendor/gpui/PATCHES.md`。
 
-**尚未实现**：AMLL 的滚轮/拖拽歌词滚动（`scroll_offset` 目前恒为 0）；
+**与 DOM 版的有意差异**：
+
+- 视口外（含 overscan）的行在布局时直接吸附目标，不像 AMLL 为全部 group
+  逐帧更新弹簧；首次可见行仍从 `2 * height` 屏外进入。这样保持每帧更新成本
+  只与可见行相关。
+- 滚轮/拖拽/惯性歌词滚动尚未实现，`scroll_offset` 目前恒为 0；滚动边界仍按
+  AMLL 公式计算，后续交互可直接复用。
+- 非 soft 的真正过阻尼弹簧使用双实根解析解；`soft` 的强制临界阻尼语义不变。
+- CSS 透明度/模糊 transition 用 80ms 一阶平滑近似，曲线并非逐像素相同。
+
+**尚未实现**：AMLL 的滚轮/拖拽歌词滚动（见上方有意差异）；
 非逐词 LRC 不做逐字扫光（与 AMLL `isNonDynamic` 分支一致，只有行级透明度）；
 `parser` 模块是独立的 LRC/ESLRC 入口，Chordial 生产路径使用
 `chordal-core` 的 LRC 解析 + YRC 逐词行，再交给本 crate 渲染。

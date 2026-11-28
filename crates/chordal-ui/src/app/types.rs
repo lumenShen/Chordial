@@ -1,6 +1,7 @@
 //! 根视图的类型与缓存结构（由 app/mod.rs 拆分，行为不变）。
 
 use std::collections::{HashSet, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 
@@ -11,24 +12,12 @@ pub enum ViewTab {
     Collection,
 }
 
-/// 曲目列表的来源标识。所有列表共用同一套队列操作与同一行渲染器。
-///
-/// 带数据的变体（歌单 / 推荐流）不能 `Copy`，调用方按需 `clone()`。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueueList {
     Search,
     Library,
     Queue,
     Collection,
-    /// 本地/订阅歌单页。
-    Playlist(chordal_core::playlist::PlaylistId),
-    /// 音源推荐流（今日推荐 / 私人 FM）。
-    Feed {
-        source: SourceId,
-        kind: SourceFeedKind,
-    },
-    /// 页面内的一次性曲目快照（音源页预览等），无需在 App 上单独存状态。
-    Snapshot(Arc<Vec<chordal_core::model::Track>>),
 }
 
 /// 当前队列的续接追踪：私人 FM 播放时记录所追踪的音源与在途状态。
@@ -81,8 +70,6 @@ pub(super) enum DockMenu {
 pub(super) enum DrawerPage {
     Root,
     Sleep,
-    /// 把当前曲目加入本地歌单的二级页；歌单列表直接画在抽屉里。
-    AddToPlaylist,
 }
 
 /// 沉浸页右下角选择器的四种视图。
@@ -126,21 +113,18 @@ impl StageView {
 pub(super) enum PhonePage {
     /// 播放页：封面 + 曲目信息 + 进度 + 传输 + 音量。
     Player,
-    /// 歌词页：封面驱动的 Mesh + 全屏滚动歌词。
-    Lyrics,
     /// 曲库页：复用桌面曲目板（本地库 / 队列 / 搜索结果 / 集合）。
     Browse,
 }
 
 /// 手机壳与 `lyric_view` 的共享状态。
 ///
-/// 播放页把歌词视图当背景（隐藏文字）；歌词页显示文字。两者共用同一个
-/// 实体，必须显式区分，不能只用一个 bool 表示“占用”。
+/// 播放页把歌词视图当背景（隐藏文字）；歌词页由沉浸层接管。
+/// 两者共用同一个实体，必须显式区分，不能只用一个 bool 表示“占用”。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PhoneBackdrop {
     Off,
     Player,
-    Lyrics,
 }
 
 /// 曲目行右键 / 「⋮」菜单。坐标是窗口坐标，渲染时再夹到视口内。
@@ -274,6 +258,129 @@ impl PlayMode {
     }
 }
 
+/// 列表随机播放的计划。
+///
+/// 随机不等于“每次独立抽一首”：那样会很快重复，且和界面里按顺序排列的
+/// 队列对不上。这里按轮次洗牌——每轮把队列中的每一首都排进来且只排一次；
+/// 一轮结束后立刻生成下一轮，因此任何时刻都有稳定的“接下来播放”可预览。
+/// 已播放项另存历史，供“上一首”按真实播放顺序回退。
+#[derive(Debug, Clone)]
+pub(super) struct ShufflePlan {
+    queue_len: usize,
+    /// 计划当前指向的曲目；与 `queue_pos` 不一致说明计划已过期。
+    current: usize,
+    /// 当前轮次里尚未播放的队列下标，队首即下一首。
+    upcoming: VecDeque<usize>,
+    /// 已经通过随机顺序播放过的下标，最近播放的在队尾。
+    history: VecDeque<usize>,
+    rng: u64,
+}
+
+impl ShufflePlan {
+    pub(super) fn new(queue_len: usize, current: usize) -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        Self::with_seed(queue_len, current, seed)
+    }
+
+    pub(super) fn with_seed(queue_len: usize, current: usize, seed: u64) -> Self {
+        let mut plan = Self {
+            queue_len,
+            current,
+            upcoming: VecDeque::new(),
+            history: VecDeque::new(),
+            // xorshift 的状态不能为 0。
+            rng: seed.max(1),
+        };
+        plan.refill(current);
+        plan
+    }
+
+    /// 计划是否仍然对应当前队列与曲目。
+    pub(super) fn matches(&self, queue_len: usize, current: usize) -> bool {
+        self.queue_len == queue_len && self.current == current
+    }
+
+    /// 推进到下一首；轮次结束后自动准备下一轮。
+    pub(super) fn advance(&mut self, current: usize) -> Option<usize> {
+        if self.queue_len == 0 || current >= self.queue_len {
+            return None;
+        }
+        if self.upcoming.is_empty() {
+            self.refill(current);
+        }
+        let next = self.upcoming.pop_front()?;
+        self.history.push_back(current);
+        if self.history.len() > self.queue_len {
+            self.history.pop_front();
+        }
+        self.current = next;
+        if self.upcoming.is_empty() {
+            // 提前生成下一轮：预览与下一次实际选曲使用同一份顺序。
+            self.refill(next);
+        }
+        Some(next)
+    }
+
+    /// 回到上一次随机播放的曲目；没有历史时保持当前曲目，由调用方重播。
+    pub(super) fn retreat(&mut self, current: usize) -> Option<usize> {
+        if self.queue_len == 0 || current >= self.queue_len {
+            return None;
+        }
+        let Some(prev) = self.history.pop_back() else {
+            return Some(current);
+        };
+        // 跨轮次回退时，目标曲目可能已经被排进当前轮次的待播列表；
+        // 它即将成为当前曲，必须从待播中移除，否则本轮会重复播放。
+        if let Some(position) = self.upcoming.iter().position(|index| *index == prev) {
+            self.upcoming.remove(position);
+        }
+        // 回退后再点“下一首”应回到刚才那首。
+        self.upcoming.push_front(current);
+        self.current = prev;
+        Some(prev)
+    }
+
+    /// 按真实随机顺序预览接下来 `count` 首，不改变计划。
+    pub(super) fn preview(&self, count: usize) -> Vec<usize> {
+        self.upcoming.iter().copied().take(count).collect()
+    }
+
+    fn refill(&mut self, current: usize) {
+        self.upcoming.clear();
+        if self.queue_len == 0 {
+            return;
+        }
+        if self.queue_len == 1 {
+            self.upcoming.push_back(0);
+            return;
+        }
+        let mut candidates: Vec<usize> = (0..self.queue_len)
+            .filter(|index| *index != current)
+            .collect();
+        self.shuffle(&mut candidates);
+        self.upcoming.extend(candidates);
+    }
+
+    fn shuffle(&mut self, items: &mut [usize]) {
+        for index in (1..items.len()).rev() {
+            let swap_with = (self.next_u64() % (index as u64 + 1)) as usize;
+            items.swap(index, swap_with);
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut value = self.rng;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.rng = value;
+        value
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LoginTab {
     Qr,
@@ -398,8 +505,8 @@ pub(super) struct PlaylistPageCache {
 /// 单个接口失败不会拖垮整页。
 #[derive(Default)]
 pub(super) struct SourceFeedState {
-    pub(super) daily: Vec<Track>,
-    pub(super) fm: Vec<Track>,
+    pub(super) daily: Arc<Vec<Track>>,
+    pub(super) fm: Arc<Vec<Track>>,
     pub(super) recommended: Vec<CollectionSummary>,
     pub(super) radar: Vec<CollectionSummary>,
     pub(super) daily_error: Option<SharedString>,
@@ -426,7 +533,7 @@ impl SourceFeedState {
     }
 }
 
-/// 网易云源页面里「推荐入口」点开后展示的详情类型。
+/// 账号源页面里「推荐入口」点开后展示的详情类型。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum SourceFeedKind {
     Daily,
@@ -485,7 +592,11 @@ impl PlaybackClock for PlayerClock {
 /// 列表封面的缓存键：同一个封面 URL 在不同音源下走各自的对象缓存命名空间。
 pub(super) fn track_cover_key(track: &Track) -> Option<String> {
     let url = cover_url(track)?;
-    Some(format!("{}|{}", track.id.source.as_str(), url))
+    Some(track_cover_key_from_url(track, &url))
+}
+
+pub(super) fn track_cover_key_from_url(track: &Track, url: &str) -> String {
+    format!("{}|{}", track.id.source.as_str(), url)
 }
 
 /// 曲目行封面缩略图缓存。只缓存当前列表实际滚动到的行，避免一次性为
@@ -507,6 +618,39 @@ impl TrackCovers {
             order: VecDeque::new(),
         }
     }
+
+    pub(super) fn accept_pending_request(
+        &mut self,
+        key: &str,
+        source: &SourceId,
+        url: &str,
+    ) -> Option<(String, SourceId, String)> {
+        if self.pending.len() >= MAX_INFLIGHT_TRACK_COVERS
+            || self.images.contains_key(key)
+            || self.pending.contains(key)
+            || self.failed.contains(key)
+        {
+            return None;
+        }
+        self.pending.insert(key.to_string());
+        Some((key.to_string(), source.clone(), url.to_string()))
+    }
+
+    pub(super) fn take_pending_requests(
+        &mut self,
+        requests: Vec<(String, SourceId, String)>,
+    ) -> Vec<(String, SourceId, String)> {
+        let mut accepted = Vec::new();
+        for (key, source, url) in requests {
+            if self.pending.len() >= MAX_INFLIGHT_TRACK_COVERS {
+                break;
+            }
+            if let Some(request) = self.accept_pending_request(&key, &source, &url) {
+                accepted.push(request);
+            }
+        }
+        accepted
+    }
 }
 
 /// 列表缩略图最多保留的纹理数。每张 72×72 BGRA ≈ 20KB，上限同时约束
@@ -520,57 +664,12 @@ pub(super) const TRACK_COVER_SIDE: u32 = 72;
 /// Windows 线程池并触发系统级配额失败。限制在途数量即可保持在 8 个线程。
 pub(super) const MAX_INFLIGHT_TRACK_COVERS: usize = 8;
 
-/// 所有音乐列表共用的一行样式。差异只体现在列与密度，行结构完全一致：
-/// 序号/均衡器 → 封面 → 标题/副标题 → 时长 → ⋮（截图版本）。
-#[derive(Clone)]
-pub(super) struct TrackRowStyle {
-    pub(super) height: f32,
-    pub(super) cover: f32,
-    pub(super) show_duration: bool,
-    pub(super) show_menu: bool,
-    /// Dock「接下来播放」的紧凑密度。
-    pub(super) compact: bool,
-    /// 歌单页用副标题尾部显示来源（替代原来的独立来源列）。
-    pub(super) source_label: Option<SharedString>,
-    pub(super) unavailable: bool,
-    pub(super) local_substitute: bool,
-}
-
-impl TrackRowStyle {
-    /// 截图中的完整行：52px 高、34px 封面、时长 + ⋮。
-    pub(super) fn full() -> Self {
-        Self {
-            height: crate::theme::size::ROW,
-            cover: 34.0,
-            show_duration: true,
-            show_menu: true,
-            compact: false,
-            source_label: None,
-            unavailable: false,
-            local_substitute: false,
-        }
-    }
-
-    /// Dock 预览：保留同样的列结构，只是更矮、更小。
-    pub(super) fn compact() -> Self {
-        Self {
-            height: 38.0,
-            cover: 30.0,
-            show_duration: true,
-            show_menu: false,
-            compact: true,
-            source_label: None,
-            unavailable: false,
-            local_substitute: false,
-        }
-    }
-}
-
 /// 曲目行的预计算显示文本。列表快照变化时一次性构建，render 期间只做
 /// `SharedString` 克隆（引用计数），不再 `format!`/`join`/`to_string`。
 pub(super) struct TrackRowText {
     pub(super) id: chordal_core::model::TrackId,
     pub(super) cover_key: Option<String>,
+    pub(super) cover_url: Option<String>,
     pub(super) number: SharedString,
     pub(super) title: SharedString,
     pub(super) subtitle_search: SharedString,
@@ -610,9 +709,14 @@ impl TrackRowText {
             .duration_ms
             .map(fmt_ms)
             .unwrap_or_else(|| "--:--".into());
+        let cover_url = cover_url(track);
+        let cover_key = cover_url
+            .as_ref()
+            .map(|url| track_cover_key_from_url(track, url));
         Self {
             id: track.id.clone(),
-            cover_key: track_cover_key(track),
+            cover_key,
+            cover_url,
             number: SharedString::from((index + 1).to_string()),
             title: SharedString::from(track.title.clone()),
             subtitle_search: SharedString::from(subtitle_search),
@@ -691,5 +795,134 @@ impl PlaylistRowText {
                     .unwrap_or_default(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(key: String) -> (String, SourceId, String) {
+        let url = format!("https://example.test/{key}");
+        (key, SourceId::new("test"), url)
+    }
+
+    #[test]
+    fn cover_requests_dedupe_and_respect_inflight_limit() {
+        let mut covers = TrackCovers::new();
+        let mut requests = vec![request("duplicate".into()), request("duplicate".into())];
+        requests.extend((0..MAX_INFLIGHT_TRACK_COVERS + 2).map(|i| request(format!("cover-{i}"))));
+
+        let accepted = covers.take_pending_requests(requests);
+        assert_eq!(accepted.len(), MAX_INFLIGHT_TRACK_COVERS);
+        assert_eq!(covers.pending.len(), MAX_INFLIGHT_TRACK_COVERS);
+        assert_eq!(
+            accepted.iter().filter(|item| item.0 == "duplicate").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cover_requests_skip_failed_keys() {
+        let mut covers = TrackCovers::new();
+        covers.failed.insert("failed".into());
+        let accepted =
+            covers.take_pending_requests(vec![request("failed".into()), request("fresh".into())]);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].0, "fresh");
+    }
+
+    /// 从 `start` 开始走完一轮，返回这一轮实际播放的曲目下标（含起点）。
+    fn shuffle_round(plan: &mut ShufflePlan, len: usize, start: usize) -> Vec<usize> {
+        let mut played = vec![start];
+        while played.len() < len {
+            let current = *played.last().unwrap();
+            played.push(plan.advance(current).unwrap());
+        }
+        played
+    }
+
+    #[test]
+    fn shuffle_plan_visits_every_queue_item_once_per_round() {
+        for seed in [1, 7, 42, 0x9e37_79b9] {
+            let len = 12;
+            let start = 5;
+            let mut plan = ShufflePlan::with_seed(len, start, seed);
+            // 已播放的当前曲目不应出现在下一首预览里。
+            assert!(plan.preview(len).iter().all(|index| *index != start));
+
+            let first = shuffle_round(&mut plan, len, start);
+            let mut unique = first.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique, (0..len).collect::<Vec<_>>());
+            assert_ne!(first[1], start);
+
+            // 第二轮同样覆盖全部曲目，并避免与上一轮末尾连续重复。
+            let last = *first.last().unwrap();
+            let second = shuffle_round(&mut plan, len, last);
+            let mut unique = second.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique, (0..len).collect::<Vec<_>>());
+            assert_ne!(second[1], last);
+        }
+    }
+
+    #[test]
+    fn shuffle_plan_previous_follows_actual_play_order() {
+        let mut plan = ShufflePlan::with_seed(6, 0, 42);
+        let first = plan.advance(0).unwrap();
+        let second = plan.advance(first).unwrap();
+
+        assert_eq!(plan.retreat(second), Some(first));
+        // 回退后再下一首应回到刚才那首，而不是重新抽签。
+        assert_eq!(plan.advance(first), Some(second));
+
+        // 没有历史时重播当前曲目，且不破坏待播放顺序。
+        let mut fresh = ShufflePlan::with_seed(6, 0, 7);
+        let upcoming = fresh.preview(1);
+        assert_eq!(fresh.retreat(0), Some(0));
+        assert_eq!(fresh.preview(1), upcoming);
+    }
+
+    #[test]
+    fn shuffle_plan_previous_across_round_boundary_does_not_duplicate_upcoming() {
+        let len = 5;
+        let start = 0;
+        let mut plan = ShufflePlan::with_seed(len, start, 123);
+        let mut current = start;
+        // 走完第一轮，进入下一轮的第一首。
+        for _ in 0..len - 1 {
+            current = plan.advance(current).unwrap();
+        }
+        let mut current = plan.advance(current).unwrap();
+
+        // 连续回退会经过上一轮的曲目；其中部分曲目已经被排进当前轮次
+        // 的待播列表，回退时必须从待播中移除，否则本轮会重复播放。
+        let mut removed_from_upcoming = false;
+        for _ in 0..len - 1 {
+            let before = plan.preview(len);
+            let prev = plan.retreat(current).unwrap();
+            if before.contains(&prev) {
+                removed_from_upcoming = true;
+            }
+            let preview = plan.preview(len);
+            assert!(!preview.contains(&prev));
+            let mut unique = preview.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), preview.len());
+            current = prev;
+        }
+        assert!(removed_from_upcoming);
+    }
+
+    #[test]
+    fn shuffle_plan_can_be_validated_against_the_queue() {
+        let plan = ShufflePlan::with_seed(4, 2, 9);
+        assert!(plan.matches(4, 2));
+        assert!(!plan.matches(5, 2));
+        assert!(!plan.matches(4, 1));
     }
 }

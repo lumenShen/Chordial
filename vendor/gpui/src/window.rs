@@ -8,16 +8,16 @@ use crate::{
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
     LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
-    Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, SUBPIXEL_VARIANTS_Y_PRECISE,
-    ScaledPixels, Scene, Shadow, SharedString, Size, SpriteMask, StrikethroughStyle, Style,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement, TransformationMatrix, Underline,
-    UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
-    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems,
-    size, transparent_black,
+    MouseMoveEvent, MouseUpEvent, PaintFilter, Path, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    SUBPIXEL_VARIANTS_Y_PRECISE, ScaledPixels, Scene, Shadow, SharedString, Size, SpriteMask,
+    StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -2871,6 +2871,51 @@ impl Window {
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
+    }
+
+    /// Paint a subtree and apply a scene-level group filter to everything it
+    /// painted. The child is painted exactly once; blur is produced by
+    /// replaying the resulting primitives at low-alpha offsets.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing. Use [`Window::prepaint_with_filter`] with the same filter
+    /// during prepaint so hitboxes match the transformed visual.
+    pub fn paint_with_filter<R>(
+        &mut self,
+        filter: PaintFilter,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let checkpoint = self.next_frame.scene.checkpoint();
+        let result = f(self);
+        self.next_frame
+            .scene
+            .apply_filter(checkpoint, filter, self.scale_factor());
+        result
+    }
+
+    /// Prepaint a subtree and transform only the hitboxes it added with the
+    /// same scale/anchor as [`Window::paint_with_filter`].
+    ///
+    /// This method should only be called as part of the prepaint phase of
+    /// element drawing. Event listeners, focus handles, and dispatch nodes are
+    /// not duplicated.
+    pub fn prepaint_with_filter<R>(
+        &mut self,
+        filter: PaintFilter,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+        let hitbox_start = self.next_frame.hitboxes.len();
+        let window_control_start = self.next_frame.window_control_hitboxes.len();
+        let result = f(self);
+        for hitbox in &mut self.next_frame.hitboxes[hitbox_start..] {
+            hitbox.bounds = filter.transform_bounds(hitbox.bounds);
+        }
+        for (_, hitbox) in &mut self.next_frame.window_control_hitboxes[window_control_start..] {
+            hitbox.bounds = filter.transform_bounds(hitbox.bounds);
+        }
+        result
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch

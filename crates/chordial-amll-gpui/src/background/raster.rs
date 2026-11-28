@@ -8,24 +8,24 @@ pub(super) fn rasterize_layer(
     w: usize,
     h: usize,
     frame_time: f32,
-    volume: f32,
+    bands: AudioBands,
 ) {
     let alpha = layer.alpha;
-    // 鼓点同时驱动四种变化，保证在低分辨率、平滑封面上也看得出来：
-    // 1) 网格整体向外呼吸（顶点级，颜色边界会移动）；
-    // 2) UV 旋转加速；3) UV 缩小（纹理被“推近”）；4) 整体提亮。
-    // 幅度相对上一版整体减半，避免安静场景里也显得过于剧烈；倍率由
-    // `set_beat_strength` 再统一缩放。
-    let beat = volume.clamp(0.0, 1.5);
-    // 鼓点只改变颜色与几何，不降低整体不透明度：叠在黑色底上时任何 alpha
-    // 下降都会被看成“背景变暗”。
+    // 控制点已经承载局部位移，这里只保留逐三角形/逐像素都能廉价表达的
+    // 全局效果：鼓点脉冲、低频呼吸、人声推近、乐器旋转、空气感提亮。
+    let kick = bands.kick.clamp(0.0, 1.5);
+    let rumble = bands.rumble.clamp(0.0, 1.5);
+    let vocals = bands.vocals.clamp(0.0, 1.5);
+    let instruments = bands.instruments.clamp(0.0, 1.5);
+    let air = bands.air.clamp(0.0, 1.5);
+    // 音频只改变颜色与几何，不降低整体不透明度。
     let alpha_volume = alpha;
-    let rotation = (frame_time / 10_000.0 + beat * 0.35) * 2.0;
+    let rotation = (frame_time / 10_000.0 + kick * 0.25 + instruments * 0.04) * 2.0;
     let cos_r = rotation.cos();
     let sin_r = rotation.sin();
-    let zoom = (1.0 - beat * 0.35).max(0.40);
-    let mesh_scale = 1.0 + beat * 0.10;
-    let light = 1.0 + beat * 0.25;
+    let zoom = (1.0 - kick * 0.25 + vocals * 0.02 - rumble * 0.01).max(0.40);
+    let mesh_scale = 1.0 + kick * 0.04 + rumble * 0.025;
+    let light = 1.0 + kick * 0.18 + rumble * 0.04 + air * 0.06;
 
     for tri in layer.indices.chunks_exact(3) {
         let v0 = layer.vertices[tri[0] as usize];
@@ -245,12 +245,7 @@ fn catmull_rom_weights(t: f32, out: &mut [f32; 4]) {
     out[3] = 0.5 * t3 - 0.5 * t2;
 }
 
-fn build_axis_lut(
-    dst: usize,
-    src: usize,
-    base: &mut [i32],
-    weights: &mut [[f32; 4]],
-) {
+fn build_axis_lut(dst: usize, src: usize, base: &mut [i32], weights: &mut [[f32; 4]]) {
     let scale = dst as f32 / src as f32;
     for i in 0..dst {
         // 中心对齐的采样坐标；左边缘钳到 0（放大时 src > 0.5，仅 i=0 可能 < 0）。

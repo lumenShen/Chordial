@@ -28,17 +28,13 @@ impl ChordialApp {
 
     // ================= macOS 标题栏 =================
 
-    pub(super) fn render_titlebar(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(super) fn render_titlebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let weak = cx.entity().downgrade();
         let dark = theme.is_dark();
-        // 标题栏新增全局搜索框后，状态消息更容易挤压品牌区；中等宽度下
-        // 只保留品牌与窗口操作，消息仍会通过列表/提示出现。
-        let show_messages = self.viewport_width >= 1360.0;
+        // 中等宽度下状态消息最容易把标题栏挤爆；消息仍会通过列表/提示出现，
+        // 标题栏只保留品牌与窗口操作。
+        let show_messages = self.viewport_width >= 1180.0;
 
         let theme_btn = {
             let weak = weak.clone();
@@ -111,52 +107,6 @@ impl ChordialApp {
                 ),
         );
 
-        // 顶栏全局搜索：与曲库搜索框共享输入状态，回车走 start_search
-        // 对所有已加载音源并发 fan-out。放在 drag area 之外，避免点击时被
-        // HTCAPTION 的窗口移动吞掉。
-        let search_focused = self.search_input.read(cx).focus_handle().is_focused(window);
-        let search_width = if self.viewport_width < 900.0 {
-            160.0
-        } else if self.viewport_width < 1180.0 {
-            210.0
-        } else {
-            260.0
-        };
-        let search_focus = self.search_input.read(cx).focus_handle().clone();
-        let search_box = div()
-            .w(px(search_width))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(9.0))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(if search_focused {
-                theme.focus_ring
-            } else {
-                theme.border
-            })
-            .bg(theme.surface_alt)
-            .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
-                window.focus(&search_focus);
-            })
-            .child(crate::icons::icon(
-                crate::icons::Icon::Search,
-                13.0,
-                theme.text_faint,
-            ))
-            .child(div().flex_1().min_w_0().child(self.search_top_view.clone()))
-            .when(self.viewport_width >= 1180.0, |d| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(9.5))
-                        .text_color(theme.text_faint)
-                        .child("Ctrl+K"),
-                )
-            });
-
         div()
             .h(px(crate::theme::size::TITLEBAR))
             .w_full()
@@ -170,7 +120,6 @@ impl ChordialApp {
             .border_color(theme.border)
             .child(Self::traffic_lights())
             .child(center)
-            .child(search_box)
             .when(show_messages, |d| {
                 d.children(self.status_message.as_ref().map(|msg| {
                     div()
@@ -406,6 +355,7 @@ impl ChordialApp {
             });
 
         // ---------- 音源 ----------
+        let source_slots = self.source_slots();
         let enabled_sources = self.source_configs.iter().filter(|s| s.enabled).count();
         list = list.child(div().h(px(10.0))).child(section_label(
             "音源",
@@ -429,8 +379,9 @@ impl ChordialApp {
         for config in &self.source_configs {
             let id = SourceId::new(config.id.clone());
             let enabled = config.enabled;
-            let loaded = self.registry.get(&id).is_some();
-            let failed = matches!(self.registry.status(&id), Some(SourceStatus::Failed(_)));
+            let slot = source_slots.get(&id);
+            let loaded = slot.is_some_and(|slot| slot.status == SourceStatus::Loaded);
+            let failed = slot.is_some_and(|slot| matches!(slot.status, SourceStatus::Failed(_)));
             let active = active_source.as_ref() == Some(&id);
             let is_local = config.is_local();
             let icon = if is_local {
@@ -449,7 +400,7 @@ impl ChordialApp {
             };
 
             let status_text = if !enabled {
-                "已关闭 · 配置保留".to_string()
+                "已关闭 · 保留设置".to_string()
             } else if failed {
                 "加载失败 · 打开查看".to_string()
             } else if is_local {
@@ -465,9 +416,8 @@ impl ChordialApp {
                     "未加载".to_string()
                 }
             } else if loaded {
-                let account = cx
-                    .global::<Globals>()
-                    .netease_sources
+                let account = self
+                    .registry
                     .get(&id)
                     .and_then(|source| source.account().map(|account| account.account_state()));
                 match account {
@@ -653,7 +603,7 @@ impl ChordialApp {
             );
         }
 
-        let summaries = self.playlists.summaries();
+        let summaries = self.playlist_summaries();
         if summaries.is_empty() {
             list = list.child(
                 div()
@@ -665,7 +615,7 @@ impl ChordialApp {
                     .child("还没有本地歌单；也可以在歌单页订阅来源歌单"),
             );
         }
-        for summary in &summaries {
+        for summary in summaries.iter() {
             let active = active_playlist.as_ref() == Some(&summary.id);
             let subscribed = summary.is_subscribed();
             let weak = weak.clone();

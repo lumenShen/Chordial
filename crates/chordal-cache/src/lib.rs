@@ -25,7 +25,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustc_hash::FxHashMap;
@@ -120,6 +120,10 @@ impl Default for CacheConfig {
 }
 
 pub fn default_cache_root() -> PathBuf {
+    // Android 等没有 XDG 缓存目录的平台，由 JNI 注入应用私有目录。
+    if let Some(root) = std::env::var_os("CHORDIAL_CACHE_DIR") {
+        return PathBuf::from(root);
+    }
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("chordial")
@@ -158,6 +162,8 @@ struct Inner {
 /// 线程安全的磁盘对象缓存。
 pub struct ObjectCache {
     inner: RwLock<Inner>,
+    /// 写操作与索引刷盘共用一把锁，避免并发 flush 使用同一临时文件。
+    mutation: Mutex<()>,
 }
 
 impl std::fmt::Debug for ObjectCache {
@@ -187,28 +193,50 @@ impl ObjectCache {
                 total,
                 entries,
             }),
+            mutation: Mutex::new(()),
         };
         cache.evict_if_needed();
         Ok(cache)
     }
 
-    /// 读取并更新 LRU 访问时间。对象缺失/损坏时自动摘除索引项。
+    /// 读取并更新 LRU 访问时间。文件读取不持有索引锁；返回的 bytes/meta
+    /// 始终来自同一个快照，即使期间发生替换或重配置。
     pub fn get(&self, key: &str) -> Option<CachedObject> {
-        let mut inner = self.inner.write().ok()?;
-        let meta = inner.entries.get(key)?.clone();
-        let path = inner.root.join(&meta.file);
+        let (meta, path) = {
+            let inner = self.inner.read().ok()?;
+            let meta = inner.entries.get(key)?.clone();
+            let path = inner.root.join(&meta.file);
+            (meta, path)
+        };
         let bytes = match fs::read(&path) {
             Ok(bytes) if bytes.len() as u64 == meta.size => bytes,
             _ => {
-                inner.entries.remove(key);
-                inner.total = inner.total.saturating_sub(meta.size);
+                if let Ok(mut inner) = self.inner.write()
+                    && inner.entries.get(key).is_some_and(|current| {
+                        current.hash == meta.hash
+                            && current.file == meta.file
+                            && current.size == meta.size
+                    })
+                {
+                    inner.entries.remove(key);
+                    inner.total = inner.total.saturating_sub(meta.size);
+                }
                 return None;
             }
         };
         let now = now_secs();
-        let entry = inner.entries.get_mut(key)?;
-        entry.last_access = now;
-        let meta = entry.clone();
+        if let Ok(mut inner) = self.inner.write()
+            && let Some(entry) = inner.entries.get_mut(key)
+            && entry.hash == meta.hash
+            && entry.file == meta.file
+            && entry.size == meta.size
+        {
+            entry.last_access = now;
+            return Some(CachedObject {
+                bytes,
+                meta: entry.clone(),
+            });
+        }
         Some(CachedObject { bytes, meta })
     }
 
@@ -225,68 +253,73 @@ impl ObjectCache {
 
     /// 写入对象。内容摘要未变时返回 [`PutOutcome::Unchanged`]。
     pub fn put(&self, key: &str, bytes: &[u8], tags: CacheTags) -> PutOutcome {
-        let Ok(mut inner) = self.inner.write() else {
+        let Ok(_mutation) = self.mutation.lock() else {
             return PutOutcome::Failed;
         };
-        if inner.limit > 0 && bytes.len() as u64 > inner.limit {
-            return PutOutcome::TooLarge;
-        }
         let hash = fnv1a64(bytes);
         let now = now_secs();
-
-        if let Some(old) = inner.entries.get(key) {
-            if old.hash == hash {
+        let (root, previous, unchanged) = {
+            let Ok(mut inner) = self.inner.write() else {
+                return PutOutcome::Failed;
+            };
+            if inner.limit > 0 && bytes.len() as u64 > inner.limit {
+                return PutOutcome::TooLarge;
+            }
+            if inner.entries.get(key).is_some_and(|old| old.hash == hash) {
+                let previous = inner.entries.get(key).cloned();
                 let entry = inner.entries.get_mut(key).expect("checked");
                 entry.fetched_at = now;
                 entry.last_access = now;
-                merge_tags(entry, tags);
-                drop(inner);
-                self.flush();
-                return PutOutcome::Unchanged;
+                merge_tags(entry, tags.clone());
+                (inner.root.clone(), previous, true)
+            } else {
+                (inner.root.clone(), inner.entries.get(key).cloned(), false)
             }
-        }
-
-        let rel = rel_path(key);
-        let abs = inner.root.join(&rel);
-        if let Some(parent) = abs.parent()
-            && fs::create_dir_all(parent).is_err()
-        {
-            return PutOutcome::Failed;
-        }
-        let tmp = abs.with_extension("tmp");
-        if fs::write(&tmp, bytes).is_err() {
-            return PutOutcome::Failed;
-        }
-        if abs.exists() {
-            let _ = fs::remove_file(&abs);
-        }
-        if fs::rename(&tmp, &abs).is_err() {
-            let _ = fs::remove_file(&tmp);
-            return PutOutcome::Failed;
-        }
-
-        let previous = inner.entries.get(key).cloned();
-        if let Some(old) = &previous {
-            inner.total = inner.total.saturating_sub(old.size);
-        }
-        let meta = ObjectMeta {
-            key: key.to_string(),
-            file: rel,
-            size: bytes.len() as u64,
-            hash,
-            etag: tags.etag,
-            last_modified: tags.last_modified,
-            content_type: tags.content_type,
-            fetched_at: now,
-            last_access: now,
-            expires_at: tags.expires_at,
         };
-        inner.total = inner.total.saturating_add(meta.size);
-        inner.entries.insert(key.to_string(), meta);
-        drop(inner);
+        if unchanged {
+            self.flush_locked();
+            return PutOutcome::Unchanged;
+        }
+
+        // 内容寻址文件路径：替换时旧 meta 仍指向旧文件，并发 get 不会读到
+        // “旧元信息 + 新字节”。写完并提交索引后才删除旧对象。
+        let rel = rel_path(key, hash);
+        let abs = root.join(&rel);
+        if chordal_core::fs::atomic_write(&abs, bytes).is_err() {
+            return PutOutcome::Failed;
+        }
+
+        {
+            let Ok(mut inner) = self.inner.write() else {
+                return PutOutcome::Failed;
+            };
+            if let Some(old) = &previous {
+                inner.total = inner.total.saturating_sub(old.size);
+            }
+            let meta = ObjectMeta {
+                key: key.to_string(),
+                file: rel.clone(),
+                size: bytes.len() as u64,
+                hash,
+                etag: tags.etag,
+                last_modified: tags.last_modified,
+                content_type: tags.content_type,
+                fetched_at: now,
+                last_access: now,
+                expires_at: tags.expires_at,
+            };
+            inner.total = inner.total.saturating_add(meta.size);
+            inner.entries.insert(key.to_string(), meta);
+        }
         self.evict_if_needed();
-        self.flush();
-        if previous.is_some() {
+        self.flush_locked();
+        let replacing = previous.is_some();
+        if let Some(old) = previous
+            && old.file != rel
+        {
+            let _ = fs::remove_file(root.join(old.file));
+        }
+        if replacing {
             PutOutcome::Replaced
         } else {
             PutOutcome::Inserted
@@ -295,6 +328,9 @@ impl ObjectCache {
 
     /// 条件刷新命中 304 时调用：不写对象，只更新元信息与 LRU。
     pub fn touch(&self, key: &str, tags: CacheTags) -> bool {
+        let Ok(_mutation) = self.mutation.lock() else {
+            return false;
+        };
         let Ok(mut inner) = self.inner.write() else {
             return false;
         };
@@ -306,7 +342,7 @@ impl ObjectCache {
         entry.last_access = now;
         merge_tags(entry, tags);
         drop(inner);
-        self.flush();
+        self.flush_locked();
         true
     }
 
@@ -318,6 +354,9 @@ impl ObjectCache {
     }
 
     pub fn remove(&self, key: &str) -> bool {
+        let Ok(_mutation) = self.mutation.lock() else {
+            return false;
+        };
         let Ok(mut inner) = self.inner.write() else {
             return false;
         };
@@ -325,14 +364,18 @@ impl ObjectCache {
             return false;
         };
         inner.total = inner.total.saturating_sub(meta.size);
-        let _ = fs::remove_file(inner.root.join(&meta.file));
+        let root = inner.root.clone();
         drop(inner);
-        self.flush();
+        let _ = fs::remove_file(root.join(meta.file));
+        self.flush_locked();
         true
     }
 
     /// 回收 key 以 `prefix` 开头的全部对象（账号级缓存用）。
     pub fn purge_prefix(&self, prefix: &str) -> u64 {
+        let Ok(_mutation) = self.mutation.lock() else {
+            return 0;
+        };
         let Ok(mut inner) = self.inner.write() else {
             return 0;
         };
@@ -343,15 +386,20 @@ impl ObjectCache {
             .cloned()
             .collect();
         let mut removed = 0u64;
+        let mut files = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(meta) = inner.entries.remove(&key) {
                 inner.total = inner.total.saturating_sub(meta.size);
-                let _ = fs::remove_file(inner.root.join(&meta.file));
+                files.push(meta.file);
                 removed += 1;
             }
         }
+        let root = inner.root.clone();
         drop(inner);
-        self.flush();
+        for file in files {
+            let _ = fs::remove_file(root.join(file));
+        }
+        self.flush_locked();
         removed
     }
 
@@ -364,42 +412,59 @@ impl ObjectCache {
     }
 
     pub fn purge_all(&self) -> u64 {
+        let Ok(_mutation) = self.mutation.lock() else {
+            return 0;
+        };
         let Ok(mut inner) = self.inner.write() else {
             return 0;
         };
-        let keys: Vec<String> = inner.entries.keys().cloned().collect();
-        for key in &keys {
-            if let Some(meta) = inner.entries.remove(key) {
-                let _ = fs::remove_file(inner.root.join(&meta.file));
-            }
+        let mut files = Vec::with_capacity(inner.entries.len());
+        for meta in inner.entries.values() {
+            files.push(meta.file.clone());
         }
+        let removed = inner.entries.len() as u64;
+        inner.entries.clear();
         inner.total = 0;
+        let root = inner.root.clone();
         drop(inner);
-        self.flush();
-        keys.len() as u64
+        for file in files {
+            let _ = fs::remove_file(root.join(file));
+        }
+        self.flush_locked();
+        removed
     }
 
     pub fn set_limit(&self, limit: u64) {
+        let Ok(_mutation) = self.mutation.lock() else {
+            return;
+        };
         if let Ok(mut inner) = self.inner.write() {
             inner.limit = limit;
         }
         self.evict_if_needed();
-        self.flush();
+        self.flush_locked();
     }
 
     /// 切换缓存目录（设置里改地址后即时生效）。旧目录内容保留在磁盘，
     /// 由用户自行清理；新目录载入自己的索引。
     pub fn reconfigure(&self, root: PathBuf, limit: u64) {
-        let Ok(mut inner) = self.inner.write() else {
+        let Ok(_mutation) = self.mutation.lock() else {
             return;
         };
-        if inner.root == root {
-            inner.limit = limit;
-            drop(inner);
+        let same_root = self
+            .inner
+            .read()
+            .ok()
+            .is_some_and(|inner| inner.root == root);
+        if same_root {
+            if let Ok(mut inner) = self.inner.write() {
+                inner.limit = limit;
+            }
             self.evict_if_needed();
-            self.flush();
+            self.flush_locked();
             return;
         }
+
         let _ = fs::create_dir_all(&root);
         let index = load_index(&root);
         let mut entries = index.entries;
@@ -409,13 +474,15 @@ impl ObjectCache {
                 .map(|m| m.is_file() && m.len() == meta.size)
                 .unwrap_or(false)
         });
-        inner.total = entries.values().map(|m| m.size).sum();
-        inner.root = root;
-        inner.limit = limit;
-        inner.entries = entries;
-        drop(inner);
+        let total = entries.values().map(|m| m.size).sum();
+        if let Ok(mut inner) = self.inner.write() {
+            inner.total = total;
+            inner.root = root;
+            inner.limit = limit;
+            inner.entries = entries;
+        }
         self.evict_if_needed();
-        self.flush();
+        self.flush_locked();
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -428,62 +495,85 @@ impl ObjectCache {
         }
     }
 
-    /// 把索引原子写回磁盘。
+    /// 把索引原子写回磁盘。所有结构变更与 flush 通过 `mutation` 串行化。
     pub fn flush(&self) {
-        let Ok(inner) = self.inner.read() else {
+        let Ok(_mutation) = self.mutation.lock() else {
             return;
         };
-        let index = Index {
-            entries: inner.entries.clone(),
+        self.flush_locked();
+    }
+
+    fn flush_locked(&self) {
+        let (root, json) = {
+            let Ok(inner) = self.inner.read() else {
+                return;
+            };
+            let index = Index {
+                entries: inner.entries.clone(),
+            };
+            let Ok(json) = serde_json::to_vec(&index) else {
+                return;
+            };
+            (inner.root.clone(), json)
         };
-        let json = match serde_json::to_vec(&index) {
-            Ok(json) => json,
-            Err(_) => return,
-        };
-        let path = inner.root.join("index.json");
-        let tmp = inner.root.join("index.json.tmp");
-        if fs::write(&tmp, json).is_ok() {
-            if path.exists() {
-                let _ = fs::remove_file(&path);
-            }
-            let _ = fs::rename(&tmp, &path);
+        if let Err(error) = chordal_core::fs::atomic_write(&root.join("index.json"), &json) {
+            tracing::warn!(root = %root.display(), %error, "cache index flush failed");
         }
     }
 
     fn evict_if_needed(&self) {
-        let Ok(mut inner) = self.inner.write() else {
-            return;
+        let (target, order) = {
+            let Ok(inner) = self.inner.read() else {
+                return;
+            };
+            if inner.limit == 0 || inner.total <= inner.limit {
+                return;
+            }
+            // 一次淘汰到 90%，避免每次写入都触发排序。
+            let target = inner.limit.saturating_mul(9) / 10;
+            let mut order: Vec<(String, u64, u64)> = inner
+                .entries
+                .iter()
+                .map(|(k, m)| (k.clone(), m.last_access, m.size))
+                .collect();
+            order.sort_unstable_by_key(|(_, access, _)| *access);
+            (target, order)
         };
-        if inner.limit == 0 || inner.total <= inner.limit {
-            return;
-        }
-        // 一次淘汰到 90%，避免每次写入都触发排序。
-        let target = inner.limit.saturating_mul(9) / 10;
-        let mut order: Vec<(String, u64, u64)> = inner
-            .entries
-            .iter()
-            .map(|(k, m)| (k.clone(), m.last_access, m.size))
-            .collect();
-        order.sort_unstable_by_key(|(_, access, _)| *access);
+
         for (key, _, size) in order {
-            if inner.total <= target {
+            let current_total = self.inner.read().ok().map(|inner| inner.total).unwrap_or(0);
+            if current_total <= target {
                 break;
             }
-            let Some(meta) = inner.entries.get(&key).cloned() else {
+            let Some(meta) = ({
+                let Ok(inner) = self.inner.read() else {
+                    return;
+                };
+                inner.entries.get(&key).cloned()
+            }) else {
                 continue;
             };
-            let abs = inner.root.join(&meta.file);
-            match fs::remove_file(&abs) {
-                Ok(()) => {
-                    inner.entries.remove(&key);
-                    inner.total = inner.total.saturating_sub(size);
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    inner.entries.remove(&key);
-                    inner.total = inner.total.saturating_sub(size);
-                }
+            let abs = {
+                let Ok(inner) = self.inner.read() else {
+                    return;
+                };
+                inner.root.join(&meta.file)
+            };
+            let removable = match fs::remove_file(&abs) {
+                Ok(()) => true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => true,
                 // 文件被占用（Windows）时保留，下一轮再试。
-                Err(_) => {}
+                Err(_) => false,
+            };
+            if removable
+                && let Ok(mut inner) = self.inner.write()
+                && inner
+                    .entries
+                    .get(&key)
+                    .is_some_and(|current| current.hash == meta.hash && current.file == meta.file)
+            {
+                inner.entries.remove(&key);
+                inner.total = inner.total.saturating_sub(size);
             }
         }
     }
@@ -521,14 +611,22 @@ fn load_index(root: &Path) -> Index {
     })
 }
 
-/// key 的 128 位摘要（两路 FNV-1a），文件落在两级目录。
-fn rel_path(key: &str) -> String {
+/// key 的 128 位摘要（两路 FNV-1a）+ 内容摘要，文件落在两级目录。
+/// 内容摘要进入路径后，替换对象不会原地覆盖旧文件，并发读取始终能拿到
+/// 与元信息匹配的字节。
+fn rel_path(key: &str, content_hash: u64) -> String {
     let h1 = fnv1a64(key.as_bytes());
     let mut salted = Vec::with_capacity(key.len() + 8);
     salted.extend_from_slice(b"chordial");
     salted.extend_from_slice(key.as_bytes());
     let h2 = fnv1a64(&salted);
-    format!("{:02x}/{:016x}{:016x}.bin", (h1 >> 56) as u8, h1, h2)
+    format!(
+        "{:02x}/{:016x}{:016x}{:016x}.bin",
+        (h1 >> 56) as u8,
+        h1,
+        h2,
+        content_hash
+    )
 }
 
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -550,6 +648,7 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -650,6 +749,63 @@ mod tests {
         drop(cache);
         let cache = open(&root, 1024);
         assert!(cache.get(&key).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_put_flush_keeps_index_and_objects_consistent() {
+        let root = temp_root("concurrent");
+        let cache = Arc::new(open(&root, 8 * 1024 * 1024));
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            let cache = cache.clone();
+            workers.push(std::thread::spawn(move || {
+                for item in 0..20 {
+                    let key = object_key("netease", "cover", &format!("{worker}-{item}"));
+                    let bytes = format!("{worker}:{item}").into_bytes();
+                    assert_eq!(
+                        cache.put(&key, &bytes, CacheTags::default()),
+                        PutOutcome::Inserted
+                    );
+                    cache.flush();
+                    let object = cache.get(&key).expect("object must be readable");
+                    assert_eq!(object.bytes, bytes);
+                    assert_eq!(object.meta.hash, fnv1a64(&object.bytes));
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        cache.flush();
+        assert_eq!(cache.stats().entries, 80);
+        drop(cache);
+
+        let reopened = open(&root, 8 * 1024 * 1024);
+        assert_eq!(reopened.stats().entries, 80);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_never_pairs_old_meta_with_new_bytes() {
+        let root = temp_root("replace-race");
+        let cache = Arc::new(open(&root, 1024 * 1024));
+        let key = object_key("netease", "lyric", "race");
+        cache.put(&key, b"initial", CacheTags::default());
+        let writer_cache = cache.clone();
+        let writer_key = key.clone();
+        let writer = std::thread::spawn(move || {
+            for value in 0..100u8 {
+                writer_cache.put(&writer_key, &[value; 32], CacheTags::default());
+            }
+        });
+        for _ in 0..500 {
+            if let Some(object) = cache.get(&key) {
+                assert_eq!(object.meta.hash, fnv1a64(&object.bytes));
+                assert_eq!(object.meta.size, object.bytes.len() as u64);
+            }
+        }
+        writer.join().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 

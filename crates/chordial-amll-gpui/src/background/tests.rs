@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 fn test_album() -> (u32, u32, Vec<u8>) {
     let mut data = vec![0u8; 64 * 64 * 4];
     for (i, px) in data.chunks_exact_mut(4).enumerate() {
@@ -48,16 +47,19 @@ fn mesh_rasterizes_cover() {
 #[test]
 fn non_square_preset_stays_in_bounds() {
     for (w, h) in [(4, 5), (5, 4)] {
+        let preset = ControlPointPreset::grid(w, h);
         let mut layer = MeshLayer {
-            preset: ControlPointPreset::grid(w, h),
+            base_preset: preset.clone(),
+            preset,
             texture: vec![255; TEXTURE_SIZE * TEXTURE_SIZE * 4],
             vertices: Vec::new(),
             indices: Vec::new(),
             vertex_aspect: 0.0,
             alpha: 1.0,
             fading_out: false,
+            audio_deformed: false,
         };
-        layer.rebuild_vertices(16.0 / 9.0);
+        layer.rebuild_vertices(16.0 / 9.0, false);
         assert_eq!(
             layer.vertices.len(),
             (w - 1) * SUBDIVISIONS * (h - 1) * SUBDIVISIONS
@@ -128,71 +130,65 @@ fn semi_transparent_album_preserves_alpha() {
 }
 
 #[test]
-fn output_pixels_are_capped() {
-    let mut renderer = MeshGradientRenderer::new();
-    renderer.set_viewport(4000, 3000);
-    renderer.set_render_scale(1.0);
-    renderer.ensure_output();
-    assert!(renderer.out_w * renderer.out_h <= MAX_OUTPUT_PIXELS);
+fn raster_size_matches_render_scale() {
+    for viewport in [(682, 480), (1920, 1080), (4000, 3000), (428, 1212)] {
+        for divisor in [1u32, 2, 4, 8, 12, 20] {
+            let mut renderer = MeshGradientRenderer::new();
+            renderer.set_viewport(viewport.0, viewport.1);
+            renderer.set_render_scale(1.0 / divisor as f32);
+            renderer.ensure_output();
+
+            let want = (
+                (viewport.0 as f32 / divisor as f32).ceil() as usize,
+                (viewport.1 as f32 / divisor as f32).ceil() as usize,
+            );
+            assert_eq!(
+                renderer.debug_raster_size(),
+                want,
+                "viewport {viewport:?}, divisor {divisor}"
+            );
+        }
+    }
 }
 
 #[test]
-fn slow_raster_shrinks_divisor_one_output() {
+fn single_axis_rounding_uses_upscale_instead_of_copy() {
+    // 两种实际崩溃尺寸：展示预算只允许高度多出 1 像素。若仅按宽度倍率判断，
+    // 会把光栅缓冲直接复制到更高的展示缓冲，触发 copy_from_slice 长度不匹配。
+    for (viewport, raster, present) in [
+        ((428, 1212), (214, 606), (214, 607)),
+        ((500, 1036), (250, 518), (250, 519)),
+    ] {
+        let mut renderer = MeshGradientRenderer::with_seed(5);
+        renderer.set_viewport(viewport.0, viewport.1);
+        renderer.set_render_scale(0.5);
+        renderer.ensure_output();
+        assert_eq!(renderer.debug_raster_size(), raster);
+        assert_eq!(renderer.debug_size(), present);
+        assert!(renderer.debug_upscale() > 1.0);
+
+        let (w, h, data) = test_album();
+        renderer.set_album_rgba(w, h, data);
+        renderer.set_fps(60);
+        let image = renderer.render(1000.0).expect("render should not panic");
+        assert_eq!(image.as_bytes(0).unwrap().len(), present.0 * present.1 * 4);
+    }
+}
+
+#[test]
+fn raster_cost_never_changes_requested_resolution() {
     let mut renderer = MeshGradientRenderer::with_seed(3);
     renderer.set_viewport(682, 480);
-    renderer.set_render_scale(1.0);
-    // 模拟 debug 构建：200k 像素光栅耗时 40ms（0.2us/px）。
-    renderer.adapt_pixel_budget(40_000.0, 200_000);
-    assert_eq!(renderer.debug_pixel_budget(), 50_000);
-    renderer.ensure_output();
-    let (rw, rh) = renderer.debug_raster_size();
-    let pixels = rw * rh;
-    assert!(
-        (MIN_ADAPTIVE_PIXELS..=50_000).contains(&pixels),
-        "adaptive raster should be ~50k px, got {pixels}"
-    );
-    assert!(pixels < MAX_OUTPUT_PIXELS);
-}
-
-#[test]
-fn fast_raster_keeps_hard_cap() {
-    let mut renderer = MeshGradientRenderer::new();
-    renderer.set_viewport(682, 480);
-    renderer.set_render_scale(1.0);
-    // release 级速度：5ns/px，预算远大于硬上限，不应降低画质。
-    renderer.adapt_pixel_budget(1_000.0, 200_000);
-    assert_eq!(renderer.debug_pixel_budget(), MAX_OUTPUT_PIXELS);
-    renderer.ensure_output();
-    let (rw, rh) = renderer.debug_raster_size();
-    assert_eq!(rw * rh, 199_875);
-}
-
-#[test]
-fn crossfade_budget_accounts_for_both_layers() {
-    let mut renderer = MeshGradientRenderer::with_seed(3);
+    renderer.set_render_scale(0.5);
     let (w, h, data) = test_album();
-    renderer.set_album_rgba(w, h, data.clone());
     renderer.set_album_rgba(w, h, data);
-    assert_eq!(renderer.layers.len(), 2);
-    // 光栅 50k 像素 × 两层，总耗时 40ms；预算应只剩 12.5k 光栅像素。
-    renderer.adapt_pixel_budget(40_000.0, 50_000);
-    assert_eq!(renderer.debug_pixel_budget(), 12_500);
-}
+    renderer.set_fps(60);
 
-#[test]
-fn small_estimate_changes_do_not_thrash_output_size() {
-    let mut renderer = MeshGradientRenderer::new();
-    renderer.set_viewport(682, 480);
-    renderer.set_render_scale(1.0);
-    renderer.pixel_budget = 50_000;
-    // 新预算约 54k，仅比当前高 8%，应被滞回拦住。
-    renderer.adapt_pixel_budget(18_520.0, 100_000);
-    assert_eq!(renderer.debug_pixel_budget(), 50_000);
-    renderer.ensure_output();
-    let first = renderer.debug_raster_size();
-    renderer.adapt_pixel_budget(18_520.0, 100_000);
-    renderer.ensure_output();
-    assert_eq!(renderer.debug_raster_size(), first);
+    let want = (341, 240);
+    for _ in 0..4 {
+        renderer.render(100.0).expect("render should not panic");
+        assert_eq!(renderer.debug_raster_size(), want);
+    }
 }
 
 #[test]
@@ -206,6 +202,7 @@ fn no_cover_returns_transparent_frame() {
 
 #[test]
 fn raster_cost_per_pixel_is_bounded() {
+    let _guard = super::worker::TEST_LOCK.lock().unwrap();
     let mut renderer = MeshGradientRenderer::with_seed(3);
     renderer.set_viewport(200, 120);
     renderer.set_render_scale(0.5);
@@ -237,6 +234,42 @@ fn solid_album(rgb: [u8; 3]) -> (u32, u32, Vec<u8>) {
         px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
     }
     (w, h, data)
+}
+
+fn test_layer(seed: u64) -> MeshLayer {
+    let base_preset = generate_preset(&mut Rng(seed));
+    let mut layer = MeshLayer {
+        base_preset: base_preset.clone(),
+        preset: base_preset,
+        texture: vec![255; TEXTURE_SIZE * TEXTURE_SIZE * 4],
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        vertex_aspect: 0.0,
+        alpha: 1.0,
+        fading_out: false,
+        audio_deformed: false,
+    };
+    layer.rebuild_vertices(1.0, false);
+    layer
+}
+
+fn changed_control_points(layer: &MeshLayer) -> Vec<usize> {
+    layer
+        .base_preset
+        .points
+        .iter()
+        .zip(&layer.preset.points)
+        .enumerate()
+        .filter_map(|(index, (base, point))| {
+            let changed = (base.x - point.x).abs() > 1e-6
+                || (base.y - point.y).abs() > 1e-6
+                || (base.u_rot - point.u_rot).abs() > 1e-6
+                || (base.v_rot - point.v_rot).abs() > 1e-6
+                || (base.u_scale - point.u_scale).abs() > 1e-6
+                || (base.v_scale - point.v_scale).abs() > 1e-6;
+            changed.then_some(index)
+        })
+        .collect()
 }
 
 fn mean_luma(image: &RenderImage) -> f64 {
@@ -275,12 +308,7 @@ fn crossfade_advances_across_fps_gated_calls() {
 
 #[test]
 fn rapid_album_switches_never_darken() {
-    const COLORS: [[u8; 3]; 4] = [
-        [220, 60, 50],
-        [40, 160, 210],
-        [80, 200, 90],
-        [220, 180, 60],
-    ];
+    const COLORS: [[u8; 3]; 4] = [[220, 60, 50], [40, 160, 210], [80, 200, 90], [220, 180, 60]];
     let mut renderer = MeshGradientRenderer::with_seed(9);
     renderer.set_viewport(160, 92);
     renderer.set_render_scale(0.5);
@@ -324,9 +352,9 @@ fn beat_attack_is_fast_across_fps_gated_calls() {
         renderer.render(5.0);
     }
     assert!(
-        renderer.beat_volume > 0.8,
+        renderer.band_values.kick > 0.8,
         "beat attack too slow: {}",
-        renderer.beat_volume
+        renderer.band_values.kick
     );
 }
 
@@ -393,6 +421,206 @@ fn zero_beat_strength_disables_the_pulse() {
         quiet_frame.as_bytes(0),
         loud_frame.as_bytes(0),
         "strength 0 should fully disable the beat pulse"
+    );
+}
+
+#[test]
+fn vocals_and_air_move_distinct_control_points() {
+    let mut layer = test_layer(29);
+    apply_audio_controls(
+        &mut layer,
+        AudioBands {
+            vocals: 1.0,
+            ..AudioBands::default()
+        },
+        AudioControlMapping::default(),
+        1.25,
+    );
+    let vocals = changed_control_points(&layer);
+    assert!(!vocals.is_empty(), "vocals should move local controls");
+
+    restore_base_controls(&mut layer);
+    apply_audio_controls(
+        &mut layer,
+        AudioBands {
+            air: 1.0,
+            ..AudioBands::default()
+        },
+        AudioControlMapping::default(),
+        1.25,
+    );
+    let air = changed_control_points(&layer);
+    assert!(!air.is_empty(), "air should move local controls");
+    assert_ne!(vocals, air, "different bands should own different regions");
+
+    let width = layer.preset.width;
+    for index in vocals.iter().chain(&air) {
+        let x = index % width;
+        let y = index / width;
+        assert!(
+            x > 0 && y > 0 && x + 1 < width && y + 1 < layer.preset.height,
+            "border control point moved: {index}"
+        );
+    }
+}
+
+#[test]
+fn custom_mapping_only_moves_selected_points() {
+    let mut layer = test_layer(33);
+    let mut mapping = AudioControlMapping::default();
+    mapping.set(
+        AudioBandKind::Vocals,
+        chordal_core::ControlPointSet::from_numbers(&[13]),
+    );
+    apply_audio_controls(
+        &mut layer,
+        AudioBands {
+            vocals: 1.0,
+            ..AudioBands::default()
+        },
+        mapping,
+        1.25,
+    );
+    assert_eq!(changed_control_points(&layer), [12]);
+
+    mapping.set(
+        AudioBandKind::Vocals,
+        chordal_core::ControlPointSet::from_numbers(&[7, 19]),
+    );
+    apply_audio_controls(
+        &mut layer,
+        AudioBands {
+            vocals: 1.0,
+            ..AudioBands::default()
+        },
+        mapping,
+        1.25,
+    );
+    assert_eq!(changed_control_points(&layer), [6, 18]);
+}
+
+#[test]
+fn reactive_controls_never_accumulate_and_restore_base() {
+    let mut layer = test_layer(31);
+    let bands = AudioBands {
+        rumble: 0.8,
+        kick: 0.7,
+        vocals: 0.6,
+        instruments: 0.5,
+        air: 0.4,
+    };
+    apply_audio_controls(&mut layer, bands, AudioControlMapping::default(), 2.5);
+    let first = layer.preset.points.clone();
+    apply_audio_controls(&mut layer, bands, AudioControlMapping::default(), 2.5);
+    for (a, b) in first.iter().zip(&layer.preset.points) {
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.y, b.y);
+        assert_eq!(a.u_rot, b.u_rot);
+        assert_eq!(a.v_rot, b.v_rot);
+        assert_eq!(a.u_scale, b.u_scale);
+        assert_eq!(a.v_scale, b.v_scale);
+    }
+
+    apply_audio_controls(
+        &mut layer,
+        AudioBands::default(),
+        AudioControlMapping::default(),
+        2.5,
+    );
+    assert!(changed_control_points(&layer).is_empty());
+}
+
+#[test]
+fn every_band_has_an_independent_visual_envelope() {
+    let mut renderer = MeshGradientRenderer::with_seed(37);
+    renderer.set_viewport(64, 64);
+    renderer.set_audio_bands(AudioBands {
+        vocals: 1.0,
+        ..AudioBands::default()
+    });
+    for _ in 0..8 {
+        renderer.render(16.0);
+    }
+    assert!(renderer.band_values.vocals > 0.6);
+    assert_eq!(renderer.band_values.kick, 0.0);
+    assert_eq!(renderer.band_values.air, 0.0);
+
+    renderer.set_audio_bands(AudioBands {
+        air: 1.0,
+        ..AudioBands::default()
+    });
+    for _ in 0..30 {
+        renderer.render(16.0);
+    }
+    assert!(renderer.band_values.air > 0.8);
+    assert!(renderer.band_values.vocals < 0.1);
+    assert_eq!(renderer.band_values.kick, 0.0);
+}
+
+#[test]
+fn zero_strength_disables_all_five_bands() {
+    let (w, h, data) = test_album();
+    let mut quiet = MeshGradientRenderer::with_seed(41);
+    let mut loud = MeshGradientRenderer::with_seed(41);
+    for renderer in [&mut quiet, &mut loud] {
+        renderer.set_viewport(180, 100);
+        renderer.set_render_scale(0.6);
+        renderer.set_fps(60);
+        renderer.set_beat_strength(0.0);
+        renderer.set_album_rgba(w, h, data.clone());
+        for _ in 0..40 {
+            renderer.render(16.0);
+        }
+    }
+    loud.set_audio_bands(AudioBands {
+        rumble: 1.0,
+        kick: 1.0,
+        vocals: 1.0,
+        instruments: 1.0,
+        air: 1.0,
+    });
+    let mut quiet_frame = None;
+    let mut loud_frame = None;
+    for _ in 0..12 {
+        quiet_frame = quiet.render(16.0).or(quiet_frame);
+        loud_frame = loud.render(16.0).or(loud_frame);
+    }
+    assert_eq!(
+        quiet_frame.expect("quiet frame").as_bytes(0),
+        loud_frame.expect("loud frame").as_bytes(0),
+        "strength 0 should disable every audio-reactive channel"
+    );
+}
+
+#[test]
+fn reactive_mesh_cost_stays_bounded() {
+    let _guard = super::worker::TEST_LOCK.lock().unwrap();
+    let mut renderer = MeshGradientRenderer::with_seed(43);
+    renderer.set_viewport(200, 120);
+    renderer.set_render_scale(0.5);
+    renderer.set_fps(60);
+    let (w, h, data) = test_album();
+    renderer.set_album_rgba(w, h, data);
+    for _ in 0..8 {
+        renderer.render(500.0);
+    }
+    renderer.set_audio_bands(AudioBands {
+        rumble: 0.8,
+        kick: 0.9,
+        vocals: 0.7,
+        instruments: 0.6,
+        air: 0.5,
+    });
+    let start = std::time::Instant::now();
+    for _ in 0..20 {
+        renderer.render(20.0);
+    }
+    let elapsed = start.elapsed().as_secs_f64() * 1e6;
+    let per_frame = elapsed / 20.0;
+    let pixels = (renderer.out_w * renderer.out_h) as f64;
+    assert!(
+        per_frame / pixels < 1.0,
+        "reactive bg too slow: {per_frame:.1}us/frame for {pixels} px"
     );
 }
 
@@ -503,6 +731,7 @@ fn large_divisor_upscales_to_capped_resolution() {
 
 #[test]
 fn upscale_cost_stays_bounded() {
+    let _guard = super::worker::TEST_LOCK.lock().unwrap();
     let (w, h, data) = test_album();
     let mut renderer = MeshGradientRenderer::with_seed(3);
     renderer.set_viewport(1920, 1080);

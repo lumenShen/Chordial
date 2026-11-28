@@ -1196,10 +1196,7 @@ impl WindowsWindowInner {
     fn flush_pending_input(&self) {
         let (pending_move, pending_scroll) = {
             let mut lock = self.state.borrow_mut();
-            (
-                lock.pending_mouse_move.take(),
-                lock.pending_scroll.take(),
-            )
+            (lock.pending_mouse_move.take(), lock.pending_scroll.take())
         };
         if pending_move.is_none() && pending_scroll.is_none() {
             return;

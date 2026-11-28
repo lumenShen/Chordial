@@ -127,7 +127,7 @@ impl ChordialApp {
                 artists
             }
         } else {
-            SharedString::from("从左侧列表选择一首歌开始")
+            SharedString::from("从曲库或搜索结果中选择一首歌")
         };
 
         let pill = |text: SharedString| {
@@ -264,6 +264,54 @@ impl ChordialApp {
                 }
                 info = info.child(links);
             }
+        } else {
+            let weak_play = weak.clone();
+            let weak_search = weak.clone();
+            let weak_source = weak.clone();
+            let mut actions = div()
+                .w(px(content_w))
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(px(8.0))
+                .mt(px(18.0));
+            if !self.library.is_empty() {
+                actions = actions.child(crate::widgets::text_button(
+                    &theme,
+                    "播放全部",
+                    true,
+                    move |_, _, cx| {
+                        let _ = weak_play.update(cx, |app, cx| {
+                            app.play_from_list(QueueList::Library, 0, cx);
+                        });
+                    },
+                ));
+            } else {
+                actions = actions.child(crate::widgets::text_button(
+                    &theme,
+                    "添加音乐",
+                    true,
+                    move |_, _, cx| {
+                        let _ = weak_source.update(cx, |app, cx| app.open_source_manager(cx));
+                    },
+                ));
+            }
+            actions = actions.child(crate::widgets::text_button(
+                &theme,
+                "搜索歌曲",
+                false,
+                move |_, window, cx| {
+                    let _ = weak_search.update(cx, |app, cx| {
+                        app.view_tab = ViewTab::Search;
+                        let input = app.search_input.clone();
+                        cx.defer_in(window, move |_, window, cx| {
+                            focus_input(&input, window, cx);
+                        });
+                        cx.notify();
+                    });
+                },
+            ));
+            info = info.child(actions);
         }
 
         // 歌词预览：跟随播放位置，当前行高亮。
@@ -386,7 +434,7 @@ impl ChordialApp {
                             .text_color(theme.text_faint)
                             .child("歌词"),
                     )
-                    .child(immersive_btn),
+                    .when(has_track, |d| d.child(immersive_btn)),
             )
             .child(lines);
 
@@ -422,8 +470,17 @@ impl ChordialApp {
                             .child(
                                 div()
                                     .text_size(px(10.5))
-                                    .text_color(theme.text_faint)
-                                    .child(if playing { "正在播放" } else { "已暂停" }),
+                                    .text_color(
+                                        if matches!(
+                                            self.player_status.state,
+                                            PlayerState::Failed(_)
+                                        ) {
+                                            theme.danger
+                                        } else {
+                                            theme.text_faint
+                                        },
+                                    )
+                                    .child(self.playback_status_label()),
                             ),
                     ),
             )

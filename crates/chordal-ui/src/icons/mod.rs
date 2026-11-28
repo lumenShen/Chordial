@@ -34,6 +34,8 @@ pub enum Icon {
     Sun,
     Moon,
     Close,
+    /// 删除链路节点 / 个人配置。
+    Trash,
     Refresh,
     ChevronDown,
     ChevronUp,
@@ -638,6 +640,16 @@ fn paint(
         Icon::Close => {
             line(window, &[(4.0, 4.0), (12.0, 12.0)]);
             line(window, &[(12.0, 4.0), (4.0, 12.0)]);
+        }
+        Icon::Trash => {
+            line(window, &[(3.2, 4.6), (12.8, 4.6)]);
+            line(window, &[(6.2, 4.6), (6.7, 2.9), (9.3, 2.9), (9.8, 4.6)]);
+            line(
+                window,
+                &[(4.8, 5.3), (5.5, 13.1), (10.5, 13.1), (11.2, 5.3)],
+            );
+            line(window, &[(6.8, 7.2), (7.0, 11.2)]);
+            line(window, &[(9.2, 7.2), (9.0, 11.2)]);
         }
         Icon::Refresh => {
             stroke_arc(

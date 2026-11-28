@@ -9,16 +9,18 @@
 //! 二次乘性开销。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use chordal_core::AudioBands;
 use chordal_core::error::CoreResult;
 use chordal_core::model::StreamHandle;
 use chordal_core::perf::PerfScope;
+use chordal_core::{AudioBandKind, AudioBandRanges, FrequencyRange};
 
-use crate::analysis::{BandAnalyzer, DEFAULT_BEAT_BAND, normalize_band};
+use crate::analysis::BandAnalyzer;
 use crate::backend::{AudioSink, open_sink};
 use crate::decode::AudioDecoder;
 use crate::equalizer::{EqSettings, Equalizer};
@@ -74,7 +76,7 @@ pub enum Command {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// 当前曲目自然播完/出错终止（generation 供 UI 过滤旧事件）。
+    /// 当前曲目自然播完（generation 供 UI 过滤旧事件）。
     TrackEnded(u64),
     StreamError(String),
     SinkError(String),
@@ -87,11 +89,10 @@ pub struct Player {
     status: Arc<RwLock<Status>>,
     events: Mutex<Receiver<Event>>,
     backend_name: &'static str,
-    /// 背景鼓点包络（0..1，f32 bits）。
-    beat_level: Arc<AtomicU32>,
-    /// 鼓点监听频段下限/上限（Hz，f32 bits）。
-    beat_low_hz: Arc<AtomicU32>,
-    beat_high_hz: Arc<AtomicU32>,
+    /// 五频段反应快照。播放线程整份写入，UI 线程整份读取。
+    audio_bands: Arc<RwLock<AudioBands>>,
+    /// 五路可编辑监听频段；播放线程按写块读取一次。
+    audio_band_ranges: Arc<RwLock<AudioBandRanges>>,
     /// 参数均衡器配置（UI 写入，播放线程按版本号热加载）。
     eq: Arc<RwLock<EqSettings>>,
     eq_version: Arc<AtomicU64>,
@@ -105,6 +106,8 @@ impl Player {
             "wasapi"
         } else if cfg!(target_os = "linux") {
             "alsa"
+        } else if cfg!(target_os = "android") {
+            "aaudio"
         } else {
             "null"
         };
@@ -119,15 +122,13 @@ impl Player {
         let (cmd_tx, cmd_rx) = channel();
         let (event_tx, event_rx) = channel();
         let status = Arc::new(RwLock::new(Status::default()));
-        let beat_level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
-        let beat_low_hz = Arc::new(AtomicU32::new(DEFAULT_BEAT_BAND.0.to_bits()));
-        let beat_high_hz = Arc::new(AtomicU32::new(DEFAULT_BEAT_BAND.1.to_bits()));
+        let audio_bands = Arc::new(RwLock::new(AudioBands::default()));
+        let audio_band_ranges = Arc::new(RwLock::new(AudioBandRanges::default()));
         let eq = Arc::new(RwLock::new(EqSettings::default()));
         let eq_version = Arc::new(AtomicU64::new(0));
         let thread_status = status.clone();
-        let thread_beat_level = beat_level.clone();
-        let thread_beat_low = beat_low_hz.clone();
-        let thread_beat_high = beat_high_hz.clone();
+        let thread_audio_bands = audio_bands.clone();
+        let thread_audio_band_ranges = audio_band_ranges.clone();
         let thread_eq = eq.clone();
         let thread_eq_version = eq_version.clone();
         std::thread::Builder::new()
@@ -140,9 +141,8 @@ impl Player {
                     sink_factory: factory,
                     volume: 0.9,
                     generation: 0,
-                    beat_level: thread_beat_level,
-                    beat_low_hz: thread_beat_low,
-                    beat_high_hz: thread_beat_high,
+                    audio_bands: thread_audio_bands,
+                    audio_band_ranges: thread_audio_band_ranges,
                     eq: thread_eq,
                     eq_version: thread_eq_version,
                 }
@@ -154,9 +154,8 @@ impl Player {
             status,
             events: Mutex::new(event_rx),
             backend_name,
-            beat_level,
-            beat_low_hz,
-            beat_high_hz,
+            audio_bands,
+            audio_band_ranges,
             eq,
             eq_version,
         })
@@ -205,30 +204,45 @@ impl Player {
         self.send(Command::SeekMs(ms));
     }
 
-    /// 设置背景鼓点监听频段（Hz）。非法输入回退到默认 4000–10000 Hz。
-    /// 下一帧分析即生效，无需重建播放管线。
-    pub fn set_beat_band(&self, low_hz: f32, high_hz: f32) {
-        let (low, high) = normalize_band(low_hz, high_hz);
-        self.beat_low_hz.store(low.to_bits(), Ordering::Relaxed);
-        self.beat_high_hz.store(high.to_bits(), Ordering::Relaxed);
-    }
-
-    /// 当前鼓点监听频段（Hz）。
-    pub fn beat_band(&self) -> (f32, f32) {
-        (
-            f32::from_bits(self.beat_low_hz.load(Ordering::Relaxed)),
-            f32::from_bits(self.beat_high_hz.load(Ordering::Relaxed)),
-        )
-    }
-
-    /// 当前鼓点包络（0..1）。UI 每帧读取，驱动歌词背景的跳动。
-    pub fn beat_level(&self) -> f32 {
-        let level = f32::from_bits(self.beat_level.load(Ordering::Relaxed));
-        if level.is_finite() {
-            level.clamp(0.0, 1.0)
-        } else {
-            0.0
+    /// 一次更新五路监听频段；非法区间按各通道默认值收敛。下一写块即生效。
+    pub fn set_audio_band_ranges(&self, ranges: AudioBandRanges) {
+        if let Ok(mut slot) = self.audio_band_ranges.write() {
+            *slot = ranges.sanitized();
         }
+    }
+
+    /// 当前五路监听频段。
+    pub fn audio_band_ranges(&self) -> AudioBandRanges {
+        self.audio_band_ranges
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sanitized()
+    }
+
+    /// 兼容旧 API：只更新低频鼓点通道，其余四路保持当前值。
+    pub fn set_beat_band(&self, low_hz: f32, high_hz: f32) {
+        if let Ok(mut ranges) = self.audio_band_ranges.write() {
+            ranges.set(AudioBandKind::Kick, FrequencyRange { low_hz, high_hz });
+        }
+    }
+
+    /// 兼容旧 API：返回低频鼓点通道。
+    pub fn beat_band(&self) -> (f32, f32) {
+        let range = self.audio_band_ranges().get(AudioBandKind::Kick);
+        (range.low_hz, range.high_hz)
+    }
+
+    /// 当前五频段反应快照。一次读锁读取整份数据，五路共享同一分析时刻。
+    pub fn audio_bands(&self) -> AudioBands {
+        self.audio_bands
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sanitized()
+    }
+
+    /// 当前鼓点包络（0..1）。兼容旧 API，等价于 [`Self::audio_bands`] 的 `kick`。
+    pub fn beat_level(&self) -> f32 {
+        self.audio_bands().kick
     }
 
     /// 热更新参数均衡器。播放线程在下一次写块前按版本号载入，
@@ -291,14 +305,19 @@ struct PlaybackThread {
     sink_factory: SinkFactory,
     volume: f32,
     generation: u64,
-    beat_level: Arc<AtomicU32>,
-    beat_low_hz: Arc<AtomicU32>,
-    beat_high_hz: Arc<AtomicU32>,
+    audio_bands: Arc<RwLock<AudioBands>>,
+    audio_band_ranges: Arc<RwLock<AudioBandRanges>>,
     eq: Arc<RwLock<EqSettings>>,
     eq_version: Arc<AtomicU64>,
 }
 
 impl PlaybackThread {
+    fn publish_audio_bands(&self, bands: AudioBands) {
+        if let Ok(mut slot) = self.audio_bands.write() {
+            *slot = bands.sanitized();
+        }
+    }
+
     fn run(mut self) {
         loop {
             let Ok(cmd) = self.rx.recv() else { return };
@@ -370,7 +389,6 @@ impl PlaybackThread {
             Err(e) => {
                 self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
                 let _ = self.event_tx.send(Event::StreamError(e.to_string()));
-                let _ = self.event_tx.send(Event::TrackEnded(generation));
                 return None;
             }
         };
@@ -389,7 +407,6 @@ impl PlaybackThread {
                 Err(e) => {
                     self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
                     let _ = self.event_tx.send(Event::StreamError(e.to_string()));
-                    let _ = self.event_tx.send(Event::TrackEnded(generation));
                     return None;
                 }
             }
@@ -402,7 +419,6 @@ impl PlaybackThread {
             Err(e) => {
                 self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
                 let _ = self.event_tx.send(Event::SinkError(e.to_string()));
-                let _ = self.event_tx.send(Event::TrackEnded(generation));
                 return None;
             }
         };
@@ -444,8 +460,8 @@ impl PlaybackThread {
         // 输出设备有缓冲（ALSA 默认 200ms）：分析发生在“写入”时，而画面
         // 应该跟“可听”的鼓点同步。按绝对帧位置排队，等播放头追到中点
         // 才发布包络。
-        let mut beat_queue: VecDeque<(u64, f32)> = VecDeque::new();
-        self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+        let mut beat_queue: VecDeque<(u64, AudioBands)> = VecDeque::new();
+        self.publish_audio_bands(AudioBands::default());
 
         let mut last_status_update = Instant::now();
         let mut seek_req: Option<u64> = None;
@@ -460,7 +476,7 @@ impl PlaybackThread {
                         let _ = sink.flush();
                         analyzer.reset();
                         beat_queue.clear();
-                        self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+                        self.publish_audio_bands(AudioBands::default());
                         self.patch_status(|s| s.state = PlayerState::Paused);
                     }
                     Ok(Command::Resume) => {
@@ -470,7 +486,7 @@ impl PlaybackThread {
                     Ok(Command::Stop) => {
                         let _ = sink.flush();
                         beat_queue.clear();
-                        self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+                        self.publish_audio_bands(AudioBands::default());
                         self.patch_status(|s| {
                             s.state = PlayerState::Stopped;
                             s.position_ms = 0;
@@ -480,7 +496,7 @@ impl PlaybackThread {
                     Ok(Command::Play(new_req)) => {
                         let _ = sink.flush();
                         beat_queue.clear();
-                        self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+                        self.publish_audio_bands(AudioBands::default());
                         drop(sink); // 旧输出句柄立即释放
                         // 交回外层迭代续播：本帧返回后 decoder/流缓冲即释放。
                         return Some(new_req);
@@ -512,6 +528,7 @@ impl PlaybackThread {
                                 analyzer.reset();
                                 eq.reset();
                                 beat_queue.clear();
+                                self.publish_audio_bands(AudioBands::default());
                                 self.patch_status(|s| s.position_ms = ms);
                             }
                         }
@@ -521,7 +538,7 @@ impl PlaybackThread {
                         }
                         Ok(Command::Stop) => {
                             beat_queue.clear();
-                            self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+                            self.publish_audio_bands(AudioBands::default());
                             self.patch_status(|s| {
                                 s.state = PlayerState::Stopped;
                                 s.position_ms = 0;
@@ -531,7 +548,7 @@ impl PlaybackThread {
                         Ok(Command::Play(new_req)) => {
                             let _ = sink.flush();
                             beat_queue.clear();
-                            self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+                            self.publish_audio_bands(AudioBands::default());
                             drop(sink);
                             return Some(new_req);
                         }
@@ -549,7 +566,7 @@ impl PlaybackThread {
                     analyzer.reset();
                     eq.reset();
                     beat_queue.clear();
-                    self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+                    self.publish_audio_bands(AudioBands::default());
                     self.patch_status(|s| s.position_ms = ms);
                 }
                 seek_scope.finish(0);
@@ -561,8 +578,9 @@ impl PlaybackThread {
                     Ok(true) => {}
                     Ok(false) => break 'play, // EOF
                     Err(e) => {
+                        self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
                         let _ = self.event_tx.send(Event::StreamError(e.to_string()));
-                        break 'play;
+                        return None;
                     }
                 }
             }
@@ -571,7 +589,9 @@ impl PlaybackThread {
             }
 
             // ---- 按整帧切块写入；EQ → 音量，均为 O(n) 内联 ----
-            let take_frames = (pending.len() / channels).min(4096);
+            // 约 21ms（48kHz）的写块足以覆盖多次 10ms 分析，又不会把碎鼓点
+            // 和镲片合并到同一个视觉快照里。
+            let take_frames = (pending.len() / channels).min(1024);
             let take_samples = take_frames * channels;
             let chunk = &mut pending[..take_samples];
             let version = self.eq_version.load(Ordering::Acquire);
@@ -591,46 +611,53 @@ impl PlaybackThread {
                 }
             }
             if let Err(e) = sink.write(chunk) {
+                self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
                 let _ = self.event_tx.send(Event::SinkError(e.to_string()));
-                break 'play;
+                return None;
             }
-            // 与输出同一批样本（已乘音量）做频段分析，驱动背景鼓点。
-            analyzer.push_interleaved(
-                chunk,
-                channels,
-                f32::from_bits(self.beat_low_hz.load(Ordering::Relaxed)),
-                f32::from_bits(self.beat_high_hz.load(Ordering::Relaxed)),
-            );
+            // 与输出同一批样本（已乘音量）做频段分析；保留写块内峰值，避免
+            // 最后一次分析覆盖掉更早出现的碎片鼓点/镲片。
+            let ranges = self
+                .audio_band_ranges
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .sanitized();
+            let bands = analyzer.push_interleaved(chunk, channels, ranges);
             let written_end = position_frames + take_frames as u64;
-            // 播放头到达这批样本中点时，鼓点才是“此刻听到”的。
-            beat_queue.push_back((written_end - take_frames as u64 / 2, analyzer.level()));
+            // 播放头到达这批样本中点时，视觉峰值对应“此刻听到”的声音。
+            beat_queue.push_back((written_end - take_frames as u64 / 2, bands));
             if beat_queue.len() > 256 {
                 beat_queue.pop_front();
             }
             position_frames = written_end;
             pending.drain(..take_samples);
 
+            // 音频反应包络按每个写块发布，不受歌词状态 33ms 节流影响；屏幕
+            // 刷新率只决定能看到其中多少快照，不改变播放线程的检测节奏。
+            let audible = position_frames.saturating_sub(sink.delay_frames());
+            while let Some(&(due, bands)) = beat_queue.front() {
+                if due > audible {
+                    break;
+                }
+                beat_queue.pop_front();
+                self.publish_audio_bands(bands);
+            }
+
             // ---- 状态节流刷新（~33ms：歌词逐词高亮的刷新下限）----
             if last_status_update.elapsed() >= Duration::from_millis(33) {
-                // 已写帧包含设备缓冲；减去 snd_pcm_delay 得到可听位置。
-                let audible = position_frames.saturating_sub(sink.delay_frames());
-                // 只发布已经可听的鼓点包络，避免画面领先音频。
-                while let Some(&(due, level)) = beat_queue.front() {
-                    if due > audible {
-                        break;
-                    }
-                    beat_queue.pop_front();
-                    self.beat_level.store(level.to_bits(), Ordering::Relaxed);
-                }
                 let pos_ms = audible * 1000 / rate as u64;
                 self.patch_status(|s| s.position_ms = pos_ms);
                 last_status_update = Instant::now();
             }
         }
 
-        let _ = sink.drain();
+        if let Err(e) = sink.drain() {
+            self.patch_status(|s| s.state = PlayerState::Failed(e.to_string()));
+            let _ = self.event_tx.send(Event::SinkError(e.to_string()));
+            return None;
+        }
         beat_queue.clear();
-        self.beat_level.store(0.0f32.to_bits(), Ordering::Relaxed);
+        self.publish_audio_bands(AudioBands::default());
         let audible = position_frames.saturating_sub(sink.delay_frames());
         let pos_ms = audible * 1000 / rate as u64;
         self.patch_status(|s| {
@@ -669,4 +696,38 @@ fn seek_to(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_failure_does_not_advance_the_queue() {
+        let player = Player::with_sink_factory(
+            Box::new(|_, _| Err(chordal_core::error::CoreError::Config("unused".into()))),
+            "test",
+        );
+        player.play(
+            StreamHandle::File(std::path::PathBuf::from("chordial-missing-test-file.wav")),
+            "broken",
+            0,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !matches!(player.status().state, PlayerState::Failed(_)) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(player.status().state, PlayerState::Failed(_)));
+        let event = loop {
+            if let Some(event) = player.try_pop_event() {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "播放器未发送失败事件");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(event, Event::StreamError(_)));
+        assert!(player.try_pop_event().is_none());
+    }
 }
