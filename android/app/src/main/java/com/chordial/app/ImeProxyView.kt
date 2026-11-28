@@ -58,6 +58,14 @@ class ImeProxyView(context: Context) : View(context) {
                 return true
             }
 
+            override fun performEditorAction(actionCode: Int): Boolean {
+                // Gboard 的“完成/前往”走 performEditorAction 而不是 sendKeyEvent，
+                // 这里转发成 Enter，交给 gpui 的 Submit 绑定。
+                sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
+                sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+                return true
+            }
+
             private fun sendKey(keyCode: Int) {
                 NativeBridge.key(keyCode, KeyEvent.ACTION_DOWN, 0)
                 NativeBridge.key(keyCode, KeyEvent.ACTION_UP, 0)

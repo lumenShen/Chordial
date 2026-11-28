@@ -154,18 +154,23 @@ impl AndroidWindowInner {
     }
 
     pub(crate) fn on_frame(&self) {
-        // 输入焦点丢失后 draw 不再注册 input handler；下一帧收起键盘。
-        let hide_ime = {
+        // on_frame 发生在两次 draw 之间：此时 input_handler 是否为空就是
+        // 上一帧的焦点状态（draw 内部的 take/set 不会持续到这里）。
+        let ime_action = {
             let mut state = self.state.borrow_mut();
-            if state.ime_visible && state.input_handler.is_none() {
+            let focused = state.input_handler.is_some();
+            if focused && !state.ime_visible {
+                state.ime_visible = true;
+                Some(true)
+            } else if !focused && state.ime_visible {
                 state.ime_visible = false;
-                true
+                Some(false)
             } else {
-                false
+                None
             }
         };
-        if hide_ime {
-            self.bridge.set_ime_visible(false);
+        if let Some(visible) = ime_action {
+            self.bridge.set_ime_visible(visible);
         }
         if let Some(callback) = self.callbacks.borrow_mut().request_frame.as_mut() {
             callback(RequestFrameOptions::default());
